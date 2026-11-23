@@ -8,7 +8,7 @@ serves it all over gRPC.
 The name comes from Košutnjak, a Belgrade forest: *košuta* (a doe) + wood. It joins the hedgehog
 and the quail.
 
-**Status:** design accepted, implementation starting. See
+**Status:** design accepted, implementation starting. See [ADR 0002](docs/adr/0002-company-enrichment.md) (company identity and registries) and
 [ADR 0001](docs/adr/0001-architecture.md).
 
 - **One binary.** It starts with no configuration at all; everything else is set at runtime
