@@ -161,7 +161,8 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
     // Without ingest the receiver is dropped here, and no events are sent to it.
     let ingesting = ingest
         .as_ref()
-        .map(|i| i.start(ingest_rx, shutdown_rx.clone()));
+        .map(|(i, _)| i.start(ingest_rx, shutdown_rx.clone()));
+    let summarizing = ingest.as_ref().map(|(_, s)| s.start(shutdown_rx.clone()));
     let scanning = start_discovery(
         Arc::clone(&store),
         Arc::clone(&progress),
@@ -182,8 +183,12 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
             instance: config.instance_id.clone(),
             discovery: scanning.discovery.clone(),
             progress,
-            reprocess: ingest
-                .map(|i| Arc::new(ingest::Reprocess(i)) as Arc<dyn doewood_api::Reprocessor>),
+            reprocess: ingest.as_ref().map(|(i, _)| {
+                Arc::new(ingest::Reprocess(i.clone())) as Arc<dyn doewood_api::Reprocessor>
+            }),
+            summarize: ingest.map(|(_, s)| {
+                Arc::new(ingest::OnDemandSummaries(s)) as Arc<dyn doewood_api::OnDemand>
+            }),
             options: ApiOptions::default(),
             shutdown: shutdown_rx.clone(),
         },
@@ -204,6 +209,11 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
     if let Some(handle) = ingesting {
         handle.join().await;
         info!("ingest stopped");
+    }
+    if let Some(task) = summarizing
+        && let Err(e) = task.await
+    {
+        warn!(error = %e, "LLM queue task failed");
     }
     if let Some(task) = supervisor
         && let Err(e) = task.await

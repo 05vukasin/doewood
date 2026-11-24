@@ -35,6 +35,10 @@ quail-core = { git = "https://github.com/05vukasin/quail", rev = "62108d4" }
 quail-engine = { git = "https://github.com/05vukasin/quail", rev = "62108d4" }
 quail-ocr = { git = "https://github.com/05vukasin/quail", rev = "62108d4", optional = true }
 quail-sketch = { git = "https://github.com/05vukasin/quail", rev = "62108d4" }
+# LLM summaries (ADR 0001, section 6): `summary.llm` through an HTTP API. Feature `api` sends
+# document text (the card and the digest) to the provider a source's policy and the configured
+# AI provider name; nothing is sent while every policy is `off` (the default).
+quail-summary = { git = "https://github.com/05vukasin/quail", rev = "62108d4", features = ["api"] }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true

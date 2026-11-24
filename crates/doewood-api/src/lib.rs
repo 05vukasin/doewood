@@ -47,6 +47,7 @@ pub use config::add_source;
 pub use progress::{EventCounts, Progress};
 pub use reprocess::{ReprocessPhase, ReprocessView, Reprocessor};
 pub use state::{ApiOptions, ApiParts, ApiState};
+pub use summarize::{BoxFuture, OnDemand, OnDemandError, OnDemandInput, OnDemandResult};
 
 /// The generated protobuf types, servers and clients of package `doewood.v1`.
 #[allow(missing_docs, clippy::all, clippy::pedantic)]

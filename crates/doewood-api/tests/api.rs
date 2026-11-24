@@ -1265,7 +1265,7 @@ async fn reprocess_jobs_stream_their_progress() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn stubs_answer_unimplemented_after_validation() {
+async fn without_ingest_jobs_and_summaries_are_unavailable_after_validation() {
     let a = Instance::start("inst-a", Some(Shared::sqlite().backend)).await;
     let ch = a.channel().await;
     let mut req = add_request("http://minio.test:9000", "docs", "");
@@ -1310,8 +1310,9 @@ async fn stubs_answer_unimplemented_after_validation() {
         })
         .await
         .unwrap_err();
-    assert_eq!(err.code(), Code::Unimplemented);
-    assert!(err.message().contains("step 6"), "{}", err.message());
+    // Without ingest there is nothing to summarize with.
+    assert_eq!(err.code(), Code::Unavailable);
+    assert!(err.message().contains("ingest"), "{}", err.message());
     let err = sum
         .summarize(pb::SummarizeRequest {
             input: Some(pb::summarize_request::Input::Location(pb::S3Location {
@@ -1352,7 +1353,7 @@ async fn stubs_answer_unimplemented_after_validation() {
         .unwrap_err(),
         &["location.source_id", "location.key"],
     );
-    // A large file within the limit is decoded (and answered UNIMPLEMENTED).
+    // A large file within the limit is decoded (and answered UNAVAILABLE: no ingest here).
     let big = vec![b'x'; 8 * 1024 * 1024];
     let err = sum
         .summarize(pb::SummarizeRequest {
@@ -1362,7 +1363,149 @@ async fn stubs_answer_unimplemented_after_validation() {
         })
         .await
         .unwrap_err();
-    assert_eq!(err.code(), Code::Unimplemented);
+    assert_eq!(err.code(), Code::Unavailable);
+    a.stop().await;
+}
+
+/// `Summarize` with ingest's part faked: what it is handed, and how its answers and errors
+/// come out.
+struct FakeOnDemand {
+    seen: std::sync::Mutex<Vec<(doewood_api::OnDemandInput, Option<String>)>>,
+    changed: std::sync::atomic::AtomicU32,
+}
+
+impl doewood_api::OnDemand for FakeOnDemand {
+    fn summarize(
+        &self,
+        input: doewood_api::OnDemandInput,
+        provider: Option<String>,
+    ) -> doewood_api::BoxFuture<'_, Result<doewood_api::OnDemandResult, doewood_api::OnDemandError>>
+    {
+        Box::pin(async move {
+            let fail = matches!(&input, doewood_api::OnDemandInput::Content { name, .. } if name == "fail.txt");
+            self.seen.lock().unwrap().push((input, provider.clone()));
+            if fail {
+                return Err(doewood_api::OnDemandError::NoProvider(
+                    "no AI provider is configured: add one with ConfigService.SetAiProvider".into(),
+                ));
+            }
+            Ok(doewood_api::OnDemandResult {
+                digest: "A supply contract.".into(),
+                checked: 3,
+                supported: 2,
+                unsupported: vec!["number:9".into()],
+                extractive: false,
+                provider: provider.unwrap_or_else(|| "local".into()),
+                model: "vllm:test-model".into(),
+                blake3: "ab".repeat(32),
+                kind: "contract".into(),
+                warnings: vec![],
+            })
+        })
+    }
+
+    fn settings_changed(&self) {
+        self.changed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn summarize_hands_requests_to_ingest() {
+    let fake = Arc::new(FakeOnDemand {
+        seen: std::sync::Mutex::new(Vec::new()),
+        changed: std::sync::atomic::AtomicU32::new(0),
+    });
+    let a = Instance::start_with(
+        "inst-a",
+        Some(Shared::sqlite().backend),
+        Options {
+            summarize: Some(Arc::clone(&fake) as Arc<dyn doewood_api::OnDemand>),
+            ..Options::default()
+        },
+    )
+    .await;
+    let ch = a.channel().await;
+    let mut req = add_request("http://minio.test:9000", "docs", "");
+    req.paused = true;
+    let source = config(&ch).add_source(req).await.unwrap().into_inner();
+    config(&ch)
+        .set_ai_provider(pb::SetAiProviderRequest {
+            name: "local".into(),
+            preset: "vllm".into(),
+            model: "test-model".into(),
+            base_url: "http://127.0.0.1:9/v1".into(),
+            ..pb::SetAiProviderRequest::default()
+        })
+        .await
+        .unwrap();
+    config(&ch)
+        .set_llm_policy(pb::SetLlmPolicyRequest {
+            source_id: source.id.clone(),
+            policy: Some(pb::LlmPolicy {
+                mode: pb::LlmMode::OnDemand as i32,
+                ..pb::LlmPolicy::default()
+            }),
+        })
+        .await
+        .unwrap();
+    // A provider and a policy change wake the queue.
+    assert_eq!(fake.changed.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+    let mut sum = SummarizeServiceClient::new(ch.clone());
+    let r = sum
+        .summarize(pb::SummarizeRequest {
+            input: Some(pb::summarize_request::Input::Location(pb::S3Location {
+                source_id: source.id.clone(),
+                key: "in/a.pdf".into(),
+            })),
+            name: String::new(),
+            provider: "local".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(r.digest, "A supply contract.");
+    let fc = r.fact_check.unwrap();
+    assert_eq!((fc.checked, fc.supported), (3, 2));
+    assert_eq!(fc.unsupported, ["number:9"]);
+    assert_eq!(
+        (r.provider.as_str(), r.kind.as_str()),
+        ("local", "contract")
+    );
+    let r = sum
+        .summarize(pb::SummarizeRequest {
+            input: Some(pb::summarize_request::Input::Content(b"text".to_vec())),
+            name: "a.txt".into(),
+            provider: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(r.provider, "local");
+    {
+        let seen = fake.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(matches!(
+            &seen[0],
+            (doewood_api::OnDemandInput::Location { key, .. }, Some(p)) if key == "in/a.pdf" && p == "local"
+        ));
+        assert!(matches!(
+            &seen[1],
+            (doewood_api::OnDemandInput::Content { name, bytes }, None) if name == "a.txt" && bytes == b"text"
+        ));
+    }
+    // Ingest's errors are statuses with their message.
+    let err = sum
+        .summarize(pb::SummarizeRequest {
+            input: Some(pb::summarize_request::Input::Content(b"text".to_vec())),
+            name: "fail.txt".into(),
+            provider: String::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert!(err.message().contains("SetAiProvider"), "{}", err.message());
     a.stop().await;
 }
 

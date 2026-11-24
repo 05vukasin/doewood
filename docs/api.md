@@ -33,7 +33,7 @@ The S3 event webhook is not part of the gRPC API: it is on the ops server (see
 | `RecordsService` | `GetRecord`, `ListRecords` |
 | `GraphService` | `GetNode`, `Neighbours`, `CompanyDocuments` |
 | `SearchService` | `Search` |
-| `SummarizeService` | `Summarize` (not built yet) |
+| `SummarizeService` | `Summarize` |
 
 The comments in the `.proto` files are the reference for every field. In short:
 
@@ -62,14 +62,17 @@ The comments in the `.proto` files are the reference for every field. In short:
 
 - **SetLlmPolicy** sets which documents of a source get an LLM summary: `LLM_MODE_OFF` (the
   default), `LLM_MODE_ALL`, `LLM_MODE_KINDS` with `kinds`, or `LLM_MODE_ON_DEMAND`; with a
-  concurrency (1 to 64, default 2) and an optional daily token budget. The policy applies once
-  the LLM queue exists (step 6).
+  concurrency (1 to 64, default 2) and an optional daily token budget (tokens per UTC day). It
+  applies to documents ingested from now on and to those waiting in the queue. See
+  [llm.md](llm.md).
 - **SetAiProvider** configures a provider with a preset, a model, an optional base URL and a
   write-only API key. The presets are those of quail's `ApiConfig` and hedgehog: `openai`,
   `openai_compatible` (needs `base_url`), `anthropic`, `bedrock`, `openrouter`, `groq`, `vllm`
   and `ollama`. The name defaults to the preset, so several providers of one preset can live
   side by side under other names. An empty `api_key` keeps the stored key; `clear_api_key`
   deletes it. The first provider set becomes the default; `make_default` moves the default.
+  The LLM queue uses the default provider. For `bedrock`, `base_url` is required
+  (`https://bedrock-runtime.<region>.amazonaws.com`): the region is read from it.
 - **ListAiProviders** lists them with `api_key_set`, never the key, plus every preset name.
 
 ### Progress
@@ -84,7 +87,9 @@ every source, including ones added later.
 | `seen` | objects under the prefix that discovery knows about |
 | `new`, `changed`, `deleted` | discovery events since this instance started (scans and the webhook) |
 | `processed`, `failed`, `pending` | objects ingested (`done`), failed (after their retries), and not ingested yet |
-| `queued_llm` | documents in the LLM queue (0 until step 6) |
+| `queued_llm` | documents waiting in the LLM queue |
+| `summarized`, `llm_failed` | documents the LLM queue summarized, and those whose summary failed (`llm_last_error` on the source's progress has the latest error) |
+| `llm_tokens_today` | tokens the source's summaries spent on the current UTC day (what its daily budget is checked against) |
 
 ### Records, graph and search
 
@@ -119,10 +124,16 @@ JOB=$(grpcurl -plaintext -d "{\"source_id\": \"$ID\"}" 127.0.0.1:7443 \
 grpcurl -plaintext -d "{\"job_id\": \"$JOB\"}" 127.0.0.1:7443 doewood.v1.JobsService/WatchReprocess
 ```
 
-### Not built yet
+### Summarize
 
-`Summarize` (step 6) is defined, so the API is stable, and it validates its requests. A valid
-request answers `UNIMPLEMENTED` with a message saying which step brings it.
+**Summarize** summarizes one file now, outside the LLM queue, and stores nothing (no record, no
+summary, no spend). Send the bytes (`content`, with `name`) or an object of a source
+(`location`); a source whose LLM policy is `LLM_MODE_OFF` is refused. `provider` names an AI
+provider; empty uses the default. The answer has the summary (`digest`), the fact check of the
+model's output, the provider and model, the file's BLAKE3 and kind. When the provider fails or
+its output fails the fact check, the answer is quail's extractive summary with `extractive`
+set and the reason in `warnings`. Without a configured provider it answers
+`FAILED_PRECONDITION`. See [llm.md](llm.md).
 
 ## Errors
 
@@ -131,9 +142,8 @@ request answers `UNIMPLEMENTED` with a message saying which step brings it.
 | `INVALID_ARGUMENT` | a field is wrong. Every problem is reported at once: the message lists `field: reason` pairs, and a `google.rpc.BadRequest` detail carries the same field paths (`credentials.access_key_id`, `llm_policy.kinds[2]`, ...). |
 | `NOT_FOUND` | the source, record, node or provider does not exist |
 | `ALREADY_EXISTS` | the source exists on this instance, or another instance has claimed it (named in the message) |
-| `UNAVAILABLE` | the shared Postgres is not connected (yet), or a call to it failed; retry. `ReprocessJob` on an instance without ingest |
-| `FAILED_PRECONDITION` | the shared database was migrated by a newer doewood |
-| `UNIMPLEMENTED` | `Summarize` |
+| `UNAVAILABLE` | the shared Postgres is not connected (yet), or a call to it failed; retry. `ReprocessJob` and `Summarize` on an instance without ingest; `Summarize` of an object that cannot be read |
+| `FAILED_PRECONDITION` | the shared database was migrated by a newer doewood. `Summarize` without a configured AI provider (or with one missing its key or base URL), of a source whose LLM policy is off, or of a file without text |
 | `OUT_OF_RANGE` | a message larger than the limit |
 | `INTERNAL` | anything else; the details are in the server log, not in the message |
 

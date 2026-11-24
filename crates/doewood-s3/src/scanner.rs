@@ -374,13 +374,19 @@ impl Scanner {
         }
     }
 
+    /// Records the state a pass ended in. A pause or removal made meanwhile wins: the store
+    /// only changes a source that is still scanned.
     async fn set_state(&self, state: SourceState, reason: Option<String>) {
         let id = self.source;
-        if let Err(e) = self
-            .db(move |s| s.set_source_state(id, state, reason.as_deref()))
+        match self
+            .db(move |s| s.set_scanned_source_state(id, state, reason.as_deref()))
             .await
         {
-            warn!(source = %id, error = %e, "cannot record the source state");
+            Ok(true) => {}
+            Ok(false) => {
+                info!(source = %id, state = %state, "source no longer scanned; state not changed");
+            }
+            Err(e) => warn!(source = %id, error = %e, "cannot record the source state"),
         }
     }
 
@@ -810,6 +816,41 @@ mod tests {
         .await
         .unwrap();
         assert!(rx.recv().await.is_none());
+        assert_eq!(bucket.pages_served.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_pass_failing_while_the_source_is_paused_keeps_the_pause() {
+        let s = setup("");
+        let bucket = Arc::new(s.bucket);
+        let (tx, _rx) = mpsc::channel(10);
+        let scanner = Scanner::new(
+            Arc::clone(&s.store),
+            &s.source,
+            tx,
+            ScanOptions {
+                error_retry: Some(Duration::from_secs(1)),
+                ..small()
+            },
+        );
+        // The API pauses the source while this attempt is failing.
+        let connect: Connect<Arc<FakeBucket>> = {
+            let store = Arc::clone(&s.store);
+            let id = s.source.id;
+            Arc::new(move |_, _| {
+                store
+                    .set_source_state(id, SourceState::Paused, None)
+                    .unwrap();
+                Err(S3Error::Config("no route".into()))
+            })
+        };
+        let (_stop_tx, stop) = watch::channel(false);
+        // The scanner sees the pause on its retry and ends.
+        tokio::time::timeout(Duration::from_secs(5), scanner.run(connect, stop))
+            .await
+            .unwrap();
+        let src = s.store.source(s.source.id).unwrap().unwrap();
+        assert_eq!((src.state, src.state_reason), (SourceState::Paused, None));
         assert_eq!(bucket.pages_served.load(Ordering::SeqCst), 0);
     }
 

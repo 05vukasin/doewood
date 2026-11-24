@@ -26,6 +26,7 @@ pub use store::ai::{
     AI_PRESETS, AiProvider, AiProviderInput, ApiKey, DEFAULT_AI_PROVIDER, KeyChange,
     valid_provider_name,
 };
+pub use store::llm::{LlmCounts, LlmJob, LlmJobStatus, LlmUsage, SECONDS_PER_DAY, utc_day};
 pub use store::objects::{IngestOutcome, IngestStatus, ObjectChange, ScanCheckpoint, SeenObject};
 pub use store::sources::{
     DEFAULT_LLM_CONCURRENCY, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_SCAN_INTERVAL, LlmMode, LlmPolicy,

@@ -13,6 +13,7 @@ use tonic::Status;
 
 use crate::progress::Progress;
 use crate::reprocess::Reprocessor;
+use crate::summarize::OnDemand;
 use crate::{convert, error, pb};
 
 /// Tuning of the API server.
@@ -47,6 +48,9 @@ pub struct ApiParts {
     pub progress: Arc<Progress>,
     /// Reprocess jobs; `None` when ingest does not run (`ReprocessJob` is then UNAVAILABLE).
     pub reprocess: Option<Arc<dyn Reprocessor>>,
+    /// On-demand summaries and the LLM queue; `None` when ingest does not run (`Summarize` is
+    /// then UNAVAILABLE).
+    pub summarize: Option<Arc<dyn OnDemand>>,
     /// Tuning.
     pub options: ApiOptions,
     /// Turns true on shutdown; streams end then.
@@ -106,6 +110,13 @@ impl ApiState {
 
     pub(crate) fn progress(&self) -> &Arc<Progress> {
         &self.inner.parts.progress
+    }
+
+    /// Tells the LLM queue that a policy or a provider changed.
+    pub(crate) fn llm_settings_changed(&self) {
+        if let Some(s) = &self.inner.parts.summarize {
+            s.settings_changed();
+        }
     }
 
     pub(crate) fn running(&self, id: SourceId) -> bool {
