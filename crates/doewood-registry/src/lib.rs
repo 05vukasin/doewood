@@ -10,6 +10,9 @@
 //!   and ultimate parents, reporting exceptions, successor entities with dates).
 //! - [`vies`]: the EU's VIES (`ec.europa.eu`): whether a VAT number is valid, with the
 //!   registered name and address.
+//! - [`wikidata`]: Wikidata's query service (SPARQL) by LEI or Q-id: parent organization,
+//!   owned by, replaced by, followed by, official website and logo, with dates; and the
+//!   `wbsearchentities` name search. The lowest trust tier ([`TrustTier::Community`]).
 //! - [`fetch`]: the shared request loop (limiter, retries, cap, cache) over a [`Transport`].
 //! - [`limit`], [`clock`], [`cache`], [`http`]: its parts, each behind a small trait so the
 //!   decision logic is tested without a network.
@@ -24,12 +27,15 @@ pub mod gleif;
 pub mod http;
 pub mod limit;
 mod parse;
+mod trust;
 pub mod vies;
 mod warning;
+pub mod wikidata;
 
 pub use cache::{Cache, CacheEntry, Cached, MemoryCache, NoCache};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use fetch::{Body, Fetch, FetchPolicy, Fetched, Fetcher, Inspect};
-pub use http::{HttpTransport, Request, Response, Transport, TransportError};
+pub use http::{HttpTransport, Request, Response, Transport, TransportError, USER_AGENT};
 pub use limit::TokenBucket;
+pub use trust::TrustTier;
 pub use warning::{Registry, Warning, WarningKind};

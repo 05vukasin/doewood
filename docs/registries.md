@@ -2,15 +2,16 @@
 
 `crates/doewood-registry` holds the public registry clients of
 [ADR 0002](adr/0002-company-enrichment.md), section 2. `doewood-enrich` stays pure (no I/O);
-this crate does the requests and parses the answers into types. GLEIF and VIES are done;
-Wikidata, EDGAR, APR and Companies House follow, one at a time.
+this crate does the requests and parses the answers into types. GLEIF, VIES and Wikidata are
+done; EDGAR, APR and Companies House follow, one at a time.
 
 Nothing calls the clients yet: the enrichment job (ADR 0002 section 6) that turns their answers
 into company identifiers and dated edges comes later.
 
 ## What is sent
 
-Only identifiers and names: an LEI, a VAT number, or a legal name and a country code. Document
+Only identifiers and names: an LEI, a VAT number, a Wikidata item id, or a legal name and a
+country code. Document
 content never leaves the instance (ADR 0002, the privacy rule). An identifier is validated before
 it is sent: an LEI must pass ISO 17442 (`doewood_enrich::check::lei`), a VAT number its
 country's format and check digits (`doewood_enrich::check::vat`), so a typo or a placeholder is
@@ -22,7 +23,8 @@ Every client is built on the same request loop (`Fetcher`):
 
 - **Failure-soft.** Every failure is a typed `Warning { registry, kind }`, never a panic or a
   failed ingest. The kinds: `Disabled`, `Config`, `InvalidInput`, `Timeout`, `Transport`,
-  `TooLarge`, `RateLimited`, `Status`, `Malformed`, and `Vies` (a VIES error code). The loop
+  `TooLarge`, `RateLimited`, `Status`, `Malformed`, `Vies` (a VIES error code) and `Wikidata`
+  (a Wikidata API error code). The loop
   logs each one at `WARN`.
 - **Length-capped.** The body is read chunk by chunk and dropped as soon as it passes the cap
   (a larger `Content-Length` is refused before reading). It is never parsed.
@@ -39,6 +41,12 @@ Every client is built on the same request loop (`Fetcher`):
   (`Inspect`): to retry, to retry with the bucket emptied, or to fail at once with its own
   warning. VIES uses it for the error codes it puts in the body.
 - **`GET` or JSON `POST`.** The transport sends either; VIES's documented endpoint is a `POST`.
+- **User-Agent.** Every request sends `doewood/<version> (+https://github.com/05vukasin/doewood)`
+  (`USER_AGENT`): generic, with the project's URL as the contact, as the Wikimedia User-Agent
+  policy asks. Never a person's name or email.
+- **Trust tier.** `Registry::tier()` is `TrustTier::Official` for GLEIF and VIES (and the
+  national registries to come) and `TrustTier::Community` for Wikidata, the lowest tier of ADR
+  0002 section 2 (`Community < Official`).
 - **Timeouts.** One for connecting, and one for the whole request, body included.
 - **Cached, with a fetch date.** Answers are cached by request under keys like
   `gleif:lei-records/<LEI>`, with the date they were fetched; every answer returns that date
@@ -171,11 +179,103 @@ HTTP status comes with which error code (all are read from the body), and the fu
 codes (the eleven above are the faults VIES lists for its test service;
 any other is kept as `ViesError::Other`).
 
+## Wikidata
+
+Wikidata, keyless, community-edited: **the lowest trust tier** (`TrustTier::Community`, ADR
+0002 section 2). Every item and search hit carries `tier: TrustTier::Community`. How the
+enrichment job weighs it: an official registry's fact always wins over a Wikidata one, and a
+Wikidata hit is never on its own a "registry identifier" match in the fusion of ADR 0002
+section 1.6 (that is the LEI or national id it was found by). Its relations are corroboration
+and gap-filling; turning them into dated edges (ADR 0002 section 3) comes with the enrichment
+job.
+
+| call | requests | gives |
+|---|---|---|
+| `by_lei(lei)` | `GET https://query.wikidata.org/sparql?query=…` (items with `wdt:P1278 "<LEI>"`) | the items with that LEI, sorted by id (normally one or none) |
+| `item(qid)` | the same query with `VALUES ?item { wd:<Q-id> }` | the item, or `None` |
+| `search(name)` | `GET https://www.wikidata.org/w/api.php?action=wbsearchentities&search=…&type=item&language=…&limit=…&format=json&maxlag=5` | candidates: Q-id, label, description, the text matched |
+
+A `WikidataItem` has the Q-id, the label (in the configured language, else the `mul` label),
+its LEIs (P1278, validated), and each statement of:
+
+| property | field | value |
+|---|---|---|
+| P749 parent organization | `parent_organizations` | `Relation` |
+| P127 owned by | `owned_by` | `Relation` (an owner may be a person: `human`) |
+| P1366 replaced by | `replaced_by` | `Relation` |
+| P156 followed by | `followed_by` | `Relation` |
+| P856 official website | `websites` | `http(s)` URL only (not verified; ADR 0002 section 5 verifies before use) |
+| P154 logo image | `logos` | the Commons file name and `https://commons.wikimedia.org/wiki/Special:FilePath/<file>` |
+
+Each statement has its period (`start` from the P580 start time qualifier, `end` from P582
+end time) and whether it has the preferred rank. Deprecated statements are left out; a
+statement with an unknown or no value, a value that is not an item, or an item pointing at
+itself is skipped. A date keeps its precision (`Day`, `Month`, `Year`): a month is its first
+day, a year January 1st, and anything coarser (decade, century) is dropped. A `Relation`'s
+`human` is P31 Q5 on the target: a person is never a company. Several start or end times on
+one statement give the earliest start and the latest end.
+
+- **Injection.** No caller text reaches a SPARQL query. A Q-id is parsed into a number (`QId`:
+  `Q` and 1 to 12 digits, nothing else); an LEI must pass ISO 17442 (compacted to 20 letters
+  and digits, and checked again when the query is built); the language is a validated tag
+  (`en`, `sr-el`) from the configuration. The query is built from those alone and then
+  percent-encoded into the URL. A name only goes to `wbsearchentities`, as one
+  percent-encoded URL parameter (whitespace collapsed; empty, longer than 256 characters or
+  with control characters is `InvalidInput`), never into SPARQL.
+- **Checks.** Every `by_lei` item must list the asked LEI, and `item` must answer about the
+  asked Q-id, else `Malformed`. A SPARQL answer that is not SPARQL 1.1 JSON, or names an item
+  that is not a Wikidata entity IRI, is `Malformed`. An item without rows (no such item, or a
+  redirect) is `None`.
+- **API errors.** `wbsearchentities` reports errors as `{"error": {"code": …}}` with a 200:
+  `maxlag` is retried with the backoff, `ratelimited` empties the bucket and is retried, any
+  other code is a `Wikidata(code)` warning at once (the code sanitized). Never cached.
+- **Cached** under `wikidata:sparql/lei/<LEI>?lang=…`, `wikidata:sparql/item/<Q-id>?lang=…` and
+  `wikidata:search?<query>` for 30 days (the ADR's refresh), found or empty. Neither endpoint
+  answers 404 for "nothing found"; a 404 is a `Status` warning.
+
+The query service's usage policy (the WDQS user manual): at most 5 parallel queries per IP and
+60 seconds of query time a minute per client (User-Agent and IP), a 60 s limit per query, 429
+with `Retry-After` beyond the limits (clients that keep going are banned), and a User-Agent
+following the Wikimedia policy, else blocked. GET is recommended for small queries (the service
+caches them). doewood stays well inside: **one request at a time per endpoint** (a gate held
+through retries and waits), 20 a minute with no burst, a 20 s timeout, and the shared 429 /
+`Retry-After` handling. A query timeout on the service side comes as a 5xx and is retried twice
+with the backoff.
+
+### Settings
+
+`WikidataConfig`, whose defaults are the production values:
+
+| field | default |
+|---|---|
+| `enabled` | `true` (keyless, ADR 0002 section 7) |
+| `sparql_url` | `https://query.wikidata.org/sparql` |
+| `api_url` | `https://www.wikidata.org/w/api.php` |
+| `language` | `en` (the `mul` label is the fallback) |
+| `timeout` / `connect_timeout` | 20 s / 5 s |
+| `per_minute` / `burst` | 20 / 1, per endpoint, one request in flight per endpoint |
+| `max_body` | 1 MiB |
+| `max_retries` / `backoff` / `max_retry_after` | 2 / 2 s, doubling / 60 s |
+| `ttl` | 30 days |
+| `search_size` | 10 (at most 50) |
+
+Assumed rather than confirmed from the documentation, and handled defensively: that every
+item has a `wikibase:statements` count in the query service's RDF (the `item` query uses it to
+tell an existing item from an unknown id), how unknown values appear (blank nodes or
+`.well-known/genid` IRIs: both are skipped), and that the WDQS v1 endpoint stays where it is
+(the manual mentions a v2 service; `sparql_url` is a setting).
+
 ## Tests
 
 `cargo test -p doewood-registry`. The tests never reach a real registry: a mock HTTP server on
 127.0.0.1 answers with fixtures written by hand in the test code (invented companies and
-addresses, LEIs and VAT numbers built with valid check digits, invented relationships). For
+addresses, LEIs and VAT numbers built with valid check digits, invented relationships, and
+invented Wikidata items from Q999000001 up). For Wikidata they cover the LEI and Q-id lookups
+with relations, dates and precisions, missing qualifiers, several parents, deprecated and
+unknown values, empty results, answers about another entity, malformed JSON, oversize bodies,
+429 with `Retry-After`, 5xx retries, timeouts, hostile ids, LEIs and names (quotes, braces,
+newlines, `&`) refused or only ever percent-encoded into the search API, the API error codes,
+one request at a time, the rate limiter, and the generic User-Agent. For
 VIES they cover a valid number with and without (`---`) name and address, an invalid one and its
 90-day cache, every error code under 200, 400 and 500 (retried or not, never cached), an outage
 followed by an answer, the busy backoff, 429, malformed and oversize bodies, numbers that are

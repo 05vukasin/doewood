@@ -1,6 +1,6 @@
 [package]
 name = "doewood-registry"
-description = "doewood's public registry clients (ADR 0002 section 2): failure-soft, length-capped, rate-limited and cached: GLEIF and VIES so far."
+description = "doewood's public registry clients (ADR 0002 section 2): failure-soft, length-capped, rate-limited and cached: GLEIF, VIES and Wikidata so far."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
