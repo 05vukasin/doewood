@@ -607,7 +607,10 @@ mod tests {
         assert_eq!(config.ingest_jobs, None);
         assert_eq!(config.ocr_models, PathBuf::from("/d/ocr-models"));
         let Loaded { config, warnings } = load(
-            &[("DOEWOOD_INGEST_JOBS", "6"), ("DOEWOOD_OCR_MODELS", "/models")],
+            &[
+                ("DOEWOOD_INGEST_JOBS", "6"),
+                ("DOEWOOD_OCR_MODELS", "/models"),
+            ],
             Some("h"),
         );
         assert!(warnings.is_empty());

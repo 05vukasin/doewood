@@ -4,8 +4,8 @@
 use doewood_core::SourceId;
 use doewood_model::SourceKey;
 use doewood_store::{
-    AI_PRESETS, AiProviderInput, ApiKey, IngestSettingsPatch, KeyChange, NewSource,
-    S3Credentials, SourcePatch, SourceState, UrlStyle, valid_min_jaccard, valid_provider_name,
+    AI_PRESETS, AiProviderInput, ApiKey, IngestSettingsPatch, KeyChange, NewSource, S3Credentials,
+    SourcePatch, SourceState, UrlStyle, valid_min_jaccard, valid_provider_name,
 };
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
@@ -424,7 +424,7 @@ impl ConfigService for Api {
         _request: Request<GetIngestSettingsRequest>,
     ) -> Result<Response<IngestSettings>, Status> {
         let settings = self.state.db(doewood_store::Store::ingest_settings).await?;
-        Ok(Response::new(convert::ingest_settings(&settings)))
+        Ok(Response::new(convert::ingest_settings(settings)))
     }
 
     async fn set_ingest_settings(
@@ -450,6 +450,6 @@ impl ConfigService for Api {
             similar_min_jaccard = settings.similar_min_jaccard,
             "ingest settings set"
         );
-        Ok(Response::new(convert::ingest_settings(&settings)))
+        Ok(Response::new(convert::ingest_settings(settings)))
     }
 }

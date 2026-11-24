@@ -74,7 +74,7 @@ pub(crate) fn ai_provider(p: &AiProvider) -> pb::AiProvider {
     }
 }
 
-pub(crate) fn ingest_settings(s: &doewood_store::IngestSettings) -> pb::IngestSettings {
+pub(crate) fn ingest_settings(s: doewood_store::IngestSettings) -> pb::IngestSettings {
     pb::IngestSettings {
         similar_min_jaccard: s.similar_min_jaccard,
     }

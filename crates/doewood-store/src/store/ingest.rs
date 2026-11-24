@@ -138,7 +138,11 @@ mod tests {
     #[test]
     fn a_bad_stored_value_reads_as_the_default() {
         let s = store();
-        for bad in [serde_json::json!("0.9"), serde_json::json!(5), serde_json::json!(null)] {
+        for bad in [
+            serde_json::json!("0.9"),
+            serde_json::json!(5),
+            serde_json::json!(null),
+        ] {
             s.set_setting(SIMILAR_MIN_JACCARD, &bad).unwrap();
             assert_eq!(s.ingest_settings().unwrap(), IngestSettings::default());
         }

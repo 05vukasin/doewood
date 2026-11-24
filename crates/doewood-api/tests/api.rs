@@ -682,7 +682,10 @@ async fn ingest_settings_round_trip_and_validation() {
     assert!(eq(set.similar_min_jaccard, 0.65));
     assert!(eq(get().await.similar_min_jaccard, 0.65));
     // Kept in the instance store, where ingest reads it.
-    assert!(eq(a.store.ingest_settings().unwrap().similar_min_jaccard, 0.65));
+    assert!(eq(
+        a.store.ingest_settings().unwrap().similar_min_jaccard,
+        0.65
+    ));
     // An unset field keeps the stored value; 1 is allowed.
     let kept = config(&ch)
         .set_ingest_settings(pb::SetIngestSettingsRequest::default())
