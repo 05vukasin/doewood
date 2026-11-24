@@ -338,10 +338,13 @@ impl RecordStore for Standalone {
         let (source, after) = (source.clone(), after.copied());
         let limit = i64::from(records_limit(limit));
         self.run(move |conn| {
+            // `> coalesce(?4, x'')` rather than `?4 IS NULL OR ...`: the OR kept SQLite from
+            // starting the scan at the page token, so every page read the records before it
+            // (issue #13). Every hash is 32 bytes, so all are greater than the empty blob.
             let mut stmt = conn
                 .prepare_cached(
                     "SELECT r.blake3, r.body_json, r.versions_json, r.updated_at FROM records r \
-                     WHERE (?4 IS NULL OR r.blake3 > ?4) \
+                     WHERE r.blake3 > coalesce(?4, x'') \
                      AND EXISTS (SELECT 1 FROM locations l WHERE l.blake3 = r.blake3 \
                      AND l.endpoint = ?1 AND l.bucket = ?2 \
                      AND substr(l.object_key, 1, length(?3)) = ?3) \

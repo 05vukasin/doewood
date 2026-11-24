@@ -10,6 +10,8 @@ use uuid::Uuid;
 
 use crate::PgStore;
 
+mod list_records;
+
 const VAR: &str = "DOEWOOD_TEST_POSTGRES_URL";
 
 fn test_url() -> Option<String> {
@@ -58,6 +60,17 @@ impl Scratch {
 
     async fn store(&self) -> PgStore {
         PgStore::connect_config(self.config.clone()).await.unwrap()
+    }
+
+    /// A plain connection with the schema on its search path.
+    async fn client(&self) -> tokio_postgres::Client {
+        let (client, conn) = self
+            .config
+            .connect(crate::tls::connector().unwrap())
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        client
     }
 
     async fn drop_schema(self) {
