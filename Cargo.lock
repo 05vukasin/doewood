@@ -1284,6 +1284,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "doewood-enrich",
+ "image",
  "reqwest",
  "rustls",
  "serde",

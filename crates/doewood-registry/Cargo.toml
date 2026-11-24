@@ -14,6 +14,9 @@ rust-version.workspace = true
 async-trait.workspace = true
 # LEI, VAT and MB/PIB validation before any request; name normalization.
 doewood-enrich.workspace = true
+# The favicon content checks decode ICO, PNG, GIF, JPEG and WEBP to refuse blank icons; no
+# SVG, no AVIF decoder (ADR 0002 section 5.4). Already in the tree through quail.
+image = { version = "0.25", default-features = false, features = ["gif", "ico", "jpeg", "png", "webp"] }
 # HTTP/1.1, rustls with the `ring` provider, no proxy discovery, no decompression: the same
 # build as doewood-s3's.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
@@ -22,8 +25,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
-# `rt` for `spawn_blocking`: indexing the APR set runs off the async workers.
-tokio = { workspace = true, features = ["rt", "sync", "time"] }
+# `rt` for `spawn_blocking`: indexing the APR set runs off the async workers. `net` for the
+# favicon guard's own DNS lookups.
+tokio = { workspace = true, features = ["rt", "sync", "time", "net"] }
 tracing.workspace = true
 url = "2.5"
 
