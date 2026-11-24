@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use doewood_api::{ApiOptions, ApiParts, ApiState, Progress, Reprocessor};
+use doewood_api::{ApiOptions, ApiParts, ApiState, OnDemand, Progress, Reprocessor};
 use doewood_core::{InstanceId, MasterKey};
 use doewood_model::Backend;
 use doewood_s3::{ClientOptions, Discovery, DiscoveryOptions, ObjectEvent, RetryPolicy};
@@ -35,6 +35,7 @@ pub struct Instance {
 pub struct Options {
     pub max_message_bytes: usize,
     pub reprocess: Option<Arc<dyn Reprocessor>>,
+    pub summarize: Option<Arc<dyn OnDemand>>,
 }
 
 impl Default for Options {
@@ -42,6 +43,7 @@ impl Default for Options {
         Self {
             max_message_bytes: 64 * 1024 * 1024,
             reprocess: None,
+            summarize: None,
         }
     }
 }
@@ -95,6 +97,7 @@ impl Instance {
             discovery: Some(discovery.clone()),
             progress: Arc::clone(&progress),
             reprocess: options.reprocess,
+            summarize: options.summarize,
             options: ApiOptions {
                 max_message_bytes: options.max_message_bytes,
                 progress_interval: Duration::from_millis(50),

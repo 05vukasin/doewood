@@ -9,6 +9,24 @@ doewood has two kinds of settings, and each setting has exactly one source
   through the [gRPC API](api.md) and kept in the instance's SQLite store. Secrets are encrypted
   with the master key and are write-only: the API never returns them.
 
+## Runtime settings
+
+Set through the API, kept in `doewood.sqlite`, applied without a restart:
+
+| setting | set with | stored as |
+|---|---|---|
+| S3 sources and their options | `AddSource`, `UpdateSource` | `sources` rows |
+| S3 credentials | `AddSource`, `UpdateSource` | secret `s3/<source id>` (sealed, write-only) |
+| A source's LLM policy: mode (`off` (default), `all`, `kinds`, `on_demand`), kinds, concurrency (1 to 64, default 2), daily token budget (tokens per UTC day, unset: no limit) | `SetLlmPolicy`, `AddSource` | `sources.policy_json` |
+| AI providers: preset, model, base URL | `SetAiProvider` | setting `ai.provider.<name>` |
+| An AI provider's API key | `SetAiProvider` | secret `ai/<name>/api_key` (sealed, write-only) |
+| The default AI provider (the LLM queue's) | `SetAiProvider` (`make_default`; the first one set) | setting `ai.default_provider` |
+
+The LLM queue's state is in the store too: `llm_jobs` (queued documents) and `llm_usage` (each
+source's spend per UTC day). The provider variables quail and hedgehog read (`AI_PROVIDER`,
+`OPENAI_API_KEY`, `AI_MAX_CONCURRENT_LLM`, ...) are **not** read by doewood: providers come only
+from the store. See [llm.md](llm.md).
+
 ## Bootstrap variables
 
 | variable | default | meaning |

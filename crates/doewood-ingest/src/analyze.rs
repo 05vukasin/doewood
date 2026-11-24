@@ -6,6 +6,8 @@
 //! - Documents (PDF, DOCX, text, CSV) get quail's record as is.
 //! - Spreadsheets get quail's identity layer (hashes, sniffed format) plus hedgehog's `sheet.*`
 //!   facts, with the spreadsheet format as the record's `format`: the same top-level shape.
+//! - Documents also get `summary.digest` (quail's bounded summary input), which the LLM queue
+//!   reads ([`crate::llm`]).
 //! - Anything without an extractor (an image, an archive, an unknown file) keeps the record of
 //!   quail's generic layer: identity and format only.
 //!
@@ -134,7 +136,20 @@ impl Analyzer {
         } else {
             Profile::Standard
         };
-        let (builder, ocr) = ocr.register(quail_cli::registry::builder(profile, limits.clone()));
+        // `summary.digest`: the bounded summary input, kept in the record so the LLM queue
+        // (and `Summarize`) work from the record alone, with what `summary.llm` would read.
+        let digest = quail_summary::SummaryDigest::with_config(
+            quail_summary::OutlineConfig::default(),
+            quail_summary::DigestConfig {
+                max_tokens: quail_summary::LlmConfig::default().digest_tokens,
+                card_tokens: quail_summary::LlmConfig::default().card_tokens,
+                ..quail_summary::DigestConfig::default()
+            },
+            0,
+        );
+        let builder =
+            quail_cli::registry::builder(profile, limits.clone()).analyzer(Box::new(digest));
+        let (builder, ocr) = ocr.register(builder);
         let engine = builder.build().map_err(|e| format!("quail engine: {e}"))?;
         let plan = plan_fingerprint(&engine);
         info!(

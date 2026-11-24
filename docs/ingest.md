@@ -95,6 +95,13 @@ The record is the quail record JSON, keyed by BLAKE3, with step versions: one pe
 - **Search:** title (`ref.title`, else the card's, the file's own, the file name), body (the
   summary card, the extractive summary, keywords, sheet text), kind, date and amount.
 
+## LLM summaries
+
+Documents also get quail's `summary.digest` in their record: the bounded text a model reads.
+After the record, the graph and search are stored, a document whose source's LLM policy asks
+for a summary (`all`, or `kinds` naming its kind) is queued for one; the summary comes later
+and never fails or holds up the file. See [llm.md](llm.md).
+
 ## Company identity
 
 `crates/doewood-enrich` holds the company identity rules of ADR 0002 section 1. It is pure: no

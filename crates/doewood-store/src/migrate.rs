@@ -11,6 +11,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0002_standalone_model.sql"),
     include_str!("migrations/0003_sources.sql"),
     include_str!("migrations/0004_ingest.sql"),
+    include_str!("migrations/0005_llm.sql"),
 ];
 
 /// The schema version this binary writes.

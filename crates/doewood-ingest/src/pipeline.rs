@@ -311,6 +311,8 @@ pub struct IngestParts {
     pub config: IngestConfig,
     /// Called after each object changes status (the progress counters).
     pub on_change: Arc<dyn Fn(SourceId) + Send + Sync>,
+    /// Called after a document was queued for an LLM summary (wakes the LLM queue).
+    pub on_llm_queued: Arc<dyn Fn(SourceId) + Send + Sync>,
 }
 
 /// The ingest service. Cheap to clone.
@@ -326,6 +328,7 @@ struct Inner {
     analyzer: Arc<Analyzer>,
     config: IngestConfig,
     on_change: Arc<dyn Fn(SourceId) + Send + Sync>,
+    on_llm_queued: Arc<dyn Fn(SourceId) + Send + Sync>,
     writer: Mutex<Option<(usize, Arc<GraphWriter>)>>,
     inflight: Mutex<HashSet<(SourceId, String)>>,
     sweep_now: Notify,
@@ -398,6 +401,7 @@ impl Ingest {
                 analyzer: parts.analyzer,
                 config: parts.config,
                 on_change: parts.on_change,
+                on_llm_queued: parts.on_llm_queued,
                 writer: Mutex::new(None),
                 inflight: Mutex::new(HashSet::new()),
                 sweep_now: Notify::new(),
@@ -741,6 +745,19 @@ impl Ingest {
             similar = stats.similar,
             "ingested"
         );
+        // The record is stored: a summary, if the source's policy asks for one, comes later
+        // through the LLM queue, and never fails this file.
+        if outcome == Outcome::Analyzed && crate::llm::has_digest(&body) {
+            let (store, kind) = (Arc::clone(&self.inner.store), facts.kind.clone());
+            let queued = tokio::task::spawn_blocking(move || {
+                crate::llm::queue_if_wanted(&store, &source, &blake3, &body, kind.as_deref())
+            })
+            .await
+            .unwrap_or(false);
+            if queued {
+                (self.inner.on_llm_queued)(id);
+            }
+        }
         let blake3 = blake3.0;
         Ok(Some(match outcome {
             Outcome::Analyzed => IngestOutcome::Done { blake3 },
