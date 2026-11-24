@@ -116,3 +116,45 @@ jobs:
       - run: |
           cargo test -p doewood-ingest --test minio_postgres -- --nocapture 2>&1 | tee test.log
           ! grep -q "are not both set: skipped" test.log
+  # The container image (Dockerfile) and the Helm chart (charts/doewood). Built, never pushed.
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: doewood:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke test
+        run: |
+          docker run --rm doewood:ci version
+          docker run -d --name dw -p 7444:7444 --read-only --cap-drop ALL --tmpfs /tmp \
+            --tmpfs /data:uid=10001,gid=10001 doewood:ci
+          for i in $(seq 1 60); do
+            curl -sf 127.0.0.1:7444/readyz && break
+            sleep 1
+          done
+          curl -sf 127.0.0.1:7444/healthz
+          curl -sf 127.0.0.1:7444/readyz
+          docker exec dw id
+          test "$(docker exec dw id -u)" = 10001
+          # OCR runs with the models of the image. Ingest is set up after the store is ready
+          # (reading the models takes a moment), so wait for its log line.
+          for i in $(seq 1 60); do
+            docker logs dw 2>&1 | grep -q '"ocr":"Ready' && break
+            sleep 1
+          done
+          docker logs dw 2>&1 | grep '"ingest configured"'
+          docker logs dw 2>&1 | grep -q '"ocr":"Ready'
+          docker rm -f dw
+      - uses: azure/setup-helm@v4
+        with: { version: v3.19.2 }
+      - run: helm lint charts/doewood
+      - run: |
+          helm template t charts/doewood > /dev/null
+          helm template t charts/doewood --set postgres.existingSecret=pg --set masterKey.existingSecret=mk > /dev/null

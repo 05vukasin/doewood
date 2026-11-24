@@ -1,0 +1,12 @@
+doewood: {{ .Values.replicas }} independent instance(s), each with its own volume.
+
+Each instance has its own sources and settings. Reach one by name:
+  {{ include "doewood.fullname" . }}-0.{{ include "doewood.fullname" . }}-headless.{{ .Release.Namespace }}.svc:{{ .Values.service.grpcPort }}
+
+  kubectl -n {{ .Release.Namespace }} port-forward pod/{{ include "doewood.fullname" . }}-0 7443 7444
+  curl -s 127.0.0.1:7444/readyz
+{{- if not .Values.masterKey.existingSecret }}
+
+WARNING: masterKey.existingSecret is unset, so each instance keeps a development key file on
+its volume. Set it for production (docs/deploy.md).
+{{- end }}

@@ -1,0 +1,9 @@
+apiVersion: v2
+name: doewood
+description: doewood instances as a StatefulSet, each with its own volume (ADR 0001)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/05vukasin/doewood
+sources:
+  - https://github.com/05vukasin/doewood

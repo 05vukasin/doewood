@@ -1,0 +1,39 @@
+# The headless Service names each instance: <pod>.<this>-headless.<namespace>.svc.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "doewood.fullname" . }}-headless
+  labels:
+    {{- include "doewood.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "doewood.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: grpc
+      port: {{ .Values.service.grpcPort }}
+      targetPort: grpc
+      appProtocol: grpc
+    - name: ops
+      port: {{ .Values.service.opsPort }}
+      targetPort: ops
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "doewood.fullname" . }}
+  labels:
+    {{- include "doewood.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "doewood.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: grpc
+      port: {{ .Values.service.grpcPort }}
+      targetPort: grpc
+      appProtocol: grpc
+    - name: ops
+      port: {{ .Values.service.opsPort }}
+      targetPort: ops

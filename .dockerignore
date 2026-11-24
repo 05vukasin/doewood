@@ -1,0 +1,7 @@
+# Only the sources the build needs go into the context.
+*
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!crates/
+!proto/
