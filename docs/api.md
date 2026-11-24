@@ -28,7 +28,7 @@ The S3 event webhook is not part of the gRPC API: it is on the ops server (see
 
 | service | RPCs |
 |---|---|
-| `ConfigService` | `AddSource`, `UpdateSource`, `PauseSource`, `ResumeSource`, `RemoveSource`, `ListSources`, `GetSource`, `SetLlmPolicy`, `SetAiProvider`, `ListAiProviders` |
+| `ConfigService` | `AddSource`, `UpdateSource`, `PauseSource`, `ResumeSource`, `RemoveSource`, `ListSources`, `GetSource`, `SetLlmPolicy`, `SetAiProvider`, `ListAiProviders`, `GetIngestSettings`, `SetIngestSettings` |
 | `JobsService` | `WatchProgress` (server stream), `ReprocessJob`, `WatchReprocess` (server stream) |
 | `RecordsService` | `GetRecord`, `ListRecords` |
 | `GraphService` | `GetNode`, `Neighbours`, `CompanyDocuments` |
@@ -81,6 +81,17 @@ The comments in the `.proto` files are the reference for every field. In short:
   The LLM queue uses the default provider. For `bedrock`, `base_url` is required
   (`https://bedrock-runtime.<region>.amazonaws.com`): the region is read from it.
 - **ListAiProviders** lists them with `api_key_set`, never the key, plus every preset name.
+
+### Ingest settings
+
+- **GetIngestSettings** returns ingest's runtime settings, defaults filled in.
+- **SetIngestSettings** changes them; an unset field keeps its value. `similar_min_jaccard` is
+  the least MinHash Jaccard estimate for a `similar_to` edge: above 0 and at most 1 (default
+  0.8), anything else is `INVALID_ARGUMENT`. Ingest reads it for every file, so it applies to
+  the next file without a restart. Edges already written are kept; `ReprocessJob` with
+  `force: true` compares a source's documents again (a lower value adds edges, a higher one
+  removes none). It replaces the old `DOEWOOD_SIMILAR_MIN_JACCARD` variable (see
+  [configuration.md](configuration.md)).
 
 ### Progress
 
@@ -202,6 +213,14 @@ grpcurl -plaintext -d @ 127.0.0.1:7443 doewood.v1.ConfigService/SetAiProvider <<
  "base_url": "http://vllm:8000/v1", "make_default": true}
 EOF
 grpcurl -plaintext 127.0.0.1:7443 doewood.v1.ConfigService/ListAiProviders
+```
+
+Ingest settings:
+
+```sh
+grpcurl -plaintext -d '{"similar_min_jaccard": 0.85}' \
+    127.0.0.1:7443 doewood.v1.ConfigService/SetIngestSettings
+grpcurl -plaintext 127.0.0.1:7443 doewood.v1.ConfigService/GetIngestSettings
 ```
 
 Progress, records, the graph and search:

@@ -91,7 +91,9 @@ The record is the quail record JSON, keyed by BLAKE3, with step versions: one pe
   its own number (`ref.doc_number`); until that document is known, the edge goes to a pending
   Document node `ref:<number>`, and moves to the real document when it arrives.
 - **`similar_to`** from quail's MinHash LSH bands: candidates come from the band index (a lookup
-  by band key), each confirmed by its Jaccard estimate (`DOEWOOD_SIMILAR_MIN_JACCARD`, 0.8).
+  by band key), each confirmed by its Jaccard estimate (the runtime setting
+  `similar_min_jaccard`, default 0.8, set with `ConfigService.SetIngestSettings`; it is read
+  for every file, so a change applies to the next file without a restart).
 - **Search:** title (`ref.title`, else the card's, the file's own, the file name), body (the
   summary card, the extractive summary, keywords, sheet text), kind, date and amount.
 
@@ -152,3 +154,23 @@ are there for enrichment, and no document merges on a fuzzy match yet.
   deletes and reprocessing. `throughput` (ignored) measures files per second.
 - `tests/minio_postgres.rs`: an S3 put in MinIO to a record in Postgres, with both
   `DOEWOOD_TEST_S3_ENDPOINT` and `DOEWOOD_TEST_POSTGRES_URL` set (CI's `ingest-e2e` job).
+
+## Throughput
+
+`throughput` in `tests/pipeline.rs`: 2000 generated files (PDF, DOCX, TXT, XLSX in equal parts,
+4.7 MiB), fetched from memory, analyzed without OCR, stored in in-memory SQLite (records, graph,
+search). Test profile (dependencies at opt-level 2). The worker count is `default_jobs()` (CPUs
+and memory); the test does not read `DOEWOOD_INGEST_JOBS`.
+
+```
+DOEWOOD_BENCH_FILES=2000 cargo test -p doewood-ingest --test pipeline -- --ignored --nocapture throughput
+```
+
+| machine | cores, RAM | workers | files/s | notes |
+|---|---|---|---|---|
+| laptop | 16, 14 GiB | 9 | 409 | from PR #5 |
+| server (AMD EPYC-Genoa) | 4, 7.6 GiB | 4 | 313 | median of 317, 313, 311 |
+| server, `taskset -c 0,1` | 2 | 2 | 228 | median of 242, 226, 228 |
+
+Server: Linux 7.0.0-30, rustc 1.97.1, commit `ba0b963`. Throughput grows less than linearly
+with workers here (2 to 4 workers: 1.4x).

@@ -48,6 +48,9 @@ pub enum StoreError {
     /// A secret value larger than the limit.
     #[error("secret value is {0} bytes; the limit is {max}", max = crate::SECRET_MAX_LEN)]
     SecretTooLarge(usize),
+    /// A runtime setting value outside its range.
+    #[error("invalid setting: {0}")]
+    InvalidSetting(String),
     /// A settings value that is not valid JSON in the database.
     #[error("setting {0:?} holds invalid JSON")]
     BadSetting(String),

@@ -77,8 +77,9 @@ pub struct IngestConfig {
 
 impl IngestConfig {
     /// The configuration for an instance: `jobs` from `DOEWOOD_INGEST_JOBS` (`None`: from the
-    /// CPUs and memory), the OCR models directory and the similarity threshold.
-    pub fn new(jobs: Option<usize>, ocr_models: &Path, min_jaccard: f64) -> Self {
+    /// CPUs and memory) and the OCR models directory. Tuning values such as the `similar_to`
+    /// threshold are runtime settings, read from the store for every file.
+    pub fn new(jobs: Option<usize>, ocr_models: &Path) -> Self {
         let jobs = jobs.unwrap_or_else(default_jobs).max(1);
         Self {
             jobs,
@@ -87,10 +88,7 @@ impl IngestConfig {
             retry_base: Duration::from_secs(2),
             sweep_interval: Duration::from_secs(30),
             reprocess_poll: Duration::from_millis(500),
-            similarity: SimilarityConfig {
-                min_jaccard,
-                ..SimilarityConfig::default()
-            },
+            similarity: SimilarityConfig::default(),
             analyzer: AnalyzerConfig {
                 workers: jobs,
                 ocr_models: ocr_models.to_owned(),
@@ -689,7 +687,11 @@ impl Ingest {
         id: SourceId,
         key: &str,
     ) -> Result<Option<IngestOutcome>, IngestError> {
-        let Some(source) = self.db(move |s| s.source(id)).await? else {
+        // The runtime settings are read per file, so a change applies without a restart.
+        let (source, settings) = self
+            .db(move |s| Ok((s.source(id)?, s.ingest_settings()?)))
+            .await?;
+        let Some(source) = source else {
             return Ok(None);
         };
         let bytes = self.inner.fetch.fetch(&source, key).await?;
@@ -733,7 +735,13 @@ impl Ingest {
         let facts = DocFacts::from_record(&body);
         let stats = self
             .writer(backend)
-            .write(&blake3, &location, &facts, &name)
+            .write(
+                &blake3,
+                &location,
+                &facts,
+                &name,
+                settings.similar_min_jaccard,
+            )
             .await?;
         debug!(
             source = %id,
