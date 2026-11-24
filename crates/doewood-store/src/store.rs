@@ -307,6 +307,8 @@ mod tests {
                 "search_index",
                 "secrets",
                 "settings",
+                "sketch_bands",
+                "sketches",
                 "source_claims",
                 "sources"
             ]

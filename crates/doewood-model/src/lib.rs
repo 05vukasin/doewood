@@ -14,10 +14,14 @@ mod traits;
 mod types;
 
 pub use error::{Error, Result};
-pub use traits::{Backend, ClaimStore, GraphStore, RecordStore, SearchStore};
+pub use traits::{
+    Backend, ClaimStore, GraphStore, RecordStore, SearchStore, SketchStore, sketch_limit,
+};
 pub use types::{
-    Blake3, Direction, Edge, EdgeKind, EdgeSource, EdgeState, Located, NODE_KEY_MAX_LEN, Neighbour,
-    NeighbourQuery, Node, NodeKind, ObjectLocation, PutOutcome, RECORDS_MAX_LIMIT, Record,
-    SEARCH_MAX_LIMIT, SearchDoc, SearchHit, SearchQuery, SourceClaim, SourceKey, StepVersions,
-    StoredEdge, records_limit, validate_node, versions_from_json, versions_to_json,
+    Blake3, Direction, Edge, EdgeKind, EdgeSource, EdgeState, Located, LocationEnded,
+    NODE_KEY_MAX_LEN, Neighbour, NeighbourQuery, Node, NodeKind, ObjectLocation,
+    PENDING_REF_PREFIX, PutOutcome, RECORDS_MAX_LIMIT, Record, SEARCH_MAX_LIMIT, SKETCH_MAX_BANDS,
+    SKETCH_MAX_SIGNATURE, SearchDoc, SearchHit, SearchQuery, Sketch, SourceClaim, SourceKey,
+    StepVersions, StoredEdge, band_to_i64, records_limit, validate_node, validate_sketch,
+    versions_from_json, versions_to_json,
 };
