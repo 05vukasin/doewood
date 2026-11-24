@@ -1,0 +1,217 @@
+// Runtime configuration: S3 sources, their LLM policies and the AI providers (ADR 0001,
+// sections 3, 5 and 6). Changes apply without a restart. Secrets (S3 credentials, API keys)
+// are write-only: no response ever carries one, only whether one is set.
+syntax = "proto3";
+
+package doewood.v1;
+
+import "doewood/v1/common.proto";
+
+service ConfigService {
+  // Adds a source. The source is first claimed in the shared store; a source another instance
+  // owns fails with ALREADY_EXISTS naming that instance. An active source starts scanning at
+  // once.
+  rpc AddSource(AddSourceRequest) returns (Source);
+  // Changes a source's options or credentials. The endpoint, bucket and prefix are its
+  // identity and cannot change: remove it and add another.
+  rpc UpdateSource(UpdateSourceRequest) returns (Source);
+  // Stops scanning a source. A pass under way keeps its checkpoint and resumes later.
+  rpc PauseSource(PauseSourceRequest) returns (Source);
+  // Scans a paused (or failing) source again.
+  rpc ResumeSource(ResumeSourceRequest) returns (Source);
+  // Removes a source with its progress and credentials, and releases its claim.
+  rpc RemoveSource(RemoveSourceRequest) returns (RemoveSourceResponse);
+  // This instance's sources, oldest first.
+  rpc ListSources(ListSourcesRequest) returns (ListSourcesResponse);
+  // One source.
+  rpc GetSource(GetSourceRequest) returns (Source);
+  // Sets which documents of a source get an LLM summary.
+  rpc SetLlmPolicy(SetLlmPolicyRequest) returns (Source);
+  // Adds or replaces an AI provider.
+  rpc SetAiProvider(SetAiProviderRequest) returns (AiProvider);
+  // The configured AI providers (never their keys).
+  rpc ListAiProviders(ListAiProvidersRequest) returns (ListAiProvidersResponse);
+}
+
+// How bucket URLs are built.
+enum UrlStyle {
+  // Path style.
+  URL_STYLE_UNSPECIFIED = 0;
+  // `https://endpoint/bucket/key`: MinIO, Ceph and most self-hosted stores.
+  URL_STYLE_PATH = 1;
+  // `https://bucket.endpoint/key`: AWS, R2, Wasabi. Needs a DNS name, not an IP.
+  URL_STYLE_VIRTUAL_HOST = 2;
+}
+
+// S3 credentials. WRITE-ONLY: stored sealed with the master key, never returned.
+message S3Credentials {
+  string access_key_id = 1;
+  string secret_access_key = 2;
+  // For temporary credentials; empty for none.
+  string session_token = 3;
+}
+
+// Which documents get an LLM summary.
+enum LlmMode {
+  // Off.
+  LLM_MODE_UNSPECIFIED = 0;
+  // None (the default).
+  LLM_MODE_OFF = 1;
+  // Every document.
+  LLM_MODE_ALL = 2;
+  // Only documents of the kinds listed in `kinds`.
+  LLM_MODE_KINDS = 3;
+  // None automatically; only through Summarize.
+  LLM_MODE_ON_DEMAND = 4;
+}
+
+// A source's LLM policy. Ingest always stores the record first; summaries then go through the
+// instance's LLM queue under this policy.
+message LlmPolicy {
+  LlmMode mode = 1;
+  // Document kinds (`invoice`, `contract`, ...) for LLM_MODE_KINDS; empty otherwise.
+  repeated string kinds = 2;
+  // Summaries of this source in flight at once, 1 to 64; 0 means the default, 2.
+  uint32 concurrency = 3;
+  // Tokens (prompt plus completion) the source may spend per UTC day; 0 means no limit.
+  uint64 daily_token_budget = 4;
+}
+
+message AddSourceRequest {
+  // `http://` or `https://` URL of the S3-compatible endpoint, without credentials, query or
+  // fragment. A path (`https://gw/s3`) is kept as a prefix.
+  string endpoint = 1;
+  // The bucket.
+  string bucket = 2;
+  // Key prefix to watch; empty for the whole bucket.
+  string prefix = 3;
+  // Signing region; empty means `us-east-1` (what MinIO and Ceph accept). `auto` for R2.
+  string region = 4;
+  UrlStyle url_style = 5;
+  // WRITE-ONLY. Unset reads the bucket anonymously.
+  S3Credentials credentials = 6;
+  // Seconds from the end of one scan pass to the start of the next, 1 to 604800; 0 means
+  // the default, 300.
+  uint64 scan_interval_seconds = 7;
+  // GetObject size cap in bytes; 0 means the default, 512 MiB.
+  uint64 max_object_bytes = 8;
+  // Unset means off.
+  LlmPolicy llm_policy = 9;
+  // Add the source paused instead of scanning it.
+  bool paused = 10;
+}
+
+message Source {
+  // A UUIDv7.
+  string id = 1;
+  // The endpoint as stored: scheme and host lowercased, no trailing `/`.
+  string endpoint = 2;
+  string bucket = 3;
+  string prefix = 4;
+  // The signing region in use.
+  string region = 5;
+  UrlStyle url_style = 6;
+  // Whether credentials are stored. The credentials themselves are never returned.
+  bool credentials_set = 7;
+  uint64 scan_interval_seconds = 8;
+  // The size cap in use.
+  uint64 max_object_bytes = 9;
+  LlmPolicy llm_policy = 10;
+  SourceState state = 11;
+  // Why the source is in the error state.
+  string state_reason = 12;
+  // The instance that owns (claimed) the source: this one.
+  string owner_instance = 13;
+  // Whether its scanner task runs now.
+  bool scanner_running = 14;
+  // Unix seconds.
+  int64 created_at = 15;
+  int64 updated_at = 16;
+}
+
+message UpdateSourceRequest {
+  string source_id = 1;
+  // Unset keeps the region; empty goes back to the default.
+  optional string region = 2;
+  // Unset keeps the URL style.
+  optional UrlStyle url_style = 3;
+  // Unset keeps the interval; 0 goes back to the default.
+  optional uint64 scan_interval_seconds = 4;
+  // Unset keeps the cap; 0 goes back to the default.
+  optional uint64 max_object_bytes = 5;
+  // WRITE-ONLY. Set replaces the stored credentials.
+  S3Credentials credentials = 6;
+  // Deletes the stored credentials: the bucket is then read anonymously.
+  bool clear_credentials = 7;
+}
+
+message PauseSourceRequest {
+  string source_id = 1;
+}
+
+message ResumeSourceRequest {
+  string source_id = 1;
+}
+
+message RemoveSourceRequest {
+  string source_id = 1;
+}
+
+message RemoveSourceResponse {
+  // Whether this instance held a claim on the source in the shared store and released it.
+  bool claim_released = 1;
+}
+
+message ListSourcesRequest {}
+
+message ListSourcesResponse {
+  repeated Source sources = 1;
+}
+
+message GetSourceRequest {
+  string source_id = 1;
+}
+
+message SetLlmPolicyRequest {
+  string source_id = 1;
+  LlmPolicy policy = 2;
+}
+
+message SetAiProviderRequest {
+  // 1 to 64 lowercase letters, digits, `_` or `-`; empty means the preset's name.
+  string name = 1;
+  // One of: openai, openai_compatible, anthropic, bedrock, openrouter, groq, vllm, ollama
+  // (the names of quail's ApiConfig and hedgehog).
+  string preset = 2;
+  // The model to ask, as the provider names it.
+  string model = 3;
+  // API base URL (`http://` or `https://`, without credentials); empty uses the preset's.
+  // Required for openai_compatible.
+  string base_url = 4;
+  // WRITE-ONLY. Empty keeps the stored key.
+  string api_key = 5;
+  // Deletes the stored key.
+  bool clear_api_key = 6;
+  // Use this provider when a request names none. The first provider set is the default.
+  bool make_default = 7;
+}
+
+message AiProvider {
+  string name = 1;
+  string preset = 2;
+  string model = 3;
+  string base_url = 4;
+  // Whether an API key is stored. The key itself is never returned.
+  bool api_key_set = 5;
+  bool is_default = 6;
+  // Unix seconds.
+  int64 updated_at = 7;
+}
+
+message ListAiProvidersRequest {}
+
+message ListAiProvidersResponse {
+  repeated AiProvider providers = 1;
+  // Every preset name SetAiProvider accepts.
+  repeated string presets = 2;
+}

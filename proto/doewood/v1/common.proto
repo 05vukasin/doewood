@@ -1,0 +1,18 @@
+// Types shared by the doewood v1 services.
+syntax = "proto3";
+
+package doewood.v1;
+
+// The state of a source.
+enum SourceState {
+  SOURCE_STATE_UNSPECIFIED = 0;
+  // Scanned on its schedule.
+  SOURCE_STATE_ACTIVE = 1;
+  // Not scanned until it is resumed.
+  SOURCE_STATE_PAUSED = 2;
+  // The last scan pass failed (see `state_reason`). Still scanned on its schedule; a pass that
+  // succeeds makes it active again.
+  SOURCE_STATE_ERROR = 3;
+  // Removed. Only reported by WatchProgress, when a watched source goes away.
+  SOURCE_STATE_REMOVED = 4;
+}

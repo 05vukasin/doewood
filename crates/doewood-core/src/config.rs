@@ -26,15 +26,18 @@ pub mod vars {
     pub const MASTER_KEY: &str = "DOEWOOD_MASTER_KEY";
     /// The instance's name; defaults to the hostname.
     pub const INSTANCE_ID: &str = "DOEWOOD_INSTANCE_ID";
+    /// Largest gRPC message the API decodes, in MiB.
+    pub const API_MAX_MESSAGE_MIB: &str = "DOEWOOD_API_MAX_MESSAGE_MIB";
 
     /// Every bootstrap variable, in the order they are reported.
-    pub const ALL: [&str; 6] = [
+    pub const ALL: [&str; 7] = [
         DATA_DIR,
         LISTEN,
         OPS_LISTEN,
         POSTGRES_URL,
         MASTER_KEY,
         INSTANCE_ID,
+        API_MAX_MESSAGE_MIB,
     ];
 }
 
@@ -48,6 +51,10 @@ pub const DEFAULT_OPS_LISTEN: SocketAddr = addr([127, 0, 0, 1], 7444);
 pub const FALLBACK_INSTANCE_ID: &str = "doewood";
 /// Name of the development key file inside the data directory.
 pub const MASTER_KEY_FILE: &str = "master.key";
+/// Default of `DOEWOOD_API_MAX_MESSAGE_MIB`: room for a document sent to `Summarize`.
+pub const DEFAULT_API_MAX_MESSAGE_MIB: u32 = 64;
+/// Largest accepted `DOEWOOD_API_MAX_MESSAGE_MIB`.
+pub const MAX_API_MAX_MESSAGE_MIB: u32 = 1024;
 
 const fn addr(ip: [u8; 4], port: u16) -> SocketAddr {
     SocketAddr::V4(std::net::SocketAddrV4::new(
@@ -200,6 +207,7 @@ struct Origins {
     postgres_url: Origin,
     master_key: Origin,
     instance_id: Origin,
+    api_max_message: Origin,
 }
 
 /// The effective bootstrap configuration.
@@ -217,6 +225,8 @@ pub struct BootstrapConfig {
     pub master_key: MasterKeySource,
     /// This instance's name.
     pub instance_id: InstanceId,
+    /// Largest gRPC message the API decodes, in bytes.
+    pub api_max_message_bytes: usize,
     origins: Origins,
 }
 
@@ -258,6 +268,8 @@ impl BootstrapConfig {
         );
         let (instance_id, instance_origin) =
             parse_instance_id(get(vars::INSTANCE_ID), hostname, &mut w);
+        let (api_max_message_mib, api_max_message_origin) =
+            parse_mib(get(vars::API_MAX_MESSAGE_MIB), &mut w);
 
         Loaded {
             config: Self {
@@ -267,6 +279,9 @@ impl BootstrapConfig {
                 postgres_url,
                 master_key,
                 instance_id,
+                api_max_message_bytes: usize::try_from(api_max_message_mib)
+                    .unwrap_or(usize::MAX)
+                    .saturating_mul(1024 * 1024),
                 origins: Origins {
                     data_dir: data_dir_origin,
                     listen: listen_origin,
@@ -274,6 +289,7 @@ impl BootstrapConfig {
                     postgres_url: postgres_origin,
                     master_key: master_key_origin,
                     instance_id: instance_origin,
+                    api_max_message: api_max_message_origin,
                 },
             },
             warnings: w,
@@ -340,6 +356,11 @@ impl BootstrapConfig {
                 var: vars::INSTANCE_ID,
                 value: self.instance_id.to_string(),
                 origin: o.instance_id,
+            },
+            Entry {
+                var: vars::API_MAX_MESSAGE_MIB,
+                value: format!("{} MiB", self.api_max_message_bytes / (1024 * 1024)),
+                origin: o.api_max_message,
             },
         ]
     }
@@ -462,6 +483,27 @@ fn parse_instance_id(
     (id, origin)
 }
 
+fn parse_mib(value: Option<OsString>, w: &mut Vec<ConfigWarning>) -> (u32, Origin) {
+    let Some(v) = value else {
+        return (DEFAULT_API_MAX_MESSAGE_MIB, Origin::Default);
+    };
+    match v.to_str().map(|s| s.trim().parse::<u32>()) {
+        Some(Ok(n)) if (1..=MAX_API_MAX_MESSAGE_MIB).contains(&n) => (n, Origin::Env),
+        _ => {
+            let shown = v.to_string_lossy();
+            warn(
+                w,
+                vars::API_MAX_MESSAGE_MIB,
+                format!(
+                    "{shown:?} is not a whole number of MiB from 1 to {MAX_API_MAX_MESSAGE_MIB}; \
+                     using {DEFAULT_API_MAX_MESSAGE_MIB}"
+                ),
+            );
+            (DEFAULT_API_MAX_MESSAGE_MIB, Origin::Fallback)
+        }
+    }
+}
+
 fn prepare_dir(path: &Path) -> Result<(), Error> {
     let fail = |source| Error::DataDir {
         path: path.to_owned(),
@@ -500,6 +542,7 @@ mod tests {
             matches!(&config.master_key, MasterKeySource::File(p) if p == &PathBuf::from("./doewood-data/master.key"))
         );
         assert_eq!(config.instance_id.as_str(), "doewood-0");
+        assert_eq!(config.api_max_message_bytes, 64 * 1024 * 1024);
         assert!(config.entries().iter().all(|e| e.origin == Origin::Default));
     }
 
@@ -517,6 +560,7 @@ mod tests {
                 ),
                 ("DOEWOOD_MASTER_KEY", &key.to_base64()),
                 ("DOEWOOD_INSTANCE_ID", "worker-7"),
+                ("DOEWOOD_API_MAX_MESSAGE_MIB", "8"),
             ],
             Some("ignored"),
         );
@@ -527,6 +571,7 @@ mod tests {
         assert!(!config.is_standalone());
         assert!(matches!(&config.master_key, MasterKeySource::Env(k) if k.as_bytes() == &[3; 32]));
         assert_eq!(config.instance_id.as_str(), "worker-7");
+        assert_eq!(config.api_max_message_bytes, 8 * 1024 * 1024);
         // The data dir also moves the key file path.
         assert_eq!(
             config.master_key_file(),
@@ -555,6 +600,7 @@ mod tests {
                 ("DOEWOOD_POSTGRES_URL", "mysql://root:topsecret@db/x"),
                 ("DOEWOOD_MASTER_KEY", "c2hvcnQ="),
                 ("DOEWOOD_INSTANCE_ID", "bad id!"),
+                ("DOEWOOD_API_MAX_MESSAGE_MIB", "0"),
             ],
             Some("pod-1"),
         );
@@ -571,9 +617,11 @@ mod tests {
                 "DOEWOOD_OPS_LISTEN",
                 "DOEWOOD_POSTGRES_URL",
                 "DOEWOOD_MASTER_KEY",
-                "DOEWOOD_INSTANCE_ID"
+                "DOEWOOD_INSTANCE_ID",
+                "DOEWOOD_API_MAX_MESSAGE_MIB"
             ]
         );
+        assert_eq!(config.api_max_message_bytes, 64 * 1024 * 1024);
         // Secret values are never echoed.
         let all = warnings.iter().map(ToString::to_string).collect::<String>();
         assert!(
@@ -585,6 +633,7 @@ mod tests {
             origins,
             [
                 Origin::Default,
+                Origin::Fallback,
                 Origin::Fallback,
                 Origin::Fallback,
                 Origin::Fallback,

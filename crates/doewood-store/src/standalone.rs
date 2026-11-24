@@ -12,7 +12,7 @@ use doewood_model::{
     Backend, Blake3, ClaimStore, Direction, Edge, EdgeKind, EdgeSource, Error, GraphStore, Located,
     Neighbour, NeighbourQuery, Node, NodeKind, ObjectLocation, PutOutcome, Record, RecordStore,
     Result, SearchDoc, SearchHit, SearchQuery, SearchStore, SourceClaim, SourceKey, StepVersions,
-    StoredEdge, validate_node, versions_from_json, versions_to_json,
+    StoredEdge, records_limit, validate_node, versions_from_json, versions_to_json,
 };
 use rusqlite::types::Value as Sql;
 use rusqlite::{Connection, OptionalExtension as _, Row, params, params_from_iter};
@@ -323,6 +323,58 @@ impl RecordStore for Standalone {
                 })
             })
             .transpose()
+        })
+        .await
+    }
+
+    async fn list_records(
+        &self,
+        source: &SourceKey,
+        after: Option<&Blake3>,
+        limit: u32,
+    ) -> Result<Vec<Record>> {
+        let (source, after) = (source.clone(), after.copied());
+        let limit = i64::from(records_limit(limit));
+        self.run(move |conn| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT r.blake3, r.body_json, r.versions_json, r.updated_at FROM records r \
+                     WHERE (?4 IS NULL OR r.blake3 > ?4) \
+                     AND EXISTS (SELECT 1 FROM locations l WHERE l.blake3 = r.blake3 \
+                     AND l.endpoint = ?1 AND l.bucket = ?2 \
+                     AND substr(l.object_key, 1, length(?3)) = ?3) \
+                     ORDER BY r.blake3 LIMIT ?5",
+                )
+                .map_err(sql)?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        source.endpoint(),
+                        source.bucket(),
+                        source.prefix(),
+                        after.as_ref().map(|h| h.as_bytes().as_slice()),
+                        limit
+                    ],
+                    |r| {
+                        Ok((
+                            r.get::<_, Vec<u8>>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .map_err(sql)?;
+            rows.map(|row| {
+                let (h, body, versions, updated_at) = row.map_err(sql)?;
+                Ok(Record {
+                    blake3: Blake3::from_slice(&h)?,
+                    body: json(&body)?,
+                    versions: versions_from_json(&json(&versions)?)?,
+                    updated_at,
+                })
+            })
+            .collect()
         })
         .await
     }

@@ -1,0 +1,47 @@
+// Full-text search with filters. Embeddings arrive in v2.
+syntax = "proto3";
+
+package doewood.v1;
+
+service SearchService {
+  // Documents matching every filter that is set, ordered by score, then date (newest first),
+  // then hash.
+  rpc Search(SearchRequest) returns (SearchResponse);
+}
+
+message SearchRequest {
+  // Words to match in the title or body: documents containing every word. Empty matches
+  // every document. Only plain words are portable across backends.
+  string text = 1;
+  // Only documents with a live `party` edge to this company node (a UUID).
+  string company_id = 2;
+  // Only documents of this kind (`invoice`, ...).
+  string kind = 3;
+  // `YYYY-MM-DD`, inclusive: only documents dated in this range.
+  string date_from = 4;
+  string date_to = 5;
+  // Only documents whose amount is in this range (inclusive).
+  optional double amount_min = 6;
+  optional double amount_max = 7;
+  // Only documents with a location in this source of the instance.
+  string source_id = 8;
+  // 1 to 1000; 0 means 50.
+  uint32 limit = 9;
+  // Hits to skip, at most 100000.
+  uint32 offset = 10;
+}
+
+message SearchHit {
+  string blake3 = 1;
+  string title = 2;
+  string kind = 3;
+  // `YYYY-MM-DD`, or empty.
+  string date = 4;
+  optional double amount = 5;
+  // Text relevance; higher is better, 0 without text. Not comparable across backends.
+  float score = 6;
+}
+
+message SearchResponse {
+  repeated SearchHit hits = 1;
+}

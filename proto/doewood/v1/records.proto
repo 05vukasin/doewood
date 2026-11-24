@@ -1,0 +1,42 @@
+// quail and hedgehog records, keyed by the BLAKE3 of the file's bytes.
+syntax = "proto3";
+
+package doewood.v1;
+
+service RecordsService {
+  // One record.
+  rpc GetRecord(GetRecordRequest) returns (Record);
+  // The records of the files in a source, ordered by hash, a page at a time.
+  rpc ListRecords(ListRecordsRequest) returns (ListRecordsResponse);
+}
+
+message GetRecordRequest {
+  // 64 hex digits.
+  string blake3 = 1;
+}
+
+message Record {
+  // 64 lowercase hex digits.
+  string blake3 = 1;
+  // The record as JSON, exactly as stored.
+  string body_json = 2;
+  // The step versions that produced it (`quail` -> `1.4.0`, ...).
+  map<string, string> versions = 3;
+  // When it was last written, Unix seconds.
+  int64 updated_at = 4;
+}
+
+message ListRecordsRequest {
+  // A source of this instance.
+  string source_id = 1;
+  // 1 to 1000; 0 means 50.
+  uint32 page_size = 2;
+  // `next_page_token` of the previous page; empty for the first.
+  string page_token = 3;
+}
+
+message ListRecordsResponse {
+  repeated Record records = 1;
+  // Empty on the last page.
+  string next_page_token = 2;
+}

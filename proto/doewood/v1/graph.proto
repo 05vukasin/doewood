@@ -1,0 +1,146 @@
+// The typed graph of documents, locations and companies (ADR 0001 section 7, ADR 0002
+// section 3).
+syntax = "proto3";
+
+package doewood.v1;
+
+service GraphService {
+  // A node by id, or by kind and key.
+  rpc GetNode(GetNodeRequest) returns (Node);
+  // The edges at a node and the nodes at their other ends, ordered by edge kind, then
+  // `valid_from` (undated first), then edge id.
+  rpc Neighbours(NeighboursRequest) returns (NeighboursResponse);
+  // The documents with a live `party` edge to a company, ordered by key.
+  rpc CompanyDocuments(CompanyDocumentsRequest) returns (CompanyDocumentsResponse);
+}
+
+enum NodeKind {
+  NODE_KIND_UNSPECIFIED = 0;
+  // A file's content; the key is its BLAKE3 in lowercase hex.
+  NODE_KIND_DOCUMENT = 1;
+  // Where a copy of a document lives; the key is the JSON array [endpoint, bucket, key].
+  NODE_KIND_LOCATION = 2;
+  NODE_KIND_COMPANY = 3;
+}
+
+enum EdgeKind {
+  EDGE_KIND_UNSPECIFIED = 0;
+  // Document -> Location.
+  EDGE_KIND_LOCATED_AT = 1;
+  // Document -> Company, with a `role` in the props.
+  EDGE_KIND_PARTY = 2;
+  // Document -> Document.
+  EDGE_KIND_AMENDS = 3;
+  EDGE_KIND_CITES = 4;
+  // Document -> Document, with a `score` in the props.
+  EDGE_KIND_SIMILAR_TO = 5;
+  // Company -> Company.
+  EDGE_KIND_PARENT_OF = 6;
+  EDGE_KIND_SUBSIDIARY_OF = 7;
+  EDGE_KIND_ACQUIRED = 8;
+  EDGE_KIND_MERGED_INTO = 9;
+  EDGE_KIND_RENAMED_TO = 10;
+  EDGE_KIND_BRANCH_OF = 11;
+  EDGE_KIND_TRADING_NAME_OF = 12;
+  EDGE_KIND_FORMER_PARENT_OF = 13;
+  EDGE_KIND_LIQUIDATED = 14;
+}
+
+enum EdgeState {
+  EDGE_STATE_UNSPECIFIED = 0;
+  EDGE_STATE_PROPOSED = 1;
+  EDGE_STATE_ACTIVE = 2;
+  EDGE_STATE_CONTESTED = 3;
+  EDGE_STATE_RETRACTED = 4;
+  EDGE_STATE_SUPERSEDED = 5;
+}
+
+enum EdgeSource {
+  EDGE_SOURCE_UNSPECIFIED = 0;
+  EDGE_SOURCE_REGISTRY = 1;
+  EDGE_SOURCE_DOCUMENT = 2;
+  EDGE_SOURCE_WEB = 3;
+  EDGE_SOURCE_MANUAL = 4;
+  EDGE_SOURCE_STORAGE = 5;
+}
+
+enum Direction {
+  // Both.
+  DIRECTION_UNSPECIFIED = 0;
+  // Edges whose source is the node.
+  DIRECTION_OUT = 1;
+  // Edges whose target is the node.
+  DIRECTION_IN = 2;
+  DIRECTION_BOTH = 3;
+}
+
+message Node {
+  // A UUID.
+  string id = 1;
+  NodeKind kind = 2;
+  string key = 3;
+  // Attributes, as a JSON object.
+  string props_json = 4;
+}
+
+message Edge {
+  string id = 1;
+  // Source and target node ids.
+  string src = 2;
+  string dst = 3;
+  EdgeKind kind = 4;
+  // Attributes, as a JSON object.
+  string props_json = 5;
+  // Why we believe it, as a JSON array.
+  string evidence_json = 6;
+  // From 0 to 1.
+  float confidence = 7;
+  EdgeState state = 8;
+  // `YYYY-MM-DD`: first day the edge holds, and first day it no longer holds. Empty is open.
+  string valid_from = 9;
+  string valid_to = 10;
+  EdgeSource source = 11;
+}
+
+message NodeKey {
+  NodeKind kind = 1;
+  string key = 2;
+}
+
+message GetNodeRequest {
+  oneof lookup {
+    string id = 1;
+    NodeKey key = 2;
+  }
+}
+
+message NeighboursRequest {
+  string node_id = 1;
+  Direction direction = 2;
+  // Only these edge kinds; empty means all.
+  repeated EdgeKind edge_kinds = 3;
+  // Only neighbours of this kind; unspecified means all.
+  NodeKind node_kind = 4;
+  // `YYYY-MM-DD`: only edges that hold on this day. Empty means any day.
+  string at = 5;
+  // Also return retracted and superseded edges.
+  bool include_inactive = 6;
+}
+
+message Neighbour {
+  Edge edge = 1;
+  // The node at the other end.
+  Node node = 2;
+}
+
+message NeighboursResponse {
+  repeated Neighbour neighbours = 1;
+}
+
+message CompanyDocumentsRequest {
+  string company_id = 1;
+}
+
+message CompanyDocumentsResponse {
+  repeated Node documents = 1;
+}

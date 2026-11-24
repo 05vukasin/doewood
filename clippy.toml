@@ -1,1 +1,3 @@
-doc-valid-idents = ["SQLite", "XChaCha20", "BLAKE3", "ETag", "gRPC", "pgvector", "PostgreSQL", "UUIDv7", "MinIO", "SigV4", "ListObjectsV2", "GetObject", "HeadObject", "..",]
+doc-valid-idents = ["SQLite", "XChaCha20", "BLAKE3", "ETag", "gRPC", "pgvector", "PostgreSQL", "UUIDv7", "MinIO", "SigV4", "ListObjectsV2", "GetObject", "HeadObject", "gRPC-Web", "OIDC",
+    "INVALID_ARGUMENT", "NOT_FOUND", "ALREADY_EXISTS", "UNAVAILABLE", "UNIMPLEMENTED",
+    "UNAUTHENTICATED", "PERMISSION_DENIED", "FAILED_PRECONDITION", "..",]

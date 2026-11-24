@@ -6,8 +6,8 @@ doewood has two kinds of settings, and each setting has exactly one source
 - **Bootstrap values** come from environment variables, listed below. Every one has a default,
   so `doewood serve` starts with no environment at all.
 - **Runtime settings** (S3 sources and credentials, AI providers, policies, schedules) are set
-  through the gRPC API and kept in the instance's SQLite store. Secrets are encrypted with the
-  master key and are write-only: the API never returns them. (The API arrives in a later step.)
+  through the [gRPC API](api.md) and kept in the instance's SQLite store. Secrets are encrypted
+  with the master key and are write-only: the API never returns them.
 
 ## Bootstrap variables
 
@@ -18,7 +18,8 @@ doewood has two kinds of settings, and each setting has exactly one source
 | `DOEWOOD_OPS_LISTEN` | `127.0.0.1:7444` | `IP:port` of the ops endpoints: `/healthz`, `/readyz`, `/metrics`. |
 | `DOEWOOD_POSTGRES_URL` | unset: standalone | `postgres://` or `postgresql://` URL of the shared Postgres + pgvector database. |
 | `DOEWOOD_MASTER_KEY` | the key file `<data>/master.key` | Base64 of 32 random bytes. Encrypts the secrets in the store. |
-| `DOEWOOD_INSTANCE_ID` | the hostname | Name of this instance: 1 to 63 ASCII letters, digits, `-`, `_`, `.`. On Kubernetes, the `StatefulSet` pod name. |
+| `DOEWOOD_INSTANCE_ID` | the hostname | Name of this instance: 1 to 63 ASCII letters, digits, `-`, `_`, `.`. On Kubernetes, the `StatefulSet` pod name. It is the owner named on the sources this instance claims. |
+| `DOEWOOD_API_MAX_MESSAGE_MIB` | `64` | Largest gRPC message the API decodes or encodes, in MiB (1 to 1024). Leaves room for a file sent to `Summarize`. |
 
 `RUST_LOG` sets the log filter (default `info`), for example `RUST_LOG=doewood=debug,info`.
 
@@ -32,8 +33,8 @@ doewood has two kinds of settings, and each setting has exactly one source
   back to `doewood`.
 - **Fatal at start:** a data directory that cannot be created or written, a key file that exists
   but does not hold a valid key (it is never overwritten, since that would lose every secret), a
-  master key that differs from the one the store was created with, and an ops address that
-  cannot be bound.
+  master key that differs from the one the store was created with, and an ops or gRPC address
+  that cannot be bound.
 
 ### The shared Postgres
 
@@ -87,6 +88,8 @@ every variable, with secrets redacted, and every warning. It creates nothing.
 | `/healthz` | `200 ok` while the process runs |
 | `/readyz` | `200 ready` once the store is open; `503` before that and during shutdown |
 | `/metrics` | Prometheus text: `doewood_build_info`, `doewood_ready`, `doewood_start_time_seconds`, `doewood_ops_requests_total` |
+| `POST /events/s3/{source_id}` | MinIO / S3 event notifications for a source (see [api.md](api.md#event-webhook)) |
 
-On SIGTERM or SIGINT, doewood reports not ready, stops its servers, checkpoints and closes the
-store, and exits 0.
+On SIGTERM or SIGINT, doewood reports not ready, stops its servers (the gRPC API gets up to 10 s
+to finish the calls in flight; its progress streams end), stops the scanners, checkpoints and
+closes the store, and exits 0.

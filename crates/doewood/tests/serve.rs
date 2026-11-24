@@ -46,6 +46,33 @@ fn get(addr: SocketAddr, path: &str) -> (u16, String) {
     (status, body)
 }
 
+/// An HTTP/1.1 POST; the status and the body as (lossy) text.
+fn post(addr: SocketAddr, path: &str, content_type: &str, body: &[u8]) -> (u16, String) {
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    write!(
+        s,
+        "POST {path} HTTP/1.1\r\nHost: test\r\nContent-Type: {content_type}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .unwrap();
+    s.write_all(body).unwrap();
+    let mut resp = Vec::new();
+    s.read_to_end(&mut resp).unwrap();
+    let resp = String::from_utf8_lossy(&resp).into_owned();
+    let status = resp
+        .split(' ')
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    let body = resp
+        .split_once("\r\n\r\n")
+        .map_or("", |(_, b)| b)
+        .to_owned();
+    (status, body)
+}
+
 /// Forwards the child's JSON log lines to a channel.
 fn log_lines(stderr: ChildStderr) -> mpsc::Receiver<serde_json::Value> {
     let (tx, rx) = mpsc::channel();
@@ -98,6 +125,7 @@ fn serve_starts_with_nothing_configured() {
         bare(tmp.path())
             .arg("serve")
             .env("DOEWOOD_OPS_LISTEN", "127.0.0.1:0")
+            .env("DOEWOOD_LISTEN", "127.0.0.1:0")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -143,6 +171,27 @@ fn serve_starts_with_nothing_configured() {
     assert!(metrics.contains("doewood_build_info{"), "{metrics}");
     assert_eq!(get(addr, "/nope").0, 404);
 
+    // The gRPC API answers on its own port, here over gRPC-Web (HTTP/1.1), as a browser
+    // calls it: an empty ListSourcesRequest frame.
+    let api = wait_for(&rx, &mut seen, API_LISTENING);
+    let api_addr: SocketAddr = api["addr"].as_str().unwrap().parse().unwrap();
+    let (status, body) = post(
+        api_addr,
+        "/doewood.v1.ConfigService/ListSources",
+        "application/grpc-web+proto",
+        &[0, 0, 0, 0, 0],
+    );
+    assert_eq!(status, 200);
+    assert!(body.contains("grpc-status:0"), "{body}");
+    // The S3 webhook is on the ops server.
+    let (status, _) = post(
+        addr,
+        "/events/s3/0192f5b2-8a7e-7cc4-9b5e-4d1b2e3f4a5b",
+        "application/json",
+        b"{\"Records\":[]}",
+    );
+    assert_eq!(status, 404, "unknown source");
+
     #[cfg(unix)]
     {
         let pid = child.0.id().to_string();
@@ -174,6 +223,78 @@ fn serve_starts_with_nothing_configured() {
 }
 
 const OPS_LISTENING: &str = "ops server listening (/healthz, /readyz, /metrics)";
+const API_LISTENING: &str = "gRPC API listening (gRPC and gRPC-Web, health, reflection)";
+
+/// `dev add-source` goes through the API's code (validation, claim), and `serve` then starts
+/// a scanner for the source.
+#[test]
+fn dev_add_source_then_serve_scans_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let add = |extra: &[&str]| {
+        bare(tmp.path())
+            .args([
+                "dev",
+                "add-source",
+                "--access-key-env",
+                "K",
+                "--secret-key-env",
+                "S",
+            ])
+            .args(extra)
+            .env("K", "test-key-id")
+            .env("S", "test-secret-value")
+            .output()
+            .unwrap()
+    };
+    let out = add(&[
+        "--endpoint",
+        "http://127.0.0.1:1",
+        "--bucket",
+        "docs",
+        "--interval-secs",
+        "3600",
+    ]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{text} {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.starts_with("added source "), "{text}");
+    // Validation is the API's: every problem, with field paths, and no secret echoed.
+    let out = add(&["--endpoint", "http://u:pw-in-url@x", "--bucket", "B!"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("InvalidArgument") && err.contains("endpoint") && err.contains("bucket"),
+        "{err}"
+    );
+    assert!(!err.contains("pw-in-url"), "{err}");
+    // The same source twice.
+    let out = add(&["--endpoint", "http://127.0.0.1:1", "--bucket", "docs"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("AlreadyExists"));
+
+    let mut child = KillOnDrop(
+        bare(tmp.path())
+            .arg("serve")
+            .env("DOEWOOD_OPS_LISTEN", "127.0.0.1:0")
+            .env("DOEWOOD_LISTEN", "127.0.0.1:0")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let rx = log_lines(child.0.stderr.take().unwrap());
+    let mut seen = Vec::new();
+    let started = wait_for(&rx, &mut seen, "starting scanner");
+    assert_eq!(started["bucket"], "docs");
+    wait_for(&rx, &mut seen, API_LISTENING);
+    #[cfg(unix)]
+    terminate(&mut child, &rx, &mut seen);
+    let all = seen.iter().map(ToString::to_string).collect::<String>();
+    assert!(!all.contains("test-secret-value"), "{all}");
+}
 
 /// Sends SIGTERM and checks a clean exit.
 #[cfg(unix)]
@@ -210,6 +331,7 @@ fn serve_runs_degraded_while_postgres_is_unreachable() {
         bare(tmp.path())
             .arg("serve")
             .env("DOEWOOD_OPS_LISTEN", "127.0.0.1:0")
+            .env("DOEWOOD_LISTEN", "127.0.0.1:0")
             .env(
                 "DOEWOOD_POSTGRES_URL",
                 "postgres://dw:hunter2@127.0.0.1:1/doewood?connect_timeout=2",
@@ -264,6 +386,7 @@ fn serve_uses_postgres_when_reachable() {
         bare(tmp.path())
             .arg("serve")
             .env("DOEWOOD_OPS_LISTEN", "127.0.0.1:0")
+            .env("DOEWOOD_LISTEN", "127.0.0.1:0")
             .env("DOEWOOD_POSTGRES_URL", &url)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -317,6 +440,7 @@ fn config_check_with_empty_env_creates_nothing() {
         "DOEWOOD_POSTGRES_URL",
         "DOEWOOD_MASTER_KEY",
         "DOEWOOD_INSTANCE_ID",
+        "DOEWOOD_API_MAX_MESSAGE_MIB",
     ] {
         assert!(text.contains(var), "{var} missing from {text}");
     }

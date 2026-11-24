@@ -43,8 +43,8 @@ enum Command {
 
 #[derive(Subcommand)]
 enum DevCommand {
-    /// FOR LOCAL TESTING ONLY, until the gRPC API exists: add an S3 source and seal its
-    /// credentials (read from the environment variables you name).
+    /// Add an S3 source without a running server (same validation and claim as
+    /// `ConfigService.AddSource`); the credentials are read from the variables you name.
     AddSource(dev::AddSource),
 }
 

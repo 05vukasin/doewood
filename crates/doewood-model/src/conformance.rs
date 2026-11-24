@@ -27,6 +27,7 @@ pub async fn run<B: Backend + ?Sized>(a: &B, b: &B) {
     graph(a).await;
     dated_edges(a).await;
     locations(a).await;
+    records_by_source(a).await;
     claims(a, b).await;
     leases(a, b).await;
     search(a).await;
@@ -394,6 +395,63 @@ pub async fn locations<B: Backend + ?Sized>(s: &B) {
         .expect("old edge kept");
     assert_eq!(old.edge.edge.state, EdgeState::Superseded);
     assert_eq!(old.edge.edge.source, EdgeSource::Storage);
+}
+
+/// Records listed by source: the bucket and prefix filter, hash order and paging.
+///
+/// # Panics
+///
+/// When the backend misbehaves.
+pub async fn records_by_source<B: Backend + ?Sized>(s: &B) {
+    let endpoint = "http://list.test:9000";
+    let at = |bucket: &str, key: &str| ObjectLocation {
+        endpoint: endpoint.to_owned(),
+        bucket: bucket.to_owned(),
+        key: key.to_owned(),
+    };
+    for (n, locations) in [
+        (33, vec![at("docs", "in/c.pdf")]),
+        (
+            31,
+            vec![at("docs", "in/a.pdf"), at("docs", "in/a-copy.pdf")],
+        ),
+        (
+            32,
+            vec![at("docs", "out/b.pdf"), at("docs", "in/sub/b.pdf")],
+        ),
+        (34, vec![at("other", "in/d.pdf")]),
+    ] {
+        s.put_record(&hash(n), &json!({"n": n}), &versions("1"))
+            .await
+            .unwrap();
+        for l in &locations {
+            s.upsert_location(&hash(n), l).await.unwrap();
+        }
+    }
+    // A location without a record is not listed.
+    s.upsert_location(&hash(35), &at("docs", "in/e.pdf"))
+        .await
+        .unwrap();
+    let list = |prefix: &'static str, after: Option<Blake3>, limit| async move {
+        let src = SourceKey::new(endpoint, "docs", prefix).unwrap();
+        s.list_records(&src, after.as_ref(), limit)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.blake3)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(list("in/", None, 0).await, [hash(31), hash(32), hash(33)]);
+    assert_eq!(list("", None, 0).await, [hash(31), hash(32), hash(33)]);
+    assert_eq!(list("out/", None, 0).await, [hash(32)]);
+    assert_eq!(list("in/", None, 2).await, [hash(31), hash(32)]);
+    assert_eq!(list("in/", Some(hash(32)), 2).await, [hash(33)]);
+    assert!(list("in/", Some(hash(33)), 2).await.is_empty());
+    assert!(list("nope/", None, 0).await.is_empty());
+    let src = SourceKey::new(endpoint, "docs", "in/").unwrap();
+    let page = s.list_records(&src, None, 1).await.unwrap();
+    assert_eq!(page[0].body, json!({"n": 31}));
+    assert_eq!(page[0].versions, versions("1"));
 }
 
 /// Source claims across two instances.

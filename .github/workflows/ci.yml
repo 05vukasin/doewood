@@ -39,7 +39,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Fails if any Postgres test skipped instead of running.
       - run: |
-          cargo test -p doewood-pg -p doewood -- --nocapture 2>&1 | tee test.log
+          cargo test -p doewood-pg -p doewood-api -p doewood -- --nocapture 2>&1 | tee test.log
           ! grep -q "skipping: DOEWOOD_TEST_POSTGRES_URL" test.log
   deny:
     runs-on: ubuntu-latest

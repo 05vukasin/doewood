@@ -4,28 +4,38 @@
 //! 1. log the effective configuration and every warning;
 //! 2. prepare the data directory (the only fatal configuration check);
 //! 3. register the signal handlers, so a SIGTERM during startup still shuts down cleanly;
-//! 4. start the ops server (`/healthz` answers, `/readyz` says not ready);
+//! 4. start the ops server (`/healthz` answers, `/readyz` says not ready) and bind the gRPC
+//!    address (both fatal when the address cannot be bound);
 //! 5. resolve the master key and open the store;
 //! 6. standalone: serve records, graph and search from the store and report ready. With
 //!    `DOEWOOD_POSTGRES_URL`: connect to the shared Postgres in the background, and report ready
 //!    once it answers. Until then the instance runs degraded: `/readyz` says why, and the
 //!    connection is retried with backoff (see [`crate::shared`]).
-//! 7. start one scanner per active S3 source (none configured: nothing starts).
+//! 7. start one scanner per active S3 source (none configured: nothing starts), accept S3
+//!    event notifications on the ops server, and serve the gRPC API. Sources added through
+//!    the API start scanning at once.
 //!
-//! On SIGTERM or SIGINT: report not ready, stop the servers and the scanners (each keeps its
-//! checkpoint), close the store, exit 0.
+//! On SIGTERM or SIGINT: report not ready, stop the servers (the API finishes the calls in
+//! flight and ends its streams) and the scanners (each keeps its checkpoint), close the store,
+//! exit 0.
 
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
+use doewood_api::{ApiOptions, ApiParts, ApiState, Progress};
 use doewood_core::{BootstrapConfig, Loaded, MasterKey, MasterKeySource};
 use doewood_model::Backend;
+use doewood_s3::inlet::webhook::WebhookInlet;
 use doewood_s3::{Discovery, DiscoveryOptions, EVENT_CHANNEL_CAPACITY, ObjectEvent};
 use doewood_store::keyfile::{self, KeyFileState};
 use doewood_store::{STORE_FILE, Standalone, Store};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
+
+/// How long the API may take to finish its calls after shutdown starts.
+const API_DRAIN: Duration = Duration::from_secs(10);
 
 use crate::ops::{self, OpsState};
 use crate::shared;
@@ -52,6 +62,9 @@ pub fn main(loaded: Loaded) -> ExitCode {
     }
 }
 
+// The start and stop order reads top to bottom, step by step as the module documentation lists
+// it; splitting it would only scatter that order.
+#[allow(clippy::too_many_lines)]
 async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
     info!(
         version = crate::VERSION,
@@ -88,8 +101,19 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
             .into_future(),
     );
 
-    // Step 5 of the plan: the gRPC API binds `config.listen` here and stops on `shutdown_rx`.
-    info!(listen = %config.listen, "gRPC API is not part of this build yet");
+    // The gRPC API binds now, so a taken port fails the start; it serves once the store is
+    // open.
+    let api_listener = match TcpListener::bind(config.listen).await {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = shutdown_tx.send(true);
+            let _ = ops_server.await;
+            return Err(format!(
+                "cannot bind the gRPC API to {}: {e}",
+                config.listen
+            ));
+        }
+    };
 
     let store = tokio::select! {
         store = open_store(&config) => store,
@@ -128,7 +152,30 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
         None
     };
 
-    let discovery = start_discovery(Arc::clone(&store), shutdown_rx.clone()).await;
+    let progress = Arc::new(Progress::new());
+    let scanning = start_discovery(
+        Arc::clone(&store),
+        Arc::clone(&progress),
+        shutdown_rx.clone(),
+    )
+    .await;
+    state.set_webhook(WebhookInlet::new(
+        Arc::clone(&store),
+        scanning.events.clone(),
+    ));
+    let api_server = start_api(
+        &config,
+        api_listener,
+        ApiParts {
+            store: Arc::clone(&store),
+            backend: backend_rx.clone(),
+            instance: config.instance_id.clone(),
+            discovery: scanning.discovery.clone(),
+            progress,
+            options: ApiOptions::default(),
+            shutdown: shutdown_rx.clone(),
+        },
+    )?;
 
     let signal = signals.recv().await;
     info!(signal, "shutting down");
@@ -139,7 +186,9 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
         Ok(Err(e)) => warn!(error = %e, "ops server ended with an error"),
         Err(e) => warn!(error = %e, "ops server task failed"),
     }
-    discovery.stop().await;
+    stop_api(api_server).await;
+    state.clear_webhook();
+    scanning.stop().await;
     if let Some(task) = supervisor
         && let Err(e) = task.await
     {
@@ -149,8 +198,9 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
     info!(backend, "servers stopped");
     drop(backend_rx);
 
-    // Nothing else holds the store once the servers and the backend are gone.
-    let store = Arc::try_unwrap(store).map_err(|_| "store still in use at shutdown".to_owned())?;
+    // Nothing else holds the store once the servers and the backend are gone; a blocking
+    // store call that was in flight may still be finishing.
+    let store = release(store).await?;
     tokio::task::spawn_blocking(move || store.close())
         .await
         .map_err(|e| e.to_string())?
@@ -207,45 +257,118 @@ pub(crate) fn master_key(source: MasterKeySource) -> Result<MasterKey, String> {
     }
 }
 
+type ApiTask = tokio::task::JoinHandle<Result<(), doewood_api::ServeError>>;
+
+/// Serves the gRPC API until the shutdown signal.
+fn start_api(
+    config: &BootstrapConfig,
+    listener: TcpListener,
+    mut parts: ApiParts,
+) -> Result<ApiTask, String> {
+    let addr = listener.local_addr().map_err(|e| e.to_string())?;
+    parts.options.max_message_bytes = config.api_max_message_bytes;
+    let shutdown = parts.shutdown.clone();
+    info!(
+        addr = %addr,
+        max_message_mib = config.api_max_message_bytes / (1024 * 1024),
+        "gRPC API listening (gRPC and gRPC-Web, health, reflection)"
+    );
+    Ok(tokio::spawn(doewood_api::serve(
+        listener,
+        ApiState::new(parts),
+        wait_for(shutdown),
+    )))
+}
+
+/// Waits for the API to finish its calls, or gives up after [`API_DRAIN`].
+async fn stop_api(task: ApiTask) {
+    let abort = task.abort_handle();
+    match tokio::time::timeout(API_DRAIN, task).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => warn!(error = %e, "gRPC API ended with an error"),
+        Ok(Err(e)) => warn!(error = %e, "gRPC API task failed"),
+        Err(_) => {
+            warn!("gRPC API calls did not finish in time; dropping them");
+            abort.abort();
+        }
+    }
+}
+
+/// Takes the store back from its last `Arc`, waiting up to 5 s for blocking calls in flight.
+async fn release(mut store: Arc<Store>) -> Result<Store, String> {
+    for _ in 0..50 {
+        match Arc::try_unwrap(store) {
+            Ok(s) => return Ok(s),
+            Err(still_shared) => store = still_shared,
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err("store still in use at shutdown".to_owned())
+}
+
 /// The scanners and the task that takes their events.
 struct Scanning {
     discovery: Option<Discovery>,
+    /// For the webhook inlet; dropped with this struct.
+    events: mpsc::Sender<ObjectEvent>,
     sink: tokio::task::JoinHandle<()>,
 }
 
 impl Scanning {
     /// Waits for the scanners (told to stop by the shutdown signal), then for the sink.
     async fn stop(self) {
-        if let Some(discovery) = self.discovery {
+        let Self {
+            discovery,
+            events,
+            sink,
+        } = self;
+        drop(events);
+        if let Some(discovery) = discovery {
             discovery.join().await;
             info!("scanners stopped");
         }
-        // Every sender is gone once the scanners have stopped.
-        let _ = self.sink.await;
+        // Every sender is gone once the scanners and the webhook have stopped.
+        let _ = sink.await;
     }
 }
 
 /// Starts one scanner per active source.
-async fn start_discovery(store: Arc<Store>, shutdown: watch::Receiver<bool>) -> Scanning {
-    // Step 4 of the plan (ingest) consumes the events; until then they are logged and dropped.
+async fn start_discovery(
+    store: Arc<Store>,
+    progress: Arc<Progress>,
+    shutdown: watch::Receiver<bool>,
+) -> Scanning {
+    // Step 4 of the plan (ingest) consumes the events; until then they are counted for
+    // `WatchProgress`, logged and dropped.
     let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-    let sink = tokio::spawn(log_events(events_rx));
-    let discovery =
-        match Discovery::start(store, events_tx, shutdown, DiscoveryOptions::default()).await {
-            Ok(d) => {
-                info!(scanners = d.len(), "discovery started");
-                Some(d)
-            }
-            Err(e) => {
-                error!(error = %e, "discovery did not start; no source is scanned");
-                None
-            }
-        };
-    Scanning { discovery, sink }
+    let sink = tokio::spawn(log_events(events_rx, progress));
+    let discovery = match Discovery::start(
+        store,
+        events_tx.clone(),
+        shutdown,
+        DiscoveryOptions::default(),
+    )
+    .await
+    {
+        Ok(d) => {
+            info!(scanners = d.len(), "discovery started");
+            Some(d)
+        }
+        Err(e) => {
+            error!(error = %e, "discovery did not start; no source is scanned");
+            None
+        }
+    };
+    Scanning {
+        discovery,
+        events: events_tx,
+        sink,
+    }
 }
 
-async fn log_events(mut events: mpsc::Receiver<ObjectEvent>) {
+async fn log_events(mut events: mpsc::Receiver<ObjectEvent>, progress: Arc<Progress>) {
     while let Some(e) = events.recv().await {
+        progress.record(&e);
         debug!(
             source = %e.source,
             key = %e.key,

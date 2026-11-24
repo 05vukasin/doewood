@@ -1,0 +1,81 @@
+// Jobs: the progress of the sources' scans and ingest, and one-shot reprocessing (ADR 0001,
+// section 5).
+syntax = "proto3";
+
+package doewood.v1;
+
+import "doewood/v1/common.proto";
+
+service JobsService {
+  // Streams the progress of the sources: first one SNAPSHOT update per source, then an update
+  // whenever a source's counters or state change, until the client cancels or the server
+  // shuts down.
+  rpc WatchProgress(WatchProgressRequest) returns (stream ProgressUpdate);
+  // Re-analyzes the files of a source whose quail/hedgehog step versions changed. Not built
+  // yet: answers UNIMPLEMENTED until ingest exists.
+  rpc ReprocessJob(ReprocessJobRequest) returns (ReprocessJobResponse);
+}
+
+message WatchProgressRequest {
+  // Only these sources; empty watches all of this instance's sources, including ones added
+  // later.
+  repeated string source_ids = 1;
+}
+
+message ProgressCounters {
+  // Objects in the bucket (under the prefix) that discovery knows about.
+  uint64 seen = 1;
+  // Events since this instance started: keys not seen before, changed (ETag or size), and
+  // gone.
+  uint64 new = 2;
+  uint64 changed = 3;
+  uint64 deleted = 4;
+  // Objects ingested, and objects whose ingest failed.
+  uint64 processed = 5;
+  uint64 failed = 6;
+  // Documents waiting in the LLM queue. 0 until the LLM queue exists.
+  uint64 queued_llm = 7;
+  // Objects seen and not ingested yet.
+  uint64 pending = 8;
+}
+
+message SourceProgress {
+  string source_id = 1;
+  SourceState state = 2;
+  string state_reason = 3;
+  ProgressCounters counters = 4;
+  // The number of the current (or last) scan pass; 0 before the first.
+  uint64 pass = 5;
+  bool pass_in_progress = 6;
+  // When the last pass completed, Unix seconds; 0 if none has.
+  int64 last_pass_completed_at = 7;
+  bool scanner_running = 8;
+}
+
+message ProgressUpdate {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    // The source as it is when the stream starts (or when it appears).
+    KIND_SNAPSHOT = 1;
+    // Its counters (or its scanner) changed.
+    KIND_COUNTERS = 2;
+    // Its state changed; `previous_state` says from what.
+    KIND_STATE_CHANGED = 3;
+    // It was removed. The last update about it.
+    KIND_REMOVED = 4;
+  }
+  Kind kind = 1;
+  SourceProgress progress = 2;
+  // For KIND_STATE_CHANGED and KIND_REMOVED.
+  SourceState previous_state = 3;
+  // When the update was made, Unix seconds.
+  int64 at = 4;
+}
+
+message ReprocessJobRequest {
+  string source_id = 1;
+}
+
+message ReprocessJobResponse {
+  string job_id = 1;
+}

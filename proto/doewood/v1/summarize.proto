@@ -1,0 +1,55 @@
+// On-demand summaries with quail's `summary.llm` (ADR 0001, section 6): the digest, the fact
+// check and the extractive fallback. Skips the LLM queue and stores nothing.
+syntax = "proto3";
+
+package doewood.v1;
+
+service SummarizeService {
+  // Summarizes one file. Not built yet: answers UNIMPLEMENTED (after validating the request)
+  // until the LLM step exists. The messages are final.
+  rpc Summarize(SummarizeRequest) returns (SummarizeResponse);
+}
+
+// An object in one of this instance's sources.
+message S3Location {
+  string source_id = 1;
+  string key = 2;
+}
+
+message SummarizeRequest {
+  oneof input {
+    // The file's bytes, up to the server's message size limit (64 MiB by default).
+    bytes content = 1;
+    // Or an object to fetch.
+    S3Location location = 2;
+  }
+  // The file name; its extension picks the reader (`.pdf`, `.docx`, `.xlsx`, ...). Required
+  // with `content`; defaults to the key with `location`.
+  string name = 3;
+  // An AI provider name (see ConfigService.ListAiProviders); empty uses the default.
+  string provider = 4;
+}
+
+message FactCheck {
+  // Facts in the digest that were checked against the document.
+  uint32 checked = 1;
+  // Of those, the ones the document supports.
+  uint32 supported = 2;
+  // The statements it does not support.
+  repeated string unsupported = 3;
+}
+
+message SummarizeResponse {
+  // The summary.
+  string digest = 1;
+  FactCheck fact_check = 2;
+  // True when the LLM was unavailable or failed the fact check, and the digest is the
+  // extractive fallback.
+  bool extractive = 3;
+  // The provider and model that wrote it; empty for the extractive fallback.
+  string provider = 4;
+  string model = 5;
+  // The file's BLAKE3 and its kind, as quail classified it.
+  string blake3 = 6;
+  string kind = 7;
+}
