@@ -22,24 +22,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
-  # The S3 integration tests (crates/doewood-s3/tests/minio.rs) against a real MinIO. The
-  # server runs from a step rather than `services:`, because a service container cannot be
-  # given MinIO's `server /data` arguments.
+  # The S3 integration tests (crates/doewood-s3/tests/minio.rs) against MinIO in a service
+  # container. MinIO no longer publishes `minio/minio` images; the frozen Bitnami build starts
+  # the server without arguments, which a service container needs.
   minio:
     runs-on: ubuntu-latest
+    services:
+      minio:
+        image: bitnamilegacy/minio:2025.7.23
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        ports: ["9000:9000"]
     env:
       DOEWOOD_TEST_S3_ENDPOINT: http://127.0.0.1:9000
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.1
       - uses: Swatinem/rust-cache@v2
-      - name: Start MinIO
+      - name: Wait for MinIO
         run: |
-          docker run -d --name minio -p 9000:9000 minio/minio:latest server /data
           for i in $(seq 1 60); do
             curl -sf http://127.0.0.1:9000/minio/health/live && exit 0
             sleep 1
           done
-          docker logs minio
           exit 1
       - run: cargo test -p doewood-s3 --test minio -- --nocapture

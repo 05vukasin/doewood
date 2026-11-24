@@ -1,6 +1,6 @@
 //! Integration tests against a real S3-compatible server. They run only when
 //! `DOEWOOD_TEST_S3_ENDPOINT` is set (CI's `minio` job; locally
-//! `docker run --rm -d -p 59000:9000 minio/minio server /data` and
+//! `docker run --rm -d -p 59000:9000 minio/minio server /data` (or `bitnamilegacy/minio`, as CI) and
 //! `DOEWOOD_TEST_S3_ENDPOINT=http://127.0.0.1:59000`). The keys default to MinIO's
 //! out-of-the-box development login; override them with `DOEWOOD_TEST_S3_ACCESS_KEY` and
 //! `DOEWOOD_TEST_S3_SECRET_KEY`. Each test works in a bucket of its own and deletes it.

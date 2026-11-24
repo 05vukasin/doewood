@@ -78,7 +78,9 @@ Until the gRPC API exists, a hidden command adds a source. **It is for local tes
 will be removed:
 
 ```sh
-docker run --rm -d --name minio -p 59000:9000 minio/minio server /data
+docker run --rm -d --name minio -p 59000:9000 minio/minio server /data   # a local image
+# (Docker Hub no longer serves minio/minio; CI uses bitnamilegacy/minio:2025.7.23 with
+#  MINIO_ROOT_USER / MINIO_ROOT_PASSWORD set to the same development login)
 # create a bucket and upload a few files (for example with `mc`), then:
 export MY_ACCESS_KEY=minioadmin MY_SECRET_KEY=minioadmin   # MinIO's development login
 doewood dev add-source --endpoint http://127.0.0.1:59000 --bucket docs --prefix in/ \
