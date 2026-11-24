@@ -32,7 +32,7 @@ the signature and any session token, so they are never logged and never part of 
 |---|---|---|
 | `active` | yes | Scanned on its schedule. |
 | `error` | yes | The last pass failed; the reason is kept. The pass is retried after the interval, and success makes the source `active` again. |
-| `paused` | no | Its scanner stops; nothing is listed. |
+| `paused` | no | Its scanner stops, during a pass at the next page (the pass stays resumable). |
 | `removed` | no | Kept until its rows are cleaned up. |
 
 ## The incremental scan

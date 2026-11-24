@@ -53,6 +53,9 @@ pub enum S3Error {
     /// The event channel is closed: its consumer is gone.
     #[error("the event channel is closed")]
     ChannelClosed,
+    /// The source was paused or removed during a pass.
+    #[error("the source is not active")]
+    Paused,
     /// Shutdown was requested.
     #[error("stopped")]
     Stopped,

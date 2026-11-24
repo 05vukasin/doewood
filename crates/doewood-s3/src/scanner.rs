@@ -203,6 +203,10 @@ impl Scanner {
                     }
                 }
                 Err(S3Error::Stopped) => return,
+                Err(S3Error::Paused) => {
+                    info!(source = %id, "source paused during a pass; scanner stops");
+                    return;
+                }
                 Err(S3Error::ChannelClosed) => {
                     warn!(source = %id, "the event consumer is gone; scanner stops");
                     return;
@@ -252,6 +256,12 @@ impl Scanner {
 
         let mut token: Option<String> = None;
         loop {
+            // A source paused (or removed) mid-pass stops at the next page; the checkpoint
+            // keeps the pass resumable.
+            let current = self.db(move |s| s.source(id)).await?.map(|s| s.state);
+            if !current.is_some_and(SourceState::is_scanned) {
+                return Err(S3Error::Paused);
+            }
             let start_after = cp.start_after.clone();
             let req = ListRequest {
                 prefix: &self.prefix,
@@ -801,6 +811,52 @@ mod tests {
         .unwrap();
         assert!(rx.recv().await.is_none());
         assert_eq!(bucket.pages_served.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn pausing_mid_pass_stops_at_the_next_page_and_stays_resumable() {
+        /// Pauses the source while serving the first page.
+        struct PausingLister<'a> {
+            inner: &'a FakeBucket,
+            store: Arc<Store>,
+            source: SourceId,
+        }
+        impl Lister for PausingLister<'_> {
+            fn list(
+                &self,
+                req: ListRequest<'_>,
+            ) -> impl Future<Output = Result<ListPage, S3Error>> + Send {
+                self.store
+                    .set_source_state(self.source, SourceState::Paused, None)
+                    .unwrap();
+                self.inner.list(req)
+            }
+        }
+        let s = setup("");
+        for i in 0..10 {
+            s.bucket.put(&format!("k{i:02}"), "e", 1);
+        }
+        let (tx, mut rx) = mpsc::channel(100);
+        let scanner = Scanner::new(Arc::clone(&s.store), &s.source, tx, small());
+        let lister = PausingLister {
+            inner: &s.bucket,
+            store: Arc::clone(&s.store),
+            source: s.source.id,
+        };
+        let (_t, mut stop) = watch::channel(false);
+        assert!(matches!(
+            scanner.pass(&lister, &mut stop).await,
+            Err(S3Error::Paused)
+        ));
+        drop(scanner);
+        let mut n = 0;
+        while rx.recv().await.is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 3, "only the first page");
+        let cp = s.store.scan_checkpoint(s.source.id).unwrap().unwrap();
+        assert!(cp.in_progress);
+        assert_eq!(cp.start_after.as_deref(), Some("k02"));
     }
 
     impl Lister for Arc<FakeBucket> {
