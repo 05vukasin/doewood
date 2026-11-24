@@ -1,0 +1,41 @@
+[workspace]
+resolver = "3"
+# Planned crates (ADR 0001), added one per step: doewood-pg (shared Postgres + pgvector),
+# doewood-s3 (sources), doewood-ingest (quail/hedgehog pipeline), doewood-api (gRPC) and
+# doewood-enrich (registries, ADR 0002).
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/05vukasin/doewood"
+rust-version = "1.97"
+
+[workspace.dependencies]
+doewood-core = { path = "crates/doewood-core" }
+doewood-store = { path = "crates/doewood-store" }
+thiserror = "2"
+zeroize = "1.8"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+must_use_candidate = "allow"
+
+# Portable: no target-cpu=native anywhere.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+strip = "symbols"
+
+# Dev builds keep dependencies optimized (SQLite, the AEAD) so tests stay fast.
+[profile.dev.package."*"]
+opt-level = 2

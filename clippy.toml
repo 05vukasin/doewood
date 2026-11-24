@@ -1,0 +1,1 @@
+doc-valid-idents = ["SQLite", "XChaCha20", "BLAKE3", "ETag", "gRPC", "pgvector", "PostgreSQL", "UUIDv7","..",]
