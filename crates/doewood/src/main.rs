@@ -2,6 +2,7 @@
 //! local testing).
 
 mod dev;
+mod icons;
 mod ingest;
 mod logging;
 mod ops;

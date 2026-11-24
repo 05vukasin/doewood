@@ -12,6 +12,7 @@ use doewood_store::{Source, Store, StoreError};
 use tokio::sync::watch;
 use tonic::Status;
 
+use crate::icons::Icons;
 use crate::progress::Progress;
 use crate::reprocess::Reprocessor;
 use crate::summarize::OnDemand;
@@ -57,6 +58,8 @@ pub struct ApiParts {
     /// On-demand summaries and the LLM queue; `None` when ingest does not run (`Summarize` is
     /// then UNAVAILABLE).
     pub summarize: Option<Arc<dyn OnDemand>>,
+    /// Company icons for `GET /icons/{domain}`; `None` answers every domain with a miss.
+    pub icons: Option<Arc<dyn Icons>>,
     /// Tuning.
     pub options: ApiOptions,
     /// Turns true on shutdown; streams end then.

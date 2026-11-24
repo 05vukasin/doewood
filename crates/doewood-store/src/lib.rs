@@ -26,6 +26,10 @@ pub use store::ai::{
     AI_PRESETS, AiProvider, AiProviderInput, ApiKey, DEFAULT_AI_PROVIDER, KeyChange,
     valid_provider_name,
 };
+pub use store::favicon::{
+    FAVICON_EGRESS_PROXY, FAVICON_FALLBACK, FaviconSettings, FaviconSettingsPatch,
+    valid_egress_proxy,
+};
 pub use store::ingest::{
     DEFAULT_SIMILAR_MIN_JACCARD, IngestSettings, IngestSettingsPatch, SIMILAR_MIN_JACCARD,
     valid_min_jaccard,
