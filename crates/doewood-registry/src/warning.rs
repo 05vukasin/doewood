@@ -12,6 +12,8 @@ pub enum Registry {
     Gleif,
     /// The EU's VAT Information Exchange System (VIES), `ec.europa.eu`.
     Vies,
+    /// Wikidata: the query service (`query.wikidata.org`) and the `wbsearchentities` API.
+    Wikidata,
 }
 
 impl Registry {
@@ -20,6 +22,7 @@ impl Registry {
         match self {
             Self::Gleif => "gleif",
             Self::Vies => "vies",
+            Self::Wikidata => "wikidata",
         }
     }
 }
@@ -70,6 +73,10 @@ pub enum WarningKind {
     /// valid. Never an "invalid" answer, and never cached.
     #[error("VIES error {}", .0.code())]
     Vies(ViesError),
+    /// The Wikidata API answered with one of its error codes (`maxlag`, `ratelimited`, ...),
+    /// sanitized. Never cached.
+    #[error("Wikidata API error {0}")]
+    Wikidata(String),
 }
 
 /// A registry failure: which registry and why. Never fatal; the caller logs it and goes on.

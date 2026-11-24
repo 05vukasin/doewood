@@ -9,6 +9,15 @@ use async_trait::async_trait;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, RETRY_AFTER};
 use url::Url;
 
+/// The `User-Agent` of every registry request: generic, with the project's URL as the contact
+/// (the Wikimedia User-Agent policy's `<client>/<version> (<contact>)`). Never a person's name
+/// or email.
+pub const USER_AGENT: &str = concat!(
+    "doewood/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/05vukasin/doewood)"
+);
+
 /// An HTTP answer, its body read in full and within the cap.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Response {
@@ -95,7 +104,7 @@ impl HttpTransport {
         let client = reqwest::Client::builder()
             .connect_timeout(connect_timeout)
             .timeout(timeout)
-            .user_agent(concat!("doewood/", env!("CARGO_PKG_VERSION")))
+            .user_agent(USER_AGENT)
             .build()
             .map_err(|e| e.to_string())?;
         Ok(Self { client, timeout })

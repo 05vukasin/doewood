@@ -1,6 +1,6 @@
 //! A mock registry server on 127.0.0.1 and hand-written GLEIF fixtures. Every company, LEI and
 //! relationship here is invented; the LEIs only carry valid ISO 17442 check digits. The VIES
-//! fixtures are in `vies.rs`.
+//! fixtures are in `vies.rs`, the Wikidata ones in `wikidata.rs`.
 
 #![allow(dead_code)]
 
@@ -70,6 +70,7 @@ pub struct MockServer {
     pub base: String,
     requests: Arc<Mutex<Vec<String>>>,
     bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+    heads: Arc<Mutex<Vec<String>>>,
 }
 
 impl MockServer {
@@ -86,9 +87,11 @@ impl MockServer {
         let addr = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let bodies = Arc::new(Mutex::new(Vec::new()));
+        let heads = Arc::new(Mutex::new(Vec::new()));
         let handler: Arc<Handler> = Arc::new(handler);
         let seen = requests.clone();
         let seen_bodies = bodies.clone();
+        let seen_heads = heads.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
@@ -97,6 +100,7 @@ impl MockServer {
                 let handler = handler.clone();
                 let seen = seen.clone();
                 let seen_bodies = seen_bodies.clone();
+                let seen_heads = seen_heads.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut chunk = [0u8; 4096];
@@ -131,6 +135,7 @@ impl MockServer {
                         let mut s = seen.lock().unwrap();
                         s.push(target.clone());
                         seen_bodies.lock().unwrap().push(body.clone());
+                        seen_heads.lock().unwrap().push(head.clone());
                         s.len() - 1
                     };
                     let reply = handler(&target, &body, n);
@@ -154,7 +159,23 @@ impl MockServer {
             base: format!("http://{addr}/api/v1/"),
             requests,
             bodies,
+            heads,
         }
+    }
+
+    /// The value of header `name` in every request so far, in order.
+    pub fn header_values(&self, name: &str) -> Vec<Option<String>> {
+        self.heads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|head| {
+                head.lines()
+                    .filter_map(|l| l.split_once(':'))
+                    .find(|(k, _)| k.trim().eq_ignore_ascii_case(name))
+                    .map(|(_, v)| v.trim().to_owned())
+            })
+            .collect()
     }
 
     /// Every request body so far, in order.
