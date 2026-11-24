@@ -183,6 +183,8 @@ struct Signals {
 }
 
 impl Signals {
+    // Registration can fail only on Unix; elsewhere the Result is always Ok.
+    #[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
     fn register() -> std::io::Result<Self> {
         #[cfg(unix)]
         {
