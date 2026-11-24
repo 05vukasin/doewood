@@ -68,7 +68,9 @@ The record is the quail record JSON, keyed by BLAKE3, with step versions: one pe
 ## The graph
 
 - **Document** (BLAKE3) and **Location** through `upsert_location`.
-- **Companies** from `party.candidates`, by the deterministic part of ADR 0002 section 1:
+- **Companies** from `party.candidates`, by the deterministic part of ADR 0002 section 1. The
+  rules are in `doewood-enrich` (see [Company identity](#company-identity) below); ingest applies
+  them and does the store lookups:
   - Normalization: Cyrillic → Latin (Serbian, Macedonian, Bulgarian, Russian, Ukrainian), NFKD
     without marks, casefold, punctuation deleted, spaces collapsed; legal forms (Balkan forms
     `d.o.o.`, `a.d.`, `d.d.`, `j.p.`, `PR`, `s.p.`, `dooel`, ... and the long spellings) taken
@@ -76,8 +78,8 @@ The record is the quail record JSON, keyed by BLAKE3, with step versions: one pe
     (`Supplier`, `Naručilac`) are never a company; `formerly`, `f/k/a`, `n/k/a`, `d/b/a`,
     `trading as`, `u daljem tekstu` brackets become aliases and leave the key.
   - Identifiers next to a party's mention (same page, within 400 bytes, the nearest party; a tie
-    gives it to nobody): VAT, PIB, MB, OIB, LEI, DUNS, IBAN, checked with quail's check digits,
-    placeholders refused.
+    gives it to nobody): VAT, PIB, MB, OIB, LEI, DUNS, IBAN, checked before use (quail's check
+    digits), placeholders refused.
   - The ladder: identifiers first, then the normalized name with its legal form, the squashed
     name, and the legal-form-blind name while exactly one company owns it (it is blocked once a
     second does). Each key is a node alias: the first claim wins, and an identifier another
@@ -93,6 +95,34 @@ The record is the quail record JSON, keyed by BLAKE3, with step versions: one pe
 - **Search:** title (`ref.title`, else the card's, the file's own, the file name), body (the
   summary card, the extractive summary, keywords, sheet text), kind, date and amount.
 
+## Company identity
+
+`crates/doewood-enrich` holds the company identity rules of ADR 0002 section 1. It is pure: no
+I/O, no store, no network.
+
+- `name`: normalization, Latin/Cyrillic keys, legal forms, noise, geography and role words,
+  aliases from parentheses, and the deterministic ladder keys ingest stores as node aliases.
+- `id` and `check`: identifiers, validated before use. LEI (ISO 17442 MOD 97-10), IBAN
+  (MOD 97-10), PIB, MB, OIB and EU VAT use quail's check-digit code; VAT also covers Serbia
+  (`RS` and the PIB), Norway (`NO`, the organisasjonsnummer, `MVA`) and Switzerland (`CHE`, the
+  UID, `MWST`/`TVA`/`IVA`/`TPV`); DUNS is format only (nine digits). Placeholders (`000000000`,
+  `123456789`) and label text are refused.
+- `fuzzy`: the fuzzy name score. Tokens pair one to one, with one Damerau-Levenshtein edit on
+  tokens of 5+ characters (none on CJK); a subset may add one token and must share two;
+  otherwise Jaccard ≥ 0.6; an overlap of typos only is not enough. The veto: names that share at
+  most one core word (function words such as `of`, `za` do not count) and are in different
+  jurisdictions are different companies.
+- `fusion`: the noisy-OR over distinct evidence sources (registry identifier 0.95, parent
+  contract 0.95, email domain 0.90, name ladder 0.90 and less on the looser steps, filename
+  0.85, invoice layout 0.75, semantic similarity 0.55; a fuzzy name hit is 0.90 times its
+  Jaccard), and the gate: merge at ≥ 0.90, a new company only when every candidate is below
+  0.50, review otherwise and whenever two candidates are at ≥ 0.90.
+- `group`: `group_id = uuid5(NAMESPACE, LEI)`, else `uuid5(NAMESPACE, "<kind>:<value>")` for the
+  MB, PIB, OIB or VAT, the strongest kind first. IBAN and DUNS never key a group.
+
+Ingest uses only the deterministic part so far: the fuzzy score, the fusion gate and group ids
+are there for enrichment, and no document merges on a fuzzy match yet.
+
 ## Status, retries, deletes
 
 - Each object ends `done`, `skipped` or `failed` with the reason and the attempts; the progress
@@ -106,7 +136,9 @@ The record is the quail record JSON, keyed by BLAKE3, with step versions: one pe
 ## Tests
 
 - Unit tests: routing, the record and fact reading, the company rules (Latin and Cyrillic, legal
-  forms, aliases, identifiers), the job sizing and error classes.
+  forms, aliases, identifiers), the job sizing and error classes. `doewood-enrich` has its own
+  (`cargo test -p doewood-enrich`): names in both scripts, every identifier check, the fuzzy
+  rules and veto, the gate boundaries and pinned group ids.
 - `tests/pipeline.rs`: generated PDF, DOCX, TXT and XLSX files through the whole pipeline into
   SQLite (and Postgres with `DOEWOOD_TEST_POSTGRES_URL`), then the records, the graph (pending
   references, companies across spellings and identifiers, `similar_to`), search, retries,

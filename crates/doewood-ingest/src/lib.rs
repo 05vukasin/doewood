@@ -4,7 +4,8 @@
 //! - [`analyze`]: one quail engine per instance (OCR behind the `ocr` feature), hedgehog
 //!   under `catch_unwind`, the record and its step versions.
 //! - [`facts`]: what the graph and search need, read from the record.
-//! - [`company`]: the deterministic company identity rules of ADR 0002 section 1.
+//! - [`company`]: the deterministic company identity rules of ADR 0002 section 1, from
+//!   `doewood-enrich`.
 //! - [`graph`]: documents, locations, companies, references, `similar_to` and search.
 
 pub mod analyze;
