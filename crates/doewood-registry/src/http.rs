@@ -106,17 +106,44 @@ impl HttpTransport {
         connect_timeout: Duration,
         user_agent: &str,
     ) -> Result<Self, String> {
+        Self::build(timeout, connect_timeout, user_agent, None)
+    }
+
+    /// As [`HttpTransport::new`], also trusting the certificates of the PEM bundle
+    /// `extra_roots` next to the system's roots (APR's server sends no intermediate
+    /// certificate; the operator may supply it). The system's roots are kept.
+    pub fn with_extra_roots(
+        timeout: Duration,
+        connect_timeout: Duration,
+        extra_roots: &str,
+    ) -> Result<Self, String> {
+        Self::build(timeout, connect_timeout, USER_AGENT, Some(extra_roots))
+    }
+
+    fn build(
+        timeout: Duration,
+        connect_timeout: Duration,
+        user_agent: &str,
+        extra_roots: Option<&str>,
+    ) -> Result<Self, String> {
         static PROVIDER: Once = Once::new();
         PROVIDER.call_once(|| {
             // Another component may have installed one already; either is fine.
             let _ = rustls::crypto::ring::default_provider().install_default();
         });
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .connect_timeout(connect_timeout)
             .timeout(timeout)
-            .user_agent(user_agent)
-            .build()
-            .map_err(|e| e.to_string())?;
+            .user_agent(user_agent);
+        if let Some(pem) = extra_roots {
+            let certs = reqwest::Certificate::from_pem_bundle(pem.as_bytes())
+                .map_err(|e| format!("extra root certificates: {e}"))?;
+            if certs.is_empty() {
+                return Err("extra root certificates: no certificate in the PEM".to_owned());
+            }
+            builder = builder.tls_certs_merge(certs);
+        }
+        let client = builder.build().map_err(|e| e.to_string())?;
         Ok(Self { client, timeout })
     }
 }

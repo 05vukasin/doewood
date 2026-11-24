@@ -1,6 +1,6 @@
 //! A mock registry server on 127.0.0.1 and hand-written GLEIF fixtures. Every company, LEI and
 //! relationship here is invented; the LEIs only carry valid ISO 17442 check digits. The VIES
-//! fixtures are in `vies.rs`, the Wikidata ones in `wikidata.rs`.
+//! fixtures are in `vies.rs`, the Wikidata ones in `wikidata.rs`, the APR ones in `apr.rs`.
 
 #![allow(dead_code)]
 
