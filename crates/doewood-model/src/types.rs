@@ -14,6 +14,10 @@ use crate::Error;
 /// Longest node key accepted, in bytes.
 pub const NODE_KEY_MAX_LEN: usize = 2048;
 
+/// Prefix of a pending reference's key: a Document node for a document that another one cites
+/// by its number before that document itself is known (`ref:<number key>`).
+pub const PENDING_REF_PREFIX: &str = "ref:";
+
 /// The BLAKE3 hash of a file's bytes: a document's identity.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Blake3(pub [u8; 32]);
@@ -267,7 +271,8 @@ macro_rules! text_enum {
 text_enum!(
     /// The kinds of graph node (ADR 0001, section 7).
     NodeKind, "node kind" {
-        /// A file's content, keyed by its BLAKE3 in hex.
+        /// A file's content, keyed by its BLAKE3 in hex; or a pending reference to a document
+        /// known only by its cited number, keyed by [`PENDING_REF_PREFIX`] and that number.
         Document = "document",
         /// Where a copy of a document lives, keyed by [`ObjectLocation::node_key`].
         Location = "location",
@@ -375,11 +380,16 @@ pub fn validate_node(kind: NodeKind, key: &str, props: &Value) -> Result<(), Err
     if key.contains('\0') {
         return Err(Error::Invalid("a node key cannot contain NUL".to_owned()));
     }
+    let pending_ref = key
+        .strip_prefix(PENDING_REF_PREFIX)
+        .is_some_and(|k| !k.is_empty());
     if kind == NodeKind::Document
+        && !pending_ref
         && key.parse::<Blake3>().map(|b| b.to_hex()).ok().as_deref() != Some(key)
     {
         return Err(Error::Invalid(
-            "a document key is its BLAKE3 in lowercase hex".to_owned(),
+            "a document key is its BLAKE3 in lowercase hex, or `ref:` and a cited number"
+                .to_owned(),
         ));
     }
     if !props.is_object() {
@@ -557,6 +567,79 @@ pub struct Located {
     pub location: Uuid,
 }
 
+/// What [`crate::GraphStore::end_location`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocationEnded {
+    /// The Document node that lived there.
+    pub document: Uuid,
+    /// The Location node.
+    pub location: Uuid,
+    /// Live `located_at` edges the document still has elsewhere.
+    pub remaining: u32,
+}
+
+/// An alias of a node: an identifier or a name key that resolves to it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodeAlias {
+    /// The node it resolves to; `None` when the alias is blocked.
+    pub node: Option<Uuid>,
+    /// Why: the evidence and confidence of the claim (a JSON object).
+    pub props: Value,
+}
+
+/// Checks an alias before it reaches a backend: the same rules as a node key.
+pub fn validate_alias(alias: &str, props: &Value) -> Result<(), Error> {
+    if alias.is_empty() || alias.len() > NODE_KEY_MAX_LEN || alias.contains('\0') {
+        return Err(Error::Invalid(format!(
+            "an alias is 1 to {NODE_KEY_MAX_LEN} bytes without NUL"
+        )));
+    }
+    if !props.is_object() {
+        return Err(Error::Invalid(
+            "alias props must be a JSON object".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// A document's `MinHash` signature in the LSH band index, as a candidate lookup returns it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sketch {
+    /// The document.
+    pub blake3: Blake3,
+    /// Its `MinHash` signature, as quail writes it.
+    pub signature: Vec<u8>,
+    /// How many of the looked-up band keys it shares.
+    pub shared_bands: u32,
+}
+
+/// Most band keys one sketch carries.
+pub const SKETCH_MAX_BANDS: usize = 256;
+
+/// Largest `MinHash` signature accepted, in bytes.
+pub const SKETCH_MAX_SIGNATURE: usize = 64 * 1024;
+
+/// Checks a sketch before it reaches a backend.
+pub fn validate_sketch(signature: &[u8], bands: &[u64]) -> Result<(), Error> {
+    if signature.is_empty() || signature.len() > SKETCH_MAX_SIGNATURE {
+        return Err(Error::Invalid(format!(
+            "a MinHash signature is 1 to {SKETCH_MAX_SIGNATURE} bytes"
+        )));
+    }
+    if bands.len() > SKETCH_MAX_BANDS {
+        return Err(Error::Invalid(format!(
+            "a sketch has at most {SKETCH_MAX_BANDS} band keys"
+        )));
+    }
+    Ok(())
+}
+
+/// A band key as both backends store it: the same 64 bits as a signed integer.
+#[allow(clippy::cast_possible_wrap)]
+pub fn band_to_i64(band: u64) -> i64 {
+    band as i64
+}
+
 /// Who owns a source.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceClaim {
@@ -697,6 +780,8 @@ mod tests {
         assert!(validate_node(NodeKind::Document, "acme", &obj).is_err());
         assert!(validate_node(NodeKind::Document, &"AB".repeat(32), &obj).is_err());
         assert!(validate_node(NodeKind::Document, &"ab".repeat(32), &obj).is_ok());
+        assert!(validate_node(NodeKind::Document, "ref:inv-42", &obj).is_ok());
+        assert!(validate_node(NodeKind::Document, "ref:", &obj).is_err());
 
         let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
         let day = |d| Date::from_calendar_date(2020, time::Month::May, d).unwrap();

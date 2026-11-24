@@ -28,9 +28,15 @@ pub mod vars {
     pub const INSTANCE_ID: &str = "DOEWOOD_INSTANCE_ID";
     /// Largest gRPC message the API decodes, in MiB.
     pub const API_MAX_MESSAGE_MIB: &str = "DOEWOOD_API_MAX_MESSAGE_MIB";
+    /// Ingest workers (files analyzed at the same time); defaults from the CPUs and memory.
+    pub const INGEST_JOBS: &str = "DOEWOOD_INGEST_JOBS";
+    /// Directory of the OCR model files; defaults to `<data>/ocr-models`.
+    pub const OCR_MODELS: &str = "DOEWOOD_OCR_MODELS";
+    /// Least `MinHash` Jaccard estimate for a `similar_to` edge.
+    pub const SIMILAR_MIN_JACCARD: &str = "DOEWOOD_SIMILAR_MIN_JACCARD";
 
     /// Every bootstrap variable, in the order they are reported.
-    pub const ALL: [&str; 7] = [
+    pub const ALL: [&str; 10] = [
         DATA_DIR,
         LISTEN,
         OPS_LISTEN,
@@ -38,6 +44,9 @@ pub mod vars {
         MASTER_KEY,
         INSTANCE_ID,
         API_MAX_MESSAGE_MIB,
+        INGEST_JOBS,
+        OCR_MODELS,
+        SIMILAR_MIN_JACCARD,
     ];
 }
 
@@ -55,6 +64,12 @@ pub const MASTER_KEY_FILE: &str = "master.key";
 pub const DEFAULT_API_MAX_MESSAGE_MIB: u32 = 64;
 /// Largest accepted `DOEWOOD_API_MAX_MESSAGE_MIB`.
 pub const MAX_API_MAX_MESSAGE_MIB: u32 = 1024;
+/// Largest accepted `DOEWOOD_INGEST_JOBS`.
+pub const MAX_INGEST_JOBS: usize = 256;
+/// Default of `DOEWOOD_OCR_MODELS`, inside the data directory.
+pub const OCR_MODELS_DIR: &str = "ocr-models";
+/// Default of `DOEWOOD_SIMILAR_MIN_JACCARD`.
+pub const DEFAULT_SIMILAR_MIN_JACCARD: f64 = 0.8;
 
 const fn addr(ip: [u8; 4], port: u16) -> SocketAddr {
     SocketAddr::V4(std::net::SocketAddrV4::new(
@@ -208,6 +223,9 @@ struct Origins {
     master_key: Origin,
     instance_id: Origin,
     api_max_message: Origin,
+    ingest_jobs: Origin,
+    ocr_models: Origin,
+    similar_min_jaccard: Origin,
 }
 
 /// The effective bootstrap configuration.
@@ -227,6 +245,12 @@ pub struct BootstrapConfig {
     pub instance_id: InstanceId,
     /// Largest gRPC message the API decodes, in bytes.
     pub api_max_message_bytes: usize,
+    /// Ingest workers; `None` lets ingest size them from the CPUs and memory.
+    pub ingest_jobs: Option<usize>,
+    /// Directory of the OCR model files.
+    pub ocr_models: PathBuf,
+    /// Least `MinHash` Jaccard estimate for a `similar_to` edge.
+    pub similar_min_jaccard: f64,
     origins: Origins,
 }
 
@@ -270,6 +294,13 @@ impl BootstrapConfig {
             parse_instance_id(get(vars::INSTANCE_ID), hostname, &mut w);
         let (api_max_message_mib, api_max_message_origin) =
             parse_mib(get(vars::API_MAX_MESSAGE_MIB), &mut w);
+        let (ingest_jobs, ingest_jobs_origin) = parse_jobs(get(vars::INGEST_JOBS), &mut w);
+        let (ocr_models, ocr_models_origin) = match get(vars::OCR_MODELS) {
+            Some(v) => (PathBuf::from(v), Origin::Env),
+            None => (data_dir.join(OCR_MODELS_DIR), Origin::Default),
+        };
+        let (similar_min_jaccard, similar_origin) =
+            parse_jaccard(get(vars::SIMILAR_MIN_JACCARD), &mut w);
 
         Loaded {
             config: Self {
@@ -282,6 +313,9 @@ impl BootstrapConfig {
                 api_max_message_bytes: usize::try_from(api_max_message_mib)
                     .unwrap_or(usize::MAX)
                     .saturating_mul(1024 * 1024),
+                ingest_jobs,
+                ocr_models,
+                similar_min_jaccard,
                 origins: Origins {
                     data_dir: data_dir_origin,
                     listen: listen_origin,
@@ -290,6 +324,9 @@ impl BootstrapConfig {
                     master_key: master_key_origin,
                     instance_id: instance_origin,
                     api_max_message: api_max_message_origin,
+                    ingest_jobs: ingest_jobs_origin,
+                    ocr_models: ocr_models_origin,
+                    similar_min_jaccard: similar_origin,
                 },
             },
             warnings: w,
@@ -361,6 +398,23 @@ impl BootstrapConfig {
                 var: vars::API_MAX_MESSAGE_MIB,
                 value: format!("{} MiB", self.api_max_message_bytes / (1024 * 1024)),
                 origin: o.api_max_message,
+            },
+            Entry {
+                var: vars::INGEST_JOBS,
+                value: self
+                    .ingest_jobs
+                    .map_or_else(|| "auto (CPUs and memory)".to_owned(), |n| n.to_string()),
+                origin: o.ingest_jobs,
+            },
+            Entry {
+                var: vars::OCR_MODELS,
+                value: self.ocr_models.display().to_string(),
+                origin: o.ocr_models,
+            },
+            Entry {
+                var: vars::SIMILAR_MIN_JACCARD,
+                value: self.similar_min_jaccard.to_string(),
+                origin: o.similar_min_jaccard,
             },
         ]
     }
@@ -504,6 +558,48 @@ fn parse_mib(value: Option<OsString>, w: &mut Vec<ConfigWarning>) -> (u32, Origi
     }
 }
 
+fn parse_jobs(value: Option<OsString>, w: &mut Vec<ConfigWarning>) -> (Option<usize>, Origin) {
+    let Some(v) = value else {
+        return (None, Origin::Default);
+    };
+    match v.to_str().map(|s| s.trim().parse::<usize>()) {
+        Some(Ok(n)) if (1..=MAX_INGEST_JOBS).contains(&n) => (Some(n), Origin::Env),
+        _ => {
+            let shown = v.to_string_lossy();
+            warn(
+                w,
+                vars::INGEST_JOBS,
+                format!(
+                    "{shown:?} is not a whole number from 1 to {MAX_INGEST_JOBS}; sizing from \
+                     the CPUs and memory"
+                ),
+            );
+            (None, Origin::Fallback)
+        }
+    }
+}
+
+fn parse_jaccard(value: Option<OsString>, w: &mut Vec<ConfigWarning>) -> (f64, Origin) {
+    let Some(v) = value else {
+        return (DEFAULT_SIMILAR_MIN_JACCARD, Origin::Default);
+    };
+    match v.to_str().map(|s| s.trim().parse::<f64>()) {
+        Some(Ok(x)) if x > 0.0 && x <= 1.0 => (x, Origin::Env),
+        _ => {
+            let shown = v.to_string_lossy();
+            warn(
+                w,
+                vars::SIMILAR_MIN_JACCARD,
+                format!(
+                    "{shown:?} is not a number above 0 and at most 1; using \
+                     {DEFAULT_SIMILAR_MIN_JACCARD}"
+                ),
+            );
+            (DEFAULT_SIMILAR_MIN_JACCARD, Origin::Fallback)
+        }
+    }
+}
+
 fn prepare_dir(path: &Path) -> Result<(), Error> {
     let fail = |source| Error::DataDir {
         path: path.to_owned(),
@@ -528,6 +624,41 @@ mod tests {
             .map(|(k, v)| ((*k).to_owned(), OsString::from(v)))
             .collect();
         BootstrapConfig::from_lookup(|k| env.get(k).cloned(), || host.map(OsString::from))
+    }
+
+    #[test]
+    fn ingest_settings() {
+        let Loaded { config, warnings } = load(&[("DOEWOOD_DATA_DIR", "/d")], Some("h"));
+        assert!(warnings.is_empty());
+        assert_eq!(config.ingest_jobs, None);
+        assert_eq!(config.ocr_models, PathBuf::from("/d/ocr-models"));
+        assert!((config.similar_min_jaccard - 0.8).abs() < f64::EPSILON);
+        let Loaded { config, warnings } = load(
+            &[
+                ("DOEWOOD_INGEST_JOBS", "6"),
+                ("DOEWOOD_OCR_MODELS", "/models"),
+                ("DOEWOOD_SIMILAR_MIN_JACCARD", "0.9"),
+            ],
+            Some("h"),
+        );
+        assert!(warnings.is_empty());
+        assert_eq!(config.ingest_jobs, Some(6));
+        assert_eq!(config.ocr_models, PathBuf::from("/models"));
+        assert!((config.similar_min_jaccard - 0.9).abs() < f64::EPSILON);
+        let Loaded { config, warnings } = load(
+            &[
+                ("DOEWOOD_INGEST_JOBS", "0"),
+                ("DOEWOOD_SIMILAR_MIN_JACCARD", "1.5"),
+            ],
+            Some("h"),
+        );
+        assert_eq!(
+            warnings.iter().map(|w| w.var).collect::<Vec<_>>(),
+            ["DOEWOOD_INGEST_JOBS", "DOEWOOD_SIMILAR_MIN_JACCARD"]
+        );
+        assert_eq!(config.ingest_jobs, None);
+        assert!((config.similar_min_jaccard - 0.8).abs() < f64::EPSILON);
+        assert_eq!(config.entries().len(), vars::ALL.len());
     }
 
     #[test]
@@ -561,6 +692,9 @@ mod tests {
                 ("DOEWOOD_MASTER_KEY", &key.to_base64()),
                 ("DOEWOOD_INSTANCE_ID", "worker-7"),
                 ("DOEWOOD_API_MAX_MESSAGE_MIB", "8"),
+                ("DOEWOOD_INGEST_JOBS", "3"),
+                ("DOEWOOD_OCR_MODELS", "/opt/ocr"),
+                ("DOEWOOD_SIMILAR_MIN_JACCARD", "0.75"),
             ],
             Some("ignored"),
         );
@@ -638,7 +772,10 @@ mod tests {
                 Origin::Fallback,
                 Origin::Fallback,
                 Origin::Fallback,
-                Origin::Fallback
+                Origin::Fallback,
+                Origin::Default,
+                Origin::Default,
+                Origin::Default,
             ]
         );
     }

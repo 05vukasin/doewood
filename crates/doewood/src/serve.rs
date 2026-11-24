@@ -11,13 +11,16 @@
 //!    `DOEWOOD_POSTGRES_URL`: connect to the shared Postgres in the background, and report ready
 //!    once it answers. Until then the instance runs degraded: `/readyz` says why, and the
 //!    connection is retried with backoff (see [`crate::shared`]).
-//! 7. start one scanner per active S3 source (none configured: nothing starts), accept S3
+//! 7. build ingest (the quail engine, with OCR when built and its models are there) and start
+//!    its workers; they wait for the backend while the shared Postgres is not connected.
+//! 8. start one scanner per active S3 source (none configured: nothing starts), accept S3
 //!    event notifications on the ops server, and serve the gRPC API. Sources added through
-//!    the API start scanning at once.
+//!    the API start scanning at once. Discovery events go to ingest through bounded channels,
+//!    so a busy ingest slows the scanners down instead of growing a queue.
 //!
 //! On SIGTERM or SIGINT: report not ready, stop the servers (the API finishes the calls in
-//! flight and ends its streams) and the scanners (each keeps its checkpoint), close the store,
-//! exit 0.
+//! flight and ends its streams), the scanners (each keeps its checkpoint) and ingest (each
+//! worker finishes its file; the rest stays pending), close the store, exit 0.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -38,7 +41,7 @@ use tracing::{debug, error, info, warn};
 const API_DRAIN: Duration = Duration::from_secs(10);
 
 use crate::ops::{self, OpsState};
-use crate::shared;
+use crate::{ingest, shared};
 
 /// Builds the runtime and runs the service until a shutdown signal.
 pub fn main(loaded: Loaded) -> ExitCode {
@@ -153,9 +156,16 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
     };
 
     let progress = Arc::new(Progress::new());
+    let ingest = ingest::build(&config, &store, backend_rx.clone(), &progress).await;
+    let (ingest_tx, ingest_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+    // Without ingest the receiver is dropped here, and no events are sent to it.
+    let ingesting = ingest
+        .as_ref()
+        .map(|i| i.start(ingest_rx, shutdown_rx.clone()));
     let scanning = start_discovery(
         Arc::clone(&store),
         Arc::clone(&progress),
+        ingest.is_some().then_some(ingest_tx),
         shutdown_rx.clone(),
     )
     .await;
@@ -172,6 +182,8 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
             instance: config.instance_id.clone(),
             discovery: scanning.discovery.clone(),
             progress,
+            reprocess: ingest
+                .map(|i| Arc::new(ingest::Reprocess(i)) as Arc<dyn doewood_api::Reprocessor>),
             options: ApiOptions::default(),
             shutdown: shutdown_rx.clone(),
         },
@@ -189,6 +201,10 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
     stop_api(api_server).await;
     state.clear_webhook();
     scanning.stop().await;
+    if let Some(handle) = ingesting {
+        handle.join().await;
+        info!("ingest stopped");
+    }
     if let Some(task) = supervisor
         && let Err(e) = task.await
     {
@@ -336,12 +352,13 @@ impl Scanning {
 async fn start_discovery(
     store: Arc<Store>,
     progress: Arc<Progress>,
+    ingest: Option<mpsc::Sender<ObjectEvent>>,
     shutdown: watch::Receiver<bool>,
 ) -> Scanning {
-    // Step 4 of the plan (ingest) consumes the events; until then they are counted for
-    // `WatchProgress`, logged and dropped.
+    // Every event is counted for `WatchProgress`, then handed to ingest (or, without it,
+    // logged and dropped).
     let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-    let sink = tokio::spawn(log_events(events_rx, progress));
+    let sink = tokio::spawn(forward_events(events_rx, progress, ingest));
     let discovery = match Discovery::start(
         store,
         events_tx.clone(),
@@ -366,15 +383,19 @@ async fn start_discovery(
     }
 }
 
-async fn log_events(mut events: mpsc::Receiver<ObjectEvent>, progress: Arc<Progress>) {
+async fn forward_events(
+    mut events: mpsc::Receiver<ObjectEvent>,
+    progress: Arc<Progress>,
+    ingest: Option<mpsc::Sender<ObjectEvent>>,
+) {
     while let Some(e) = events.recv().await {
         progress.record(&e);
-        debug!(
-            source = %e.source,
-            key = %e.key,
-            kind = e.kind.name(),
-            "object event (ingest is not part of this build yet)"
-        );
+        debug!(source = %e.source, key = %e.key, kind = e.kind.name(), "object event");
+        // Waits while ingest's queue is full: the scanners wait in turn. A closed ingest
+        // (shutdown) drops the event; the object stays pending for the next start.
+        if let Some(tx) = &ingest {
+            let _ = tx.send(e).await;
+        }
     }
 }
 

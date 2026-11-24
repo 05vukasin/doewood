@@ -138,6 +138,7 @@ async fn add(
         // No scanner here: `serve` starts it.
         discovery: None,
         progress: Arc::new(Progress::new()),
+        reprocess: None,
         options: ApiOptions::default(),
         shutdown: shutdown_rx,
     });

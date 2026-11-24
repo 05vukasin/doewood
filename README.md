@@ -9,7 +9,8 @@ The name comes from Košutnjak, a Belgrade forest: *košuta* (a doe) + wood. It 
 and the quail.
 
 **Status:** the skeleton (configuration, local store, ops endpoints), the shared store, S3
-discovery and the gRPC API are in; ingest (quail/hedgehog) and the LLM step are next. See
+discovery, the gRPC API and ingest (quail and hedgehog into records, the graph and search) are
+in; the LLM step and registry enrichment are next. See
 [ADR 0002](docs/adr/0002-company-enrichment.md) (company identity and registries) and
 [ADR 0001](docs/adr/0001-architecture.md).
 
@@ -47,8 +48,8 @@ grpcurl -plaintext 127.0.0.1:7443 list            # the services, through reflec
 ```
 
 The bootstrap variables are listed in [docs/configuration.md](docs/configuration.md), sources
-and discovery in [docs/sources.md](docs/sources.md), and the API, with `grpcurl` examples, in
-[docs/api.md](docs/api.md).
+and discovery in [docs/sources.md](docs/sources.md), ingest in [docs/ingest.md](docs/ingest.md),
+and the API, with `grpcurl` examples, in [docs/api.md](docs/api.md).
 
 ## Layout
 
@@ -60,11 +61,13 @@ crates/
                   and the standalone backend of the store traits (FTS5 search)
   doewood-pg      the shared Postgres (+ pgvector) backend of the store traits
   doewood-s3      S3 sources: a light SigV4 client, the incremental scanner, event inlets
+  doewood-ingest  ingest: fetch, quail and hedgehog, records, the graph (companies, references,
+                  similar documents) and search; feature `ocr` (on in the binary)
   doewood-api     the gRPC API (tonic, gRPC-Web, health, reflection); protos in proto/doewood/v1
   doewood         the binary: serve, version, config check
 ```
 
-Planned: `doewood-ingest` (quail/hedgehog) and `doewood-enrich` (registries, ADR 0002).
+Planned: `doewood-enrich` (registries, ADR 0002).
 
 The `.proto` files compile with `protox` (pure Rust) in `doewood-api`'s build script, so
 `cargo build` needs no `protoc`.

@@ -1,0 +1,244 @@
+//! Spreadsheets with hedgehog: the workbook read from memory (`hh_core::open_bytes_with`),
+//! its tables found (`hh_core::try_normalize_workbook`), and both turned into quail-shaped
+//! facts in the `sheet.*` namespace, so a spreadsheet's record has the same top-level shape
+//! as a document's.
+//!
+//! Every hedgehog call runs under [`std::panic::catch_unwind`]: calamine's XLSB reader has
+//! known panics on hostile files, and a panic must end only that file.
+
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::time::{Duration, Instant};
+
+use hh_core::normalize::Options as NormalizeOptions;
+use hh_core::reader::ReadOptions;
+use hh_core::{Value as Cell, Workbook};
+use quail_core::{AnalyzerId, Fact, FactKey, Value};
+
+/// The step that reads the workbook. Its version follows doewood's conversion; hedgehog's own
+/// revision is in [`HEDGEHOG_REV`].
+pub const READ_ID: AnalyzerId = AnalyzerId::new("sheet.read", 1);
+/// The step that finds the tables.
+pub const TABLES_ID: AnalyzerId = AnalyzerId::new("sheet.tables", 1);
+/// The hedgehog revision doewood is built with (a step version for reprocessing).
+pub const HEDGEHOG_REV: &str = "c418c2b";
+
+/// Fact keys of the `sheet.*` namespace.
+pub mod keys {
+    use quail_core::FactKey;
+
+    /// The spreadsheet format: `xlsx`, `xlsb`, `xls`, `ods` (Text).
+    pub const FORMAT: FactKey = FactKey::new("sheet.format");
+    /// Sheets in the workbook (Int).
+    pub const SHEETS: FactKey = FactKey::new("sheet.count");
+    /// One sheet (Record: `name`, `range`?, `cells`, `formulas`, `merges`).
+    pub const SHEET: FactKey = FactKey::new("sheet.sheet");
+    /// Non-empty cells in the workbook (Int).
+    pub const CELLS: FactKey = FactKey::new("sheet.cells");
+    /// Formula cells in the workbook (Int).
+    pub const FORMULAS: FactKey = FactKey::new("sheet.formulas");
+    /// Tables found (Int).
+    pub const TABLES: FactKey = FactKey::new("sheet.tables");
+    /// One table (Record: `id`, `sheet`, `title`?, `columns` (List of Text), `rows`, `conf`).
+    pub const TABLE: FactKey = FactKey::new("sheet.table");
+    /// The first text cells, for search (Text, bounded).
+    pub const TEXT: FactKey = FactKey::new("sheet.text");
+}
+
+/// Most text kept in [`keys::TEXT`], in bytes.
+const MAX_TEXT: usize = 16 * 1024;
+/// Most tables described one by one.
+const MAX_TABLES: usize = 50;
+/// Most columns named per table.
+const MAX_COLUMNS: usize = 64;
+/// Most sheets described one by one.
+const MAX_SHEETS: usize = 200;
+
+/// What hedgehog made of a workbook.
+#[derive(Debug, Default)]
+pub struct SheetOutcome {
+    /// The facts, in production order.
+    pub facts: Vec<Fact>,
+    /// Steps that ran.
+    pub steps: Vec<AnalyzerId>,
+    /// Problems (a step failed or panicked); the facts present are still valid.
+    pub problems: Vec<String>,
+    /// The workbook could not be read at all.
+    pub failed: Option<String>,
+}
+
+/// Reads and analyzes a workbook within `timeout`.
+pub fn analyze(bytes: &[u8], name: &str, format: &str, timeout: Duration) -> SheetOutcome {
+    let mut out = SheetOutcome::default();
+    let deadline = Instant::now().checked_add(timeout);
+    let read =
+        guarded(|| hh_core::reader::open_bytes_with(bytes, Some(name), ReadOptions::default()));
+    let wb = match read {
+        Ok(Ok(wb)) => wb,
+        Ok(Err(e)) => {
+            out.failed = Some(format!("{READ_ID}: {e}"));
+            return out;
+        }
+        Err(panic) => {
+            out.failed = Some(format!("{READ_ID}: hedgehog panicked: {panic}"));
+            return out;
+        }
+    };
+    out.steps.push(READ_ID);
+    let fact = |key: FactKey, value: Value| Fact {
+        key,
+        value,
+        conf: 1.0,
+        src: READ_ID,
+        evidence: None,
+    };
+    out.facts.push(fact(keys::FORMAT, Value::text(format)));
+    out.facts.push(fact(keys::SHEETS, int(wb.sheets.len())));
+    let (mut cells, mut formulas) = (0usize, 0usize);
+    for s in &wb.sheets {
+        cells += s.cells.len();
+        formulas += s.formula_count();
+    }
+    for s in wb.sheets.iter().take(MAX_SHEETS) {
+        let mut r = vec![("name", Value::text(s.name.as_str()))];
+        if let Some(u) = s.used_range() {
+            r.push((
+                "range",
+                Value::text(format!(
+                    "{}:{}",
+                    hh_core::a1(u.top, u.left),
+                    hh_core::a1(u.bottom, u.right)
+                )),
+            ));
+        }
+        r.push(("cells", int(s.cells.len())));
+        r.push(("formulas", int(s.formula_count())));
+        r.push(("merges", int(s.merges.len())));
+        out.facts.push(fact(keys::SHEET, Value::record(r)));
+    }
+    out.facts.push(fact(keys::CELLS, int(cells)));
+    out.facts.push(fact(keys::FORMULAS, int(formulas)));
+    let text = sample_text(&wb);
+    if !text.is_empty() {
+        out.facts.push(fact(keys::TEXT, Value::text(text)));
+    }
+    tables(&wb, deadline, &mut out);
+    out
+}
+
+/// The tables, through hedgehog's normalizer (rules plus its learned row model).
+fn tables(wb: &Workbook, deadline: Option<Instant>, out: &mut SheetOutcome) {
+    let opts = NormalizeOptions {
+        deadline,
+        threads: Some(1),
+        ..NormalizeOptions::default()
+    };
+    let norm = match guarded(|| hh_core::try_normalize_workbook(wb, &opts)) {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => {
+            out.problems.push(format!("{TABLES_ID}: {e}"));
+            return;
+        }
+        Err(panic) => {
+            out.problems
+                .push(format!("{TABLES_ID}: hedgehog panicked: {panic}"));
+            return;
+        }
+    };
+    out.steps.push(TABLES_ID);
+    let fact = |key: FactKey, value: Value, conf: f32| Fact {
+        key,
+        value,
+        conf,
+        src: TABLES_ID,
+        evidence: None,
+    };
+    out.facts
+        .push(fact(keys::TABLES, int(norm.tables.len()), 1.0));
+    for t in norm.tables.iter().take(MAX_TABLES) {
+        let mut r = vec![
+            ("id", Value::text(format!("T{}", t.n))),
+            ("sheet", Value::text(t.source_sheet.as_str())),
+        ];
+        if let Some((title, _)) = &t.title {
+            r.push(("title", Value::text(title.as_str())));
+        }
+        let columns = t
+            .columns
+            .iter()
+            .filter(|c| c.source_col.is_some())
+            .take(MAX_COLUMNS)
+            .map(|c| Value::text(c.name.as_str()))
+            .collect();
+        r.push(("columns", Value::List(columns)));
+        r.push(("rows", int(t.src_rows.len())));
+        r.push(("conf", Value::Float(f64::from(t.confidence))));
+        out.facts.push(fact(
+            keys::TABLE,
+            Value::record(r),
+            t.confidence.clamp(0.0, 1.0),
+        ));
+    }
+}
+
+/// The text cells in sheet order, up to [`MAX_TEXT`] bytes.
+fn sample_text(wb: &Workbook) -> String {
+    let mut text = String::new();
+    'sheets: for s in &wb.sheets {
+        for c in &s.cells {
+            if let Some(Cell::Text(t)) = &c.value {
+                let t = t.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                if text.len() + t.len() + 1 > MAX_TEXT {
+                    break 'sheets;
+                }
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(t);
+            }
+        }
+    }
+    text
+}
+
+fn int(n: usize) -> Value {
+    Value::Int(i64::try_from(n).unwrap_or(i64::MAX))
+}
+
+/// Runs `f`, turning a panic into its message.
+fn guarded<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+    catch_unwind(AssertUnwindSafe(f)).map_err(|p| {
+        p.downcast_ref::<&str>()
+            .map(|s| (*s).to_owned())
+            .or_else(|| p.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "a panic without a message".to_owned())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_panic_becomes_an_error() {
+        let r = guarded(|| -> u8 { panic!("boom") });
+        assert_eq!(r, Err("boom".to_owned()));
+        let r = guarded(|| -> u8 { panic!("{}", String::from("formatted")) });
+        assert_eq!(r, Err("formatted".to_owned()));
+        assert_eq!(guarded(|| 7), Ok(7));
+    }
+
+    #[test]
+    fn garbage_fails_without_a_panic() {
+        let out = analyze(
+            b"PK\x03\x04garbage",
+            "x.xlsx",
+            "xlsx",
+            Duration::from_secs(5),
+        );
+        assert!(out.failed.is_some());
+        assert!(out.facts.is_empty());
+    }
+}

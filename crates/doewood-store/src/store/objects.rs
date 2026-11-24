@@ -36,6 +36,46 @@ pub enum ObjectChange {
     },
 }
 
+/// How ingest finished with one object.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IngestOutcome {
+    /// Analyzed and stored: status `done`.
+    Done {
+        /// The content's hash.
+        blake3: [u8; 32],
+    },
+    /// Not analyzable (an unknown format, stored with its identity only): status `skipped`.
+    Skipped {
+        /// The content's hash.
+        blake3: [u8; 32],
+    },
+    /// Gave up: status `failed`.
+    Failed {
+        /// Why, one line.
+        error: String,
+        /// Attempts made in total.
+        attempts: u32,
+    },
+}
+
+/// An object's ingest status (`objects_seen`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IngestStatus {
+    /// `pending`, `done`, `failed`, `skipped` or `deleted`.
+    pub status: String,
+    /// The ETag ingest worked on.
+    pub etag: Option<String>,
+    /// The content's hash, once ingested (kept after a delete).
+    pub blake3: Option<[u8; 32]>,
+    /// Attempts so far.
+    pub attempts: u32,
+    /// The last failure.
+    pub last_error: Option<String>,
+}
+
+/// Longest `last_error` kept, in bytes.
+const MAX_ERROR_LEN: usize = 1000;
+
 /// Where a source's scan is.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScanCheckpoint {
@@ -169,6 +209,194 @@ impl Store {
         Ok(())
     }
 
+    /// Up to `limit` objects of a source waiting for ingest (status `pending`) with a key after
+    /// `after`, in key order: the durable ingest queue. Events only make ingest look sooner.
+    pub fn pending_objects(
+        &self,
+        source: SourceId,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SeenObject>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT key, etag, size, last_modified FROM objects_seen \
+             WHERE source_id = ?1 AND status = 'pending' AND (?2 IS NULL OR key > ?2) \
+             ORDER BY key LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    source.to_string(),
+                    after,
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
+                |r| {
+                    Ok(SeenObject {
+                        key: r.get(0)?,
+                        etag: r.get(1)?,
+                        size: u64::try_from(r.get::<_, i64>(2)?).unwrap_or(0),
+                        last_modified: r.get(3)?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Records how ingest finished with the version `etag` of an object. Only a `pending` row
+    /// with that ETag changes: when the object changed (or was deleted) meanwhile, the newer
+    /// state wins and this returns `false`.
+    pub fn finish_object(
+        &self,
+        source: SourceId,
+        key: &str,
+        etag: Option<&str>,
+        outcome: &IngestOutcome,
+    ) -> Result<bool, StoreError> {
+        let (status, blake3, error, attempts): (&str, Option<&[u8]>, Option<String>, Option<i64>) =
+            match outcome {
+                IngestOutcome::Done { blake3 } => ("done", Some(blake3), None, None),
+                IngestOutcome::Skipped { blake3 } => ("skipped", Some(blake3), None, None),
+                IngestOutcome::Failed { error, attempts } => (
+                    "failed",
+                    None,
+                    Some(truncate(error, MAX_ERROR_LEN)),
+                    Some(i64::from(*attempts)),
+                ),
+            };
+        let n = self.conn().execute(
+            "UPDATE objects_seen SET status = ?4, blake3 = coalesce(?5, blake3), \
+             last_error = ?6, attempts = coalesce(?7, attempts + 1), updated_at = ?8 \
+             WHERE source_id = ?1 AND key = ?2 AND etag IS ?3 AND status = 'pending'",
+            params![
+                source.to_string(),
+                key,
+                etag,
+                status,
+                blake3,
+                error,
+                attempts,
+                now()
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Notes a failed attempt that will be retried: the row stays `pending`.
+    pub fn note_attempt(
+        &self,
+        source: SourceId,
+        key: &str,
+        etag: Option<&str>,
+        attempts: u32,
+        error: &str,
+    ) -> Result<bool, StoreError> {
+        let n = self.conn().execute(
+            "UPDATE objects_seen SET attempts = ?4, last_error = ?5, updated_at = ?6 \
+             WHERE source_id = ?1 AND key = ?2 AND etag IS ?3 AND status = 'pending'",
+            params![
+                source.to_string(),
+                key,
+                etag,
+                i64::from(attempts),
+                truncate(error, MAX_ERROR_LEN),
+                now()
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// An object's ingest status, deleted objects included.
+    pub fn ingest_status(
+        &self,
+        source: SourceId,
+        key: &str,
+    ) -> Result<Option<IngestStatus>, StoreError> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT status, etag, blake3, attempts, last_error FROM objects_seen \
+                 WHERE source_id = ?1 AND key = ?2",
+                params![source.to_string(), key],
+                |r| {
+                    let blake3: Option<Vec<u8>> = r.get(2)?;
+                    Ok(IngestStatus {
+                        status: r.get(0)?,
+                        etag: r.get(1)?,
+                        blake3: blake3.and_then(|b| b.try_into().ok()),
+                        attempts: u32::try_from(r.get::<_, i64>(3)?).unwrap_or(0),
+                        last_error: r.get(4)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Up to `limit` ingested objects (`done` or `skipped`, with their hash) with a key after
+    /// `after`, in key order: what reprocessing compares with the running step versions.
+    pub fn ingested_objects(
+        &self,
+        source: SourceId,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, [u8; 32])>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT key, blake3 FROM objects_seen WHERE source_id = ?1 \
+             AND status IN ('done', 'skipped') AND blake3 IS NOT NULL \
+             AND (?2 IS NULL OR key > ?2) ORDER BY key LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    source.to_string(),
+                    after,
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)),
+            )?
+            .filter_map(|row| match row {
+                Ok((k, b)) => b.try_into().ok().map(|b| Ok((k, b))),
+                Err(e) => Some(Err(e)),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Puts objects back in the ingest queue (status `pending`, attempts reset). `None`
+    /// requeues every live object of the source. Returns how many rows changed.
+    pub fn requeue_objects(
+        &self,
+        source: SourceId,
+        keys: Option<&[String]>,
+    ) -> Result<u64, StoreError> {
+        let id = source.to_string();
+        let now = now();
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let n = match keys {
+            None => tx.execute(
+                "UPDATE objects_seen SET status = 'pending', attempts = 0, last_error = NULL, \
+                 updated_at = ?2 WHERE source_id = ?1 AND status <> 'deleted'",
+                params![id, now],
+            )?,
+            Some(keys) => {
+                let mut stmt = tx.prepare_cached(
+                    "UPDATE objects_seen SET status = 'pending', attempts = 0, \
+                     last_error = NULL, updated_at = ?3 \
+                     WHERE source_id = ?1 AND key = ?2 AND status <> 'deleted'",
+                )?;
+                let mut n = 0;
+                for k in keys {
+                    n += stmt.execute(params![id, k, now])?;
+                }
+                n
+            }
+        };
+        tx.commit()?;
+        Ok(n as u64)
+    }
+
     /// A source's scan checkpoint; `None` before its first pass.
     pub fn scan_checkpoint(&self, source: SourceId) -> Result<Option<ScanCheckpoint>, StoreError> {
         Ok(self
@@ -198,6 +426,18 @@ impl Store {
     ) -> Result<(), StoreError> {
         write_checkpoint(&self.conn(), &source.to_string(), checkpoint, now())
     }
+}
+
+/// At most `max` bytes of `s`, cut at a character boundary.
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_owned();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_owned()
 }
 
 fn write_checkpoint(
@@ -285,6 +525,82 @@ mod tests {
             .record_objects(id, &[ObjectChange::Upsert(obj("b", 9))], None)
             .unwrap();
         assert_eq!(store.seen_object(id, "b").unwrap().unwrap().size, 9);
+    }
+
+    #[test]
+    fn ingest_status_follows_the_etag() {
+        let (store, id) = setup();
+        let changes: Vec<_> = ["a", "b", "c"]
+            .iter()
+            .map(|k| ObjectChange::Upsert(obj(k, 1)))
+            .collect();
+        store.record_objects(id, &changes, None).unwrap();
+        let keys = |v: Vec<SeenObject>| v.into_iter().map(|o| o.key).collect::<Vec<_>>();
+        assert_eq!(
+            keys(store.pending_objects(id, None, 10).unwrap()),
+            ["a", "b", "c"]
+        );
+        assert_eq!(
+            keys(store.pending_objects(id, Some("a"), 1).unwrap()),
+            ["b"]
+        );
+
+        let done = IngestOutcome::Done { blake3: [7; 32] };
+        // A stale ETag changes nothing.
+        assert!(!store.finish_object(id, "a", Some("old"), &done).unwrap());
+        assert!(store.finish_object(id, "a", Some("e-a"), &done).unwrap());
+        // Only pending rows change.
+        assert!(!store.finish_object(id, "a", Some("e-a"), &done).unwrap());
+        let s = store.ingest_status(id, "a").unwrap().unwrap();
+        assert_eq!(
+            (s.status.as_str(), s.blake3, s.attempts),
+            ("done", Some([7; 32]), 1)
+        );
+
+        assert!(
+            store
+                .note_attempt(id, "b", Some("e-b"), 1, "timeout")
+                .unwrap()
+        );
+        let failed = IngestOutcome::Failed {
+            error: "x".repeat(5000),
+            attempts: 3,
+        };
+        assert!(store.finish_object(id, "b", Some("e-b"), &failed).unwrap());
+        let s = store.ingest_status(id, "b").unwrap().unwrap();
+        assert_eq!((s.status.as_str(), s.attempts), ("failed", 3));
+        assert_eq!(s.last_error.unwrap().len(), MAX_ERROR_LEN);
+        let skipped = IngestOutcome::Skipped { blake3: [8; 32] };
+        assert!(store.finish_object(id, "c", Some("e-c"), &skipped).unwrap());
+        let counts = store.object_counts(id).unwrap();
+        assert_eq!(
+            (counts.done, counts.failed, counts.skipped, counts.pending),
+            (1, 1, 1, 0)
+        );
+
+        assert_eq!(
+            store.ingested_objects(id, None, 10).unwrap(),
+            [("a".to_owned(), [7; 32]), ("c".to_owned(), [8; 32])]
+        );
+        // A delete keeps the hash.
+        store
+            .record_objects(id, &[ObjectChange::Delete { key: "a".into() }], None)
+            .unwrap();
+        let s = store.ingest_status(id, "a").unwrap().unwrap();
+        assert_eq!((s.status.as_str(), s.blake3), ("deleted", Some([7; 32])));
+
+        assert_eq!(
+            store.requeue_objects(id, Some(&["c".to_owned()])).unwrap(),
+            1
+        );
+        assert_eq!(keys(store.pending_objects(id, None, 10).unwrap()), ["c"]);
+        // Everything live, not the deleted one.
+        assert_eq!(store.requeue_objects(id, None).unwrap(), 2);
+        assert_eq!(
+            keys(store.pending_objects(id, None, 10).unwrap()),
+            ["b", "c"]
+        );
+        assert_eq!(store.ingest_status(id, "b").unwrap().unwrap().attempts, 0);
     }
 
     #[test]

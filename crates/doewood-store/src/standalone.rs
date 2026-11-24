@@ -10,9 +10,11 @@ use async_trait::async_trait;
 use doewood_core::InstanceId;
 use doewood_model::{
     Backend, Blake3, ClaimStore, Direction, Edge, EdgeKind, EdgeSource, Error, GraphStore, Located,
-    Neighbour, NeighbourQuery, Node, NodeKind, ObjectLocation, PutOutcome, Record, RecordStore,
-    Result, SearchDoc, SearchHit, SearchQuery, SearchStore, SourceClaim, SourceKey, StepVersions,
-    StoredEdge, records_limit, validate_node, versions_from_json, versions_to_json,
+    LocationEnded, Neighbour, NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation,
+    PutOutcome, Record, RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery,
+    SearchStore, Sketch, SketchStore, SourceClaim, SourceKey, StepVersions, StoredEdge,
+    band_to_i64, records_limit, sketch_limit, validate_alias, validate_node, validate_sketch,
+    versions_from_json, versions_to_json,
 };
 use rusqlite::types::Value as Sql;
 use rusqlite::{Connection, OptionalExtension as _, Row, params, params_from_iter};
@@ -541,6 +543,207 @@ impl GraphStore for Standalone {
             )?;
             tx.commit().map_err(sql)?;
             Ok(Located { document, location })
+        })
+        .await
+    }
+
+    async fn end_location(&self, at: &ObjectLocation, on: Date) -> Result<Option<LocationEnded>> {
+        let at = at.checked()?;
+        self.run(move |conn| {
+            let tx = conn.transaction().map_err(sql)?;
+            let row: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT node_id, document_id FROM locations \
+                     WHERE endpoint = ?1 AND bucket = ?2 AND object_key = ?3",
+                    params![at.endpoint, at.bucket, at.key],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .map_err(sql)?;
+            let Some((location, document)) = row else {
+                return Ok(None);
+            };
+            tx.execute(
+                "UPDATE edges SET state = 'superseded', \
+                 valid_to = CASE WHEN valid_from IS NULL OR valid_from <= ?2 THEN ?2 \
+                 ELSE valid_from END, updated_at = ?3 \
+                 WHERE dst = ?1 AND kind = 'located_at' \
+                 AND state NOT IN ('retracted', 'superseded')",
+                params![location, julian(on), now()],
+            )
+            .map_err(sql)?;
+            tx.execute("DELETE FROM locations WHERE node_id = ?1", [&location])
+                .map_err(sql)?;
+            let remaining: i64 = tx
+                .query_row(
+                    "SELECT count(*) FROM edges WHERE src = ?1 AND kind = 'located_at' \
+                     AND state NOT IN ('retracted', 'superseded')",
+                    [&document],
+                    |r| r.get(0),
+                )
+                .map_err(sql)?;
+            tx.commit().map_err(sql)?;
+            Ok(Some(LocationEnded {
+                document: uuid(&document)?,
+                location: uuid(&location)?,
+                remaining: u32::try_from(remaining).unwrap_or(u32::MAX),
+            }))
+        })
+        .await
+    }
+
+    async fn claim_alias(
+        &self,
+        kind: NodeKind,
+        alias: &str,
+        node: Uuid,
+        props: &Value,
+    ) -> Result<NodeAlias> {
+        validate_alias(alias, props)?;
+        let (alias, props) = (alias.to_owned(), props.to_string());
+        self.run(move |conn| {
+            let (node, props): (Option<String>, String) = conn
+                .query_row(
+                    "INSERT INTO node_aliases (kind, alias, node_id, props_json, created_at, \
+                     updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5) \
+                     ON CONFLICT (kind, alias) DO UPDATE SET kind = node_aliases.kind \
+                     RETURNING node_id, props_json",
+                    params![kind.as_str(), alias, node.to_string(), props, now()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(sql)?;
+            Ok(NodeAlias {
+                node: node.as_deref().map(uuid).transpose()?,
+                props: json(&props)?,
+            })
+        })
+        .await
+    }
+
+    async fn alias(&self, kind: NodeKind, alias: &str) -> Result<Option<NodeAlias>> {
+        let alias = alias.to_owned();
+        self.run(move |conn| {
+            let row: Option<(Option<String>, String)> = conn
+                .query_row(
+                    "SELECT node_id, props_json FROM node_aliases WHERE kind = ?1 AND alias = ?2",
+                    params![kind.as_str(), alias],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .map_err(sql)?;
+            row.map(|(node, props)| {
+                Ok(NodeAlias {
+                    node: node.as_deref().map(uuid).transpose()?,
+                    props: json(&props)?,
+                })
+            })
+            .transpose()
+        })
+        .await
+    }
+
+    async fn block_alias(&self, kind: NodeKind, alias: &str, props: &Value) -> Result<()> {
+        validate_alias(alias, props)?;
+        let (alias, props) = (alias.to_owned(), props.to_string());
+        self.run(move |conn| {
+            conn.execute(
+                "INSERT INTO node_aliases (kind, alias, node_id, props_json, created_at, \
+                 updated_at) VALUES (?1, ?2, NULL, ?3, ?4, ?4) \
+                 ON CONFLICT (kind, alias) DO UPDATE SET node_id = NULL, \
+                 props_json = excluded.props_json, updated_at = excluded.updated_at",
+                params![kind.as_str(), alias, props, now()],
+            )
+            .map_err(sql)?;
+            Ok(())
+        })
+        .await
+    }
+}
+
+#[async_trait]
+impl SketchStore for Standalone {
+    async fn put_sketch(&self, blake3: &Blake3, signature: &[u8], bands: &[u64]) -> Result<()> {
+        validate_sketch(signature, bands)?;
+        let (h, signature, bands) = (*blake3, signature.to_vec(), bands.to_vec());
+        self.run(move |conn| {
+            let tx = conn.transaction().map_err(sql)?;
+            let key = h.as_bytes().as_slice();
+            tx.execute(
+                "INSERT INTO sketches (blake3, signature, updated_at) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT (blake3) DO UPDATE SET signature = excluded.signature, \
+                 updated_at = excluded.updated_at",
+                params![key, signature, now()],
+            )
+            .map_err(sql)?;
+            tx.execute("DELETE FROM sketch_bands WHERE blake3 = ?1", [key])
+                .map_err(sql)?;
+            {
+                let mut insert = tx
+                    .prepare_cached(
+                        "INSERT INTO sketch_bands (band, blake3) VALUES (?1, ?2) \
+                         ON CONFLICT DO NOTHING",
+                    )
+                    .map_err(sql)?;
+                for band in bands {
+                    insert
+                        .execute(params![band_to_i64(band), key])
+                        .map_err(sql)?;
+                }
+            }
+            tx.commit().map_err(sql)
+        })
+        .await
+    }
+
+    async fn sketch_candidates(
+        &self,
+        bands: &[u64],
+        exclude: &Blake3,
+        limit: u32,
+    ) -> Result<Vec<Sketch>> {
+        if bands.is_empty() {
+            return Ok(Vec::new());
+        }
+        if bands.len() > SKETCH_MAX_BANDS {
+            return Err(Error::Invalid(format!(
+                "at most {SKETCH_MAX_BANDS} band keys per lookup"
+            )));
+        }
+        let (exclude, limit) = (*exclude, i64::from(sketch_limit(limit)));
+        let mut args: Vec<Sql> = bands
+            .iter()
+            .map(|b| Sql::Integer(band_to_i64(*b)))
+            .collect();
+        args.push(Sql::Blob(exclude.as_bytes().to_vec()));
+        args.push(Sql::Integer(limit));
+        let marks = vec!["?"; bands.len()].join(", ");
+        self.run(move |conn| {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT b.blake3, s.signature, count(DISTINCT b.band) AS shared \
+                     FROM sketch_bands b JOIN sketches s ON s.blake3 = b.blake3 \
+                     WHERE b.band IN ({marks}) AND b.blake3 <> ? \
+                     GROUP BY b.blake3 ORDER BY shared DESC, b.blake3 LIMIT ?"
+                ))
+                .map_err(sql)?;
+            let rows = stmt
+                .query_map(params_from_iter(args), |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?,
+                        r.get::<_, Vec<u8>>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                })
+                .map_err(sql)?;
+            rows.map(|row| {
+                let (h, signature, shared) = row.map_err(sql)?;
+                Ok(Sketch {
+                    blake3: Blake3::from_slice(&h)?,
+                    signature,
+                    shared_bands: u32::try_from(shared).unwrap_or(u32::MAX),
+                })
+            })
+            .collect()
         })
         .await
     }

@@ -1,0 +1,59 @@
+[package]
+name = "doewood-ingest"
+description = "doewood's ingest pipeline: fetch from S3, analyze with quail and hedgehog, store records, the graph and search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["ocr"]
+# OCR of scanned pages (quail's PP-OCRv6 on ONNX Runtime, whose prebuilt native library the
+# `ort` build script downloads). Without it, or without the model files, scanned pages are only
+# flagged `needs_ocr`.
+ocr = ["dep:quail-ocr", "quail-ocr/paddle"]
+
+[dependencies]
+async-trait.workspace = true
+# Same build as quail's (`pure`: no C toolchain, SIMD still selected at runtime).
+blake3 = { version = "1.8", default-features = false, features = ["std", "pure"] }
+doewood-core.workspace = true
+doewood-model.workspace = true
+doewood-s3.workspace = true
+doewood-store.workspace = true
+# hedgehog for spreadsheets. Its patched calamine and rust_xlsxwriter are patched in at the
+# workspace root, because `[patch]` does not carry over to dependents.
+hh_core = { git = "https://github.com/05vukasin/hedgehog", rev = "c418c2b" }
+# quail: `quail-cli` is a library too, and its `registry` module wires every extractor and
+# analyzer. OCR is added here (feature `ocr`) so the model directory comes from doewood's
+# configuration, not from the process environment.
+quail-cli = { git = "https://github.com/05vukasin/quail", rev = "62108d4" }
+quail-core = { git = "https://github.com/05vukasin/quail", rev = "62108d4" }
+quail-engine = { git = "https://github.com/05vukasin/quail", rev = "62108d4" }
+quail-ocr = { git = "https://github.com/05vukasin/quail", rev = "62108d4", optional = true }
+quail-signals = { git = "https://github.com/05vukasin/quail", rev = "62108d4" }
+quail-sketch = { git = "https://github.com/05vukasin/quail", rev = "62108d4" }
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tracing.workspace = true
+unicode-normalization = "0.1"
+uuid.workspace = true
+
+[dev-dependencies]
+doewood-pg.workspace = true
+# Writes the generated DOCX and XLSX fixtures (stored entries only), like quail's tests.
+zip = { version = "9.0.5", default-features = false }
+# Writes the generated PDF fixtures, like quail's tests.
+lopdf = { version = "0.47.0", default-features = false }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
+# The end-to-end test writes to MinIO with raw presigned requests, as doewood-s3's tests do.
+reqwest = { version = "0.13", default-features = false }
+rusty-s3 = { version = "0.12", default-features = false, features = ["rustcrypto", "xml"] }
+
+[lints]
+workspace = true

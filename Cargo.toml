@@ -1,7 +1,6 @@
 [workspace]
 resolver = "3"
-# Planned crates (ADR 0001), added one per step: doewood-ingest (quail/hedgehog pipeline) and
-# doewood-enrich (registries, ADR 0002).
+# Planned crates (ADR 0001), added one per step: doewood-enrich (registries, ADR 0002) is next.
 members = ["crates/*"]
 
 [workspace.package]
@@ -14,6 +13,8 @@ rust-version = "1.97"
 [workspace.dependencies]
 doewood-api = { path = "crates/doewood-api" }
 doewood-core = { path = "crates/doewood-core" }
+# Features are chosen by the binary (`ocr`, on by default there).
+doewood-ingest = { path = "crates/doewood-ingest", default-features = false }
 doewood-model = { path = "crates/doewood-model" }
 doewood-pg = { path = "crates/doewood-pg" }
 doewood-s3 = { path = "crates/doewood-s3" }
@@ -38,13 +39,32 @@ module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 must_use_candidate = "allow"
 
-# Portable: no target-cpu=native anywhere.
+# Portable: no target-cpu=native anywhere. Unwinding, not abort: a panic on a hostile file
+# (quail contains its steps; doewood wraps every hedgehog call in `catch_unwind`) must end only
+# that file, never the service.
 [profile.release]
 lto = "fat"
 codegen-units = 1
 opt-level = 3
 strip = "symbols"
+panic = "unwind"
 
-# Dev builds keep dependencies optimized (SQLite, the AEAD) so tests stay fast.
+# Dev builds keep dependencies optimized (SQLite, the AEAD, quail, hedgehog) so tests stay fast.
 [profile.dev.package."*"]
 opt-level = 2
+
+# `[patch]` does not carry over to dependents, so the hardened third-party crates of quail and
+# hedgehog are patched in again here, from the same revisions as the dependencies
+# (`vendor/` in each repository; cargo finds a git package by name).
+[patch.crates-io]
+# quail: hayro with per-file decode budgets and image size checks for hostile PDFs, and the
+# faster lingua of quail-text (output unchanged).
+hayro = { git = "https://github.com/05vukasin/quail", rev = "62108d4" }
+hayro-syntax = { git = "https://github.com/05vukasin/quail", rev = "62108d4" }
+hayro-interpret = { git = "https://github.com/05vukasin/quail", rev = "62108d4" }
+hayro-jbig2 = { git = "https://github.com/05vukasin/quail", rev = "62108d4" }
+lingua = { git = "https://github.com/05vukasin/quail", rev = "62108d4" }
+# hedgehog: calamine 0.37 with the fixes for hostile files its fuzzer found, and its
+# rust_xlsxwriter.
+calamine = { git = "https://github.com/05vukasin/hedgehog", rev = "c418c2b" }
+rust_xlsxwriter = { git = "https://github.com/05vukasin/hedgehog", rev = "c418c2b" }

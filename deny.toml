@@ -6,8 +6,36 @@ confidence-threshold = 0.9
 
 [bans]
 multiple-versions = "warn"
-# A system OpenSSL would break "builds anywhere `cargo build` does"; TLS will be rustls.
-deny = [{ name = "openssl-sys" }]
+# A system OpenSSL would break "builds anywhere `cargo build` does"; TLS is rustls. The one
+# exception is a build-time download: with the `ocr` feature, oar-ocr turns on
+# `ort/tls-native`, and ort-sys's build script fetches ONNX Runtime through native-tls. It is
+# a build dependency only (the binary links no OpenSSL); `--no-default-features` builds without
+# it.
+deny = [{ name = "openssl-sys", wrappers = ["native-tls", "openssl"] }]
+
+[sources]
+unknown-git = "deny"
+# quail and hedgehog, pinned to revisions (crates/doewood-ingest/Cargo.toml and the workspace
+# `[patch.crates-io]`).
+allow-git = ["https://github.com/05vukasin/quail", "https://github.com/05vukasin/hedgehog"]
 
 [advisories]
 yanked = "deny"
+ignore = [
+    # zip 8.6 comes only through hedgehog's vendored rust_xlsxwriter, its workbook *writer*,
+    # which doewood never calls. These advisories are about extracting and reading archives;
+    # every archive doewood reads goes through zip 9 (calamine, hh_core, quail). Drop these
+    # once hedgehog's vendored rust_xlsxwriter moves to zip 9.
+    { id = "RUSTSEC-2026-0367", reason = "zip 8 only in hedgehog's xlsx writer; extraction is never called" },
+    { id = "RUSTSEC-2026-0368", reason = "zip 8 only in hedgehog's xlsx writer; extraction is never called" },
+    { id = "RUSTSEC-2026-0369", reason = "zip 8 only in hedgehog's xlsx writer; extraction is never called" },
+    { id = "RUSTSEC-2026-0429", reason = "zip 8 only in hedgehog's xlsx writer; extraction is never called" },
+    { id = "RUSTSEC-2026-0545", reason = "zip 8 only in hedgehog's xlsx writer; it reads no AES entries" },
+    { id = "RUSTSEC-2026-0546", reason = "zip 8 only in hedgehog's xlsx writer; extraction is never called" },
+    { id = "RUSTSEC-2026-0547", reason = "zip 8 only in hedgehog's xlsx writer; it decodes no legacy methods" },
+    { id = "RUSTSEC-2026-0548", reason = "zip 8 only in hedgehog's xlsx writer; ZipStreamReader is never used" },
+    # Unmaintained, no maintained release to move to; both only under the `ocr` feature
+    # (oar-ocr → image → rav1e → paste, a proc macro; oar-ocr → imageproc → ab_glyph → ttf-parser).
+    { id = "RUSTSEC-2024-0436", reason = "paste: a proc macro under the ocr feature, no maintained successor in the tree" },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser: under the ocr feature (imageproc's text drawing), not used to parse fonts from files" },
+]
