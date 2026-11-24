@@ -1,5 +1,7 @@
-//! The `doewood` binary: `serve`, `version` and `config check`.
+//! The `doewood` binary: `serve`, `version` and `config check` (plus the hidden `dev` tools for
+//! local testing).
 
+mod dev;
 mod logging;
 mod ops;
 mod serve;
@@ -30,6 +32,19 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Development tools for local testing only; not a stable interface.
+    #[command(hide = true)]
+    Dev {
+        #[command(subcommand)]
+        command: DevCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum DevCommand {
+    /// FOR LOCAL TESTING ONLY, until the gRPC API exists: add an S3 source and seal its
+    /// credentials (read from the environment variables you name).
+    AddSource(dev::AddSource),
 }
 
 #[derive(Subcommand)]
@@ -57,6 +72,21 @@ fn main() -> ExitCode {
         } => {
             print!("{}", config_report(&BootstrapConfig::from_env()));
             ExitCode::SUCCESS
+        }
+        Command::Dev {
+            command: DevCommand::AddSource(args),
+        } => {
+            logging::init();
+            match args.run(&BootstrapConfig::from_env().config) {
+                Ok(line) => {
+                    println!("{line}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("doewood dev add-source: {e}");
+                    ExitCode::FAILURE
+                }
+            }
         }
     }
 }

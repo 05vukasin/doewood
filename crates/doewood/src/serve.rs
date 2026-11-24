@@ -5,19 +5,23 @@
 //! 2. prepare the data directory (the only fatal configuration check);
 //! 3. register the signal handlers, so a SIGTERM during startup still shuts down cleanly;
 //! 4. start the ops server (`/healthz` answers, `/readyz` says not ready);
-//! 5. resolve the master key and open the store, then report ready.
+//! 5. resolve the master key and open the store;
+//! 6. start one scanner per active S3 source (none configured: nothing starts), then report
+//!    ready.
 //!
-//! On SIGTERM or SIGINT: report not ready, stop the servers, close the store, exit 0.
+//! On SIGTERM or SIGINT: report not ready, stop the servers and the scanners (each keeps its
+//! checkpoint), close the store, exit 0.
 
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use doewood_core::{BootstrapConfig, Loaded, MasterKey, MasterKeySource};
+use doewood_s3::{Discovery, DiscoveryOptions, EVENT_CHANNEL_CAPACITY, ObjectEvent};
 use doewood_store::keyfile::{self, KeyFileState};
 use doewood_store::{STORE_FILE, Store};
 use tokio::net::TcpListener;
-use tokio::sync::watch;
-use tracing::{error, info, warn};
+use tokio::sync::{mpsc, watch};
+use tracing::{debug, error, info, warn};
 
 use crate::ops::{self, OpsState};
 
@@ -99,6 +103,28 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
             return Err(e);
         }
     };
+
+    // Step 4 of the plan (ingest) consumes the events; until then they are logged and dropped.
+    let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+    let sink = tokio::spawn(log_events(events_rx));
+    let discovery = match Discovery::start(
+        Arc::clone(&store),
+        events_tx,
+        shutdown_rx.clone(),
+        DiscoveryOptions::default(),
+    )
+    .await
+    {
+        Ok(d) => {
+            info!(scanners = d.len(), "discovery started");
+            Some(d)
+        }
+        Err(e) => {
+            error!(error = %e, "discovery did not start; no source is scanned");
+            None
+        }
+    };
+
     state.set_ready(true);
     info!(addr = %ops_addr, "ready");
 
@@ -111,6 +137,12 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
         Ok(Err(e)) => warn!(error = %e, "ops server ended with an error"),
         Err(e) => warn!(error = %e, "ops server task failed"),
     }
+    if let Some(discovery) = discovery {
+        discovery.join().await;
+        info!("scanners stopped");
+    }
+    // Every sender is gone once the scanners have stopped.
+    let _ = sink.await;
 
     // Nothing else holds the store once the servers have stopped.
     let store = Arc::try_unwrap(store).map_err(|_| "store still in use at shutdown".to_owned())?;
@@ -137,7 +169,7 @@ async fn open_store(config: &BootstrapConfig) -> Result<Store, String> {
     .map_err(|e| e.to_string())?
 }
 
-fn master_key(source: MasterKeySource) -> Result<MasterKey, String> {
+pub(crate) fn master_key(source: MasterKeySource) -> Result<MasterKey, String> {
     match source {
         MasterKeySource::Env(key) => {
             info!("master key from DOEWOOD_MASTER_KEY");
@@ -167,6 +199,17 @@ fn master_key(source: MasterKeySource) -> Result<MasterKey, String> {
             }
             Ok(key)
         }
+    }
+}
+
+async fn log_events(mut events: mpsc::Receiver<ObjectEvent>) {
+    while let Some(e) = events.recv().await {
+        debug!(
+            source = %e.source,
+            key = %e.key,
+            kind = e.kind.name(),
+            "object event (ingest is not part of this build yet)"
+        );
     }
 }
 

@@ -147,6 +147,16 @@ impl NewSource {
         if !(lower.starts_with("http://") || lower.starts_with("https://")) {
             return bad("the endpoint must be an http:// or https:// URL");
         }
+        let authority = self.endpoint.split_once("://").map_or("", |(_, rest)| {
+            rest.split(['/', '?', '#']).next().unwrap_or("")
+        });
+        if authority.is_empty() {
+            return bad("the endpoint has no host");
+        }
+        if authority.contains('@') {
+            // Credentials belong in the sealed secret, never in a URL that gets logged.
+            return bad("the endpoint must not contain credentials");
+        }
         if self.bucket.is_empty() || self.bucket.len() > 255 {
             return bad("the bucket name must be 1 to 255 characters");
         }
@@ -553,6 +563,8 @@ mod tests {
         assert_eq!(store.source_credentials(id).unwrap(), None);
         for bad in [
             NewSource::new("ftp://x", "b"),
+            NewSource::new("http://user:pw@x", "b"),
+            NewSource::new("http:///b", "b"),
             NewSource::new("http://x", ""),
             NewSource {
                 scan_interval: Duration::ZERO,
