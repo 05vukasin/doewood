@@ -324,6 +324,7 @@ impl ConfigService for Api {
         let _guard = self.state.lock_sources().await;
         let source = self.state.db(move |s| s.update_source(id, &patch)).await?;
         info!(source = %id, mode = source.llm_policy.mode.name(), "LLM policy set");
+        self.state.llm_settings_changed();
         Ok(Response::new(self.state.source_pb(&source)))
     }
 
@@ -402,6 +403,7 @@ impl ConfigService for Api {
             api_key_set = provider.api_key_set,
             "AI provider set"
         );
+        self.state.llm_settings_changed();
         Ok(Response::new(convert::ai_provider(&provider)))
     }
 

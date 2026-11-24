@@ -114,6 +114,7 @@ impl Harness {
             analyzer: analyzer(jobs),
             config,
             on_change: Arc::new(|_| {}),
+            on_llm_queued: Arc::new(|_| {}),
         });
         let (events, events_rx) = mpsc::channel(16);
         let (shutdown, shutdown_rx) = watch::channel(false);

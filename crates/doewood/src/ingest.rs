@@ -1,12 +1,18 @@
 //! Ingest in the service: the analyzer and the workers built from the bootstrap
-//! configuration, and its reprocess jobs offered to the API.
+//! configuration, its reprocess jobs offered to the API, and the LLM queue with on-demand
+//! summaries.
 
 use std::sync::Arc;
 
-use doewood_api::{Progress, ReprocessPhase, ReprocessView, Reprocessor};
+use doewood_api::{
+    BoxFuture, OnDemand, OnDemandError, OnDemandInput, OnDemandResult, Progress, ReprocessPhase,
+    ReprocessView, Reprocessor,
+};
 use doewood_core::{BootstrapConfig, SourceId};
 use doewood_ingest::{
-    Analyzer, Ingest, IngestConfig, IngestParts, ReprocessState, ReprocessStatus, S3Fetch,
+    Analyzer, Fetch, Ingest, IngestConfig, IngestParts, QueueConfig, ReprocessState,
+    ReprocessStatus, S3Fetch, Summaries, SummariesParts, SummarizeError, SummarizeInput,
+    SystemClock,
 };
 use doewood_model::Backend;
 use doewood_s3::ClientOptions;
@@ -15,14 +21,15 @@ use tokio::sync::watch;
 use tracing::{error, info};
 use uuid::Uuid;
 
-/// Builds ingest: one analyzer (quail engine, OCR when built and its models are there) and the
-/// workers. `None` when the engine cannot be built; the service then runs without ingest.
+/// Builds ingest: one analyzer (quail engine, OCR when built and its models are there), the
+/// workers, and the LLM queue. `None` when the engine cannot be built; the service then runs
+/// without ingest (and without summaries).
 pub async fn build(
     config: &BootstrapConfig,
     store: &Arc<Store>,
     backend: watch::Receiver<Option<Arc<dyn Backend>>>,
     progress: &Arc<Progress>,
-) -> Option<Ingest> {
+) -> Option<(Ingest, Summaries)> {
     let ingest_config = IngestConfig::new(
         config.ingest_jobs,
         &config.ocr_models,
@@ -43,15 +50,76 @@ pub async fn build(
         }
     };
     info!(jobs = ingest_config.jobs, ocr = ?analyzer.ocr(), "ingest configured");
+    let fetch: Arc<dyn Fetch> = Arc::new(S3Fetch::new(Arc::clone(store), ClientOptions::default()));
+    let summaries = {
+        let progress = Arc::clone(progress);
+        Summaries::new(SummariesParts {
+            store: Arc::clone(store),
+            backend: backend.clone(),
+            fetch: Arc::clone(&fetch),
+            analyzer: Arc::clone(&analyzer),
+            config: QueueConfig::default(),
+            clock: Arc::new(SystemClock),
+            on_change: Arc::new(move |_source: SourceId| progress.touch()),
+        })
+    };
     let progress = Arc::clone(progress);
-    Some(Ingest::new(IngestParts {
+    let queue = summaries.clone();
+    let ingest = Ingest::new(IngestParts {
         store: Arc::clone(store),
         backend,
-        fetch: Arc::new(S3Fetch::new(Arc::clone(store), ClientOptions::default())),
+        fetch,
         analyzer,
         config: ingest_config,
         on_change: Arc::new(move |_source: SourceId| progress.touch()),
-    }))
+        on_llm_queued: Arc::new(move |_source: SourceId| queue.notify()),
+    });
+    Some((ingest, summaries))
+}
+
+/// On-demand summaries and the queue's wake-up, as the API sees them.
+pub struct OnDemandSummaries(pub Summaries);
+
+impl OnDemand for OnDemandSummaries {
+    fn summarize(
+        &self,
+        input: OnDemandInput,
+        provider: Option<String>,
+    ) -> BoxFuture<'_, Result<OnDemandResult, OnDemandError>> {
+        Box::pin(async move {
+            let input = match input {
+                OnDemandInput::Content { bytes, name } => SummarizeInput::Content { bytes, name },
+                OnDemandInput::Location { source, key } => SummarizeInput::Location { source, key },
+            };
+            let s = self
+                .0
+                .summarize(input, provider.as_deref())
+                .await
+                .map_err(|e| match e {
+                    SummarizeError::NoProvider(m) => OnDemandError::NoProvider(m),
+                    SummarizeError::NotFound(m) => OnDemandError::NotFound(m),
+                    SummarizeError::FailedPrecondition(m) => OnDemandError::FailedPrecondition(m),
+                    SummarizeError::Unavailable(m) => OnDemandError::Unavailable(m),
+                    SummarizeError::Internal(m) => OnDemandError::Internal(m),
+                })?;
+            Ok(OnDemandResult {
+                digest: s.digest,
+                checked: s.checked,
+                supported: s.supported,
+                unsupported: s.unsupported,
+                extractive: s.extractive,
+                provider: s.provider,
+                model: s.model,
+                blake3: s.blake3,
+                kind: s.kind,
+                warnings: s.warnings,
+            })
+        })
+    }
+
+    fn settings_changed(&self) {
+        self.0.notify();
+    }
 }
 
 /// Ingest's reprocess jobs, as the API sees them.

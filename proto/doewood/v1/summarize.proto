@@ -1,16 +1,24 @@
 // On-demand summaries with quail's `summary.llm` (ADR 0001, section 6): the digest, the fact
-// check and the extractive fallback. Skips the LLM queue and stores nothing.
+// check and the extractive fallback. Skips the LLM queue and stores nothing: not the record,
+// not a summary, not the spend (a source's daily budget governs its queue only).
 syntax = "proto3";
 
 package doewood.v1;
 
 service SummarizeService {
-  // Summarizes one file. Not built yet: answers UNIMPLEMENTED (after validating the request)
-  // until the LLM step exists. The messages are final.
+  // Summarizes one file now, with the named or the default AI provider. Errors:
+  // - FAILED_PRECONDITION: no AI provider is configured (or the one used has no API key, or
+  //   no base URL where its preset needs one); the source's LLM policy is `off`; the file has
+  //   no text;
+  // - NOT_FOUND: the provider or the source does not exist;
+  // - UNAVAILABLE: ingest does not run on this instance, or the object cannot be read.
+  // A provider that fails or answers badly is not an error: the response is then the
+  // extractive summary, with `extractive` set and the reason in `warnings`.
   rpc Summarize(SummarizeRequest) returns (SummarizeResponse);
 }
 
 // An object in one of this instance's sources.
+// The source's LLM policy must not be `off`.
 message S3Location {
   string source_id = 1;
   string key = 2;
@@ -52,4 +60,7 @@ message SummarizeResponse {
   // The file's BLAKE3 and its kind, as quail classified it.
   string blake3 = 6;
   string kind = 7;
+  // Why the model's output was not used (the provider's error, the failed fact check), when
+  // it was not. Keys are never part of it.
+  repeated string warnings = 8;
 }

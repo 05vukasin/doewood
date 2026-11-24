@@ -139,6 +139,7 @@ async fn add(
         discovery: None,
         progress: Arc::new(Progress::new()),
         reprocess: None,
+        summarize: None,
         options: ApiOptions::default(),
         shutdown: shutdown_rx,
     });

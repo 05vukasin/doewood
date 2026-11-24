@@ -25,9 +25,12 @@ service ConfigService {
   rpc ListSources(ListSourcesRequest) returns (ListSourcesResponse);
   // One source.
   rpc GetSource(GetSourceRequest) returns (Source);
-  // Sets which documents of a source get an LLM summary.
+  // Sets which documents of a source get an LLM summary. Applies to documents queued from now
+  // on, and to waiting ones: a queued document the new policy does not ask for is skipped.
   rpc SetLlmPolicy(SetLlmPolicyRequest) returns (Source);
-  // Adds or replaces an AI provider.
+  // Adds or replaces an AI provider. The LLM queue uses the default provider. For bedrock the
+  // base URL is required, `https://bedrock-runtime.<region>.amazonaws.com`: the region is read
+  // from it.
   rpc SetAiProvider(SetAiProviderRequest) returns (AiProvider);
   // The configured AI providers (never their keys).
   rpc ListAiProviders(ListAiProvidersRequest) returns (ListAiProvidersResponse);
@@ -73,7 +76,10 @@ message LlmPolicy {
   repeated string kinds = 2;
   // Summaries of this source in flight at once, 1 to 64; 0 means the default, 2.
   uint32 concurrency = 3;
-  // Tokens (prompt plus completion) the source may spend per UTC day; 0 means no limit.
+  // Tokens (prompt plus completion, as the provider reports them, else estimated) the source's
+  // queued summaries may spend per UTC day; 0 means no limit. No summary starts once the
+  // day's spend reaches it (those in flight finish); waiting documents go on the next UTC
+  // day. Summarize does not count against it.
   uint64 daily_token_budget = 4;
 }
 

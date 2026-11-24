@@ -185,6 +185,7 @@ async fn s3_put_to_postgres_record() {
         ),
         config,
         on_change: Arc::new(|_| {}),
+        on_llm_queued: Arc::new(|_| {}),
     });
     let handle = ingest.start(events_rx, shutdown_rx);
 

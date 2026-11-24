@@ -10,8 +10,8 @@ use crate::crypto::Cipher;
 use crate::{StoreError, migrate};
 
 pub(crate) mod ai;
-pub(crate) mod objects;
 pub(crate) mod llm;
+pub(crate) mod objects;
 pub(crate) mod sources;
 
 /// Name of the store file inside the data directory.

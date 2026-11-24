@@ -9,8 +9,9 @@ The name comes from Košutnjak, a Belgrade forest: *košuta* (a doe) + wood. It 
 and the quail.
 
 **Status:** the skeleton (configuration, local store, ops endpoints), the shared store, S3
-discovery, the gRPC API and ingest (quail and hedgehog into records, the graph and search) are
-in; the LLM step and registry enrichment are next. See
+discovery, the gRPC API, ingest (quail and hedgehog into records, the graph and search) and the
+LLM queue (per-source policy, concurrency cap, daily budget, on-demand `Summarize`; see
+[docs/llm.md](docs/llm.md)) are in; registry enrichment is next. See
 [ADR 0002](docs/adr/0002-company-enrichment.md) (company identity and registries) and
 [ADR 0001](docs/adr/0001-architecture.md).
 

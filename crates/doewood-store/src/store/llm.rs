@@ -401,7 +401,10 @@ mod tests {
             assert_eq!(policy.queues(kind), queued, "{policy:?} {kind:?}");
             assert_eq!(policy.allows_on_demand(), on_demand, "{policy:?}");
         }
-        assert!(!LlmPolicy::default().queues(Some("contract")), "off by default");
+        assert!(
+            !LlmPolicy::default().queues(Some("contract")),
+            "off by default"
+        );
     }
 
     #[test]

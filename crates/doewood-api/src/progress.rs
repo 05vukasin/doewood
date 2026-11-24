@@ -32,8 +32,6 @@ pub struct EventCounts {
     pub changed: u64,
     /// Keys that are gone.
     pub deleted: u64,
-    /// Documents waiting in the LLM queue (0 until the LLM queue exists).
-    pub queued_llm: u64,
 }
 
 /// The live event counters, shared by the binary (which feeds them) and the API.
@@ -171,7 +169,9 @@ impl Watch {
                 .map(|s| {
                     let counts = store.object_counts(s.id)?;
                     let checkpoint = store.scan_checkpoint(s.id)?.unwrap_or_default();
-                    Ok((s, counts, checkpoint))
+                    let llm = store.llm_counts(s.id)?;
+                    let spent = store.llm_usage(s.id, doewood_store::utc_day(unix_now()))?;
+                    Ok((s, counts, checkpoint, (llm, spent)))
                 })
                 .collect::<Result<Vec<_>, _>>()
         })
@@ -180,7 +180,7 @@ impl Watch {
         .map_err(crate::error::store)?;
         Ok(rows
             .into_iter()
-            .map(|(s, counts, cp)| {
+            .map(|(s, counts, cp, (llm, spent))| {
                 let events = self.progress.get(s.id);
                 let p = SourceProgress {
                     source_id: s.id.to_string(),
@@ -193,13 +193,17 @@ impl Watch {
                         deleted: events.deleted,
                         processed: counts.done,
                         failed: counts.failed,
-                        queued_llm: events.queued_llm,
+                        queued_llm: llm.pending,
                         pending: counts.pending,
+                        summarized: llm.done,
+                        llm_failed: llm.failed,
+                        llm_tokens_today: spent.tokens,
                     }),
                     pass: cp.pass,
                     pass_in_progress: cp.in_progress,
                     last_pass_completed_at: cp.last_completed_at.unwrap_or(0),
                     scanner_running: (self.running)(s.id),
+                    llm_last_error: llm.last_error.unwrap_or_default(),
                 };
                 (s.id, p)
             })

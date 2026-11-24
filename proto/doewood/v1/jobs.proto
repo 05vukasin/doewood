@@ -37,10 +37,17 @@ message ProgressCounters {
   // Objects ingested, and objects whose ingest failed.
   uint64 processed = 5;
   uint64 failed = 6;
-  // Documents waiting in the LLM queue. 0 until the LLM queue exists.
+  // Documents waiting in the LLM queue (the source's policy asked for a summary).
   uint64 queued_llm = 7;
   // Objects seen and not ingested yet.
   uint64 pending = 8;
+  // Documents the LLM queue summarized, and those whose summary failed (the record stays,
+  // without a summary; see `SourceProgress.llm_last_error`).
+  uint64 summarized = 9;
+  uint64 llm_failed = 10;
+  // Tokens (prompt plus completion) the source's summaries spent on the current UTC day,
+  // which its daily budget is checked against.
+  uint64 llm_tokens_today = 11;
 }
 
 message SourceProgress {
@@ -54,6 +61,8 @@ message SourceProgress {
   // When the last pass completed, Unix seconds; 0 if none has.
   int64 last_pass_completed_at = 7;
   bool scanner_running = 8;
+  // The latest error of a failed LLM summary of the source; empty if none failed.
+  string llm_last_error = 9;
 }
 
 message ProgressUpdate {
