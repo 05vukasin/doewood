@@ -1,0 +1,38 @@
+[package]
+name = "doewood-s3"
+description = "doewood's S3 sources: a light SigV4 client, the incremental scanner and event inlets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["webhook"]
+# Parsing MinIO / S3 event notification JSON (the API step mounts the handler).
+webhook = ["dep:serde", "dep:serde_json"]
+
+[dependencies]
+bytes = "1"
+doewood-core.workspace = true
+doewood-store.workspace = true
+jiff = { version = "1", default-features = false, features = ["std"] }
+percent-encoding = "2.3"
+# HTTP/1.1 only, rustls with the `ring` provider (no C toolchain for aws-lc), no proxy
+# discovery, no decompression: S3 bodies are stored files.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# SigV4 signing only (Sans-IO): no runtime, no HTTP stack of its own.
+rusty-s3 = { version = "0.12", default-features = false, features = ["rustcrypto", "xml"] }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+thiserror.workspace = true
+tokio = { version = "1.47", features = ["rt", "sync", "time", "macros"] }
+tracing = "0.1"
+url = "2.5"
+
+[dev-dependencies]
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+[lints]
+workspace = true

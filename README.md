@@ -39,7 +39,8 @@ cargo run -- config check         # effective configuration, secrets redacted
 cargo run -- version
 ```
 
-The bootstrap variables are listed in [docs/configuration.md](docs/configuration.md).
+The bootstrap variables are listed in [docs/configuration.md](docs/configuration.md); sources
+and discovery in [docs/sources.md](docs/sources.md).
 The gRPC API (`127.0.0.1:7443`) arrives in a later step.
 
 ## Layout
@@ -51,10 +52,11 @@ crates/
   doewood-store   the instance-local SQLite store: settings, encrypted secrets, sources, jobs,
                   and the standalone backend of the store traits (FTS5 search)
   doewood-pg      the shared Postgres (+ pgvector) backend of the store traits
+  doewood-s3      S3 sources: a light SigV4 client, the incremental scanner, event inlets
   doewood         the binary: serve, version, config check
 ```
 
-Planned: `doewood-s3` (sources), `doewood-ingest`
+Planned: `doewood-ingest`
 (quail/hedgehog), `doewood-api` (gRPC) and `doewood-enrich` (registries, ADR 0002).
 
 ## Development

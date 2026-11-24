@@ -9,6 +9,7 @@ use crate::StoreError;
 const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_init.sql"),
     include_str!("migrations/0002_standalone_model.sql"),
+    include_str!("migrations/0003_sources.sql"),
 ];
 
 /// The schema version this binary writes.
@@ -16,7 +17,13 @@ const MIGRATIONS: &[&str] = &[
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 
 /// Brings the schema up to [`SCHEMA_VERSION`], one transaction per migration.
+///
+/// Foreign keys are off while migrations run, so that a migration can rebuild a table that
+/// others reference (SQLite's create-copy-drop-rename procedure; the pragma has no effect
+/// inside a transaction). Each migration checks them before it commits; the caller turns them
+/// back on.
 pub(crate) fn migrate(conn: &mut Connection) -> Result<i64, StoreError> {
+    conn.pragma_update(None, "foreign_keys", false)?;
     let current: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     if current > SCHEMA_VERSION {
         return Err(StoreError::SchemaTooNew {
@@ -30,6 +37,17 @@ pub(crate) fn migrate(conn: &mut Connection) -> Result<i64, StoreError> {
     {
         let tx = conn.transaction()?;
         tx.execute_batch(sql)?;
+        let violations: i64 =
+            tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })?;
+        if violations > 0 {
+            // Dropping `tx` rolls the migration back.
+            return Err(StoreError::Migration {
+                version,
+                reason: format!("{violations} foreign key violation(s)"),
+            });
+        }
         tx.pragma_update(None, "user_version", version)?;
         tx.commit()?;
     }

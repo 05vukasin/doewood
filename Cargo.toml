@@ -16,6 +16,7 @@ rust-version = "1.97"
 doewood-core = { path = "crates/doewood-core" }
 doewood-model = { path = "crates/doewood-model" }
 doewood-pg = { path = "crates/doewood-pg" }
+doewood-s3 = { path = "crates/doewood-s3" }
 doewood-store = { path = "crates/doewood-store" }
 async-trait = "0.1"
 serde_json = "1"

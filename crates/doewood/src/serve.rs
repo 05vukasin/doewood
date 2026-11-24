@@ -10,19 +10,22 @@
 //!    `DOEWOOD_POSTGRES_URL`: connect to the shared Postgres in the background, and report ready
 //!    once it answers. Until then the instance runs degraded: `/readyz` says why, and the
 //!    connection is retried with backoff (see [`crate::shared`]).
+//! 7. start one scanner per active S3 source (none configured: nothing starts).
 //!
-//! On SIGTERM or SIGINT: report not ready, stop the servers, close the store, exit 0.
+//! On SIGTERM or SIGINT: report not ready, stop the servers and the scanners (each keeps its
+//! checkpoint), close the store, exit 0.
 
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use doewood_core::{BootstrapConfig, Loaded, MasterKey, MasterKeySource};
 use doewood_model::Backend;
+use doewood_s3::{Discovery, DiscoveryOptions, EVENT_CHANNEL_CAPACITY, ObjectEvent};
 use doewood_store::keyfile::{self, KeyFileState};
 use doewood_store::{STORE_FILE, Standalone, Store};
 use tokio::net::TcpListener;
-use tokio::sync::watch;
-use tracing::{error, info, warn};
+use tokio::sync::{mpsc, watch};
+use tracing::{debug, error, info, warn};
 
 use crate::ops::{self, OpsState};
 use crate::shared;
@@ -125,6 +128,8 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
         None
     };
 
+    let discovery = start_discovery(Arc::clone(&store), shutdown_rx.clone()).await;
+
     let signal = signals.recv().await;
     info!(signal, "shutting down");
     state.set_not_ready("shutting down");
@@ -134,6 +139,7 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
         Ok(Err(e)) => warn!(error = %e, "ops server ended with an error"),
         Err(e) => warn!(error = %e, "ops server task failed"),
     }
+    discovery.stop().await;
     if let Some(task) = supervisor
         && let Err(e) = task.await
     {
@@ -168,7 +174,7 @@ async fn open_store(config: &BootstrapConfig) -> Result<Store, String> {
     .map_err(|e| e.to_string())?
 }
 
-fn master_key(source: MasterKeySource) -> Result<MasterKey, String> {
+pub(crate) fn master_key(source: MasterKeySource) -> Result<MasterKey, String> {
     match source {
         MasterKeySource::Env(key) => {
             info!("master key from DOEWOOD_MASTER_KEY");
@@ -198,6 +204,54 @@ fn master_key(source: MasterKeySource) -> Result<MasterKey, String> {
             }
             Ok(key)
         }
+    }
+}
+
+/// The scanners and the task that takes their events.
+struct Scanning {
+    discovery: Option<Discovery>,
+    sink: tokio::task::JoinHandle<()>,
+}
+
+impl Scanning {
+    /// Waits for the scanners (told to stop by the shutdown signal), then for the sink.
+    async fn stop(self) {
+        if let Some(discovery) = self.discovery {
+            discovery.join().await;
+            info!("scanners stopped");
+        }
+        // Every sender is gone once the scanners have stopped.
+        let _ = self.sink.await;
+    }
+}
+
+/// Starts one scanner per active source.
+async fn start_discovery(store: Arc<Store>, shutdown: watch::Receiver<bool>) -> Scanning {
+    // Step 4 of the plan (ingest) consumes the events; until then they are logged and dropped.
+    let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+    let sink = tokio::spawn(log_events(events_rx));
+    let discovery =
+        match Discovery::start(store, events_tx, shutdown, DiscoveryOptions::default()).await {
+            Ok(d) => {
+                info!(scanners = d.len(), "discovery started");
+                Some(d)
+            }
+            Err(e) => {
+                error!(error = %e, "discovery did not start; no source is scanned");
+                None
+            }
+        };
+    Scanning { discovery, sink }
+}
+
+async fn log_events(mut events: mpsc::Receiver<ObjectEvent>) {
+    while let Some(e) = events.recv().await {
+        debug!(
+            source = %e.source,
+            key = %e.key,
+            kind = e.kind.name(),
+            "object event (ingest is not part of this build yet)"
+        );
     }
 }
 
