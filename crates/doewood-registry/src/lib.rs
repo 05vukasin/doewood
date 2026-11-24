@@ -8,6 +8,8 @@
 //!
 //! - [`gleif`]: the GLEIF API (`api.gleif.org`): LEI records, name search, and Level 2 (direct
 //!   and ultimate parents, reporting exceptions, successor entities with dates).
+//! - [`vies`]: the EU's VIES (`ec.europa.eu`): whether a VAT number is valid, with the
+//!   registered name and address.
 //! - [`fetch`]: the shared request loop (limiter, retries, cap, cache) over a [`Transport`].
 //! - [`limit`], [`clock`], [`cache`], [`http`]: its parts, each behind a small trait so the
 //!   decision logic is tested without a network.
@@ -21,11 +23,13 @@ pub mod fetch;
 pub mod gleif;
 pub mod http;
 pub mod limit;
+mod parse;
+pub mod vies;
 mod warning;
 
 pub use cache::{Cache, CacheEntry, Cached, MemoryCache, NoCache};
 pub use clock::{Clock, ManualClock, SystemClock};
-pub use fetch::{Body, Fetch, FetchPolicy, Fetcher};
-pub use http::{HttpTransport, Response, Transport, TransportError};
+pub use fetch::{Body, Fetch, FetchPolicy, Fetched, Fetcher, Inspect};
+pub use http::{HttpTransport, Request, Response, Transport, TransportError};
 pub use limit::TokenBucket;
 pub use warning::{Registry, Warning, WarningKind};

@@ -25,6 +25,7 @@ pub use model::{
 
 use crate::cache::Cache;
 use crate::clock::{Clock, SystemClock};
+pub use crate::fetch::Fetched;
 use crate::fetch::{Body, Fetch, FetchPolicy, Fetcher};
 use crate::http::{HttpTransport, Transport};
 use crate::limit::TokenBucket;
@@ -90,24 +91,6 @@ impl Default for GleifConfig {
             ttl_found: Duration::from_secs(30 * DAY),
             ttl_missing: Duration::from_secs(DAY),
             search_size: 10,
-        }
-    }
-}
-
-/// An answer with its fetch date (from the cache, or now).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Fetched<T> {
-    /// The answer.
-    pub value: T,
-    /// When GLEIF gave it.
-    pub fetched_at: time::OffsetDateTime,
-}
-
-impl<T> Fetched<T> {
-    fn new(value: T, fetch: &Fetch) -> Self {
-        Self {
-            value,
-            fetched_at: fetch.fetched_at,
         }
     }
 }
