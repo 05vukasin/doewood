@@ -667,6 +667,32 @@ impl Store {
         Ok(())
     }
 
+    /// Sets the state a scanner reports ([`SourceState::Active`] or [`SourceState::Error`]),
+    /// but only while the source is still scanned: a pause or removal made meanwhile (through
+    /// the API, while a pass was failing) is never overwritten. Returns whether it was set.
+    pub fn set_scanned_source_state(
+        &self,
+        id: SourceId,
+        state: SourceState,
+        reason: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        debug_assert!(state.is_scanned(), "a scanner only reports active or error");
+        let reason = if state == SourceState::Error {
+            reason
+        } else {
+            None
+        };
+        let n = self.conn().execute(
+            "UPDATE sources SET state = ?2, state_reason = ?3, updated_at = ?4 \
+             WHERE id = ?1 AND state IN ('active', 'error')",
+            params![id.to_string(), state.as_str(), reason, now()],
+        )?;
+        if n == 0 && self.source(id)?.is_none() {
+            return Err(StoreError::NoSuchSource(id.to_string()));
+        }
+        Ok(n == 1)
+    }
+
     /// Replaces a source's credentials (write-only, like every secret).
     pub fn set_source_credentials(
         &self,
@@ -922,6 +948,40 @@ mod tests {
         assert_eq!((got.state, got.state_reason), (SourceState::Paused, None));
         assert!(matches!(
             store.set_source_state(SourceId::generate(), SourceState::Active, None),
+            Err(StoreError::NoSuchSource(_))
+        ));
+    }
+
+    #[test]
+    fn a_scanner_state_never_overwrites_a_pause() {
+        let store = store();
+        let id = store
+            .add_source(&NewSource::new("http://x", "b"), None)
+            .unwrap();
+        assert!(
+            store
+                .set_scanned_source_state(id, SourceState::Error, Some("timeout"))
+                .unwrap()
+        );
+        assert_eq!(store.source(id).unwrap().unwrap().state, SourceState::Error);
+        store
+            .set_source_state(id, SourceState::Paused, None)
+            .unwrap();
+        // A pass that was failing while the source was paused reports late: the pause stays.
+        assert!(
+            !store
+                .set_scanned_source_state(id, SourceState::Error, Some("timeout"))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .set_scanned_source_state(id, SourceState::Active, None)
+                .unwrap()
+        );
+        let got = store.source(id).unwrap().unwrap();
+        assert_eq!((got.state, got.state_reason), (SourceState::Paused, None));
+        assert!(matches!(
+            store.set_scanned_source_state(SourceId::generate(), SourceState::Active, None),
             Err(StoreError::NoSuchSource(_))
         ));
     }
