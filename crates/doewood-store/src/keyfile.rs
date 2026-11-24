@@ -8,8 +8,6 @@ use std::fs::OpenOptions;
 use std::io::{ErrorKind, Write as _};
 use std::path::Path;
 
-use chacha20poly1305::aead::OsRng;
-use chacha20poly1305::aead::rand_core::RngCore as _;
 use doewood_core::MasterKey;
 use doewood_core::key::MASTER_KEY_LEN;
 use zeroize::Zeroizing;
@@ -29,10 +27,10 @@ pub enum KeyFileState {
 }
 
 /// A fresh random master key from the operating system's generator.
-pub fn generate_key() -> MasterKey {
+pub fn generate_key() -> Result<MasterKey, StoreError> {
     let mut bytes = Zeroizing::new([0u8; MASTER_KEY_LEN]);
-    OsRng.fill_bytes(bytes.as_mut_slice());
-    MasterKey::from_bytes(*bytes)
+    getrandom::fill(bytes.as_mut_slice()).map_err(|_| StoreError::Random)?;
+    Ok(MasterKey::from_bytes(*bytes))
 }
 
 /// Reads the key file, or creates it with a new random key (mode 0600 on Unix) when it does
@@ -42,13 +40,15 @@ pub fn load_or_generate(path: &Path) -> Result<(MasterKey, KeyFileState), StoreE
         path: path.to_owned(),
         source,
     };
+    // Drawn before the file exists: a failing generator must not leave an empty key file.
+    let fresh = generate_key()?;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     match options.open(path) {
         Ok(mut file) => {
-            let key = generate_key();
+            let key = fresh;
             let text = key.to_base64();
             file.write_all(text.as_bytes()).map_err(io)?;
             file.write_all(b"\n").map_err(io)?;
@@ -110,7 +110,10 @@ mod tests {
 
     #[test]
     fn keys_are_random() {
-        assert_ne!(generate_key().as_bytes(), generate_key().as_bytes());
+        assert_ne!(
+            generate_key().unwrap().as_bytes(),
+            generate_key().unwrap().as_bytes()
+        );
     }
 
     #[cfg(unix)]
