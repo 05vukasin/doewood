@@ -29,6 +29,49 @@ pub struct Response {
     pub body: Vec<u8>,
 }
 
+/// An API key, sent as the user name of HTTP basic auth (Companies House). Its `Debug` never
+/// shows it, it has no `Display`, and nothing in this crate puts it in a warning or a log.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ApiKey(String);
+
+impl ApiKey {
+    /// The shortest key accepted (so that redacting it from a text is meaningful).
+    pub const MIN_CHARS: usize = 8;
+    /// The longest key accepted.
+    pub const MAX_CHARS: usize = 256;
+
+    /// `key`, trimmed: printable ASCII without spaces or `:`, 8 to 256 characters. The error
+    /// never contains the key.
+    pub fn new(key: &str) -> Result<Self, String> {
+        let k = key.trim();
+        if !(Self::MIN_CHARS..=Self::MAX_CHARS).contains(&k.len())
+            || !k.bytes().all(|b| b.is_ascii_graphic() && b != b':')
+        {
+            return Err(format!(
+                "an API key is {} to {} printable ASCII characters, without spaces or ':'",
+                Self::MIN_CHARS,
+                Self::MAX_CHARS
+            ));
+        }
+        Ok(Self(k.to_owned()))
+    }
+
+    /// `text` with every occurrence of the key replaced by `<redacted>`.
+    pub fn redact(&self, text: &str) -> String {
+        text.replace(&self.0, "<redacted>")
+    }
+
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ApiKey(<redacted>)")
+    }
+}
+
 /// One request: a `GET`, or a `POST` of a JSON body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Request<'a> {
@@ -38,6 +81,8 @@ pub struct Request<'a> {
     pub accept: &'a str,
     /// `None`: a `GET`. `Some(body)`: a `POST` of `body` as `application/json`.
     pub json: Option<&'a [u8]>,
+    /// HTTP basic auth with this key as the user name and an empty password.
+    pub basic_auth: Option<&'a ApiKey>,
 }
 
 impl<'a> Request<'a> {
@@ -47,6 +92,7 @@ impl<'a> Request<'a> {
             url,
             accept,
             json: None,
+            basic_auth: None,
         }
     }
 
@@ -56,6 +102,16 @@ impl<'a> Request<'a> {
             url,
             accept,
             json: Some(body),
+            basic_auth: None,
+        }
+    }
+
+    /// The same request with HTTP basic auth: `key` as the user name, no password.
+    #[must_use]
+    pub fn with_basic_auth(self, key: &'a ApiKey) -> Self {
+        Self {
+            basic_auth: Some(key),
+            ..self
         }
     }
 }
@@ -155,7 +211,7 @@ impl Transport for HttpTransport {
         request: &Request<'_>,
         max_body: usize,
     ) -> Result<Response, TransportError> {
-        let builder = match request.json {
+        let mut builder = match request.json {
             None => self.client.get(request.url.clone()),
             Some(body) => self
                 .client
@@ -163,6 +219,10 @@ impl Transport for HttpTransport {
                 .header(CONTENT_TYPE, "application/json")
                 .body(body.to_vec()),
         };
+        if let Some(key) = request.basic_auth {
+            // reqwest marks the header sensitive, so it is not in its `Debug` either.
+            builder = builder.basic_auth(key.expose(), None::<&str>);
+        }
         let exchange = async {
             let mut resp = builder
                 .header(ACCEPT, request.accept)

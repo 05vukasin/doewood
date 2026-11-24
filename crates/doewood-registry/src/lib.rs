@@ -19,6 +19,10 @@
 //! - [`apr`]: the Serbian Business Registers Agency's open data (`openapi.apr.gov.rs`): a
 //!   company by MB (name, status, legal form, founding date, municipality, activity), and a
 //!   name search over the set, which is downloaded monthly and searched here.
+//! - [`companies_house`]: UK Companies House (`api.company-information.service.gov.uk`), with
+//!   the operator's API key: a company by number (status, previous names), its officers and
+//!   people with significant control (personal data kept minimal), the name changes and
+//!   merger filings of its filing history, and the name search. Skipped with no key.
 //! - [`fetch`]: the shared request loop (limiter, retries, cap, cache) over a [`Transport`].
 //! - [`limit`], [`clock`], [`cache`], [`http`]: its parts, each behind a small trait so the
 //!   decision logic is tested without a network.
@@ -29,6 +33,7 @@
 pub mod apr;
 pub mod cache;
 pub mod clock;
+pub mod companies_house;
 pub mod edgar;
 pub mod fetch;
 pub mod gleif;
@@ -43,7 +48,7 @@ pub mod wikidata;
 pub use cache::{Cache, CacheEntry, Cached, MemoryCache, NoCache};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use fetch::{Body, Fetch, FetchPolicy, Fetched, Fetcher, Inspect};
-pub use http::{HttpTransport, Request, Response, Transport, TransportError, USER_AGENT};
+pub use http::{ApiKey, HttpTransport, Request, Response, Transport, TransportError, USER_AGENT};
 pub use limit::TokenBucket;
 pub use trust::TrustTier;
 pub use warning::{Registry, Warning, WarningKind};

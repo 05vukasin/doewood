@@ -2,8 +2,8 @@
 
 `crates/doewood-registry` holds the public registry clients of
 [ADR 0002](adr/0002-company-enrichment.md), section 2. `doewood-enrich` stays pure (no I/O);
-this crate does the requests and parses the answers into types. GLEIF, VIES, Wikidata,
-SEC EDGAR and the Serbian APR are done; Companies House follows.
+this crate does the requests and parses the answers into types: GLEIF, VIES, Wikidata,
+SEC EDGAR, the Serbian APR and UK Companies House.
 
 Nothing calls the clients yet: the enrichment job (ADR 0002 section 6) that turns their answers
 into company identifiers and dated edges comes later.
@@ -11,7 +11,7 @@ into company identifiers and dated edges comes later.
 ## What is sent
 
 Only identifiers and names: an LEI, a VAT number, a Wikidata item id, an EDGAR CIK and
-accession number, or a legal name and a country code. The APR client sends nothing about a
+accession number, a Companies House company number, or a legal name and a country code. The APR client sends nothing about a
 company at all: it downloads the whole open-data set and looks up MBs and names in it. Document
 content never leaves the instance (ADR 0002, the privacy rule). An identifier is validated before
 it is sent: an LEI must pass ISO 17442 (`doewood_enrich::check::lei`), a VAT number its
@@ -25,7 +25,8 @@ Every client is built on the same request loop (`Fetcher`):
 - **Failure-soft.** Every failure is a typed `Warning { registry, kind }`, never a panic or a
   failed ingest. The kinds: `Disabled`, `Config`, `InvalidInput`, `Timeout`, `Transport`,
   `TooLarge`, `RateLimited`, `Status`, `Malformed`, `Unsupported` (the source cannot answer
-  that question: APR has no PIB), `Vies` (a VIES error code), `Wikidata`
+  that question: APR has no PIB), `NotConfigured` (the registry needs a key and none is set),
+  `KeyRefused` (the registry refused the key), `Vies` (a VIES error code), `Wikidata`
   (a Wikidata API error code) and `Edgar` (the SEC refused the request). The loop
   logs each one at `WARN`.
 - **Length-capped.** The body is read chunk by chunk and dropped as soon as it passes the cap
@@ -43,13 +44,17 @@ Every client is built on the same request loop (`Fetcher`):
   (`Inspect`): to retry, to retry with the bucket emptied, or to fail at once with its own
   warning. VIES uses it for the error codes it puts in the body.
 - **`GET` or JSON `POST`.** The transport sends either; VIES's documented endpoint is a `POST`.
+  A request may carry HTTP basic auth with an `ApiKey` (Companies House).
+- **API keys.** An `ApiKey` is runtime configuration supplied by the operator, never in the
+  code. Its `Debug` is `ApiKey(<redacted>)`, it has no `Display`, it never goes into a URL,
+  and a client that has one also scrubs it from the text of every warning it returns.
 - **User-Agent.** Every request sends `doewood/<version> (+https://github.com/05vukasin/doewood)`
   (`USER_AGENT`): generic, with the project's URL as the contact, as the Wikimedia User-Agent
   policy asks. Never a person's name or email in the code. EDGAR is the one exception: the SEC
   asks for the requester's name and email, which the operator configures (see
   [EDGAR](#sec-edgar)).
-- **Trust tier.** `Registry::tier()` is `TrustTier::Official` for GLEIF, VIES, EDGAR and APR
-  (and Companies House to come) and `TrustTier::Community` for Wikidata, the lowest tier of ADR
+- **Trust tier.** `Registry::tier()` is `TrustTier::Official` for GLEIF, VIES, EDGAR, APR
+  and Companies House, and `TrustTier::Community` for Wikidata, the lowest tier of ADR
   0002 section 2 (`Community < Official`).
 - **Timeouts.** One for connecting, and one for the whole request, body included.
 - **Cached, with a fetch date.** Answers are cached by request under keys like
@@ -471,14 +476,155 @@ the monthly update; the missing intermediate. Assumed: that the shape stays stab
 reader is lenient), the spellings of a deleted status, and that no PIB or event data will be
 added soon.
 
+## Companies House
+
+UK Companies House's public data API (`https://api.company-information.service.gov.uk/`),
+JSON, `TrustTier::Official`. It needs a **free API key**, which the operator registers with
+Companies House and configures (`CompaniesHouseConfig::api_key`; later from the encrypted
+settings store, ADR 0002 section 7). The key is sent as Companies House specifies: as the user
+name of HTTP basic auth, with an empty password (`Authorization: Basic base64("<key>:")`).
+doewood ships no key.
+
+| call | requests | gives |
+|---|---|---|
+| `company(number)` | `GET company/{number}` | `Company`, or `None` (404) |
+| `officers(number)` | `GET company/{number}/officers?items_per_page=…&start_index=…`, every page | `Listing<Officer>` |
+| `significant_control(number)` | `GET company/{number}/persons-with-significant-control?…`, every page | `Listing<Psc>` |
+| `filing_events(number)` | `GET company/{number}/filing-history?…`, every page | `Listing<Filing>`: name changes and mergers only |
+| `search(name)` | `GET search/companies?q=…&items_per_page=…&start_index=0` | candidates (`SearchHit`) |
+
+- **A company** (`Company`): the number, the name, the status (`Active`, `Dissolved`,
+  `Liquidation`, `Receivership`, `Administration`, `VoluntaryArrangement`, `ConvertedClosed`,
+  `InsolvencyProceedings`, `Registered`, `Removed`, `Open`, `Closed`, or `Other` as sent) and
+  its detail (`active-proposal-to-strike-off`, `converted-to-plc`, ...), the type, the
+  jurisdiction, the creation and cessation dates, the **previous names** with `from` / `to`
+  (the dated `renamed_to` events of ADR 0002 section 3), the SIC codes, the registered office
+  and whether it has an insolvency history. It must be about the number asked and have a name,
+  else `Malformed`.
+- **Officers** (`Officer`): name, role (`director`, `secretary`, `llp-member`,
+  `corporate-director`, ...), whether it is a company or firm (a `corporate-*` role), appointed
+  and resigned dates, nationality and country of residence; for a corporate officer its
+  registration (`Registration`: identification type, registration number, register, country,
+  legal authority, legal form).
+- **People with significant control** (`Psc`): the kind (`Individual`, `CorporateEntity`,
+  `LegalPerson`, `SuperSecure`, or `Other`; an overseas entity's `*-beneficial-owner` kinds map
+  to the same four, with `beneficial_owner` set), the name (none for a super-secure PSC), the
+  notified and ceased dates, the natures of control as sent
+  (`ownership-of-shares-75-to-100-percent`, ...), nationality and country of residence for an
+  individual, and for a corporate entity or legal person its `Registration`: a corporate PSC's
+  registration number and country are how ownership chains are followed (a UK company's number
+  leads to its own profile and PSCs).
+- **Filing history.** The whole history is read page by page (newest first, at most
+  `max_filings` filings) and only the corporate events are kept, with their filing date and
+  action date: **name changes** (category `change-of-name`, or a description with
+  `change-of-name`; not the `change-of-name-exemption`) and **mergers** (a description with
+  `merger`, such as `formation-by-merger-of-societas-europaea`, a cross-border merger form
+  `CB<digits>`, or a legacy filing whose text mentions a merger, kept as `text`). The merger
+  detection is best-effort.
+- **Paging.** Lists are read with `items_per_page` = `page_size` (100) until `total_results`
+  is reached, a page is empty, or the cap (`max_items`, 1,000; `max_filings` for the filing
+  history) is passed; `Listing::truncated` says the cap stopped it. Each page is cached on its
+  own; the listing's fetch date is its oldest page's. A 404 on a list is an empty list (an
+  unknown company; assumed also for a company with no PSC).
+- **Name search.** The name is whitespace-collapsed and sent as one percent-encoded `q`
+  parameter (empty, longer than 256 characters or with control characters is
+  `InvalidInput`). Hits without a valid company number or a title are skipped. Candidates
+  only: matching is doewood-enrich's.
+- **Before sending.** A company number is eight characters: eight digits, or two letters and
+  six digits (`SC`, `NI`, `OC`, `LP`, ...; `R0` and six digits), case and spaces ignored,
+  zero-padded after the prefix (`990001` is `00990001`, `sc12345` is `SC012345`); all zeros
+  are refused. Anything else is `InvalidInput`, and nothing is sent. No other caller text
+  reaches a path.
+- **No key.** With no key configured, every call is `NotConfigured` and nothing is sent (ADR
+  0002 section 7: "everything else is skipped"). `enabled: false` is `Disabled`.
+- **401.** A refused key is `KeyRefused`, never retried; the client then sends nothing for
+  `key_pause` (30 minutes) and answers `KeyRefused` meanwhile; cached answers are still
+  served. The warning never holds the key, and a client with a key scrubs it from every
+  warning text it returns.
+- **Rate limit.** Companies House allows 600 requests in 5 minutes per key and answers 429
+  beyond. One bucket for every endpoint: 100 a minute with a burst of 10, so at most 510 in any
+  5 minutes. A 429 and 5xx get the shared backoff (5 s, doubling) and `Retry-After` handling.
+- **Cached** under `companies_house:company/<number>`, `companies_house:company/<number>/
+  {officers,persons-with-significant-control,filing-history}?items_per_page=…&start_index=…`
+  and `companies_house:search/companies?<query>` for 30 days (the ADR's refresh); a 404 for a
+  day. Failures and malformed bodies are never cached.
+- **Streaming API.** ADR 0002 lists the Companies House streaming API as optional. It is not
+  implemented: it is an open item for the enrichment job's refresh (ADR 0002 section 6).
+
+### Personal data
+
+Officers and PSCs are mostly natural persons. Their entries are public registry data (ADR
+0002's privacy rule allows public registry data), but doewood keeps them minimal:
+
+- **Kept** for a natural person: the name as registered, the role, the appointed / resigned
+  (officers) or notified / ceased (PSCs) dates, the nationality and the country of residence
+  when given, and a PSC's natures of control.
+- **Dropped** when the answer is read: the date of birth (Companies House gives month and
+  year), the residential, correspondence or service address, the occupation, the name parts
+  (`name_elements`), the officer id and appointment links, and any identification block on a
+  natural person. A super-secure PSC keeps only its kind, dates and natures of control.
+- **Never cached either.** The cache otherwise keeps raw bodies; officer, PSC and filing-history
+  pages are cached as the kept fields only (re-serialized after the read), so a dropped field
+  never reaches the cache, and later the shared Postgres cache. Filing-history pages keep only
+  the name-change and merger filings, without their `description_values` (which may hold an
+  officer's name) unless the filing is a legacy one whose free text is the description.
+- **Companies keep their registration.** A corporate officer or a corporate-entity or
+  legal-person PSC keeps its identification (registration number, register, country, legal
+  authority and form): that is how ownership chains are built. A company's registered office
+  is kept; it is not a person's address.
+
+### Settings
+
+`CompaniesHouseConfig`, whose defaults are the production values:
+
+| field | default |
+|---|---|
+| `enabled` | `true`, but nothing is sent without a key |
+| `api_key` | none (`NotConfigured`); `ApiKey::new` takes 8 to 256 printable ASCII characters without spaces or `:` |
+| `base_url` | `https://api.company-information.service.gov.uk/` |
+| `timeout` / `connect_timeout` | 15 s / 5 s |
+| `per_minute` / `burst` | 100 / 10, one bucket for every endpoint |
+| `max_body` | 1 MiB |
+| `max_retries` / `backoff` / `max_retry_after` | 2 / 5 s, doubling / 60 s |
+| `key_pause` | 30 minutes after a 401 |
+| `ttl` / `ttl_missing` | 30 days / 1 day |
+| `page_size` | 100 (at most 100) |
+| `max_items` / `max_filings` | 1,000 / 2,000 |
+| `search_size` | 10 (at most 100) |
+
+Confirmed from the Companies House developer documentation and its published enumerations
+(`companieshouse/api-enumerations`): the host; basic auth with the key as the user name and no
+password; the 600 requests per 5 minutes and the 429; the endpoints and their `items_per_page`
+/ `start_index` paging; the profile fields (`company_number`, `company_name`,
+`company_status`, `company_status_detail`, `type`, `jurisdiction`, `date_of_creation`,
+`date_of_cessation`, `previous_company_names` with `name` / `effective_from` / `ceased_on`,
+`sic_codes`, `registered_office_address`); the company statuses; the officer roles; the PSC
+kinds and natures of control; the filing-history fields (`category`, `type`, `description`,
+`description_values`, `date`, `action_date`, `transaction_id`) and the name-change
+descriptions. Assumed, and handled defensively: that a 401 is the only answer to a bad key
+(another 4xx is a `Status` warning), that a 404 on a list means no list, the exact form codes
+of merger filings (the enumerations list only `formation-by-merger-of-societas-europaea`;
+`CB<digits>` and legacy text are a best-effort reading), and that `items_per_page` above 100 is
+not honoured (the default asks for 100).
+
 ## Tests
 
 `cargo test -p doewood-registry`. The tests never reach a real registry: a mock HTTP server on
 127.0.0.1 answers with fixtures written by hand in the test code (invented companies and
 addresses, LEIs and VAT numbers built with valid check digits, invented relationships, and
 invented Wikidata items from Q999000001 up, and invented EDGAR companies, CIKs from 9990000001
-up, filings, filing indexes and Exhibit 21 documents, with `example.invalid` contacts, and an
-invented APR set of Cyrillic and Latin names with MBs from 9900001x up). For APR they cover
+up, filings, filing indexes and Exhibit 21 documents, with `example.invalid` contacts, an
+invented APR set of Cyrillic and Latin names with MBs from 9900001x up, and invented Companies
+House companies from 99000001 up with obviously fake officers and PSCs, and the key
+`test-key`). For Companies House they cover the profile with previous names and its 30-day
+cache, every status, 404 and answers about another company, officers over two pages and the
+cap, every PSC kind (a corporate PSC with its registration number), that natural persons'
+dates of birth, addresses, occupations and ids are neither returned nor cached, name changes
+and mergers from a paged filing history, the name search, that nothing is sent without a key
+or for an invalid number, the basic-auth header, a 401 that pauses the client and never shows
+the key (in warnings or the configuration's `Debug`), 429 and 5xx backoff, oversize and
+malformed bodies (never cached), one rate limit over every endpoint, and configuration
+errors. For APR they cover
 the lookup by MB (one download for many lookups and for concurrent callers), every status and
 legal form, a PIB refused as unsupported, MBs, PIBs and names that are never sent, not found,
 the script-blind name search done locally, the 30-day refresh, a shared cache, malformed,
