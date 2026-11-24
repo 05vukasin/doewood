@@ -3,6 +3,7 @@
 use std::fmt;
 use std::time::Duration;
 
+use crate::edgar::EdgarRefusal;
 use crate::vies::ViesError;
 
 /// A registry client.
@@ -14,6 +15,9 @@ pub enum Registry {
     Vies,
     /// Wikidata: the query service (`query.wikidata.org`) and the `wbsearchentities` API.
     Wikidata,
+    /// SEC EDGAR: `data.sec.gov` (submissions) and `www.sec.gov` (the tickers file, the
+    /// filing archives).
+    Edgar,
 }
 
 impl Registry {
@@ -23,6 +27,7 @@ impl Registry {
             Self::Gleif => "gleif",
             Self::Vies => "vies",
             Self::Wikidata => "wikidata",
+            Self::Edgar => "edgar",
         }
     }
 }
@@ -77,6 +82,10 @@ pub enum WarningKind {
     /// sanitized. Never cached.
     #[error("Wikidata API error {0}")]
     Wikidata(String),
+    /// The SEC refused the request (403): an undeclared User-Agent, the request rate
+    /// threshold, or another refusal. The client then pauses (see `EdgarConfig::pause`).
+    #[error("SEC refused the request: {0}")]
+    Edgar(EdgarRefusal),
 }
 
 /// A registry failure: which registry and why. Never fatal; the caller logs it and goes on.

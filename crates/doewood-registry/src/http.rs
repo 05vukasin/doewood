@@ -96,6 +96,16 @@ impl HttpTransport {
     /// A transport whose every request (connect, send, read the whole body) ends within
     /// `timeout`, connecting within `connect_timeout`.
     pub fn new(timeout: Duration, connect_timeout: Duration) -> Result<Self, String> {
+        Self::with_user_agent(timeout, connect_timeout, USER_AGENT)
+    }
+
+    /// As [`HttpTransport::new`], sending `user_agent` instead of [`USER_AGENT`] (EDGAR's,
+    /// with the operator's contact).
+    pub fn with_user_agent(
+        timeout: Duration,
+        connect_timeout: Duration,
+        user_agent: &str,
+    ) -> Result<Self, String> {
         static PROVIDER: Once = Once::new();
         PROVIDER.call_once(|| {
             // Another component may have installed one already; either is fine.
@@ -104,7 +114,7 @@ impl HttpTransport {
         let client = reqwest::Client::builder()
             .connect_timeout(connect_timeout)
             .timeout(timeout)
-            .user_agent(USER_AGENT)
+            .user_agent(user_agent)
             .build()
             .map_err(|e| e.to_string())?;
         Ok(Self { client, timeout })

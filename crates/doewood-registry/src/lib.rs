@@ -13,6 +13,9 @@
 //! - [`wikidata`]: Wikidata's query service (SPARQL) by LEI or Q-id: parent organization,
 //!   owned by, replaced by, followed by, official website and logo, with dates; and the
 //!   `wbsearchentities` name search. The lowest trust tier ([`TrustTier::Community`]).
+//! - [`edgar`]: SEC EDGAR by CIK: name, former names with dates, tickers, SIC, state of
+//!   incorporation and recent filings; the name and ticker lookup in the company tickers file;
+//!   Exhibit 21 subsidiaries (best-effort); 8-K Item 2.01 (completed acquisitions).
 //! - [`fetch`]: the shared request loop (limiter, retries, cap, cache) over a [`Transport`].
 //! - [`limit`], [`clock`], [`cache`], [`http`]: its parts, each behind a small trait so the
 //!   decision logic is tested without a network.
@@ -22,6 +25,7 @@
 
 pub mod cache;
 pub mod clock;
+pub mod edgar;
 pub mod fetch;
 pub mod gleif;
 pub mod http;
