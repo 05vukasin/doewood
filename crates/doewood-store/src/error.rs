@@ -17,6 +17,20 @@ pub enum StoreError {
         /// Newest version this binary knows.
         supported: i64,
     },
+    /// A migration left the schema inconsistent; nothing of it was committed.
+    #[error("migration to schema {version} failed: {reason}")]
+    Migration {
+        /// The version the migration leads to.
+        version: i64,
+        /// Why.
+        reason: String,
+    },
+    /// A source that does not exist.
+    #[error("source {0} does not exist")]
+    NoSuchSource(String),
+    /// A source value that does not follow the format.
+    #[error("invalid source: {0}")]
+    InvalidSource(String),
     /// The master key is not the one the store was created with.
     #[error("the master key does not match the one this store was created with")]
     WrongMasterKey,

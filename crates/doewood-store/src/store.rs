@@ -9,6 +9,9 @@ use zeroize::Zeroizing;
 use crate::crypto::Cipher;
 use crate::{StoreError, migrate};
 
+pub(crate) mod objects;
+pub(crate) mod sources;
+
 /// Name of the store file inside the data directory.
 pub const STORE_FILE: &str = "doewood.sqlite";
 
@@ -60,8 +63,9 @@ impl Store {
         let _mode: String =
             conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.pragma_update(None, "foreign_keys", true)?;
+        // Migrations run with foreign keys off (see `migrate`); they are on from here.
         migrate::migrate(&mut conn)?;
+        conn.pragma_update(None, "foreign_keys", true)?;
         let store = Self {
             conn: Mutex::new(conn),
             cipher: Cipher::new(key),
@@ -267,7 +271,14 @@ mod tests {
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         assert_eq!(
             store.tables().unwrap(),
-            ["jobs", "objects_seen", "secrets", "settings", "sources"]
+            [
+                "jobs",
+                "objects_seen",
+                "scan_checkpoints",
+                "secrets",
+                "settings",
+                "sources"
+            ]
         );
         let mode: String = store
             .raw()
@@ -307,11 +318,15 @@ mod tests {
                 "bucket",
                 "prefix",
                 "region",
+                "url_style",
                 "credentials_secret",
+                "max_object_bytes",
                 "policy_json",
                 "state",
+                "state_reason",
                 "scan_interval_s",
-                "created_at"
+                "created_at",
+                "updated_at"
             ]
         );
         assert_eq!(
