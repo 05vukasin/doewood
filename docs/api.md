@@ -324,10 +324,11 @@ profile, commit `fa9f72f` plus this change.
 
 With 50,000 records, the page halfway through read 32,024 buffers before and 485 after: the
 `locations` index scan starts at the page token now. A prefix that matches few or no keys
-gets a sequential scan of `locations`, which grows with the table: about 10 ms at 60,000
+gets a sequential scan of `locations`, which grows with the table: about 10 ms at 62,597
 locations. The default collation does not let `starts_with` use the
-`(endpoint, bucket, object_key)` index. An index on `(endpoint, bucket, object_key COLLATE
-"C")` brings these cases under 1.2 ms in a trial. It needs a schema migration, though, and a
+`(endpoint, bucket, object_key)` index. In a trial with a similar 60,000 locations, an index on
+`(endpoint, bucket, object_key COLLATE "C")` brought these cases from 7 to 11 ms to under
+1.2 ms. It needs a schema migration, though, and a
 database migrated by a newer doewood is refused by older instances
 ([configuration.md](configuration.md#the-shared-postgres)). So it is left for a release that
 upgrades every instance together.
