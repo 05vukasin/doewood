@@ -6,6 +6,7 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use common::{Instance, Options, Shared, closed_port, eventually};
@@ -16,6 +17,7 @@ use doewood_api::pb::records_service_client::RecordsServiceClient;
 use doewood_api::pb::search_service_client::SearchServiceClient;
 use doewood_api::pb::summarize_service_client::SummarizeServiceClient;
 use doewood_api::pb::{self, progress_update::Kind};
+use doewood_api::{ReprocessPhase, ReprocessView, Reprocessor};
 use doewood_model::{Blake3, Edge, EdgeKind, EdgeSource, NodeKind, ObjectLocation, SearchDoc};
 use doewood_s3::{EventKind, EventOrigin, ObjectEvent, ObjectVersion};
 use serde_json::json;
@@ -1138,6 +1140,130 @@ async fn watch_progress_streams_counters_and_state_changes() {
     assert!(!matches!(end, Ok(Some(_))), "{end:?}");
 }
 
+/// Reprocess jobs that walk through their states on a timer.
+struct FakeReprocess {
+    jobs: std::sync::Mutex<
+        std::collections::HashMap<uuid::Uuid, tokio::sync::watch::Receiver<ReprocessView>>,
+    >,
+}
+
+impl Reprocessor for FakeReprocess {
+    fn start(
+        &self,
+        source: doewood_core::SourceId,
+        force: bool,
+    ) -> tokio::sync::watch::Receiver<ReprocessView> {
+        let view = ReprocessView {
+            job: uuid::Uuid::now_v7(),
+            source,
+            force,
+            phase: ReprocessPhase::Selecting,
+            examined: 0,
+            selected: 0,
+            processed: 0,
+            failed: 0,
+            pending: 0,
+            error: None,
+        };
+        let (tx, rx) = tokio::sync::watch::channel(view.clone());
+        self.jobs.lock().unwrap().insert(view.job, rx.clone());
+        tokio::spawn(async move {
+            for (phase, n) in [(ReprocessPhase::Running, 3), (ReprocessPhase::Done, 0)] {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                tx.send_modify(|v| {
+                    v.phase = phase;
+                    v.examined = 3;
+                    v.selected = 3;
+                    v.pending = n;
+                    v.processed = 3 - n;
+                });
+            }
+            // Keep the sender until every watcher saw the last state.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        rx
+    }
+
+    fn watch(&self, job: uuid::Uuid) -> Option<tokio::sync::watch::Receiver<ReprocessView>> {
+        self.jobs.lock().unwrap().get(&job).cloned()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reprocess_jobs_stream_their_progress() {
+    let fake = Arc::new(FakeReprocess {
+        jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
+    });
+    let a = Instance::start_with(
+        "inst-a",
+        Some(Shared::sqlite().backend),
+        common::Options {
+            reprocess: Some(fake),
+            ..common::Options::default()
+        },
+    )
+    .await;
+    let ch = a.channel().await;
+    let mut req = add_request("http://minio.test:9000", "docs", "");
+    req.paused = true;
+    let source = config(&ch).add_source(req).await.unwrap().into_inner();
+    let mut jobs = JobsServiceClient::new(ch.clone());
+    let job = jobs
+        .reprocess_job(pb::ReprocessJobRequest {
+            source_id: source.id.clone(),
+            force: true,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .job_id;
+    let mut stream = jobs
+        .watch_reprocess(pb::WatchReprocessRequest {
+            job_id: job.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut states = Vec::new();
+    while let Some(p) = tokio::time::timeout(Duration::from_secs(5), stream.message())
+        .await
+        .expect("an update")
+        .unwrap()
+    {
+        assert_eq!(
+            (p.job_id.as_str(), p.source_id.as_str()),
+            (job.as_str(), source.id.as_str())
+        );
+        assert!(p.force);
+        states.push(p.state);
+        if p.state == pb::reprocess_progress::State::Done as i32 {
+            assert_eq!((p.selected, p.processed, p.pending), (3, 3, 0));
+        }
+    }
+    assert_eq!(
+        states.last().copied(),
+        Some(pb::reprocess_progress::State::Done as i32),
+        "the stream ends after the last state: {states:?}"
+    );
+    let err = jobs
+        .watch_reprocess(pb::WatchReprocessRequest {
+            job_id: uuid::Uuid::now_v7().to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::NotFound);
+    invalid(
+        &jobs
+            .watch_reprocess(pb::WatchReprocessRequest {
+                job_id: "nope".into(),
+            })
+            .await
+            .unwrap_err(),
+        &["job_id"],
+    );
+    a.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stubs_answer_unimplemented_after_validation() {
     let a = Instance::start("inst-a", Some(Shared::sqlite().backend)).await;
@@ -1146,18 +1272,21 @@ async fn stubs_answer_unimplemented_after_validation() {
     req.paused = true;
     let source = config(&ch).add_source(req).await.unwrap().into_inner();
 
+    // Without ingest on the instance, reprocessing is unavailable (after validation).
     let mut jobs = JobsServiceClient::new(ch.clone());
     let err = jobs
         .reprocess_job(pb::ReprocessJobRequest {
             source_id: source.id.clone(),
+            force: false,
         })
         .await
         .unwrap_err();
-    assert_eq!(err.code(), Code::Unimplemented);
-    assert!(err.message().contains("step 4"), "{}", err.message());
+    assert_eq!(err.code(), Code::Unavailable);
+    assert!(err.message().contains("ingest"), "{}", err.message());
     let err = jobs
         .reprocess_job(pb::ReprocessJobRequest {
             source_id: doewood_core::SourceId::generate().to_string(),
+            force: false,
         })
         .await
         .unwrap_err();
@@ -1244,6 +1373,7 @@ async fn messages_above_the_limit_are_refused() {
         Some(Shared::sqlite().backend),
         Options {
             max_message_bytes: 64 * 1024,
+            ..Options::default()
         },
     )
     .await;

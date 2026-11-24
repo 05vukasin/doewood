@@ -12,6 +12,7 @@ use tokio::sync::watch;
 use tonic::Status;
 
 use crate::progress::Progress;
+use crate::reprocess::Reprocessor;
 use crate::{convert, error, pb};
 
 /// Tuning of the API server.
@@ -44,6 +45,8 @@ pub struct ApiParts {
     pub discovery: Option<Discovery>,
     /// The live event counters.
     pub progress: Arc<Progress>,
+    /// Reprocess jobs; `None` when ingest does not run (`ReprocessJob` is then UNAVAILABLE).
+    pub reprocess: Option<Arc<dyn Reprocessor>>,
     /// Tuning.
     pub options: ApiOptions,
     /// Turns true on shutdown; streams end then.

@@ -1,8 +1,8 @@
 //! doewood's gRPC API (ADR 0001, section 4), served with tonic on `DOEWOOD_LISTEN`.
 //!
 //! - **Services** (package `doewood.v1`, `proto/doewood/v1/*.proto`): `ConfigService`
-//!   (sources, LLM policies, AI providers), `JobsService` (the progress stream; reprocessing
-//!   later), `RecordsService`, `GraphService`, `SearchService` and `SummarizeService` (its
+//!   (sources, LLM policies, AI providers), `JobsService` (the progress stream and
+//!   reprocessing), `RecordsService`, `GraphService`, `SearchService` and `SummarizeService` (its
 //!   messages are final; the work arrives with the LLM step).
 //! - **gRPC-Web** (`tonic-web`, HTTP/1.1 accepted), so a browser frontend calls the API
 //!   directly. No CORS headers are sent: serve the frontend from the same origin.
@@ -23,6 +23,7 @@ mod graph;
 mod jobs;
 mod progress;
 mod records;
+mod reprocess;
 mod search;
 mod state;
 mod summarize;
@@ -44,6 +45,7 @@ use tonic_web::GrpcWebLayer;
 pub use auth::Authorize;
 pub use config::add_source;
 pub use progress::{EventCounts, Progress};
+pub use reprocess::{ReprocessPhase, ReprocessView, Reprocessor};
 pub use state::{ApiOptions, ApiParts, ApiState};
 
 /// The generated protobuf types, servers and clients of package `doewood.v1`.

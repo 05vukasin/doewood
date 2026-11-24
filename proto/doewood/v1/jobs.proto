@@ -11,9 +11,13 @@ service JobsService {
   // whenever a source's counters or state change, until the client cancels or the server
   // shuts down.
   rpc WatchProgress(WatchProgressRequest) returns (stream ProgressUpdate);
-  // Re-analyzes the files of a source whose quail/hedgehog step versions changed. Not built
-  // yet: answers UNIMPLEMENTED until ingest exists.
+  // Starts a one-shot job that re-analyzes the files of a source whose stored quail/hedgehog
+  // step versions differ from the running engine's (every file with `force`). Answers at once
+  // with the job's id; WatchReprocess streams its progress.
   rpc ReprocessJob(ReprocessJobRequest) returns (ReprocessJobResponse);
+  // Streams a reprocess job's progress: its current state first, then every change, until it
+  // is done or failed (the last update), the client cancels or the server shuts down.
+  rpc WatchReprocess(WatchReprocessRequest) returns (stream ReprocessProgress);
 }
 
 message WatchProgressRequest {
@@ -74,8 +78,43 @@ message ProgressUpdate {
 
 message ReprocessJobRequest {
   string source_id = 1;
+  // Re-analyze every file of the source, current or not.
+  bool force = 2;
 }
 
 message ReprocessJobResponse {
   string job_id = 1;
+}
+
+message WatchReprocessRequest {
+  // From ReprocessJobResponse. Jobs live in the instance that started them, until it restarts.
+  string job_id = 1;
+}
+
+message ReprocessProgress {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    // Comparing the stored step versions with the running engine's.
+    STATE_SELECTING = 1;
+    // The selected files are back in the ingest queue and being analyzed.
+    STATE_RUNNING = 2;
+    // Nothing of the source is waiting any more. The last update.
+    STATE_DONE = 3;
+    // The job stopped; see `error`. The last update.
+    STATE_FAILED = 4;
+  }
+  string job_id = 1;
+  string source_id = 2;
+  State state = 3;
+  bool force = 4;
+  // Ingested files compared so far, and those put back in the queue.
+  uint64 examined = 5;
+  uint64 selected = 6;
+  // The source's files now: ingested (done or skipped), failed, and waiting.
+  uint64 processed = 7;
+  uint64 failed = 8;
+  uint64 pending = 9;
+  string error = 10;
+  // When the update was made, Unix seconds.
+  int64 at = 11;
 }
