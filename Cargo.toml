@@ -1,7 +1,6 @@
 [workspace]
 resolver = "3"
-# Planned crates (ADR 0001), added one per step: doewood-pg (shared Postgres + pgvector),
-# doewood-s3 (sources), doewood-ingest (quail/hedgehog pipeline), doewood-api (gRPC) and
+# Planned crates (ADR 0001), added one per step: doewood-ingest (quail/hedgehog pipeline) and
 # doewood-enrich (registries, ADR 0002).
 members = ["crates/*"]
 

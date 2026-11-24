@@ -1,9 +1,13 @@
 # Sources and discovery
 
 A **source** is an S3-compatible endpoint, a bucket and an optional key prefix
-([ADR 0001](adr/0001-architecture.md), section 5). Sources are runtime settings: the gRPC API
-(a later step) adds them; they live in the instance's SQLite store, and their credentials are
-sealed in its encrypted secrets.
+([ADR 0001](adr/0001-architecture.md), section 5). Sources are runtime settings: the
+[gRPC API](api.md) adds, changes, pauses and removes them without a restart; they live in the
+instance's SQLite store, and their credentials are sealed in its encrypted secrets.
+
+Before a source is stored, the instance **claims** it (its endpoint, bucket and prefix) in the
+shared store. A source another instance owns is refused with `ALREADY_EXISTS`, naming that
+instance; removing the source releases the claim.
 
 ## Any S3-compatible store
 
@@ -38,7 +42,8 @@ the signature and any session token, so they are never logged and never part of 
 ## The incremental scan
 
 `serve` starts one scanner task per `active` or `error` source; with no sources it starts
-nothing. Each pass lists the source with `ListObjectsV2` and compares every key's ETag and size
+nothing. A source added or resumed through the API starts its scanner at once; pausing or
+removing one stops it, and an update restarts it with the new options. Each pass lists the source with `ListObjectsV2` and compares every key's ETag and size
 with the `objects_seen` table:
 
 - a key not seen before is **New**, a key whose ETag or size differs is **Changed**, and a seen
@@ -68,14 +73,15 @@ Push notifications pick changes up within seconds; the scan catches anything the
 - **Webhook** (cargo feature `webhook`, on by default): `doewood_s3::inlet::webhook` parses MinIO
   and S3 event notification JSON (`ObjectCreated:*`, `ObjectRemoved:*`,
   `LifecycleExpiration:*`) and `WebhookInlet::handle(source, body)` turns it into the same events
-  after comparing with `objects_seen`. The API step mounts it on a URL per source; nothing
-  listens until then.
+  after comparing with `objects_seen`. The ops server mounts it at
+  `POST /events/s3/{source_id}` (see [api.md](api.md#event-webhook)).
 - **SQS**: not built yet; it will implement the `EventInlet` trait.
 
 ## Trying it locally
 
-Until the gRPC API exists, a hidden command adds a source. **It is for local testing only** and
-will be removed:
+Add a source through the API (see [api.md](api.md#examples-with-grpcurl)), or, for scripts and
+without a running server, with the hidden `dev add-source` command. It goes through the same
+code as `ConfigService.AddSource` (the same validation and claim):
 
 ```sh
 docker run --rm -d --name minio -p 59000:9000 minio/minio server /data   # a local image

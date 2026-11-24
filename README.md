@@ -8,7 +8,9 @@ serves it all over gRPC.
 The name comes from Košutnjak, a Belgrade forest: *košuta* (a doe) + wood. It joins the hedgehog
 and the quail.
 
-**Status:** step 1 (skeleton: configuration, local store, ops endpoints) in progress. See [ADR 0002](docs/adr/0002-company-enrichment.md) (company identity and registries) and
+**Status:** the skeleton (configuration, local store, ops endpoints), the shared store, S3
+discovery and the gRPC API are in; ingest (quail/hedgehog) and the LLM step are next. See
+[ADR 0002](docs/adr/0002-company-enrichment.md) (company identity and registries) and
 [ADR 0001](docs/adr/0001-architecture.md).
 
 - **One binary.** It starts with no configuration at all; everything else is set at runtime
@@ -29,7 +31,8 @@ With no environment at all, this:
 
 - creates `./doewood-data/` with the SQLite store and a development master key (and warns
   loudly that the key file is for development only);
-- serves `/healthz`, `/readyz` and `/metrics` on `127.0.0.1:7444`;
+- serves the gRPC API (with gRPC-Web, health and reflection) on `127.0.0.1:7443`, and
+  `/healthz`, `/readyz` and `/metrics` on `127.0.0.1:7444`;
 - runs standalone, without a shared Postgres;
 - logs JSON to stderr (`RUST_LOG` sets the filter) and stops cleanly on Ctrl-C or SIGTERM.
 
@@ -39,9 +42,13 @@ cargo run -- config check         # effective configuration, secrets redacted
 cargo run -- version
 ```
 
-The bootstrap variables are listed in [docs/configuration.md](docs/configuration.md); sources
-and discovery in [docs/sources.md](docs/sources.md).
-The gRPC API (`127.0.0.1:7443`) arrives in a later step.
+```sh
+grpcurl -plaintext 127.0.0.1:7443 list            # the services, through reflection
+```
+
+The bootstrap variables are listed in [docs/configuration.md](docs/configuration.md), sources
+and discovery in [docs/sources.md](docs/sources.md), and the API, with `grpcurl` examples, in
+[docs/api.md](docs/api.md).
 
 ## Layout
 
@@ -53,11 +60,14 @@ crates/
                   and the standalone backend of the store traits (FTS5 search)
   doewood-pg      the shared Postgres (+ pgvector) backend of the store traits
   doewood-s3      S3 sources: a light SigV4 client, the incremental scanner, event inlets
+  doewood-api     the gRPC API (tonic, gRPC-Web, health, reflection); protos in proto/doewood/v1
   doewood         the binary: serve, version, config check
 ```
 
-Planned: `doewood-ingest`
-(quail/hedgehog), `doewood-api` (gRPC) and `doewood-enrich` (registries, ADR 0002).
+Planned: `doewood-ingest` (quail/hedgehog) and `doewood-enrich` (registries, ADR 0002).
+
+The `.proto` files compile with `protox` (pure Rust) in `doewood-api`'s build script, so
+`cargo build` needs no `protoc`.
 
 ## Development
 
