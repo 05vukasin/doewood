@@ -158,6 +158,11 @@ fn serve_starts_with_nothing_configured() {
             std::thread::sleep(Duration::from_millis(50));
         };
         assert!(status.success(), "{status:?}");
+        let stopped = seen
+            .iter()
+            .find(|l| l["message"] == "servers stopped")
+            .unwrap();
+        assert_eq!(stopped["backend"], "sqlite", "standalone backend");
         // The WAL was checkpointed into the main file on close.
         let wal = data.join("doewood.sqlite-wal");
         assert!(!wal.exists() || std::fs::metadata(&wal).unwrap().len() == 0);
@@ -165,6 +170,121 @@ fn serve_starts_with_nothing_configured() {
         let out = bare(tmp.path()).args(["config", "check"]).output().unwrap();
         let text = String::from_utf8(out.stdout).unwrap();
         assert!(text.contains("key file: exists"), "{text}");
+    }
+}
+
+const OPS_LISTENING: &str = "ops server listening (/healthz, /readyz, /metrics)";
+
+/// Sends SIGTERM and checks a clean exit.
+#[cfg(unix)]
+fn terminate(
+    child: &mut KillOnDrop,
+    rx: &mpsc::Receiver<serde_json::Value>,
+    seen: &mut Vec<serde_json::Value>,
+) {
+    let pid = child.0.id().to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    wait_for(rx, seen, "store closed; bye");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "no exit after SIGTERM");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "{status:?}");
+}
+
+#[test]
+fn serve_runs_degraded_while_postgres_is_unreachable() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Nothing listens on port 1: every attempt is refused.
+    let mut child = KillOnDrop(
+        bare(tmp.path())
+            .arg("serve")
+            .env("DOEWOOD_OPS_LISTEN", "127.0.0.1:0")
+            .env(
+                "DOEWOOD_POSTGRES_URL",
+                "postgres://dw:hunter2@127.0.0.1:1/doewood?connect_timeout=2",
+            )
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let rx = log_lines(child.0.stderr.take().unwrap());
+    let mut seen = Vec::new();
+    let listening = wait_for(&rx, &mut seen, OPS_LISTENING);
+    let addr: SocketAddr = listening["addr"].as_str().unwrap().parse().unwrap();
+    wait_for(&rx, &mut seen, "shared Postgres unreachable; retrying");
+    // A second attempt follows the backoff: the instance keeps trying.
+    wait_for(&rx, &mut seen, "shared Postgres unreachable; retrying");
+
+    assert_eq!(get(addr, "/healthz"), (200, "ok\n".to_owned()));
+    let (status, body) = get(addr, "/readyz");
+    assert_eq!(status, 503, "{body}");
+    assert!(
+        body.starts_with("not ready: shared Postgres unreachable"),
+        "{body}"
+    );
+    assert!(body.contains("retrying"), "{body}");
+    let (_, metrics) = get(addr, "/metrics");
+    assert!(metrics.contains("doewood_ready 0"), "{metrics}");
+    assert!(metrics.contains("mode=\"shared\""), "{metrics}");
+    assert!(!seen.iter().any(|l| l["message"] == "ready"), "{seen:#?}");
+
+    #[cfg(unix)]
+    terminate(&mut child, &rx, &mut seen);
+    let all = seen.iter().map(ToString::to_string).collect::<String>();
+    assert!(
+        !all.contains("hunter2") && !body.contains("hunter2"),
+        "{all}"
+    );
+}
+
+/// Runs only when `DOEWOOD_TEST_POSTGRES_URL` is set (the postgres CI job sets it).
+#[test]
+fn serve_uses_postgres_when_reachable() {
+    let Some(url) = std::env::var("DOEWOOD_TEST_POSTGRES_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    else {
+        eprintln!("skipping: DOEWOOD_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let mut child = KillOnDrop(
+        bare(tmp.path())
+            .arg("serve")
+            .env("DOEWOOD_OPS_LISTEN", "127.0.0.1:0")
+            .env("DOEWOOD_POSTGRES_URL", &url)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let rx = log_lines(child.0.stderr.take().unwrap());
+    let mut seen = Vec::new();
+    let listening = wait_for(&rx, &mut seen, OPS_LISTENING);
+    let addr: SocketAddr = listening["addr"].as_str().unwrap().parse().unwrap();
+    wait_for(&rx, &mut seen, "shared Postgres connected");
+    wait_for(&rx, &mut seen, "ready");
+    assert_eq!(get(addr, "/readyz"), (200, "ready\n".to_owned()));
+    #[cfg(unix)]
+    {
+        terminate(&mut child, &rx, &mut seen);
+        let stopped = seen
+            .iter()
+            .find(|l| l["message"] == "servers stopped")
+            .unwrap();
+        assert_eq!(stopped["backend"], "postgres");
     }
 }
 

@@ -449,6 +449,8 @@ dependencies = [
  "axum",
  "clap",
  "doewood-core",
+ "doewood-model",
+ "doewood-pg",
  "doewood-store",
  "prometheus",
  "serde_json",

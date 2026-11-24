@@ -3,6 +3,7 @@
 mod logging;
 mod ops;
 mod serve;
+mod shared;
 
 use std::process::ExitCode;
 
@@ -47,8 +48,9 @@ fn main() -> ExitCode {
         }
         Command::Version => {
             println!(
-                "doewood {VERSION} (store schema {})",
-                doewood_store::SCHEMA_VERSION
+                "doewood {VERSION} (store schema {}, shared schema {})",
+                doewood_store::SCHEMA_VERSION,
+                doewood_pg::SCHEMA_VERSION
             );
             ExitCode::SUCCESS
         }
