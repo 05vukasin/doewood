@@ -14,6 +14,7 @@ rust-version = "1.97"
 
 [workspace.dependencies]
 doewood-core = { path = "crates/doewood-core" }
+doewood-s3 = { path = "crates/doewood-s3" }
 doewood-store = { path = "crates/doewood-store" }
 thiserror = "2"
 zeroize = "1.8"
