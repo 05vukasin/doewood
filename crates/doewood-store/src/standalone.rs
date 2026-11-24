@@ -453,7 +453,7 @@ impl GraphStore for Standalone {
     }
 
     async fn upsert_location(&self, blake3: &Blake3, at: &ObjectLocation) -> Result<Located> {
-        let (h, at) = (*blake3, at.clone());
+        let (h, at) = (*blake3, at.checked()?);
         self.run(move |conn| {
             let tx = conn.transaction().map_err(sql)?;
             let document = ensure_node(&tx, NodeKind::Document, &h.to_hex())?;

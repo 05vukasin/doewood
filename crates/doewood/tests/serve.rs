@@ -223,9 +223,9 @@ fn serve_runs_degraded_while_postgres_is_unreachable() {
     let mut seen = Vec::new();
     let listening = wait_for(&rx, &mut seen, OPS_LISTENING);
     let addr: SocketAddr = listening["addr"].as_str().unwrap().parse().unwrap();
-    wait_for(&rx, &mut seen, "shared Postgres unreachable; retrying");
+    wait_for(&rx, &mut seen, "shared Postgres unavailable; retrying");
     // A second attempt follows the backoff: the instance keeps trying.
-    wait_for(&rx, &mut seen, "shared Postgres unreachable; retrying");
+    wait_for(&rx, &mut seen, "shared Postgres unavailable; retrying");
 
     assert_eq!(get(addr, "/healthz"), (200, "ok\n".to_owned()));
     let (status, body) = get(addr, "/readyz");

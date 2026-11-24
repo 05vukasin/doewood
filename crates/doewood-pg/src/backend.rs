@@ -29,7 +29,16 @@ pub(crate) fn pg(e: tokio_postgres::Error) -> Error {
     if e.code() == Some(&SqlState::FOREIGN_KEY_VIOLATION) {
         return Error::NotFound("a node or record the write refers to does not exist".to_owned());
     }
-    if e.is_closed() || e.code().is_none() {
+    // Connection-level trouble: closed or failed sockets, and the server's own "come back
+    // later" classes (08 connection exception, 53 insufficient resources, 57P operator
+    // intervention such as a shutdown).
+    let io =
+        std::error::Error::source(&e).is_some_and(<dyn std::error::Error>::is::<std::io::Error>);
+    let transient = e.code().is_some_and(|c| {
+        let c = c.code();
+        c.starts_with("08") || c.starts_with("53") || c.starts_with("57P")
+    });
+    if e.is_closed() || io || transient {
         return Error::Unavailable(e.to_string());
     }
     Error::Backend {
@@ -349,6 +358,7 @@ impl GraphStore for PgStore {
     }
 
     async fn upsert_location(&self, blake3: &Blake3, at: &ObjectLocation) -> Result<Located> {
+        let at = &at.checked()?;
         let mut c = client(&self.pool).await?;
         let tx = c.transaction().await.map_err(pg)?;
         let document = ensure_node(&*tx, NodeKind::Document, &blake3.to_hex()).await?;

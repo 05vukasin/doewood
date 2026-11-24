@@ -141,6 +141,20 @@ pub struct ObjectLocation {
 }
 
 impl ObjectLocation {
+    /// The location as stored: the endpoint and bucket normalized like [`SourceKey::new`],
+    /// so source filters match it. The endpoint, bucket and key must not be empty.
+    pub fn checked(&self) -> Result<Self, Error> {
+        let source = SourceKey::new(&self.endpoint, &self.bucket, "")?;
+        if self.key.is_empty() {
+            return Err(Error::Invalid("an object key cannot be empty".to_owned()));
+        }
+        Ok(Self {
+            endpoint: source.endpoint,
+            bucket: source.bucket,
+            key: self.key.clone(),
+        })
+    }
+
     /// The key of the location's graph node: a JSON array, so no separator can be ambiguous.
     pub fn node_key(&self) -> String {
         Value::from(vec![

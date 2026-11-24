@@ -625,7 +625,8 @@ pub async fn search<B: Backend + ?Sized>(s: &B) {
     s.upsert_location(
         &d3,
         &ObjectLocation {
-            endpoint: "http://minio:9000".to_owned(),
+            // Normalized like a source key, so the source filter below matches.
+            endpoint: "http://minio:9000/".to_owned(),
             bucket: "search".to_owned(),
             key: "inbox/2024/x.pdf".to_owned(),
         },

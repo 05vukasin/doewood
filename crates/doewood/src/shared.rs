@@ -80,10 +80,16 @@ pub async fn supervise(
                     url = %url,
                     error = %e,
                     retry_in_s = wait.as_secs(),
-                    "shared Postgres unreachable; retrying"
+                    "shared Postgres unavailable; retrying"
                 );
+                // Unreachable, or reachable but unusable (a bad URL, a newer schema).
+                let what = if matches!(e, doewood_model::Error::Unavailable(_)) {
+                    "unreachable"
+                } else {
+                    "unusable"
+                };
                 ops.set_not_ready(format!(
-                    "shared Postgres unreachable: {e} (retrying in {}s)",
+                    "shared Postgres {what}: {e} (retrying in {}s)",
                     wait.as_secs().max(1)
                 ));
                 if sleep_or_shutdown(wait, &mut shutdown).await {
