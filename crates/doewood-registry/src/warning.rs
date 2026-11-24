@@ -18,6 +18,8 @@ pub enum Registry {
     /// SEC EDGAR: `data.sec.gov` (submissions) and `www.sec.gov` (the tickers file, the
     /// filing archives).
     Edgar,
+    /// The Serbian Business Registers Agency (APR): its open data, `openapi.apr.gov.rs`.
+    Apr,
 }
 
 impl Registry {
@@ -28,6 +30,7 @@ impl Registry {
             Self::Vies => "vies",
             Self::Wikidata => "wikidata",
             Self::Edgar => "edgar",
+            Self::Apr => "apr",
         }
     }
 }
@@ -44,6 +47,10 @@ pub enum WarningKind {
     /// The registry is switched off in the configuration; nothing was sent.
     #[error("disabled in the configuration")]
     Disabled,
+    /// The registry's source cannot answer this kind of question (APR's open data has no
+    /// PIB); nothing was sent.
+    #[error("unsupported: {0}")]
+    Unsupported(String),
     /// The client configuration is unusable (for example the base URL).
     #[error("configuration: {0}")]
     Config(String),

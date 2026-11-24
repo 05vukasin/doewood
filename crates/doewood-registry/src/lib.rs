@@ -16,6 +16,9 @@
 //! - [`edgar`]: SEC EDGAR by CIK: name, former names with dates, tickers, SIC, state of
 //!   incorporation and recent filings; the name and ticker lookup in the company tickers file;
 //!   Exhibit 21 subsidiaries (best-effort); 8-K Item 2.01 (completed acquisitions).
+//! - [`apr`]: the Serbian Business Registers Agency's open data (`openapi.apr.gov.rs`): a
+//!   company by MB (name, status, legal form, founding date, municipality, activity), and a
+//!   name search over the set, which is downloaded monthly and searched here.
 //! - [`fetch`]: the shared request loop (limiter, retries, cap, cache) over a [`Transport`].
 //! - [`limit`], [`clock`], [`cache`], [`http`]: its parts, each behind a small trait so the
 //!   decision logic is tested without a network.
@@ -23,6 +26,7 @@
 //! Only identifiers and names are ever sent, never document content (ADR 0002, the privacy
 //! rule). Identifiers are validated with [`doewood_enrich::check`] before a request is made.
 
+pub mod apr;
 pub mod cache;
 pub mod clock;
 pub mod edgar;

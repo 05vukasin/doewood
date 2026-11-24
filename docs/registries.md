@@ -2,8 +2,8 @@
 
 `crates/doewood-registry` holds the public registry clients of
 [ADR 0002](adr/0002-company-enrichment.md), section 2. `doewood-enrich` stays pure (no I/O);
-this crate does the requests and parses the answers into types. GLEIF, VIES, Wikidata and
-SEC EDGAR are done; APR and Companies House follow, one at a time.
+this crate does the requests and parses the answers into types. GLEIF, VIES, Wikidata,
+SEC EDGAR and the Serbian APR are done; Companies House follows.
 
 Nothing calls the clients yet: the enrichment job (ADR 0002 section 6) that turns their answers
 into company identifiers and dated edges comes later.
@@ -11,7 +11,8 @@ into company identifiers and dated edges comes later.
 ## What is sent
 
 Only identifiers and names: an LEI, a VAT number, a Wikidata item id, an EDGAR CIK and
-accession number, or a legal name and a country code. Document
+accession number, or a legal name and a country code. The APR client sends nothing about a
+company at all: it downloads the whole open-data set and looks up MBs and names in it. Document
 content never leaves the instance (ADR 0002, the privacy rule). An identifier is validated before
 it is sent: an LEI must pass ISO 17442 (`doewood_enrich::check::lei`), a VAT number its
 country's format and check digits (`doewood_enrich::check::vat`), so a typo or a placeholder is
@@ -23,7 +24,8 @@ Every client is built on the same request loop (`Fetcher`):
 
 - **Failure-soft.** Every failure is a typed `Warning { registry, kind }`, never a panic or a
   failed ingest. The kinds: `Disabled`, `Config`, `InvalidInput`, `Timeout`, `Transport`,
-  `TooLarge`, `RateLimited`, `Status`, `Malformed`, `Vies` (a VIES error code), `Wikidata`
+  `TooLarge`, `RateLimited`, `Status`, `Malformed`, `Unsupported` (the source cannot answer
+  that question: APR has no PIB), `Vies` (a VIES error code), `Wikidata`
   (a Wikidata API error code) and `Edgar` (the SEC refused the request). The loop
   logs each one at `WARN`.
 - **Length-capped.** The body is read chunk by chunk and dropped as soon as it passes the cap
@@ -46,8 +48,8 @@ Every client is built on the same request loop (`Fetcher`):
   policy asks. Never a person's name or email in the code. EDGAR is the one exception: the SEC
   asks for the requester's name and email, which the operator configures (see
   [EDGAR](#sec-edgar)).
-- **Trust tier.** `Registry::tier()` is `TrustTier::Official` for GLEIF, VIES and EDGAR (and
-  the national registries to come) and `TrustTier::Community` for Wikidata, the lowest tier of ADR
+- **Trust tier.** `Registry::tier()` is `TrustTier::Official` for GLEIF, VIES, EDGAR and APR
+  (and Companies House to come) and `TrustTier::Community` for Wikidata, the lowest tier of ADR
   0002 section 2 (`Community < Official`).
 - **Timeouts.** One for connecting, and one for the whole request, body included.
 - **Cached, with a fetch date.** Answers are cached by request under keys like
@@ -367,13 +369,122 @@ page's table and its `Document` / `Type` columns, the 403 page texts ("Undeclare
 Tool", "Request Rate Threshold Exceeded"; any other 403 is `Forbidden`), and the length of the
 SEC's block (the default pause is 10 minutes).
 
+## APR
+
+The Serbian Business Registers Agency (Агенција за привредне регистре, APR), keyless, through
+its **official open data**.
+
+**Source.** The data.gov.rs dataset "АПИ за Регистар привредних друштава"
+(`data.gov.rs/sr/datasets/api-za-registar-privrednikh-drushtava/`, publisher: APR), whose
+resource is `https://openapi.apr.gov.rs/api/opendata/companies`: one JSON document with the
+snapshot date and every registered company that is active, in liquidation, in forced
+liquidation or in bankruptcy. It is one of the EU high-value datasets (Implementing Regulation
+2023/138). APR updates it **monthly** (the dataset says "једном месечно"); it was about 58 MB
+for some 134,000 companies in November 2026. No delta feed is published.
+
+**Licence.** The dataset's licence is the Serbian open data licence (data.gov.rs terms,
+"Лиценца за коришћење података"): free reuse by anyone, commercial or not, including
+copying, adapting and combining, with **attribution**: name the publishing body (APR), the
+download date, the address the data came from, and mark any change. Every record carries the
+snapshot date (`as_of`) and the download date (`fetched_at`) for that.
+
+**Why not the search pages.** APR's website terms ("Terms and Conditions of Use") forbid web
+robots for downloading data and search results, and allow copying only for personal,
+non-commercial use. APR's own data service ("e-data on request") and its web service are paid
+and contract-based. The client uses neither.
+
+| call | requests | gives |
+|---|---|---|
+| `company(mb)` / `lookup(IdKind::RsMb, mb)` | the set (once per 30 days) | the company, or `None` |
+| `lookup(IdKind::RsPib, pib)` | nothing | `Unsupported`: the set has no PIB |
+| `search(name)` | the set (once per 30 days) | candidate companies |
+
+A company (`apr::Company`) has the MB, the business name as registered (`PoslovnoIme`) and its
+script (Cyrillic or Latin; the set gives one spelling only, and matching keys are
+script-blind), the status (`Active`, `InLiquidation`, `InForcedLiquidation`, `InBankruptcy`,
+`Deleted`, or `Other` as given), the legal form (`LimitedLiability`, `JointStock`, the older
+open and closed joint-stock forms, `Partnership`, `LimitedPartnership`, `PublicEnterprise`,
+`SocialEnterprise`, `Cooperative`, `CooperativeUnion`, `ForeignRepresentativeOffice`,
+`ForeignBranch`, or `Other`; `canonical()` gives the `doewood_enrich::LEGAL_FORMS` spelling such
+as `d.o.o.`), the founding date, the municipality of the seat (code and name), the activity
+code, and the snapshot date. Statuses and legal forms are read in either script.
+
+- **Not in the set:** the PIB, deleted companies (a deleted company is absent, so `None`;
+  `Deleted` is read in case APR adds them), the date of a status change, statutory changes,
+  mergers and divisions, and the street address. ADR 0002 lists these for APR; the open data
+  does not have them, and APR's search pages may not be scraped (above). They stay open.
+- **Before sending.** An MB must pass `doewood_enrich::check::rs_mb` (8 digits, MOD 11), a PIB
+  `rs_pib` (9 digits, MOD 11,10); placeholders are refused. Anything else is `InvalidInput`. No
+  identifier or name ever reaches a URL.
+- **The set.** It is downloaded whole, capped (`max_body`, 128 MiB), and read with a streaming
+  visitor into a compact index by MB (no JSON tree; each name kept once, the low-cardinality
+  fields interned). The body is dropped once indexed; the index is a fraction of it. At most
+  `max_companies` (400,000) entries; a larger set is `Malformed`. Unknown fields are ignored, a
+  key that is not eight digits or a record without a name is skipped, a value that is not a
+  string or a number is empty. The set is UTF-8 JSON (a byte order mark is tolerated); any
+  other encoding, such as Windows-1251, is `Malformed` rather than misread. Indexing and
+  searching run on Tokio's blocking pool.
+- **One download.** The snapshot is shared by every caller; concurrent lookups wait for one
+  download. It is fresh for `ttl` (30 days, the ADR's refresh), then downloaded again.
+- **Failures.** A failed download (transport, status, oversize, malformed) is never cached.
+  The client then sends nothing for `failure_pause` (15 minutes) and answers with the same
+  warning meanwhile, so a broken set is not downloaded on every lookup. 429 and 5xx get the
+  shared backoff and `Retry-After` handling.
+- **Cached** by MB under `apr:companies/<MB>`, with the download's date: a company found is
+  fresh for 30 days (until the set is), "no such MB" for one day. The cached body is the
+  company's raw fields, so a better reader applies to it. With a shared cache a second instance
+  answers without downloading the set.
+- **Name search.** Every word of the name (after `doewood_enrich::normalize`: Cyrillic to
+  Latin, marks, case and punctuation dropped) must be in the company's name; exact names first,
+  then by MB, at most `search_size`. Matching a candidate to a company is doewood-enrich's.
+- **TLS.** In November 2026 `openapi.apr.gov.rs` sends its certificate (`*.apr.gov.rs`, issued
+  by "SSL2BUY EMEA RSA Domain Validation Secure Server CA") **without the intermediate**. The
+  platform verifier does not fetch intermediates, so the download fails with
+  `Transport(... UnknownIssuer)`. The operator can supply that intermediate (its URL is in the
+  leaf's Authority Information Access, `crt.sectigo.com`; it chains to Sectigo's public root)
+  as `extra_roots_pem`, a PEM bundle trusted next to the system's roots. doewood ships none.
+
+### Settings
+
+`AprConfig`, whose defaults are the production values:
+
+| field | default |
+|---|---|
+| `enabled` | `true` (keyless, ADR 0002 section 7) |
+| `url` | `https://openapi.apr.gov.rs/api/opendata/companies` |
+| `timeout` / `connect_timeout` | 5 minutes / 10 s |
+| `per_minute` / `burst` | 1 / 1 |
+| `max_body` / `max_companies` | 128 MiB / 400,000 |
+| `max_retries` / `backoff` / `max_retry_after` | 2 / 10 s, doubling / 60 s |
+| `ttl` / `ttl_missing` | 30 days / 1 day |
+| `failure_pause` | 15 minutes |
+| `search_size` | 10 (at most 100) |
+| `extra_roots_pem` | none (see TLS above) |
+
+Confirmed from the data.gov.rs dataset metadata and a look at the set's structure (field names
+and value vocabularies only, nothing stored): the URL, the top-level `DatumPreseka` and
+`Podaci` (an object keyed by the eight-digit MB), the fields `PoslovnoIme`, `SifraOpstine`,
+`NazivOpstine`, `NazivStatus`, `DatumOsnivanja`, `NazivPravneForme`, `SifraDelatnosti`, all
+strings, ISO dates; the four statuses and thirteen legal-form names in Cyrillic; names in
+both scripts (about 8% Cyrillic); that every MB but one passes the MOD 11 check; the licence;
+the monthly update; the missing intermediate. Assumed: that the shape stays stable (the
+reader is lenient), the spellings of a deleted status, and that no PIB or event data will be
+added soon.
+
 ## Tests
 
 `cargo test -p doewood-registry`. The tests never reach a real registry: a mock HTTP server on
 127.0.0.1 answers with fixtures written by hand in the test code (invented companies and
 addresses, LEIs and VAT numbers built with valid check digits, invented relationships, and
 invented Wikidata items from Q999000001 up, and invented EDGAR companies, CIKs from 9990000001
-up, filings, filing indexes and Exhibit 21 documents, with `example.invalid` contacts). For
+up, filings, filing indexes and Exhibit 21 documents, with `example.invalid` contacts, and an
+invented APR set of Cyrillic and Latin names with MBs from 9900001x up). For APR they cover
+the lookup by MB (one download for many lookups and for concurrent callers), every status and
+legal form, a PIB refused as unsupported, MBs, PIBs and names that are never sent, not found,
+the script-blind name search done locally, the 30-day refresh, a shared cache, malformed,
+truncated and oversize sets (never cached, with the pause after a failure), too many
+companies, a missing set, 429 and 5xx backoff, UTF-8 with a byte order mark and a refused
+Windows-1251 body, lenient fields, and the configuration errors. For
 EDGAR they cover the lookup by CIK with former names, tickers and filings, the cache's day,
 404 and answers about another CIK, CIKs and tickers that are never sent, the ticker and name
 lookup (the file fetched once, no name sent), the filing index with and without an EX-21,

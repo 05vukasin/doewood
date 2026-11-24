@@ -1,6 +1,6 @@
 [package]
 name = "doewood-registry"
-description = "doewood's public registry clients (ADR 0002 section 2): failure-soft, length-capped, rate-limited and cached: GLEIF, VIES, Wikidata and SEC EDGAR so far."
+description = "doewood's public registry clients (ADR 0002 section 2): failure-soft, length-capped, rate-limited and cached: GLEIF, VIES, Wikidata, SEC EDGAR and the Serbian APR so far."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,7 +12,7 @@ rust-version.workspace = true
 # document content (ADR 0002, the privacy rule).
 [dependencies]
 async-trait.workspace = true
-# LEI and VAT validation before any request.
+# LEI, VAT and MB/PIB validation before any request; name normalization.
 doewood-enrich.workspace = true
 # HTTP/1.1, rustls with the `ring` provider, no proxy discovery, no decompression: the same
 # build as doewood-s3's.
@@ -22,7 +22,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
-tokio = { workspace = true, features = ["sync", "time"] }
+# `rt` for `spawn_blocking`: indexing the APR set runs off the async workers.
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tracing.workspace = true
 url = "2.5"
 
