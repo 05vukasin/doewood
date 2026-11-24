@@ -429,7 +429,7 @@ impl Store {
 }
 
 /// At most `max` bytes of `s`, cut at a character boundary.
-fn truncate(s: &str, max: usize) -> String {
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_owned();
     }

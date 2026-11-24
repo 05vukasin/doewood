@@ -186,6 +186,21 @@ impl LlmPolicy {
         Ok(())
     }
 
+    /// Whether ingest queues a summary for a document of `kind`: `all` queues every
+    /// document, `kinds` the listed ones (exact match), `off` and `on_demand` none.
+    pub fn queues(&self, kind: Option<&str>) -> bool {
+        match &self.mode {
+            LlmMode::All => true,
+            LlmMode::Kinds(kinds) => kind.is_some_and(|k| kinds.iter().any(|x| x == k)),
+            LlmMode::Off | LlmMode::OnDemand => false,
+        }
+    }
+
+    /// Whether `Summarize` may read this source's objects: every mode but `off`.
+    pub fn allows_on_demand(&self) -> bool {
+        self.mode != LlmMode::Off
+    }
+
     /// The policy as stored in `sources.policy_json`.
     pub fn to_json(&self) -> serde_json::Value {
         let mut v = serde_json::json!({

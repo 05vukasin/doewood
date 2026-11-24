@@ -11,6 +11,7 @@ use crate::{StoreError, migrate};
 
 pub(crate) mod ai;
 pub(crate) mod objects;
+pub(crate) mod llm;
 pub(crate) mod sources;
 
 /// Name of the store file inside the data directory.
@@ -294,6 +295,8 @@ mod tests {
                 "company_leases",
                 "edges",
                 "jobs",
+                "llm_jobs",
+                "llm_usage",
                 "locations",
                 "node_aliases",
                 "nodes",
