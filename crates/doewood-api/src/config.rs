@@ -19,7 +19,7 @@ use crate::pb::{
     UpdateSourceRequest,
 };
 use crate::validate::{self, Violations};
-use crate::{Api, ApiState, convert, error};
+use crate::{Api, ApiState, claims, convert, error};
 
 /// Longest model name accepted.
 const MODEL_MAX_LEN: usize = 256;
@@ -173,13 +173,29 @@ impl Api {
         state: SourceState,
     ) -> Result<doewood_store::Source, Status> {
         let _guard = self.state.lock_sources().await;
-        let previous = self.state.source(id).await?.state;
+        let current = self.state.source(id).await?;
+        let previous = current.state;
+        // With a shared store, a source is scanned only under this instance's claim.
+        let claim_now = state.is_scanned() && self.state.shared_claims();
+        if claim_now && self.state.claims_checked() {
+            self.claim_for_scan(&current).await?;
+        }
         if previous != state {
             self.state
                 .db(move |s| s.set_source_state(id, state, None))
                 .await?;
         }
         let source = self.state.source(id).await?;
+        if claim_now && !self.state.claims_checked() {
+            // The start-up claim pass has not run yet: it claims the source and starts it.
+            info!(
+                source = %id,
+                state = %source.state,
+                "source state set; scanning starts once its claim is checked"
+            );
+            self.state.progress().touch();
+            return Ok(source);
+        }
         if let Some(d) = self.state.discovery() {
             match (state.is_scanned(), previous) {
                 // A failing source waits out its retry delay: resuming retries now.
@@ -191,6 +207,31 @@ impl Api {
         info!(source = %id, state = %source.state, "source state set");
         self.state.progress().touch();
         Ok(source)
+    }
+
+    /// Claims the source for this instance before it is scanned. Another owner: the source is
+    /// marked (state `error`, the owner in the reason) and the call fails with ALREADY_EXISTS.
+    async fn claim_for_scan(&self, source: &doewood_store::Source) -> Result<(), Status> {
+        let backend = self.state.backend()?;
+        let key = SourceKey::new(&source.endpoint, &source.bucket, source.prefix.clone())
+            .map_err(error::model)?;
+        match backend.claim_source(&key, self.state.instance()).await {
+            Ok(_) => Ok(()),
+            Err(doewood_model::Error::SourceClaimed { owner, key }) => {
+                // Marked as an active source would be: resuming asked for a scan.
+                let mut marked = source.clone();
+                marked.state = SourceState::Error;
+                claims::mark_conflict(&self.state, &backend, &marked, &key, &owner)
+                    .await
+                    .map_err(Status::unavailable)?;
+                self.state.progress().touch();
+                Err(error::model(doewood_model::Error::SourceClaimed {
+                    owner,
+                    key,
+                }))
+            }
+            Err(e) => Err(error::model(e)),
+        }
     }
 }
 
@@ -230,6 +271,9 @@ impl ConfigService for Api {
             .await?;
         if let Some(d) = self.state.discovery()
             && source.state.is_scanned()
+            // With shared claims, a source that is not scanned (claimed elsewhere, or waiting
+            // for the start-up claim pass) is not started here.
+            && (!self.state.shared_claims() || d.is_running(id))
         {
             // The new options (interval, credentials) apply now, not after the next sleep.
             d.restart_source(&source);

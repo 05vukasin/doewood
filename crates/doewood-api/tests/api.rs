@@ -1702,3 +1702,200 @@ async fn health_and_reflection() {
     assert!(!files.file_descriptor_proto.is_empty());
     a.stop().await;
 }
+
+/// Adds a source to the instance's own store only, as an earlier run (or a standalone one) left
+/// it: no claim in the shared store.
+fn local_source(
+    inst: &Instance,
+    endpoint: &str,
+    bucket: &str,
+    state: doewood_store::SourceState,
+) -> String {
+    let mut new = doewood_store::NewSource::new(endpoint, bucket);
+    new.state = state;
+    inst.store.add_source(&new, None).unwrap().to_string()
+}
+
+async fn get_source(ch: &Channel, id: &str) -> pb::Source {
+    config(ch)
+        .get_source(pb::GetSourceRequest {
+            source_id: id.to_owned(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+}
+
+/// `serve` with a shared store re-claims its sources at start: its own are claimed and scanned,
+/// one another instance owns is marked and not scanned, and the start goes on (issue #12).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_start_up_pass_reclaims_sources_and_reports_conflicts() {
+    use doewood_store::SourceState as S;
+    for shared in Shared::all().await {
+        let endpoint = format!("http://127.0.0.1:{}", closed_port().await);
+        let a = Instance::start("inst-a", Some(shared.backend.clone())).await;
+        let cha = a.channel().await;
+        let taken = config(&cha)
+            .add_source(add_request(&endpoint, "taken", ""))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut paused_req = add_request(&endpoint, "taken-paused", "");
+        paused_req.paused = true;
+        config(&cha).add_source(paused_req).await.unwrap();
+
+        let b = Instance::start_with(
+            "inst-b",
+            Some(shared.backend.clone()),
+            Options {
+                shared_claims: true,
+                ..Options::default()
+            },
+        )
+        .await;
+        let chb = b.channel().await;
+        let mine = local_source(&b, &endpoint, "mine", S::Active);
+        let conflict = local_source(&b, &endpoint, "taken", S::Active);
+        let paused = local_source(&b, &endpoint, "taken-paused", S::Paused);
+        assert_eq!(b.discovery.len(), 0, "nothing is scanned before the pass");
+
+        let found = doewood_api::reclaim_sources(&b.state, b.shutdown_rx())
+            .await
+            .unwrap();
+        assert_eq!(
+            found,
+            doewood_api::Reclaimed {
+                claimed: 1,
+                conflicts: 2
+            },
+            "{}",
+            shared.name
+        );
+        let key = |bucket: &str| doewood_model::SourceKey::new(&endpoint, bucket, "").unwrap();
+        let claim = shared
+            .backend
+            .source_owner(&key("mine"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.owner.as_str(), "inst-b", "{}", shared.name);
+        assert!(get_source(&chb, &mine).await.scanner_running);
+
+        let c = get_source(&chb, &conflict).await;
+        assert_eq!(c.state, pb::SourceState::Error as i32, "{}", shared.name);
+        assert!(
+            c.state_reason
+                .starts_with("claimed by instance \"inst-a\" since 20"),
+            "{}: {}",
+            shared.name,
+            c.state_reason
+        );
+        assert!(!c.scanner_running);
+        let p = get_source(&chb, &paused).await;
+        assert_eq!(p.state, pb::SourceState::Paused as i32);
+        assert!(!p.scanner_running);
+        // The owner keeps its claim.
+        let owner = shared.backend.source_owner(&key("taken")).await.unwrap();
+        assert_eq!(owner.unwrap().owner.as_str(), "inst-a");
+
+        // A restart finds the same: its own claim kept (with its first time), the conflict again.
+        let again = doewood_api::reclaim_sources(&b.state, b.shutdown_rx())
+            .await
+            .unwrap();
+        assert_eq!(again, found);
+        let kept = shared.backend.source_owner(&key("mine")).await.unwrap();
+        assert_eq!(kept, Some(claim));
+        assert!(!get_source(&chb, &conflict).await.scanner_running);
+
+        // Updating a source claimed elsewhere does not start it.
+        config(&chb)
+            .update_source(pb::UpdateSourceRequest {
+                source_id: conflict.clone(),
+                scan_interval_seconds: Some(120),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!get_source(&chb, &conflict).await.scanner_running);
+        // Resuming it is refused, naming the owner; so is resuming the paused one.
+        for id in [&conflict, &paused] {
+            let err = config(&chb)
+                .resume_source(pb::ResumeSourceRequest {
+                    source_id: id.clone(),
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), Code::AlreadyExists, "{}: {err:?}", shared.name);
+            assert!(err.message().contains("\"inst-a\""), "{}", err.message());
+            let s = get_source(&chb, id).await;
+            assert_eq!(s.state, pb::SourceState::Error as i32);
+            assert!(s.state_reason.starts_with("claimed by instance"));
+            assert!(!s.scanner_running);
+        }
+
+        // Once A gives it up, resuming claims it and scans it.
+        config(&cha)
+            .remove_source(pb::RemoveSourceRequest {
+                source_id: taken.id,
+            })
+            .await
+            .unwrap();
+        config(&chb)
+            .resume_source(pb::ResumeSourceRequest {
+                source_id: conflict.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(get_source(&chb, &conflict).await.scanner_running);
+        let owner = shared.backend.source_owner(&key("taken")).await.unwrap();
+        assert_eq!(owner.unwrap().owner.as_str(), "inst-b");
+
+        a.stop().await;
+        b.stop().await;
+        shared.drop_schema().await;
+    }
+}
+
+/// Before the shared store answers, resuming a source only stores its state; the start-up pass
+/// claims it and starts it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resuming_before_the_pass_waits_for_it() {
+    use doewood_store::SourceState as S;
+    for shared in Shared::all().await {
+        let endpoint = format!("http://127.0.0.1:{}", closed_port().await);
+        let b = Instance::start_with(
+            "inst-b",
+            None,
+            Options {
+                shared_claims: true,
+                ..Options::default()
+            },
+        )
+        .await;
+        let chb = b.channel().await;
+        let id = local_source(&b, &endpoint, "later", S::Paused);
+        let pass = tokio::spawn({
+            let (state, shutdown) = (b.state.clone(), b.shutdown_rx());
+            async move { doewood_api::reclaim_sources(&state, shutdown).await }
+        });
+        let s = config(&chb)
+            .resume_source(pb::ResumeSourceRequest {
+                source_id: id.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(s.state, pb::SourceState::Active as i32);
+        assert!(!s.scanner_running, "{}", shared.name);
+
+        b.backend.send_replace(Some(shared.backend.clone()));
+        let found = pass.await.unwrap().unwrap();
+        assert_eq!(found.claimed, 1, "{}", shared.name);
+        assert!(get_source(&chb, &id).await.scanner_running);
+        let key = doewood_model::SourceKey::new(&endpoint, "later", "").unwrap();
+        let owner = shared.backend.source_owner(&key).await.unwrap().unwrap();
+        assert_eq!(owner.owner.as_str(), "inst-b");
+        b.stop().await;
+        shared.drop_schema().await;
+    }
+}

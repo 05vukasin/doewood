@@ -132,7 +132,8 @@ message Source {
   SourceState state = 11;
   // Why the source is in the error state.
   string state_reason = 12;
-  // The instance that owns (claimed) the source: this one.
+  // The instance that owns (claimed) the source: this one. A source another instance claimed
+  // is in the error state, with the owner in `state_reason`.
   string owner_instance = 13;
   // Whether its scanner task runs now.
   bool scanner_running = 14;

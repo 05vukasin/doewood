@@ -9,6 +9,32 @@ Before a source is stored, the instance **claims** it (its endpoint, bucket and 
 shared store. A source another instance owns is refused with `ALREADY_EXISTS`, naming that
 instance; removing the source releases the claim.
 
+## Claims
+
+A claim is a row in the shared store naming the owning instance (`DOEWOOD_INSTANCE_ID`) and when
+it first claimed the source ([ADR 0001](adr/0001-architecture.md), section 2). It has no lease
+and does not expire: it stays until its owner removes the source.
+
+With a shared Postgres, `serve` re-claims its sources at start, once the database answers
+(before that, no scanner runs):
+
+| the source in the shared store | result |
+|---|---|
+| claimed by nobody (for example added while standalone) | claimed for this instance, then scanned (a paused source stays paused) |
+| already claimed by this instance | claim kept, with its first time; scanned |
+| claimed by another instance | not taken over, not scanned, and the start goes on. An active or failing source turns `error` with `state_reason` `claimed by instance "<owner>" since <UTC time>; this instance does not scan it`; a paused one stays paused. A WARN names the owner. |
+| the database fails during the pass | the whole pass is retried with backoff (1 s doubling to 60 s) |
+
+`ListSources`, `GetSource` and `WatchProgress` show the state and the reason. Resuming such a
+source claims it first: while the other instance holds the claim, `ResumeSource` fails with
+`ALREADY_EXISTS` naming it; once that instance removes the source, `ResumeSource` claims and
+scans it. Standalone, nothing of this runs: claims live in the instance's own file.
+
+Known limits: objects that were already pending for a source before its claim went to another
+instance are still ingested from the local queue, and S3 event notifications sent to this
+instance for such a source are still accepted. Changing `DOEWOOD_INSTANCE_ID` makes the old name
+the owner of every source: keep it stable (on Kubernetes it is the pod name).
+
 ## Any S3-compatible store
 
 The client (`crates/doewood-s3`) is small on purpose: `rusty-s3` presigns each request with
