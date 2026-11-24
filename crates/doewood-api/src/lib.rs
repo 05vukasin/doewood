@@ -14,6 +14,8 @@
 //!   for a file sent to `Summarize`); every input is validated, and problems come back as
 //!   INVALID_ARGUMENT with their field paths.
 //! - **Secrets** are write-only: no response or error carries one.
+//! - **`GET /icons/{domain}`** (plain HTTP, on the same port): company icons, always proxied
+//!   through doewood (ADR 0002 section 5), behind the [`Icons`] trait.
 
 mod auth;
 mod claims;
@@ -21,6 +23,7 @@ mod config;
 mod convert;
 mod error;
 mod graph;
+mod icons;
 mod jobs;
 mod progress;
 mod records;
@@ -36,16 +39,22 @@ use std::sync::Arc;
 use doewood_model::Backend;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
+use tonic::service::Routes;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
 use tonic_health::ServingStatus;
 use tonic_health::server::HealthReporter;
 use tonic_web::GrpcWebLayer;
+use tower_layer::Layer as _;
 
 pub use auth::Authorize;
 pub use claims::{Reclaimed, reclaim_sources};
 pub use config::add_source;
+pub use icons::{
+    CACHE_HIT, CACHE_MISS, CSP, ICON_CONTENT_TYPES, ICONS_PATH, IconAnswer, Icons,
+    respond as icon_response,
+};
 pub use progress::{EventCounts, Progress};
 pub use reprocess::{ReprocessPhase, ReprocessView, Reprocessor};
 pub use state::{ApiOptions, ApiParts, ApiState};
@@ -156,10 +165,8 @@ pub async fn serve(
         };
     }
 
-    Server::builder()
-        .accept_http1(true)
-        .layer(GrpcWebLayer::new())
-        .add_service(health)
+    let mut grpc = Routes::builder();
+    grpc.add_service(health)
         .add_service(reflection_v1)
         .add_service(reflection_v1alpha)
         .add_service(guarded!(ConfigServiceServer))
@@ -167,7 +174,15 @@ pub async fn serve(
         .add_service(guarded!(RecordsServiceServer))
         .add_service(guarded!(GraphServiceServer))
         .add_service(guarded!(SearchServiceServer))
-        .add_service(guarded!(SummarizeServiceServer))
+        .add_service(guarded!(SummarizeServiceServer));
+    // gRPC-Web wraps the gRPC services only: it answers 400 to any other HTTP/1.1 request,
+    // so the icon route sits next to it, and everything else falls through to it.
+    let grpc = GrpcWebLayer::new().layer(grpc.routes().prepare());
+    let app = icons::router(state.parts().icons.clone()).fallback_service(grpc);
+
+    Server::builder()
+        .accept_http1(true)
+        .add_routes(Routes::from(app))
         .serve_with_incoming_shutdown(
             TcpIncoming::from(listener).with_nodelay(Some(true)),
             shutdown,

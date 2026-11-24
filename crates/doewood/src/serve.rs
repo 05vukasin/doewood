@@ -44,7 +44,7 @@ use tracing::{debug, error, info, warn};
 const API_DRAIN: Duration = Duration::from_secs(10);
 
 use crate::ops::{self, OpsState};
-use crate::{ingest, shared};
+use crate::{icons, ingest, shared};
 
 /// Builds the runtime and runs the service until a shutdown signal.
 pub fn main(loaded: Loaded) -> ExitCode {
@@ -190,6 +190,7 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
         }),
         summarize: ingest
             .map(|(_, s)| Arc::new(ingest::OnDemandSummaries(s)) as Arc<dyn doewood_api::OnDemand>),
+        icons: Some(Arc::new(icons::FaviconIcons::new(Arc::clone(&store)))),
         options: ApiOptions {
             max_message_bytes: config.api_max_message_bytes,
             shared_claims: shared,

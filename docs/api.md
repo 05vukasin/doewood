@@ -22,7 +22,8 @@ changes go to a new package (`doewood.v2`), never into v1.
   key), nor a presigned URL.
 
 The S3 event webhook is not part of the gRPC API: it is on the ops server (see
-[Event webhook](#event-webhook)).
+[Event webhook](#event-webhook)). One plain HTTP route shares the API port,
+`GET /icons/{domain}` (see [Company icons](#company-icons)).
 
 ## Services
 
@@ -288,6 +289,44 @@ mc admin service restart local
 mc event add local/docs arn:minio:sqs::doewood:webhook --event put,delete --prefix in/
 ```
 
+## Company icons
+
+```
+GET /icons/{domain}
+```
+
+The icon of a company's web site, fetched and checked by doewood and served from the API port,
+so a frontend on the same origin uses it as `<img src="/icons/acme.com">` and no third party
+learns which companies a user looks at. doewood always proxies the icon; it never redirects
+the browser to the site or to a favicon service. How the icon is found, the SSRF guard and the
+content checks are in [favicons.md](favicons.md). Like the API, it has no authentication in v1.
+
+`{domain}` is a bare host name (`acme.com`, `bücher.de`, percent-encoded or not), without a
+scheme, port, path or user info; an IP address is refused.
+
+| status | when | body | `Content-Type` | `Cache-Control` |
+|---|---|---|---|---|
+| `200` | an icon that passed the checks | the icon | from its magic bytes: `image/x-icon`, `image/png`, `image/gif`, `image/jpeg`, `image/webp` or `image/avif` (never the upstream one, never SVG) | `private, max-age=86400` |
+| `404` | no usable icon (also cached by doewood for 6 hours) | empty | `text/plain; charset=utf-8` | `private, max-age=21600` |
+| `400` | the domain is not valid | the reason | `text/plain; charset=utf-8` | `no-store` |
+| `503` | too many lookups at once (16); `Retry-After: 5` | empty | `text/plain; charset=utf-8` | `no-store` |
+
+Every answer also has:
+
+```
+X-Content-Type-Options: nosniff
+Content-Security-Policy: default-src 'none'; sandbox
+Cross-Origin-Resource-Policy: same-origin
+Referrer-Policy: no-referrer
+```
+
+A first lookup can take up to 12 s (the site, then the fallback when it is on); later ones
+come from the cache.
+
+```sh
+curl -si http://127.0.0.1:7443/icons/acme.com -o icon.bin
+```
+
 ## Scripts without a server
 
 `doewood dev add-source` (hidden) adds a source through the same code as `AddSource` (the same
@@ -351,5 +390,6 @@ page took 471 ms before and 69 ms after, with the same results.
 `cargo test -p doewood-api` starts in-process servers and calls every RPC with a tonic client:
 the happy paths, validation errors, two instances sharing one backend (the claim conflict),
 secrets never coming back, the progress stream, a gRPC-Web request over HTTP/1.1, health,
-reflection and the message limit. With `DOEWOOD_TEST_POSTGRES_URL` set, the claim, records,
+reflection and the message limit. `tests/icons.rs` checks the icon route's answers and
+headers with a fake resolver. With `DOEWOOD_TEST_POSTGRES_URL` set, the claim, records,
 graph and search tests also run against Postgres.

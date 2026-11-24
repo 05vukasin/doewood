@@ -22,6 +22,8 @@ Set through the API, kept in `doewood.sqlite`, applied without a restart:
 | An AI provider's API key | `SetAiProvider` | secret `ai/<name>/api_key` (sealed, write-only) |
 | The default AI provider (the LLM queue's) | `SetAiProvider` (`make_default`; the first one set) | setting `ai.default_provider` |
 | Ingest: least MinHash Jaccard estimate for a `similar_to` edge (above 0, at most 1, default `0.8`). Read for every file, so a change applies to the next file ingested. Edges already written are kept; `ReprocessJob` with `force` compares a source's documents again (a lower value adds edges, a higher one removes none). | `SetIngestSettings`, read with `GetIngestSettings` | setting `ingest.similar_min_jaccard` |
+| Company icons: ask the public fallback service (default off) | none yet (see [favicons.md](favicons.md#settings)) | setting `favicon.fallback` |
+| Company icons: the egress proxy (`http://` or `https://`, no credentials; default none) | none yet | setting `favicon.egress_proxy` |
 
 The LLM queue's state is in the store too: `llm_jobs` (queued documents) and `llm_usage` (each
 source's spend per UTC day). The provider variables quail and hedgehog read (`AI_PROVIDER`,

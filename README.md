@@ -51,7 +51,8 @@ grpcurl -plaintext 127.0.0.1:7443 list            # the services, through reflec
 
 The bootstrap variables are listed in [docs/configuration.md](docs/configuration.md), sources
 and discovery in [docs/sources.md](docs/sources.md), ingest in [docs/ingest.md](docs/ingest.md),
-the API, with `grpcurl` examples, in [docs/api.md](docs/api.md), and the image and the Helm
+the API, with `grpcurl` examples, in [docs/api.md](docs/api.md), company icons
+(`GET /icons/{domain}`) in [docs/favicons.md](docs/favicons.md), and the image and the Helm
 chart in [docs/deploy.md](docs/deploy.md).
 
 ## Layout
@@ -67,10 +68,12 @@ crates/
   doewood-enrich  company identity (ADR 0002 section 1), pure: names, legal forms, aliases,
                   identifier checks, the fuzzy score, evidence fusion, uuid5 group ids
   doewood-registry public registry clients (ADR 0002 section 2): failure-soft, capped,
-                  rate-limited, cached; GLEIF (LEI records, Level 2 parents, successors)
+                  rate-limited, cached; GLEIF (LEI records, Level 2 parents, successors);
+                  the favicon resolver with its SSRF guard (ADR 0002 section 5)
   doewood-ingest  ingest: fetch, quail and hedgehog, records, the graph (companies, references,
                   similar documents) and search; feature `ocr` (on in the binary)
-  doewood-api     the gRPC API (tonic, gRPC-Web, health, reflection); protos in proto/doewood/v1
+  doewood-api     the gRPC API (tonic, gRPC-Web, health, reflection) and GET /icons/{domain};
+                  protos in proto/doewood/v1
   doewood         the binary: serve, version, config check
 charts/doewood    the Helm chart (StatefulSet, one volume per instance)
 Dockerfile        the image, with OCR
