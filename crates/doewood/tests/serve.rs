@@ -411,6 +411,129 @@ fn serve_uses_postgres_when_reachable() {
     }
 }
 
+/// `dev add-source` into `dir`, with keys from the environment; the shared Postgres only when
+/// `pg` is given. Returns whether it worked, and stderr.
+fn dev_add(dir: &Path, instance: &str, pg: Option<&str>, bucket: &str) -> (bool, String) {
+    let mut cmd = bare(dir);
+    cmd.args([
+        "dev",
+        "add-source",
+        "--access-key-env",
+        "K",
+        "--secret-key-env",
+        "S",
+        "--endpoint",
+        "http://127.0.0.1:1",
+        "--bucket",
+        bucket,
+        "--interval-secs",
+        "3600",
+    ])
+    .env("K", "test-key-id")
+    .env("S", "test-secret-value")
+    .env("DOEWOOD_INSTANCE_ID", instance);
+    if let Some(url) = pg {
+        cmd.env("DOEWOOD_POSTGRES_URL", url);
+    }
+    let out = cmd.output().unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Runs `serve` on `dir` against the shared Postgres until its sources are re-claimed; returns
+/// the log lines up to then, and the summary line. Stops it with SIGTERM (Unix).
+fn serve_until_reclaimed(
+    dir: &Path,
+    instance: &str,
+    url: &str,
+) -> (Vec<serde_json::Value>, serde_json::Value) {
+    let mut child = KillOnDrop(
+        bare(dir)
+            .arg("serve")
+            .env("DOEWOOD_OPS_LISTEN", "127.0.0.1:0")
+            .env("DOEWOOD_LISTEN", "127.0.0.1:0")
+            .env("DOEWOOD_INSTANCE_ID", instance)
+            .env("DOEWOOD_POSTGRES_URL", url)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let rx = log_lines(child.0.stderr.take().unwrap());
+    let mut seen = Vec::new();
+    let listening = wait_for(&rx, &mut seen, OPS_LISTENING);
+    let addr: SocketAddr = listening["addr"].as_str().unwrap().parse().unwrap();
+    let summary = wait_for(&rx, &mut seen, "source claims checked in the shared store");
+    // The start did not fail: the instance is ready.
+    assert_eq!(get(addr, "/readyz"), (200, "ready\n".to_owned()));
+    let upto = seen.clone();
+    #[cfg(unix)]
+    terminate(&mut child, &rx, &mut seen);
+    (upto, summary)
+}
+
+/// Runs only when `DOEWOOD_TEST_POSTGRES_URL` is set (the postgres CI job sets it). `serve`
+/// re-claims the sources of its store at start: its own are claimed and scanned, one another
+/// instance claimed is reported and not scanned, and a restart keeps its claims (issue #12).
+#[test]
+fn serve_reclaims_its_sources_and_reports_conflicts() {
+    let Some(url) = std::env::var("DOEWOOD_TEST_POSTGRES_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    else {
+        eprintln!("skipping: DOEWOOD_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    // Unique names: the database is shared with other tests and earlier runs.
+    let run = uuid::Uuid::now_v7().simple().to_string();
+    let run = &run[run.len() - 12..];
+    let (a, b) = (format!("dw-a-{run}"), format!("dw-b-{run}"));
+    let (mine, taken) = (format!("mine-{run}"), format!("taken-{run}"));
+    let (dir_a, dir_b, dir_c) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    // A claims `taken` in the shared store. B has both sources in its own store only, as a
+    // standalone run left them.
+    let (ok, err) = dev_add(dir_a.path(), &a, Some(&url), &taken);
+    assert!(ok, "{err}");
+    for bucket in [&mine, &taken] {
+        let (ok, err) = dev_add(dir_b.path(), &b, None, bucket);
+        assert!(ok, "{err}");
+    }
+
+    for round in ["first start", "restart"] {
+        let (seen, summary) = serve_until_reclaimed(dir_b.path(), &b, &url);
+        assert_eq!(summary["claimed"], 1, "{round}: {summary}");
+        assert_eq!(summary["conflicts"], 1, "{round}: {summary}");
+        let scanned: Vec<_> = seen
+            .iter()
+            .filter(|l| l["message"] == "starting scanner")
+            .map(|l| l["bucket"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(scanned, std::slice::from_ref(&mine), "{round}: {seen:#?}");
+        let warn = seen
+            .iter()
+            .find(|l| l["message"] == "source claimed by another instance; not scanning it")
+            .unwrap_or_else(|| panic!("{round}: no conflict warning in {seen:#?}"));
+        assert_eq!(warn["level"], "WARN");
+        assert_eq!(warn["owner"], a.as_str());
+        let reason = warn["reason"].as_str().unwrap();
+        assert!(
+            reason.starts_with(&format!("claimed by instance \"{a}\" since ")),
+            "{reason}"
+        );
+    }
+
+    // B's claim on `mine` is in the shared store: a third instance is refused, B named.
+    let (ok, err) = dev_add(dir_c.path(), "dw-c", Some(&url), &mine);
+    assert!(!ok);
+    assert!(err.contains("AlreadyExists") && err.contains(&b), "{err}");
+}
+
 #[test]
 fn an_unusable_data_dir_is_fatal() {
     let tmp = tempfile::tempdir().unwrap();

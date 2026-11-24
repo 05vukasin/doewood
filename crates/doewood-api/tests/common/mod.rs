@@ -28,6 +28,8 @@ pub struct Instance {
     /// Sends events as the scanners would; they reach `progress`.
     pub events: mpsc::Sender<ObjectEvent>,
     pub backend: watch::Sender<Option<Arc<dyn Backend>>>,
+    /// The API's state, for calls the services do not expose (the start-up claim pass).
+    pub state: ApiState,
     shutdown: watch::Sender<bool>,
     server: JoinHandle<Result<(), doewood_api::ServeError>>,
 }
@@ -36,6 +38,8 @@ pub struct Options {
     pub max_message_bytes: usize,
     pub reprocess: Option<Arc<dyn Reprocessor>>,
     pub summarize: Option<Arc<dyn OnDemand>>,
+    /// As `serve` with a shared store: sources are re-claimed at start.
+    pub shared_claims: bool,
 }
 
 impl Default for Options {
@@ -44,6 +48,7 @@ impl Default for Options {
             max_message_bytes: 64 * 1024 * 1024,
             reprocess: None,
             summarize: None,
+            shared_claims: false,
         }
     }
 }
@@ -101,13 +106,14 @@ impl Instance {
             options: ApiOptions {
                 max_message_bytes: options.max_message_bytes,
                 progress_interval: Duration::from_millis(50),
+                shared_claims: options.shared_claims,
             },
             shutdown: shutdown_rx.clone(),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let mut stop = shutdown_rx;
-        let server = tokio::spawn(doewood_api::serve(listener, state, async move {
+        let server = tokio::spawn(doewood_api::serve(listener, state.clone(), async move {
             let _ = stop.wait_for(|s| *s).await;
         }));
         Self {
@@ -117,6 +123,7 @@ impl Instance {
             discovery,
             events,
             backend: backend_tx,
+            state,
             shutdown,
             server,
         }
@@ -128,6 +135,11 @@ impl Instance {
             .connect()
             .await
             .unwrap()
+    }
+
+    /// A shutdown receiver, as `serve` hands out.
+    pub fn shutdown_rx(&self) -> watch::Receiver<bool> {
+        self.shutdown.subscribe()
     }
 
     /// Stops the server; it must stop within a few seconds, streams included.

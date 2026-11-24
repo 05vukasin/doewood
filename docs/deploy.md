@@ -66,7 +66,10 @@ helm install doewood charts/doewood \
   --set postgres.existingSecret=doewood --set postgres.key=postgres-url
 ```
 
-Instances are independent: each has its own settings and sources, set through the API. Talk to
+Instances are independent: each has its own settings and sources, set through the API. Each
+source is claimed in the shared Postgres by one instance; a restarted pod re-claims its sources
+under the same name, and one another instance owns is reported (state `error`, the owner in the
+reason) instead of scanned (see [sources](sources.md#claims)). Talk to
 one instance through the headless Service, for example
 `doewood-0.doewood-headless.<namespace>.svc:7443`; the regular Service spreads calls over all of
 them, which suits only reads of the shared store.

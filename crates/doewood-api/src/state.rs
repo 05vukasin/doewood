@@ -2,6 +2,7 @@
 //! counters.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use doewood_core::{InstanceId, SourceId};
@@ -23,6 +24,10 @@ pub struct ApiOptions {
     pub max_message_bytes: usize,
     /// How often `WatchProgress` looks at the store when nothing notified it.
     pub progress_interval: Duration,
+    /// `serve` with a shared store: the sources are re-claimed at start
+    /// ([`crate::reclaim_sources`]). Until that pass finishes no scanner starts through the
+    /// API, and resuming a source claims it first. Off standalone (the default).
+    pub shared_claims: bool,
 }
 
 impl Default for ApiOptions {
@@ -30,6 +35,7 @@ impl Default for ApiOptions {
         Self {
             max_message_bytes: 64 * 1024 * 1024,
             progress_interval: Duration::from_secs(1),
+            shared_claims: false,
         }
     }
 }
@@ -68,17 +74,26 @@ struct Inner {
     /// Serializes source changes (add, update, remove), so a claim and the row that owns it
     /// never race.
     sources: tokio::sync::Mutex<()>,
+    /// Whether the start-up claim pass has finished (always, without shared claims).
+    claims_checked: AtomicBool,
 }
 
 impl ApiState {
     /// The state of an API built from these parts.
     pub fn new(parts: ApiParts) -> Self {
+        let claims_checked = AtomicBool::new(!parts.options.shared_claims);
         Self {
             inner: Arc::new(Inner {
                 parts,
                 sources: tokio::sync::Mutex::new(()),
+                claims_checked,
             }),
         }
+    }
+
+    /// The shutdown signal the API was built with.
+    pub fn shutdown(&self) -> watch::Receiver<bool> {
+        self.inner.parts.shutdown.clone()
     }
 
     pub(crate) fn parts(&self) -> &ApiParts {
@@ -87,6 +102,20 @@ impl ApiState {
 
     pub(crate) async fn lock_sources(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.inner.sources.lock().await
+    }
+
+    /// Whether sources are claimed in a shared store (see [`ApiOptions::shared_claims`]).
+    pub(crate) fn shared_claims(&self) -> bool {
+        self.inner.parts.options.shared_claims
+    }
+
+    /// Whether the start-up claim pass has finished.
+    pub(crate) fn claims_checked(&self) -> bool {
+        self.inner.claims_checked.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn claims_done(&self) {
+        self.inner.claims_checked.store(true, Ordering::Release);
     }
 
     pub(crate) fn instance(&self) -> &InstanceId {

@@ -16,6 +16,7 @@
 //! - **Secrets** are write-only: no response or error carries one.
 
 mod auth;
+mod claims;
 mod config;
 mod convert;
 mod error;
@@ -43,6 +44,7 @@ use tonic_health::server::HealthReporter;
 use tonic_web::GrpcWebLayer;
 
 pub use auth::Authorize;
+pub use claims::{Reclaimed, reclaim_sources};
 pub use config::add_source;
 pub use progress::{EventCounts, Progress};
 pub use reprocess::{ReprocessPhase, ReprocessView, Reprocessor};

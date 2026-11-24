@@ -49,14 +49,21 @@ The comments in the `.proto` files are the reference for every field. In short:
   and a trailing `/` dropped), so `HTTP://MinIO:9000/` and `http://minio:9000` are one source.
 - **UpdateSource** changes the region, URL style, scan interval, size cap or credentials
   (`clear_credentials` deletes them). The endpoint, bucket and prefix are the source's identity
-  and do not change. A running scanner restarts, so new options apply at once.
+  and do not change. A running scanner restarts, so new options apply at once (with a shared
+  Postgres, a source that is not scanned, for example one claimed by another instance, is not
+  started).
 - **PauseSource** stops the scanner (a pass under way keeps its checkpoint); **ResumeSource**
-  starts it again, and retries a failing source right away.
+  starts it again, and retries a failing source right away. With a shared Postgres it claims the
+  source first: when another instance owns it, the source turns `error` (the owner in
+  `state_reason`) and the call fails with `ALREADY_EXISTS`. Before the start-up claim pass has
+  run, it only stores the state, and the pass starts the scanner (see
+  [sources](sources.md#claims)).
 - **RemoveSource** releases the claim, stops the scanner, and deletes the source with its
   progress and credentials. If the shared store is unreachable it fails with `UNAVAILABLE` and
   removes nothing, so no claim is left behind.
 - While the shared Postgres is not connected yet, `AddSource`, `RemoveSource` and the records,
-  graph and search RPCs answer `UNAVAILABLE`; the rest works.
+  graph and search RPCs answer `UNAVAILABLE`; the rest works. Once the start-up claim pass has
+  run, `ResumeSource` needs the database too (it claims the source).
 
 ### LLM policy and AI providers
 

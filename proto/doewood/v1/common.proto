@@ -11,7 +11,8 @@ enum SourceState {
   // Not scanned until it is resumed.
   SOURCE_STATE_PAUSED = 2;
   // The last scan pass failed (see `state_reason`). Still scanned on its schedule; a pass that
-  // succeeds makes it active again.
+  // succeeds makes it active again. With a shared store, also a source another instance has
+  // claimed: `state_reason` names the owner, and it is not scanned until a resume can claim it.
   SOURCE_STATE_ERROR = 3;
   // Removed. Only reported by WatchProgress, when a watched source goes away.
   SOURCE_STATE_REMOVED = 4;

@@ -15,8 +15,11 @@
 //!    its workers; they wait for the backend while the shared Postgres is not connected.
 //! 8. start one scanner per active S3 source (none configured: nothing starts), accept S3
 //!    event notifications on the ops server, and serve the gRPC API. Sources added through
-//!    the API start scanning at once. Discovery events go to ingest through bounded channels,
-//!    so a busy ingest slows the scanners down instead of growing a queue.
+//!    the API start scanning at once. With `DOEWOOD_POSTGRES_URL`, no scanner starts before
+//!    the shared Postgres answers: the instance then re-claims each of its sources there and
+//!    scans those it owns; a source another instance claimed is marked and not scanned (see
+//!    [`doewood_api::reclaim_sources`]). Discovery events go to ingest through bounded
+//!    channels, so a busy ingest slows the scanners down instead of growing a queue.
 //!
 //! On SIGTERM or SIGINT: report not ready, stop the servers (the API finishes the calls in
 //! flight and ends its streams), the scanners (each keeps its checkpoint) and ingest (each
@@ -163,36 +166,43 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
         .as_ref()
         .map(|(i, _)| i.start(ingest_rx, shutdown_rx.clone()));
     let summarizing = ingest.as_ref().map(|(_, s)| s.start(shutdown_rx.clone()));
+    let shared = !config.is_standalone();
     let scanning = start_discovery(
         Arc::clone(&store),
         Arc::clone(&progress),
         ingest.is_some().then_some(ingest_tx),
         shutdown_rx.clone(),
+        shared,
     )
     .await;
     state.set_webhook(WebhookInlet::new(
         Arc::clone(&store),
         scanning.events.clone(),
     ));
-    let api_server = start_api(
-        &config,
-        api_listener,
-        ApiParts {
-            store: Arc::clone(&store),
-            backend: backend_rx.clone(),
-            instance: config.instance_id.clone(),
-            discovery: scanning.discovery.clone(),
-            progress,
-            reprocess: ingest.as_ref().map(|(i, _)| {
-                Arc::new(ingest::Reprocess(i.clone())) as Arc<dyn doewood_api::Reprocessor>
-            }),
-            summarize: ingest.map(|(_, s)| {
-                Arc::new(ingest::OnDemandSummaries(s)) as Arc<dyn doewood_api::OnDemand>
-            }),
-            options: ApiOptions::default(),
-            shutdown: shutdown_rx.clone(),
+    let api = ApiState::new(ApiParts {
+        store: Arc::clone(&store),
+        backend: backend_rx.clone(),
+        instance: config.instance_id.clone(),
+        discovery: scanning.discovery.clone(),
+        progress,
+        reprocess: ingest.as_ref().map(|(i, _)| {
+            Arc::new(ingest::Reprocess(i.clone())) as Arc<dyn doewood_api::Reprocessor>
+        }),
+        summarize: ingest
+            .map(|(_, s)| Arc::new(ingest::OnDemandSummaries(s)) as Arc<dyn doewood_api::OnDemand>),
+        options: ApiOptions {
+            max_message_bytes: config.api_max_message_bytes,
+            shared_claims: shared,
+            ..ApiOptions::default()
         },
-    )?;
+        shutdown: shutdown_rx.clone(),
+    });
+    // With a shared store, the sources are re-claimed once it answers, and only then scanned.
+    let reclaiming = shared.then(|| {
+        let (api, shutdown) = (api.clone(), shutdown_rx.clone());
+        tokio::spawn(async move { doewood_api::reclaim_sources(&api, shutdown).await })
+    });
+    let api_server = start_api(&config, api_listener, api)?;
 
     let signal = signals.recv().await;
     info!(signal, "shutting down");
@@ -204,6 +214,11 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
         Err(e) => warn!(error = %e, "ops server task failed"),
     }
     stop_api(api_server).await;
+    if let Some(task) = reclaiming
+        && let Err(e) = task.await
+    {
+        warn!(error = %e, "source claim task failed");
+    }
     state.clear_webhook();
     scanning.stop().await;
     if let Some(handle) = ingesting {
@@ -289,11 +304,10 @@ type ApiTask = tokio::task::JoinHandle<Result<(), doewood_api::ServeError>>;
 fn start_api(
     config: &BootstrapConfig,
     listener: TcpListener,
-    mut parts: ApiParts,
+    state: ApiState,
 ) -> Result<ApiTask, String> {
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
-    parts.options.max_message_bytes = config.api_max_message_bytes;
-    let shutdown = parts.shutdown.clone();
+    let shutdown = state.shutdown();
     info!(
         addr = %addr,
         max_message_mib = config.api_max_message_bytes / (1024 * 1024),
@@ -301,7 +315,7 @@ fn start_api(
     );
     Ok(tokio::spawn(doewood_api::serve(
         listener,
-        ApiState::new(parts),
+        state,
         wait_for(shutdown),
     )))
 }
@@ -358,25 +372,32 @@ impl Scanning {
     }
 }
 
-/// Starts one scanner per active source.
+/// Starts one scanner per active source; with a shared store, none yet (the start-up claim
+/// pass starts them).
 async fn start_discovery(
     store: Arc<Store>,
     progress: Arc<Progress>,
     ingest: Option<mpsc::Sender<ObjectEvent>>,
     shutdown: watch::Receiver<bool>,
+    shared: bool,
 ) -> Scanning {
     // Every event is counted for `WatchProgress`, then handed to ingest (or, without it,
     // logged and dropped).
     let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let sink = tokio::spawn(forward_events(events_rx, progress, ingest));
-    let discovery = match Discovery::start(
-        store,
-        events_tx.clone(),
-        shutdown,
-        DiscoveryOptions::default(),
-    )
-    .await
-    {
+    let options = DiscoveryOptions::default();
+    let started = if shared {
+        Discovery::idle(store, events_tx.clone(), shutdown, options)
+    } else {
+        Discovery::start(store, events_tx.clone(), shutdown, options).await
+    };
+    let discovery = match started {
+        Ok(d) if shared => {
+            info!(
+                "discovery started; the scanners start once the sources are re-claimed in the shared store"
+            );
+            Some(d)
+        }
         Ok(d) => {
             info!(scanners = d.len(), "discovery started");
             Some(d)

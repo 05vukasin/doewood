@@ -76,6 +76,15 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
   rustls. The server certificate is always verified, against the system roots plus the Mozilla
   roots; put a private CA into the system store.
 - Unset parameters get defaults: `connect_timeout=5`, `application_name=doewood`.
+- **Source claims at start.** No scanner starts before the database answers. Then the instance
+  claims each source of its SQLite store for `DOEWOOD_INSTANCE_ID` (a source added while
+  standalone gets its claim now; one it already owns keeps its claim and its first time) and
+  scans those. A source **another instance** owns is not taken over and does not fail the
+  start: it is not scanned, an active source turns `error` with the reason
+  `claimed by instance "doewood-1" since 2026-11-24T10:00:00Z; this instance does not scan it`
+  (a paused one stays paused), and a WARN `source claimed by another instance` names the owner.
+  The log line `source claims checked in the shared store` gives the counts. See
+  [sources](sources.md#claims).
 
 ### The master key
 
