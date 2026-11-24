@@ -37,8 +37,7 @@ service ConfigService {
   // Ingest's settings, with the defaults filled in.
   rpc GetIngestSettings(GetIngestSettingsRequest) returns (IngestSettings);
   // Changes ingest's settings; an unset field keeps its value. Applies to the next file
-  // ingested, without a restart. Documents already in the graph keep their edges until they
-  // are reprocessed.
+  // ingested, without a restart. Edges already written are kept.
   rpc SetIngestSettings(SetIngestSettingsRequest) returns (IngestSettings);
 }
 
