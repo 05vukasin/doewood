@@ -339,11 +339,11 @@ mod tests {
     #[test]
     fn digit_fields() {
         assert_eq!(
-            digits(Some(" 70114 ".to_owned()), 5).as_deref(),
-            Some("70114")
+            digits(Some(" 99001 ".to_owned()), 5).as_deref(),
+            Some("99001")
         );
-        assert_eq!(digits(Some("7011".to_owned()), 5), None);
-        assert_eq!(digits(Some("70a14".to_owned()), 5), None);
+        assert_eq!(digits(Some("9900".to_owned()), 5), None);
+        assert_eq!(digits(Some("99a01".to_owned()), 5), None);
         assert_eq!(digits(None, 5), None);
     }
 }

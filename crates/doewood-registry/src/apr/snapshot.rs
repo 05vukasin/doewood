@@ -380,37 +380,37 @@ mod tests {
     #[test]
     fn reads_the_set_and_interns() {
         let body = r#"{"DatumPreseka":"2026-11-01","Extra":[1,2],"Podaci":{
-            "10000013":{"PoslovnoIme":" Пекара Измишљена ДОО ","SifraOpstine":"70114",
+            "99000013":{"PoslovnoIme":" Пекара Измишљена ДОО ","SifraOpstine":"99001",
                 "NazivOpstine":"Измишљено","NazivStatus":"Активан","DatumOsnivanja":"2001-02-03",
                 "NazivPravneForme":"Друштво са ограниченом одговорношћу","SifraDelatnosti":"1071",
                 "Novo":{"x":1}},
-            "10000021":{"PoslovnoIme":"Primer Dva","SifraOpstine":70114,"NazivOpstine":"Измишљено",
+            "99000021":{"PoslovnoIme":"Primer Dva","SifraOpstine":99001,"NazivOpstine":"Измишљено",
                 "NazivStatus":null,"DatumOsnivanja":true},
             "1234":{"PoslovnoIme":"Short key"},
-            "10000048":{"PoslovnoIme":"   "}
+            "99000048":{"PoslovnoIme":"   "}
         }}"#;
         let s = parse(body.as_bytes(), 10, at()).unwrap();
         assert_eq!(s.len(), 2);
         assert_eq!(s.skipped, 2);
-        let r = s.record("10000013").unwrap();
+        let r = s.record("99000013").unwrap();
         assert_eq!(r.name.as_deref(), Some("Пекара Измишљена ДОО"));
         assert_eq!(r.as_of.as_deref(), Some("2026-11-01"));
         assert_eq!(r.activity.as_deref(), Some("1071"));
-        let r = s.record("10000021").unwrap();
-        assert_eq!(r.municipality_code.as_deref(), Some("70114"));
+        let r = s.record("99000021").unwrap();
+        assert_eq!(r.municipality_code.as_deref(), Some("99001"));
         assert_eq!(r.status, None);
         assert_eq!(r.founded, None);
-        // "70114" and "Измишљено" are stored once.
+        // "99001" and "Измишљено" are stored once.
         assert_eq!(s.pool.strings.len(), 6);
-        assert!(s.record("10000048").is_none());
-        assert!(s.record("1000001").is_none());
+        assert!(s.record("99000048").is_none());
+        assert!(s.record("9900001").is_none());
         assert_eq!(s.filter(|n| n.starts_with("Primer")).len(), 1);
     }
 
     #[test]
     fn refusals() {
         let one = r#"{"PoslovnoIme":"X"}"#;
-        let two = format!(r#"{{"Podaci":{{"10000013":{one},"10000021":{one}}}}}"#);
+        let two = format!(r#"{{"Podaci":{{"99000013":{one},"99000021":{one}}}}}"#);
         assert!(parse(two.as_bytes(), 2, at()).is_ok());
         assert!(
             parse(two.as_bytes(), 1, at())
@@ -423,8 +423,8 @@ mod tests {
             b"{}",
             b"{\"Podaci\":[]}",
             b"{\"Podaci\":{}}",
-            b"{\"Podaci\":{\"10000013\":{\"PoslovnoIme\":\"X\"}}} trailing",
-            b"{\"Podaci\":{\"10000013\":{\"PoslovnoIme\":\"X\"}",
+            b"{\"Podaci\":{\"99000013\":{\"PoslovnoIme\":\"X\"}}} trailing",
+            b"{\"Podaci\":{\"99000013\":{\"PoslovnoIme\":\"X\"}",
             b"<html>maintenance</html>",
         ] {
             assert!(
