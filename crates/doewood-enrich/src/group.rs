@@ -100,7 +100,7 @@ mod tests {
         let m = id(IdKind::RsMb, &mb("2108734"));
         let p = id(IdKind::RsPib, &mod_11_10("10873452"));
         let account = id(IdKind::Iban, &iban("RS", "265000000837164209"));
-        let duns = id(IdKind::Duns, "150483782");
+        let duns = id(IdKind::Duns, "604817352");
         let all = [
             account.clone(),
             p.clone(),

@@ -300,7 +300,7 @@ mod tests {
         assert_eq!(m.score, 0.6);
         assert!(!m.subset);
         // 2 of 4: 0.5.
-        assert!(no_match("Bank of America", "Bank of China"));
+        assert!(no_match("Bank of Primeria", "Bank of Exemplia"));
         // 3 of 6.
         assert!(no_match("Alfa Beta Gama Delta Ro", "Alfa Beta Gama Omega"));
         // Nothing shared.
@@ -309,7 +309,12 @@ mod tests {
 
     #[test]
     fn jurisdiction_veto() {
-        let us_cn = verdict("Bank of America", Some("US"), "Bank of China", Some("CN"));
+        let us_cn = verdict(
+            "Bank of Primeria",
+            Some("US"),
+            "Bank of Exemplia",
+            Some("CN"),
+        );
         assert_eq!(us_cn, FuzzyVerdict::Veto);
         // One core word, different countries: different companies even with equal names.
         assert_eq!(

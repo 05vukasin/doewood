@@ -139,7 +139,7 @@ mod tests {
         let rs = make_iban("RS", "265000000837164209");
         assert_eq!(rs.len(), 22);
         assert!(iban(&rs), "{rs}");
-        let de = make_iban("DE", "370400440837164209");
+        let de = make_iban("DE", "870199990837164209");
         assert!(iban(&de), "{de}");
         let gb = make_iban("GB", "PRIM20451797164209");
         assert!(iban(&gb), "{gb}");
@@ -170,11 +170,11 @@ mod tests {
 
     #[test]
     fn duns_is_format_only() {
-        assert!(duns("150483782"));
+        assert!(duns("604817352"));
         assert!(duns("080000001"));
-        assert!(!duns("15048378"));
-        assert!(!duns("1504837820"));
-        assert!(!duns("15048378A"));
+        assert!(!duns("60481735"));
+        assert!(!duns("6048173520"));
+        assert!(!duns("60481735A"));
         assert!(!duns(""));
     }
 

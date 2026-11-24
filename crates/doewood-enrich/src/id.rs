@@ -149,8 +149,8 @@ mod tests {
             assert_eq!(ok(kind, valid), valid, "{kind:?}");
             assert!(bad(kind, &broken(valid)), "{kind:?} {valid}");
         }
-        assert_eq!(ok(IdKind::Duns, "15-048-3782"), "150483782");
-        assert!(bad(IdKind::Duns, "15048378"));
+        assert_eq!(ok(IdKind::Duns, "60-481-7352"), "604817352");
+        assert!(bad(IdKind::Duns, "60481735"));
     }
 
     #[test]
