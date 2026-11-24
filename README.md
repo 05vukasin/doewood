@@ -61,13 +61,15 @@ crates/
                   and the standalone backend of the store traits (FTS5 search)
   doewood-pg      the shared Postgres (+ pgvector) backend of the store traits
   doewood-s3      S3 sources: a light SigV4 client, the incremental scanner, event inlets
+  doewood-enrich  company identity (ADR 0002 section 1), pure: names, legal forms, aliases,
+                  identifier checks, the fuzzy score, evidence fusion, uuid5 group ids
   doewood-ingest  ingest: fetch, quail and hedgehog, records, the graph (companies, references,
                   similar documents) and search; feature `ocr` (on in the binary)
   doewood-api     the gRPC API (tonic, gRPC-Web, health, reflection); protos in proto/doewood/v1
   doewood         the binary: serve, version, config check
 ```
 
-Planned: `doewood-enrich` (registries, ADR 0002).
+Planned: the registry clients of `doewood-enrich` (ADR 0002 section 2).
 
 The `.proto` files compile with `protox` (pure Rust) in `doewood-api`'s build script, so
 `cargo build` needs no `protoc`.

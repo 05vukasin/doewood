@@ -1,0 +1,18 @@
+[package]
+name = "doewood-enrich"
+description = "doewood's company identity: names, legal forms, aliases, identifier checks, fuzzy matching, evidence fusion and stable group ids (ADR 0002 section 1)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# Pure: no I/O, no store, no network. Registry clients (ADR 0002 section 2) come later.
+[dependencies]
+# quail's check-digit code (LEI, IBAN, PIB, MB, OIB, EU VAT), reused rather than copied.
+quail-signals = { git = "https://github.com/05vukasin/quail", rev = "62108d4" }
+unicode-normalization = "0.1"
+uuid = { workspace = true, features = ["v5"] }
+
+[lints]
+workspace = true
