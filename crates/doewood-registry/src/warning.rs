@@ -20,6 +20,8 @@ pub enum Registry {
     Edgar,
     /// The Serbian Business Registers Agency (APR): its open data, `openapi.apr.gov.rs`.
     Apr,
+    /// UK Companies House: the public data API, `api.company-information.service.gov.uk`.
+    CompaniesHouse,
 }
 
 impl Registry {
@@ -31,6 +33,7 @@ impl Registry {
             Self::Wikidata => "wikidata",
             Self::Edgar => "edgar",
             Self::Apr => "apr",
+            Self::CompaniesHouse => "companies_house",
         }
     }
 }
@@ -51,6 +54,14 @@ pub enum WarningKind {
     /// PIB); nothing was sent.
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// The registry needs an API key and none is configured (Companies House); nothing was
+    /// sent.
+    #[error("no API key configured")]
+    NotConfigured,
+    /// The registry refused the configured API key (401). The client then pauses; the key is
+    /// never part of the warning.
+    #[error("the API key was refused (HTTP 401)")]
+    KeyRefused,
     /// The client configuration is unusable (for example the base URL).
     #[error("configuration: {0}")]
     Config(String),
