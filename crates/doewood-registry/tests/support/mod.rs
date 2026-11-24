@@ -1,5 +1,6 @@
 //! A mock registry server on 127.0.0.1 and hand-written GLEIF fixtures. Every company, LEI and
-//! relationship here is invented; the LEIs only carry valid ISO 17442 check digits.
+//! relationship here is invented; the LEIs only carry valid ISO 17442 check digits. The VIES
+//! fixtures are in `vies.rs`.
 
 #![allow(dead_code)]
 
@@ -49,28 +50,45 @@ impl Reply {
         )
     }
 
+    pub fn json_status(status: u16, v: &Value) -> Self {
+        let mut r = Self::raw(status, serde_json::to_vec(v).unwrap());
+        r.headers = vec![("Content-Type".to_owned(), "application/json".to_owned())];
+        r
+    }
+
     pub fn header(mut self, k: &str, v: &str) -> Self {
         self.headers.push((k.to_owned(), v.to_owned()));
         self
     }
 }
 
-type Handler = dyn Fn(&str, usize) -> Reply + Send + Sync;
+type Handler = dyn Fn(&str, &[u8], usize) -> Reply + Send + Sync;
 
-/// An HTTP/1.1 server answering every request from a handler `(path and query, how many
-/// requests came before) -> Reply`, recording each request target.
+/// An HTTP/1.1 server answering every request from a handler, recording each request target
+/// and body.
 pub struct MockServer {
     pub base: String,
     requests: Arc<Mutex<Vec<String>>>,
+    bodies: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 impl MockServer {
+    /// A server whose handler is `(path and query, how many requests came before) -> Reply`.
     pub async fn start(handler: impl Fn(&str, usize) -> Reply + Send + Sync + 'static) -> Self {
+        Self::start_with_body(move |target, _, n| handler(target, n)).await
+    }
+
+    /// A server whose handler also gets the request body.
+    pub async fn start_with_body(
+        handler: impl Fn(&str, &[u8], usize) -> Reply + Send + Sync + 'static,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
         let handler: Arc<Handler> = Arc::new(handler);
         let seen = requests.clone();
+        let seen_bodies = bodies.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
@@ -78,6 +96,7 @@ impl MockServer {
                 };
                 let handler = handler.clone();
                 let seen = seen.clone();
+                let seen_bodies = seen_bodies.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut chunk = [0u8; 4096];
@@ -87,7 +106,21 @@ impl MockServer {
                             Ok(n) => buf.extend_from_slice(&chunk[..n]),
                         }
                     }
-                    let head = String::from_utf8_lossy(&buf).into_owned();
+                    let end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                    let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+                    let length = head
+                        .lines()
+                        .filter_map(|l| l.split_once(':'))
+                        .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+                        .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let mut body = buf[end..].to_vec();
+                    while body.len() < length {
+                        match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => body.extend_from_slice(&chunk[..n]),
+                        }
+                    }
                     let target = head
                         .lines()
                         .next()
@@ -97,9 +130,10 @@ impl MockServer {
                     let n = {
                         let mut s = seen.lock().unwrap();
                         s.push(target.clone());
+                        seen_bodies.lock().unwrap().push(body.clone());
                         s.len() - 1
                     };
-                    let reply = handler(&target, n);
+                    let reply = handler(&target, &body, n);
                     tokio::time::sleep(reply.delay).await;
                     let mut out =
                         format!("HTTP/1.1 {} Mock\r\nConnection: close\r\n", reply.status);
@@ -119,7 +153,13 @@ impl MockServer {
         Self {
             base: format!("http://{addr}/api/v1/"),
             requests,
+            bodies,
         }
+    }
+
+    /// Every request body so far, in order.
+    pub fn bodies(&self) -> Vec<Vec<u8>> {
+        self.bodies.lock().unwrap().clone()
     }
 
     /// Every request target so far (path and query).

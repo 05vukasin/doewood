@@ -2,7 +2,7 @@
 
 `crates/doewood-registry` holds the public registry clients of
 [ADR 0002](adr/0002-company-enrichment.md), section 2. `doewood-enrich` stays pure (no I/O);
-this crate does the requests and parses the answers into types. GLEIF is the first client; VIES,
+this crate does the requests and parses the answers into types. GLEIF and VIES are done;
 Wikidata, EDGAR, APR and Companies House follow, one at a time.
 
 Nothing calls the clients yet: the enrichment job (ADR 0002 section 6) that turns their answers
@@ -10,10 +10,11 @@ into company identifiers and dated edges comes later.
 
 ## What is sent
 
-Only identifiers and names: an LEI, or a legal name and a country code. Document content never
-leaves the instance (ADR 0002, the privacy rule). An identifier is validated before it is sent:
-an LEI must pass ISO 17442 (`doewood_enrich::check::lei`), so a typo or a placeholder is a
-warning and no request is made.
+Only identifiers and names: an LEI, a VAT number, or a legal name and a country code. Document
+content never leaves the instance (ADR 0002, the privacy rule). An identifier is validated before
+it is sent: an LEI must pass ISO 17442 (`doewood_enrich::check::lei`), a VAT number its
+country's format and check digits (`doewood_enrich::check::vat`), so a typo or a placeholder is
+a warning and no request is made.
 
 ## Shared behaviour
 
@@ -21,7 +22,8 @@ Every client is built on the same request loop (`Fetcher`):
 
 - **Failure-soft.** Every failure is a typed `Warning { registry, kind }`, never a panic or a
   failed ingest. The kinds: `Disabled`, `Config`, `InvalidInput`, `Timeout`, `Transport`,
-  `TooLarge`, `RateLimited`, `Status`, `Malformed`. The loop logs each one at `WARN`.
+  `TooLarge`, `RateLimited`, `Status`, `Malformed`, and `Vies` (a VIES error code). The loop
+  logs each one at `WARN`.
 - **Length-capped.** The body is read chunk by chunk and dropped as soon as it passes the cap
   (a larger `Content-Length` is refused before reading). It is never parsed.
 - **Typed.** JSON is read leniently (every field optional, unknown fields ignored), then checked:
@@ -33,6 +35,10 @@ Every client is built on the same request loop (`Fetcher`):
   bucket; a `Retry-After` longer than the limit gives up at once with `RateLimited`, so a lookup
   never hangs. Other statuses (400, 403, ...) are not retried. The HTTP-date form of
   `Retry-After` is not parsed; the backoff applies.
+- **The registry's own errors.** A client may read each answer before the status rules
+  (`Inspect`): to retry, to retry with the bucket emptied, or to fail at once with its own
+  warning. VIES uses it for the error codes it puts in the body.
+- **`GET` or JSON `POST`.** The transport sends either; VIES's documented endpoint is a `POST`.
 - **Timeouts.** One for connecting, and one for the whole request, body included.
 - **Cached, with a fetch date.** Answers are cached by request under keys like
   `gleif:lei-records/<LEI>`, with the date they were fetched; every answer returns that date
@@ -103,11 +109,77 @@ The on/off switch is not yet a runtime setting: it becomes one (store and API, A
 section 3) together with the other registries' switches and keys, when the enrichment job uses
 the clients.
 
+## VIES
+
+The EU's VAT Information Exchange System, keyless. doewood uses the documented REST endpoint
+(`https://ec.europa.eu/taxation_customs/vies/rest-api/`, the `CheckVatRequest` /
+`CheckVatResponse` of the EC's OpenAPI description):
+
+| call | requests | gives |
+|---|---|---|
+| `check(country, number)` | `POST check-vat-number` with `{"countryCode", "vatNumber"}` | `VatRecord`: valid or not, name, address, request date, request identifier |
+
+- **Before sending.** The country must be a VIES country: the 27 member states and `XI`
+  (Northern Ireland). Greece is `EL` in VIES: `GR` is accepted and sent as `EL`. `GB` left VIES
+  in 2021 and is refused, like any other country. The number may carry its prefix (`GR` too, for
+  Greece) and spaces, dots or dashes; it is compacted and validated with doewood-enrich (format,
+  and check digits where the country has a public algorithm). A malformed number, a bad check
+  digit or a placeholder is `InvalidInput`, and nothing is sent.
+- **Nothing else is sent.** No requester VAT number (`requesterMemberStateCode`,
+  `requesterNumber`) and no trader details: VIES then gives no consultation number, so
+  `request_identifier` is normally `None` (it is kept when VIES sends one).
+- **The answer.** `valid` is required. The answer must be about the number asked (its
+  `countryCode` and `vatNumber`, when present, must match), else it is `Malformed`. `name` and
+  `address` are kept only for a valid number; `---` (the member state does not share them) is
+  `None`. The address keeps VIES's line breaks. `requestDate` gives `request_date`.
+- **VIES errors** come as `{"actionSucceed": false, "errorWrappers": [{"error": CODE}]}`,
+  whatever the HTTP status (200, 4xx or 5xx); a `userError` other than `VALID` / `INVALID` is
+  read the same way. Each is a `WarningKind::Vies(ViesError)`, never an "invalid" answer, and
+  never cached:
+
+  | code | handling |
+  |---|---|
+  | `MS_MAX_CONCURRENT_REQ`, `MS_MAX_CONCURRENT_REQ_TIME`, `GLOBAL_MAX_CONCURRENT_REQ`, `GLOBAL_MAX_CONCURRENT_REQ_TIME` | too many requests: the bucket is emptied and the request retried with the backoff |
+  | `SERVICE_UNAVAILABLE`, `TIMEOUT` | retried with the backoff |
+  | `MS_UNAVAILABLE` | at once (a member state's outage or maintenance lasts hours; the enrichment job asks again later) |
+  | `INVALID_INPUT`, `INVALID_REQUESTER_INFO`, `VAT_BLOCKED`, `IP_BLOCKED`, any other code | at once; `ViesError::is_transient` is false for the first four |
+
+- **Cached** under `vies:check-vat-number/<prefix><number>` for 90 days, valid or invalid (the
+  ADR's refresh: on first sight, then every 90 days). A 404 is a `Status` warning and is not
+  cached: it is not an answer about the number.
+
+VIES publishes no rate limit. It refuses with the "max concurrent" codes when it or a member
+state is busy, and blocks addresses that poll hard, so the default is low: 20 requests a minute
+with a burst of 2, one bucket for all member states.
+
+### Settings
+
+`ViesConfig`, whose defaults are the production values:
+
+| field | default |
+|---|---|
+| `enabled` | `true` (keyless, ADR 0002 section 7) |
+| `base_url` | `https://ec.europa.eu/taxation_customs/vies/rest-api/` |
+| `timeout` / `connect_timeout` | 20 s (VIES waits on the member state) / 5 s |
+| `per_minute` / `burst` | 20 / 2 |
+| `max_body` | 64 KiB |
+| `max_retries` / `backoff` / `max_retry_after` | 2 / 2 s, doubling / 60 s |
+| `ttl` | 90 days |
+
+What the EC's OpenAPI description does not say, and is therefore handled defensively: which
+HTTP status comes with which error code (all are read from the body), and the full list of error
+codes (the eleven above are the faults VIES lists for its test service;
+any other is kept as `ViesError::Other`).
+
 ## Tests
 
 `cargo test -p doewood-registry`. The tests never reach a real registry: a mock HTTP server on
-127.0.0.1 answers with fixtures written by hand in the test code (invented companies, LEIs built
-with valid check digits, invented relationships). They cover the lookup, the name search, direct
+127.0.0.1 answers with fixtures written by hand in the test code (invented companies and
+addresses, LEIs and VAT numbers built with valid check digits, invented relationships). For
+VIES they cover a valid number with and without (`---`) name and address, an invalid one and its
+90-day cache, every error code under 200, 400 and 500 (retried or not, never cached), an outage
+followed by an answer, the busy backoff, 429, malformed and oversize bodies, numbers that are
+never sent, and the `GR`/`EL` and `XI` prefixes. For GLEIF they cover the lookup, the name search, direct
 and ultimate parents with every reporting exception, successors with dates, 404 and empty
 results, malformed JSON, oversize bodies (with and without `Content-Length`), 429 with
 `Retry-After`, 5xx backoff, timeouts, refused connections, the rate limiter's spacing on an

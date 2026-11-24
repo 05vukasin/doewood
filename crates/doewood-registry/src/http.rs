@@ -1,12 +1,12 @@
-//! The HTTP side: a `GET` that reads at most a capped body within a timeout, behind the
-//! [`Transport`] trait.
+//! The HTTP side: a `GET` or a JSON `POST` that reads at most a capped body within a timeout,
+//! behind the [`Transport`] trait.
 
 use std::fmt;
 use std::sync::Once;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use reqwest::header::{ACCEPT, RETRY_AFTER};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, RETRY_AFTER};
 use url::Url;
 
 /// An HTTP answer, its body read in full and within the cap.
@@ -20,7 +20,38 @@ pub struct Response {
     pub body: Vec<u8>,
 }
 
-/// Why a `GET` gave no [`Response`].
+/// One request: a `GET`, or a `POST` of a JSON body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Request<'a> {
+    /// The URL.
+    pub url: &'a Url,
+    /// The `Accept` header.
+    pub accept: &'a str,
+    /// `None`: a `GET`. `Some(body)`: a `POST` of `body` as `application/json`.
+    pub json: Option<&'a [u8]>,
+}
+
+impl<'a> Request<'a> {
+    /// `GET url`, asking for `accept`.
+    pub fn get(url: &'a Url, accept: &'a str) -> Self {
+        Self {
+            url,
+            accept,
+            json: None,
+        }
+    }
+
+    /// `POST url` with the JSON `body`, asking for `accept`.
+    pub fn post_json(url: &'a Url, accept: &'a str, body: &'a [u8]) -> Self {
+        Self {
+            url,
+            accept,
+            json: Some(body),
+        }
+    }
+}
+
+/// Why a request gave no [`Response`].
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TransportError {
     /// The request or reading the body took longer than the timeout.
@@ -34,14 +65,13 @@ pub enum TransportError {
     Other(String),
 }
 
-/// Sends a `GET` and reads at most `max_body` bytes of the answer.
+/// Sends a request and reads at most `max_body` bytes of the answer.
 #[async_trait]
 pub trait Transport: Send + Sync + fmt::Debug {
-    /// `GET url`, asking for `accept`.
-    async fn get(
+    /// Sends `request`.
+    async fn send(
         &self,
-        url: &Url,
-        accept: &str,
+        request: &Request<'_>,
         max_body: usize,
     ) -> Result<Response, TransportError>;
 }
@@ -74,17 +104,22 @@ impl HttpTransport {
 
 #[async_trait]
 impl Transport for HttpTransport {
-    async fn get(
+    async fn send(
         &self,
-        url: &Url,
-        accept: &str,
+        request: &Request<'_>,
         max_body: usize,
     ) -> Result<Response, TransportError> {
-        let request = async {
-            let mut resp = self
+        let builder = match request.json {
+            None => self.client.get(request.url.clone()),
+            Some(body) => self
                 .client
-                .get(url.clone())
-                .header(ACCEPT, accept)
+                .post(request.url.clone())
+                .header(CONTENT_TYPE, "application/json")
+                .body(body.to_vec()),
+        };
+        let exchange = async {
+            let mut resp = builder
+                .header(ACCEPT, request.accept)
                 .send()
                 .await
                 .map_err(transport)?;
@@ -112,7 +147,7 @@ impl Transport for HttpTransport {
             })
         };
         // reqwest's own timeout covers the body too; this one is the guarantee.
-        tokio::time::timeout(self.timeout, request)
+        tokio::time::timeout(self.timeout, exchange)
             .await
             .unwrap_or(Err(TransportError::Timeout))
     }

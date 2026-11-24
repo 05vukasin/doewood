@@ -3,11 +3,15 @@
 use std::fmt;
 use std::time::Duration;
 
+use crate::vies::ViesError;
+
 /// A registry client.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Registry {
     /// GLEIF, `api.gleif.org`.
     Gleif,
+    /// The EU's VAT Information Exchange System (VIES), `ec.europa.eu`.
+    Vies,
 }
 
 impl Registry {
@@ -15,6 +19,7 @@ impl Registry {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Gleif => "gleif",
+            Self::Vies => "vies",
         }
     }
 }
@@ -61,6 +66,10 @@ pub enum WarningKind {
     /// The body was not the JSON the client expects.
     #[error("malformed response: {0}")]
     Malformed(String),
+    /// VIES answered with one of its error codes: it could not say whether the number is
+    /// valid. Never an "invalid" answer, and never cached.
+    #[error("VIES error {}", .0.code())]
+    Vies(ViesError),
 }
 
 /// A registry failure: which registry and why. Never fatal; the caller logs it and goes on.

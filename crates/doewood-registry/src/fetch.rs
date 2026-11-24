@@ -1,5 +1,5 @@
-//! The request loop every registry client shares: cache, rate limiter, capped `GET`, retries
-//! with backoff, `Retry-After`.
+//! The request loop every registry client shares: cache, rate limiter, capped `GET` or JSON
+//! `POST`, retries with backoff, `Retry-After`, and a client's own reading of error answers.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,7 +8,7 @@ use url::Url;
 
 use crate::cache::{Cache, CacheEntry, Cached};
 use crate::clock::Clock;
-use crate::http::{Transport, TransportError};
+use crate::http::{Request, Response, Transport, TransportError};
 use crate::limit::TokenBucket;
 use crate::warning::{Registry, Warning, WarningKind};
 
@@ -48,6 +48,41 @@ pub struct Fetch {
     pub fetched_at: time::OffsetDateTime,
     /// Whether it came from the cache.
     pub cached: bool,
+}
+
+/// A client's answer with its fetch date (from the cache, or now).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fetched<T> {
+    /// The answer.
+    pub value: T,
+    /// When the registry gave it.
+    pub fetched_at: time::OffsetDateTime,
+}
+
+impl<T> Fetched<T> {
+    /// `value`, dated by `fetch`.
+    pub fn new(value: T, fetch: &Fetch) -> Self {
+        Self {
+            value,
+            fetched_at: fetch.fetched_at,
+        }
+    }
+}
+
+/// How a client reads an HTTP answer before the default status handling (see
+/// [`Fetcher::send`]). Registries such as VIES report their own errors in the body, sometimes
+/// with a 200.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Inspect {
+    /// The default: 2xx is the answer, 404 is "no such record", 429 and 5xx are retried, any
+    /// other status is a [`WarningKind::Status`].
+    Status,
+    /// A transient failure: retried with the backoff, then this warning.
+    Retry(WarningKind),
+    /// The registry is overloaded: the bucket is emptied, then as [`Inspect::Retry`].
+    Busy(WarningKind),
+    /// A failure that a retry does not fix: this warning at once.
+    Fail(WarningKind),
 }
 
 impl Fetch {
@@ -97,11 +132,22 @@ impl Fetcher {
     /// yet: the client calls [`Fetcher::remember`] once it has parsed it, so a malformed body
     /// is never cached.
     pub async fn get(&self, key: &str, url: &Url, accept: &str) -> Result<Fetch, Warning> {
+        self.send(key, &Request::get(url, accept), &|_| Inspect::Status)
+            .await
+    }
+
+    /// As [`Fetcher::get`], for any request, with `inspect` reading each HTTP answer first.
+    pub async fn send(
+        &self,
+        key: &str,
+        request: &Request<'_>,
+        inspect: &(dyn Fn(&Response) -> Inspect + Sync),
+    ) -> Result<Fetch, Warning> {
         let key = self.key(key);
         if let Some(hit) = self.fresh(&key).await {
             return Ok(hit);
         }
-        let result = self.fetch(url, accept).await;
+        let result = self.fetch(request, inspect).await;
         if let Err(w) = &result {
             tracing::warn!(registry = %self.registry, key, warning = %w.kind,
                 "registry request failed");
@@ -156,36 +202,52 @@ impl Fetcher {
         })
     }
 
-    async fn fetch(&self, url: &Url, accept: &str) -> Result<Fetch, Warning> {
+    async fn fetch(
+        &self,
+        request: &Request<'_>,
+        inspect: &(dyn Fn(&Response) -> Inspect + Sync),
+    ) -> Result<Fetch, Warning> {
         let mut attempt = 0u32;
         loop {
             self.bucket.acquire(self.clock.as_ref()).await;
-            let answer = self.transport.get(url, accept, self.policy.max_body).await;
+            let answer = self.transport.send(request, self.policy.max_body).await;
             let fetched_at = self.clock.now_utc();
             let backoff = self.backoff(attempt);
-            let (kind, wait) = match answer {
-                Ok(r) if (200..300).contains(&r.status) => {
-                    return Ok(Fetch::new(Body::Found(r.body), fetched_at));
-                }
-                Ok(r) if r.status == 404 => return Ok(Fetch::new(Body::NotFound, fetched_at)),
-                Ok(r) if r.status == 429 => {
-                    let after = r.retry_after.as_deref().and_then(retry_after);
-                    let kind = WarningKind::RateLimited { retry_after: after };
-                    if after.is_some_and(|a| a > self.policy.max_retry_after) {
-                        return Err(self.warning(kind));
-                    }
+            let verdict = match &answer {
+                Ok(r) => inspect(r),
+                Err(_) => Inspect::Status,
+            };
+            let (kind, wait) = match (verdict, answer) {
+                (Inspect::Retry(kind), _) => (kind, backoff),
+                (Inspect::Busy(kind), _) => {
                     self.bucket.drain(self.clock.as_ref()).await;
-                    (kind, after.unwrap_or(backoff))
+                    (kind, backoff)
                 }
-                Ok(r) if r.status >= 500 => (WarningKind::Status(r.status), backoff),
-                Ok(r) => return Err(self.warning(WarningKind::Status(r.status))),
-                Err(TransportError::TooLarge) => {
-                    return Err(self.warning(WarningKind::TooLarge {
-                        limit: self.policy.max_body,
-                    }));
-                }
-                Err(TransportError::Timeout) => (WarningKind::Timeout, backoff),
-                Err(TransportError::Other(e)) => (WarningKind::Transport(e), backoff),
+                (Inspect::Fail(kind), _) => return Err(self.warning(kind)),
+                (Inspect::Status, answer) => match answer {
+                    Ok(r) if (200..300).contains(&r.status) => {
+                        return Ok(Fetch::new(Body::Found(r.body), fetched_at));
+                    }
+                    Ok(r) if r.status == 404 => return Ok(Fetch::new(Body::NotFound, fetched_at)),
+                    Ok(r) if r.status == 429 => {
+                        let after = r.retry_after.as_deref().and_then(retry_after);
+                        let kind = WarningKind::RateLimited { retry_after: after };
+                        if after.is_some_and(|a| a > self.policy.max_retry_after) {
+                            return Err(self.warning(kind));
+                        }
+                        self.bucket.drain(self.clock.as_ref()).await;
+                        (kind, after.unwrap_or(backoff))
+                    }
+                    Ok(r) if r.status >= 500 => (WarningKind::Status(r.status), backoff),
+                    Ok(r) => return Err(self.warning(WarningKind::Status(r.status))),
+                    Err(TransportError::TooLarge) => {
+                        return Err(self.warning(WarningKind::TooLarge {
+                            limit: self.policy.max_body,
+                        }));
+                    }
+                    Err(TransportError::Timeout) => (WarningKind::Timeout, backoff),
+                    Err(TransportError::Other(e)) => (WarningKind::Transport(e), backoff),
+                },
             };
             if attempt >= self.policy.max_retries {
                 return Err(self.warning(kind));
