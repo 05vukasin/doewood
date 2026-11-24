@@ -287,7 +287,7 @@ impl Edgar {
         })
     }
 
-    /// The company with CIK `cik` (`320193`, `0000320193`, `CIK0000320193`); `None` when
+    /// The company with CIK `cik` (`42`, `0000000042`, `CIK0000000042`); `None` when
     /// EDGAR has none. An invalid CIK is [`WarningKind::InvalidInput`], and nothing is sent.
     pub async fn company(&self, cik: &str) -> Result<Fetched<Option<Company>>, Warning> {
         self.on()?;

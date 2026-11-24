@@ -22,7 +22,7 @@ impl Cik {
         (1..=9_999_999_999).contains(&n).then_some(Self(n))
     }
 
-    /// `320193`, `0000320193` or `CIK0000320193`: 1 to 10 ASCII digits, optionally after
+    /// `42`, `0000000042` or `CIK0000000042`: 1 to 10 ASCII digits, optionally after
     /// `CIK`, surrounding whitespace ignored. Anything else is `None`.
     pub fn parse(s: &str) -> Option<Self> {
         let t = s.trim();
