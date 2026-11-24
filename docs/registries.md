@@ -5,6 +5,9 @@
 this crate does the requests and parses the answers into types: GLEIF, VIES, Wikidata,
 SEC EDGAR, the Serbian APR and UK Companies House.
 
+The same crate holds the favicon resolver behind `GET /icons/{domain}` (ADR 0002 section 5),
+with its SSRF guard; see [favicons.md](favicons.md).
+
 Nothing calls the clients yet: the enrichment job (ADR 0002 section 6) that turns their answers
 into company identifiers and dated edges comes later.
 
