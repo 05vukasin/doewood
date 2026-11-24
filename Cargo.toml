@@ -13,6 +13,7 @@ repository = "https://github.com/05vukasin/doewood"
 rust-version = "1.97"
 
 [workspace.dependencies]
+doewood-api = { path = "crates/doewood-api" }
 doewood-core = { path = "crates/doewood-core" }
 doewood-model = { path = "crates/doewood-model" }
 doewood-pg = { path = "crates/doewood-pg" }
