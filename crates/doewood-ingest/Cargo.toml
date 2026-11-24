@@ -19,6 +19,8 @@ async-trait.workspace = true
 # Same build as quail's (`pure`: no C toolchain, SIMD still selected at runtime).
 blake3 = { version = "1.8", default-features = false, features = ["std", "pure"] }
 doewood-core.workspace = true
+# The company identity rules (ADR 0002 section 1).
+doewood-enrich.workspace = true
 doewood-model.workspace = true
 doewood-s3.workspace = true
 doewood-store.workspace = true
@@ -32,7 +34,6 @@ quail-cli = { git = "https://github.com/05vukasin/quail", rev = "62108d4" }
 quail-core = { git = "https://github.com/05vukasin/quail", rev = "62108d4" }
 quail-engine = { git = "https://github.com/05vukasin/quail", rev = "62108d4" }
 quail-ocr = { git = "https://github.com/05vukasin/quail", rev = "62108d4", optional = true }
-quail-signals = { git = "https://github.com/05vukasin/quail", rev = "62108d4" }
 quail-sketch = { git = "https://github.com/05vukasin/quail", rev = "62108d4" }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
@@ -40,7 +41,6 @@ thiserror.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 tracing.workspace = true
-unicode-normalization = "0.1"
 uuid.workspace = true
 
 [dev-dependencies]

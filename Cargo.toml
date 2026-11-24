@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
-# Planned crates (ADR 0001), added one per step: doewood-enrich (registries, ADR 0002) is next.
+# Planned crates (ADR 0001), added one per step: the registry clients of doewood-enrich (ADR 0002
+# section 2) are next.
 members = ["crates/*"]
 
 [workspace.package]
@@ -13,6 +14,7 @@ rust-version = "1.97"
 [workspace.dependencies]
 doewood-api = { path = "crates/doewood-api" }
 doewood-core = { path = "crates/doewood-core" }
+doewood-enrich = { path = "crates/doewood-enrich" }
 # Features are chosen by the binary (`ocr`, on by default there).
 doewood-ingest = { path = "crates/doewood-ingest", default-features = false }
 doewood-model = { path = "crates/doewood-model" }
