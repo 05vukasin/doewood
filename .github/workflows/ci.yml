@@ -141,8 +141,15 @@ jobs:
           done
           curl -sf 127.0.0.1:7444/healthz
           curl -sf 127.0.0.1:7444/readyz
+          docker exec dw id
           test "$(docker exec dw id -u)" = 10001
-          # OCR runs with the models of the image.
+          # OCR runs with the models of the image. Ingest is set up after the store is ready
+          # (reading the models takes a moment), so wait for its log line.
+          for i in $(seq 1 60); do
+            docker logs dw 2>&1 | grep -q '"ocr":"Ready' && break
+            sleep 1
+          done
+          docker logs dw 2>&1 | grep '"ingest configured"'
           docker logs dw 2>&1 | grep -q '"ocr":"Ready'
           docker rm -f dw
       - uses: azure/setup-helm@v4
