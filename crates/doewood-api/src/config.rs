@@ -1,5 +1,5 @@
-//! `ConfigService`: sources, LLM policies, AI providers and ingest's settings. Every change applies without a
-//! restart; secrets are write-only.
+//! `ConfigService`: sources, LLM policies, AI providers and ingest's settings. Every change
+//! applies without a restart; secrets are write-only.
 
 use doewood_core::SourceId;
 use doewood_model::SourceKey;

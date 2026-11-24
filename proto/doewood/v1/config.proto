@@ -1,6 +1,7 @@
 // Runtime configuration: S3 sources, their LLM policies, the AI providers and ingest's
-// settings (ADR 0001, sections 3, 5 and 6). Changes apply without a restart. Secrets (S3 credentials, API keys)
-// are write-only: no response ever carries one, only whether one is set.
+// settings (ADR 0001, sections 3, 5 and 6). Changes apply without a restart. Secrets (S3
+// credentials, API keys) are write-only: no response ever carries one, only whether one is
+// set.
 syntax = "proto3";
 
 package doewood.v1;

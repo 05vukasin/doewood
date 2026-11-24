@@ -6,9 +6,8 @@ doewood has two kinds of settings, and each setting has exactly one source
 - **Bootstrap values** come from environment variables, listed below. Every one has a default,
   so `doewood serve` starts with no environment at all.
 - **Runtime settings** (S3 sources and credentials, AI providers, policies, schedules, ingest
-  tuning) are set
-  through the [gRPC API](api.md) and kept in the instance's SQLite store. Secrets are encrypted
-  with the master key and are write-only: the API never returns them.
+  tuning) are set through the [gRPC API](api.md) and kept in the instance's SQLite store.
+  Secrets are encrypted with the master key and are write-only: the API never returns them.
 
 ## Runtime settings
 
