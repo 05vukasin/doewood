@@ -204,6 +204,17 @@ pub struct Record {
     pub updated_at: i64,
 }
 
+/// Largest page of [`crate::RecordStore::list_records`].
+pub const RECORDS_MAX_LIMIT: u32 = 1000;
+
+/// The page size [`crate::RecordStore::list_records`] uses for `limit`.
+pub fn records_limit(limit: u32) -> u32 {
+    match limit {
+        0 => 50,
+        n => n.min(RECORDS_MAX_LIMIT),
+    }
+}
+
 /// What a put did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PutOutcome {

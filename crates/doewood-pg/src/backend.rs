@@ -10,7 +10,7 @@ use doewood_model::{
     Backend, Blake3, ClaimStore, Direction, Edge, EdgeKind, EdgeSource, Error, GraphStore, Located,
     Neighbour, NeighbourQuery, Node, NodeKind, ObjectLocation, PutOutcome, Record, RecordStore,
     Result, SearchDoc, SearchHit, SearchQuery, SearchStore, SourceClaim, SourceKey, StepVersions,
-    StoredEdge, validate_node, versions_from_json, versions_to_json,
+    StoredEdge, records_limit, validate_node, versions_from_json, versions_to_json,
 };
 use serde_json::Value;
 use tokio_postgres::error::SqlState;
@@ -252,6 +252,43 @@ impl RecordStore for PgStore {
             })
         })
         .transpose()
+    }
+
+    async fn list_records(
+        &self,
+        source: &SourceKey,
+        after: Option<&Blake3>,
+        limit: u32,
+    ) -> Result<Vec<Record>> {
+        let c = client(&self.pool).await?;
+        let after = after.map(|h| h.as_bytes().to_vec());
+        let rows = c
+            .query(
+                "SELECT r.blake3, r.record, r.versions, extract(epoch FROM r.updated_at)::bigint \
+                 FROM records r WHERE ($4::bytea IS NULL OR r.blake3 > $4) \
+                 AND EXISTS (SELECT 1 FROM locations l WHERE l.blake3 = r.blake3 \
+                 AND l.endpoint = $1 AND l.bucket = $2 AND starts_with(l.object_key, $3)) \
+                 ORDER BY r.blake3 LIMIT $5",
+                &[
+                    &source.endpoint(),
+                    &source.bucket(),
+                    &source.prefix(),
+                    &after,
+                    &i64::from(records_limit(limit)),
+                ],
+            )
+            .await
+            .map_err(pg)?;
+        rows.iter()
+            .map(|r| {
+                Ok(Record {
+                    blake3: Blake3::from_slice(r.try_get::<_, &[u8]>(0).map_err(pg)?)?,
+                    body: r.try_get(1).map_err(pg)?,
+                    versions: versions_from_json(&r.try_get::<_, Value>(2).map_err(pg)?)?,
+                    updated_at: r.try_get(3).map_err(pg)?,
+                })
+            })
+            .collect()
     }
 }
 

@@ -17,7 +17,7 @@ pub use error::{Error, Result};
 pub use traits::{Backend, ClaimStore, GraphStore, RecordStore, SearchStore};
 pub use types::{
     Blake3, Direction, Edge, EdgeKind, EdgeSource, EdgeState, Located, NODE_KEY_MAX_LEN, Neighbour,
-    NeighbourQuery, Node, NodeKind, ObjectLocation, PutOutcome, Record, SEARCH_MAX_LIMIT,
-    SearchDoc, SearchHit, SearchQuery, SourceClaim, SourceKey, StepVersions, StoredEdge,
-    validate_node, versions_from_json, versions_to_json,
+    NeighbourQuery, Node, NodeKind, ObjectLocation, PutOutcome, RECORDS_MAX_LIMIT, Record,
+    SEARCH_MAX_LIMIT, SearchDoc, SearchHit, SearchQuery, SourceClaim, SourceKey, StepVersions,
+    StoredEdge, records_limit, validate_node, versions_from_json, versions_to_json,
 };

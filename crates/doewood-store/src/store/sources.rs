@@ -105,6 +105,144 @@ impl FromStr for UrlStyle {
     }
 }
 
+/// Which documents of a source get an LLM summary (ADR 0001, section 6). Ingest always stores
+/// the record first; summaries then go through the instance's LLM queue.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum LlmMode {
+    /// None (the default: no LLM spend without opting in).
+    #[default]
+    Off,
+    /// Every document.
+    All,
+    /// Only documents of these kinds (`invoice`, `contract`, ...).
+    Kinds(Vec<String>),
+    /// None automatically; only when asked through the API.
+    OnDemand,
+}
+
+impl LlmMode {
+    /// `off`, `all`, `kinds` or `on_demand`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::All => "all",
+            Self::Kinds(_) => "kinds",
+            Self::OnDemand => "on_demand",
+        }
+    }
+}
+
+/// Default of [`LlmPolicy::concurrency`].
+pub const DEFAULT_LLM_CONCURRENCY: u32 = 2;
+/// Largest [`LlmPolicy::concurrency`].
+pub const MAX_LLM_CONCURRENCY: u32 = 64;
+/// Most kinds a [`LlmMode::Kinds`] policy lists.
+pub const MAX_LLM_KINDS: usize = 100;
+
+/// A source's LLM policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LlmPolicy {
+    /// Which documents are summarized.
+    pub mode: LlmMode,
+    /// Summaries of this source in flight at once (1 to [`MAX_LLM_CONCURRENCY`]).
+    pub concurrency: u32,
+    /// Tokens (prompt plus completion) this source may spend per UTC day; `None` is no limit.
+    pub daily_token_budget: Option<u64>,
+}
+
+impl Default for LlmPolicy {
+    fn default() -> Self {
+        Self {
+            mode: LlmMode::Off,
+            concurrency: DEFAULT_LLM_CONCURRENCY,
+            daily_token_budget: None,
+        }
+    }
+}
+
+impl LlmPolicy {
+    /// Checks the policy: a concurrency from 1 to 64, a positive budget if any, and for
+    /// `kinds` 1 to 100 kind names of 1 to 64 ASCII letters, digits, `_`, `-` or `.`.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        let bad = |m: String| Err(StoreError::InvalidSource(m));
+        if !(1..=MAX_LLM_CONCURRENCY).contains(&self.concurrency) {
+            return bad(format!(
+                "the LLM concurrency must be 1 to {MAX_LLM_CONCURRENCY}"
+            ));
+        }
+        if self.daily_token_budget == Some(0) {
+            return bad("a daily token budget must be positive (unset means no limit)".into());
+        }
+        if let LlmMode::Kinds(kinds) = &self.mode {
+            if kinds.is_empty() || kinds.len() > MAX_LLM_KINDS {
+                return bad(format!("a kinds policy lists 1 to {MAX_LLM_KINDS} kinds"));
+            }
+            if let Some(k) = kinds.iter().find(|k| !valid_kind(k)) {
+                return bad(format!(
+                    "kind {k:?} is not 1 to 64 ASCII letters, digits, '_', '-' or '.'"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The policy as stored in `sources.policy_json`.
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut v = serde_json::json!({
+            "mode": self.mode.name(),
+            "concurrency": self.concurrency,
+        });
+        if let LlmMode::Kinds(kinds) = &self.mode {
+            v["kinds"] = serde_json::json!(kinds);
+        }
+        if let Some(b) = self.daily_token_budget {
+            v["daily_token_budget"] = serde_json::json!(b);
+        }
+        v
+    }
+
+    /// Reads a stored policy; `{}` (a source added before policies existed) is the default.
+    pub fn from_json(value: &serde_json::Value) -> Result<Self, StoreError> {
+        let bad = || StoreError::InvalidSource("stored LLM policy is malformed".to_owned());
+        let obj = value.as_object().ok_or_else(bad)?;
+        let mut policy = Self::default();
+        if let Some(c) = obj.get("concurrency") {
+            policy.concurrency = c
+                .as_u64()
+                .and_then(|c| u32::try_from(c).ok())
+                .ok_or_else(bad)?;
+        }
+        if let Some(b) = obj.get("daily_token_budget") {
+            policy.daily_token_budget = Some(b.as_u64().ok_or_else(bad)?);
+        }
+        policy.mode = match obj.get("mode") {
+            None => LlmMode::Off,
+            Some(m) => match m.as_str().ok_or_else(bad)? {
+                "off" => LlmMode::Off,
+                "all" => LlmMode::All,
+                "on_demand" => LlmMode::OnDemand,
+                "kinds" => LlmMode::Kinds(
+                    obj.get("kinds")
+                        .and_then(serde_json::Value::as_array)
+                        .ok_or_else(bad)?
+                        .iter()
+                        .map(|k| k.as_str().map(str::to_owned).ok_or_else(bad))
+                        .collect::<Result<_, _>>()?,
+                ),
+                _ => return Err(bad()),
+            },
+        };
+        Ok(policy)
+    }
+}
+
+/// Whether `k` is a valid document kind name for a policy.
+pub fn valid_kind(k: &str) -> bool {
+    (1..=64).contains(&k.len())
+        && k.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
 /// A source to add.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewSource {
@@ -122,8 +260,10 @@ pub struct NewSource {
     pub max_object_bytes: Option<u64>,
     /// Time between the end of one scan pass and the start of the next.
     pub scan_interval: Duration,
-    /// The initial state.
+    /// The initial state: active or paused.
     pub state: SourceState,
+    /// Which documents get an LLM summary.
+    pub llm_policy: LlmPolicy,
 }
 
 impl NewSource {
@@ -138,10 +278,17 @@ impl NewSource {
             max_object_bytes: None,
             scan_interval: DEFAULT_SCAN_INTERVAL,
             state: SourceState::Active,
+            llm_policy: LlmPolicy::default(),
         }
     }
 
     fn validate(&self) -> Result<(), StoreError> {
+        if !matches!(self.state, SourceState::Active | SourceState::Paused) {
+            return Err(StoreError::InvalidSource(
+                "a new source is active or paused".to_owned(),
+            ));
+        }
+        self.llm_policy.validate()?;
         let bad = |m: &str| Err(StoreError::InvalidSource(m.to_owned()));
         let lower = self.endpoint.to_ascii_lowercase();
         if !(lower.starts_with("http://") || lower.starts_with("https://")) {
@@ -163,13 +310,59 @@ impl NewSource {
         if self.prefix.len() > 1024 {
             return bad("the prefix is longer than 1024 bytes");
         }
-        if self.scan_interval.as_secs() == 0 {
-            return bad("the scan interval must be at least one second");
-        }
-        if self.max_object_bytes == Some(0) {
-            return bad("the object size cap must be positive");
-        }
-        Ok(())
+        check_options(self.scan_interval, self.max_object_bytes)
+    }
+}
+
+fn check_options(scan_interval: Duration, max_object_bytes: Option<u64>) -> Result<(), StoreError> {
+    if scan_interval.as_secs() == 0 {
+        return Err(StoreError::InvalidSource(
+            "the scan interval must be at least one second".to_owned(),
+        ));
+    }
+    if max_object_bytes == Some(0) {
+        return Err(StoreError::InvalidSource(
+            "the object size cap must be positive".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Changes to a source's options. `None` leaves a field as it is. The endpoint, bucket and
+/// prefix never change: they are the source's identity (and its claim).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SourcePatch {
+    /// The signing region; `Some(None)` goes back to the default.
+    pub region: Option<Option<String>>,
+    /// The URL style.
+    pub url_style: Option<UrlStyle>,
+    /// The scan interval.
+    pub scan_interval: Option<Duration>,
+    /// The GetObject size cap; `Some(None)` goes back to the default.
+    pub max_object_bytes: Option<Option<u64>>,
+    /// The LLM policy.
+    pub llm_policy: Option<LlmPolicy>,
+}
+
+/// How many objects of a source are in each ingest status (`objects_seen.status`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ObjectCounts {
+    /// Seen, not yet ingested.
+    pub pending: u64,
+    /// Ingested.
+    pub done: u64,
+    /// Ingest failed.
+    pub failed: u64,
+    /// Skipped by ingest (not a supported file).
+    pub skipped: u64,
+    /// Gone from the bucket.
+    pub deleted: u64,
+}
+
+impl ObjectCounts {
+    /// Objects still in the bucket.
+    pub fn live(&self) -> u64 {
+        self.pending + self.done + self.failed + self.skipped
     }
 }
 
@@ -198,8 +391,12 @@ pub struct Source {
     pub state_reason: Option<String>,
     /// Time between scan passes.
     pub scan_interval: Duration,
+    /// Which documents get an LLM summary.
+    pub llm_policy: LlmPolicy,
     /// When it was added (Unix seconds).
     pub created_at: i64,
+    /// When it last changed (Unix seconds).
+    pub updated_at: i64,
 }
 
 impl Source {
@@ -226,6 +423,8 @@ impl Source {
         let credentials_secret = r.get("credentials_secret")?;
         let state_reason = r.get("state_reason")?;
         let created_at = r.get("created_at")?;
+        let updated_at = r.get("updated_at")?;
+        let policy: String = r.get("policy_json")?;
         Ok((|| {
             Ok(Self {
                 id: id
@@ -243,7 +442,11 @@ impl Source {
                 state: state.parse()?,
                 state_reason,
                 scan_interval: Duration::from_secs(u64::try_from(interval).unwrap_or(1)),
+                llm_policy: LlmPolicy::from_json(&serde_json::from_str(&policy).map_err(
+                    |_| StoreError::InvalidSource("stored LLM policy is not JSON".to_owned()),
+                )?)?,
                 created_at,
+                updated_at,
             })
         })())
     }
@@ -356,7 +559,8 @@ fn credentials_secret_name(id: SourceId) -> String {
 }
 
 const SOURCE_COLUMNS: &str = "id, endpoint, bucket, prefix, region, url_style, \
-    credentials_secret, max_object_bytes, state, state_reason, scan_interval_s, created_at";
+    credentials_secret, max_object_bytes, policy_json, state, state_reason, scan_interval_s, \
+    created_at, updated_at";
 
 impl Store {
     /// Adds a source, with its credentials sealed in one transaction. A source with the same
@@ -387,8 +591,8 @@ impl Store {
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO sources (id, endpoint, bucket, prefix, region, url_style, \
-             credentials_secret, max_object_bytes, state, scan_interval_s, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+             credentials_secret, max_object_bytes, state, scan_interval_s, created_at, updated_at, \
+             policy_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?12)",
             params![
                 id.to_string(),
                 source.endpoint,
@@ -401,6 +605,7 @@ impl Store {
                 source.state.as_str(),
                 interval,
                 now,
+                source.llm_policy.to_json().to_string(),
             ],
         )?;
         if let Some((name, nonce, ct)) = &sealed {
@@ -489,6 +694,125 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// The source with this endpoint, bucket and prefix (compared exactly as stored).
+    pub fn source_by_key(
+        &self,
+        endpoint: &str,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Option<Source>, StoreError> {
+        self.conn()
+            .query_row(
+                &format!(
+                    "SELECT {SOURCE_COLUMNS} FROM sources \
+                     WHERE endpoint = ?1 AND bucket = ?2 AND prefix = ?3"
+                ),
+                params![endpoint, bucket, prefix],
+                Source::from_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    /// Applies a patch to a source's options and returns the source as it is now.
+    pub fn update_source(&self, id: SourceId, patch: &SourcePatch) -> Result<Source, StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let select = format!("SELECT {SOURCE_COLUMNS} FROM sources WHERE id = ?1");
+        let current = tx
+            .query_row(&select, [id.to_string()], Source::from_row)
+            .optional()?
+            .transpose()?
+            .ok_or_else(|| StoreError::NoSuchSource(id.to_string()))?;
+        let region = patch.region.clone().unwrap_or(current.region);
+        let url_style = patch.url_style.unwrap_or(current.url_style);
+        let interval = patch.scan_interval.unwrap_or(current.scan_interval);
+        let max = patch.max_object_bytes.unwrap_or(current.max_object_bytes);
+        let policy = patch.llm_policy.clone().unwrap_or(current.llm_policy);
+        check_options(interval, max)?;
+        policy.validate()?;
+        let max = max
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| StoreError::InvalidSource("object size cap too large".to_owned()))?;
+        let interval = i64::try_from(interval.as_secs())
+            .map_err(|_| StoreError::InvalidSource("scan interval too large".to_owned()))?;
+        tx.execute(
+            "UPDATE sources SET region = ?2, url_style = ?3, scan_interval_s = ?4, \
+             max_object_bytes = ?5, policy_json = ?6, updated_at = ?7 WHERE id = ?1",
+            params![
+                id.to_string(),
+                region,
+                url_style.as_str(),
+                interval,
+                max,
+                policy.to_json().to_string(),
+                now()
+            ],
+        )?;
+        let updated = tx.query_row(&select, [id.to_string()], Source::from_row)??;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Removes a source's credentials: it is then read anonymously.
+    pub fn clear_source_credentials(&self, id: SourceId) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let n = tx.execute(
+            "UPDATE sources SET credentials_secret = NULL, updated_at = ?2 WHERE id = ?1",
+            params![id.to_string(), now()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NoSuchSource(id.to_string()));
+        }
+        tx.execute(
+            "DELETE FROM secrets WHERE name = ?1",
+            [credentials_secret_name(id)],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Deletes a source with its progress, its checkpoint and its credentials, in one
+    /// transaction. Returns whether it existed.
+    pub fn delete_source(&self, id: SourceId) -> Result<bool, StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        // `objects_seen`, `scan_checkpoints` and `jobs` go with it (ON DELETE CASCADE).
+        let n = tx.execute("DELETE FROM sources WHERE id = ?1", [id.to_string()])?;
+        tx.execute(
+            "DELETE FROM secrets WHERE name = ?1",
+            [credentials_secret_name(id)],
+        )?;
+        tx.commit()?;
+        Ok(n > 0)
+    }
+
+    /// How many of a source's objects are in each ingest status.
+    pub fn object_counts(&self, id: SourceId) -> Result<ObjectCounts, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT status, count(*) FROM objects_seen WHERE source_id = ?1 GROUP BY status",
+        )?;
+        let mut counts = ObjectCounts::default();
+        let rows = stmt.query_map([id.to_string()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (status, n) = row?;
+            let n = u64::try_from(n).unwrap_or(0);
+            match status.as_str() {
+                "pending" => counts.pending = n,
+                "done" => counts.done = n,
+                "failed" => counts.failed = n,
+                "skipped" => counts.skipped = n,
+                _ => counts.deleted = n,
+            }
+        }
+        Ok(counts)
     }
 
     /// Decrypts a source's credentials: the S3 connector's access path to the secret store.
@@ -634,6 +958,129 @@ mod tests {
         let got = store.source_credentials(id).unwrap().unwrap();
         assert_eq!(got.session_token(), Some("test-session-token"));
         assert!(store.secret_exists(&format!("s3/{id}")).unwrap());
+    }
+
+    #[test]
+    fn updates_policies_and_deletion() {
+        let store = store();
+        let id = store
+            .add_source(&NewSource::new("http://x", "b"), Some(&creds(None)))
+            .unwrap();
+        let got = store.source(id).unwrap().unwrap();
+        assert_eq!(got.llm_policy, LlmPolicy::default());
+        let policy = LlmPolicy {
+            mode: LlmMode::Kinds(vec!["invoice".into(), "contract".into()]),
+            concurrency: 4,
+            daily_token_budget: Some(100_000),
+        };
+        let patch = SourcePatch {
+            region: Some(Some("eu-1".into())),
+            url_style: Some(UrlStyle::VirtualHost),
+            scan_interval: Some(Duration::from_secs(30)),
+            max_object_bytes: Some(Some(10)),
+            llm_policy: Some(policy.clone()),
+        };
+        let got = store.update_source(id, &patch).unwrap();
+        assert_eq!(got.region(), "eu-1");
+        assert_eq!(got.url_style, UrlStyle::VirtualHost);
+        assert_eq!(got.scan_interval, Duration::from_secs(30));
+        assert_eq!(got.max_object_bytes(), 10);
+        assert_eq!(got.llm_policy, policy);
+        assert_eq!(LlmPolicy::from_json(&policy.to_json()).unwrap(), policy);
+        // Back to the defaults; an empty patch changes nothing.
+        let got = store
+            .update_source(
+                id,
+                &SourcePatch {
+                    region: Some(None),
+                    max_object_bytes: Some(None),
+                    ..SourcePatch::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            (got.region(), got.max_object_bytes()),
+            ("us-east-1", DEFAULT_MAX_OBJECT_BYTES)
+        );
+        let same = store.update_source(id, &SourcePatch::default()).unwrap();
+        assert_eq!(same.llm_policy, policy);
+        for bad in [
+            SourcePatch {
+                scan_interval: Some(Duration::ZERO),
+                ..SourcePatch::default()
+            },
+            SourcePatch {
+                llm_policy: Some(LlmPolicy {
+                    concurrency: 0,
+                    ..LlmPolicy::default()
+                }),
+                ..SourcePatch::default()
+            },
+            SourcePatch {
+                llm_policy: Some(LlmPolicy {
+                    mode: LlmMode::Kinds(vec![]),
+                    ..LlmPolicy::default()
+                }),
+                ..SourcePatch::default()
+            },
+        ] {
+            assert!(store.update_source(id, &bad).is_err(), "{bad:?}");
+        }
+        assert!(matches!(
+            store.update_source(SourceId::generate(), &SourcePatch::default()),
+            Err(StoreError::NoSuchSource(_))
+        ));
+        assert_eq!(
+            store
+                .source_by_key("http://x", "b", "")
+                .unwrap()
+                .map(|s| s.id),
+            Some(id)
+        );
+        assert!(
+            store
+                .source_by_key("http://x", "b", "p/")
+                .unwrap()
+                .is_none()
+        );
+        // Credentials can be cleared; deleting removes the source and its secret.
+        store.clear_source_credentials(id).unwrap();
+        assert_eq!(store.source_credentials(id).unwrap(), None);
+        store.set_source_credentials(id, &creds(None)).unwrap();
+        assert!(store.delete_source(id).unwrap());
+        assert!(!store.delete_source(id).unwrap());
+        assert!(store.source(id).unwrap().is_none());
+        assert!(!store.secret_exists(&format!("s3/{id}")).unwrap());
+        assert_eq!(
+            LlmPolicy::from_json(&serde_json::json!({})).unwrap(),
+            LlmPolicy::default()
+        );
+        assert!(LlmPolicy::from_json(&serde_json::json!({"mode": "sometimes"})).is_err());
+    }
+
+    #[test]
+    fn object_counts_by_status() {
+        let store = store();
+        let id = store
+            .add_source(&NewSource::new("http://x", "b"), None)
+            .unwrap();
+        assert_eq!(store.object_counts(id).unwrap(), ObjectCounts::default());
+        let obj = |k: &str| {
+            crate::ObjectChange::Upsert(crate::SeenObject {
+                key: k.into(),
+                etag: None,
+                size: 1,
+                last_modified: None,
+            })
+        };
+        store
+            .record_objects(id, &[obj("a"), obj("b"), obj("c")], None)
+            .unwrap();
+        store
+            .record_objects(id, &[crate::ObjectChange::Delete { key: "c".into() }], None)
+            .unwrap();
+        let counts = store.object_counts(id).unwrap();
+        assert_eq!((counts.pending, counts.deleted, counts.live()), (2, 1, 2));
     }
 
     #[test]

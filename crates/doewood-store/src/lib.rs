@@ -22,9 +22,14 @@ mod store;
 pub use error::StoreError;
 pub use migrate::SCHEMA_VERSION;
 pub use standalone::Standalone;
+pub use store::ai::{
+    AI_PRESETS, AiProvider, AiProviderInput, ApiKey, DEFAULT_AI_PROVIDER, KeyChange,
+    valid_provider_name,
+};
 pub use store::objects::{ObjectChange, ScanCheckpoint, SeenObject};
 pub use store::sources::{
-    DEFAULT_MAX_OBJECT_BYTES, DEFAULT_SCAN_INTERVAL, NewSource, S3Credentials, Source, SourceState,
-    UrlStyle,
+    DEFAULT_LLM_CONCURRENCY, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_SCAN_INTERVAL, LlmMode, LlmPolicy,
+    MAX_LLM_CONCURRENCY, MAX_LLM_KINDS, NewSource, ObjectCounts, S3Credentials, Source,
+    SourcePatch, SourceState, UrlStyle, valid_kind,
 };
 pub use store::{SECRET_MAX_LEN, STORE_FILE, Store};

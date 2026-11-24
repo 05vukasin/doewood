@@ -9,6 +9,7 @@ use zeroize::Zeroizing;
 use crate::crypto::Cipher;
 use crate::{StoreError, migrate};
 
+pub(crate) mod ai;
 pub(crate) mod objects;
 pub(crate) mod sources;
 
@@ -245,6 +246,24 @@ fn validate_secret_name(name: &str) -> Result<(), StoreError> {
             "only ASCII letters, digits, '.', '_', '-' and '/' are allowed",
         ));
     }
+    Ok(())
+}
+
+/// Stores an already sealed secret inside a caller's transaction.
+pub(crate) fn write_sealed_tx(
+    conn: &Connection,
+    name: &str,
+    nonce: &[u8],
+    ciphertext: &[u8],
+    now: i64,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO secrets (name, nonce, ciphertext, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?4) \
+         ON CONFLICT (name) DO UPDATE SET nonce = excluded.nonce, \
+         ciphertext = excluded.ciphertext, updated_at = excluded.updated_at",
+        params![name, nonce, ciphertext, now],
+    )?;
     Ok(())
 }
 

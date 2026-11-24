@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use clap::Args;
 use doewood_core::BootstrapConfig;
-use doewood_store::{NewSource, S3Credentials, STORE_FILE, SourceState, Store, UrlStyle};
+use doewood_store::{
+    LlmPolicy, NewSource, S3Credentials, STORE_FILE, SourceState, Store, UrlStyle,
+};
 
 /// FOR LOCAL TESTING ONLY, until the gRPC API exists: adds an S3 source to this instance's
 /// store and seals its credentials. The keys are read from the environment variables you name,
@@ -79,6 +81,7 @@ impl AddSource {
             } else {
                 SourceState::Active
             },
+            llm_policy: LlmPolicy::default(),
         };
         config.prepare_data_dir().map_err(|e| e.to_string())?;
         let key = crate::serve::master_key(config.master_key.clone())?;

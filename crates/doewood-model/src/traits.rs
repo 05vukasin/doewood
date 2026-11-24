@@ -29,6 +29,16 @@ pub trait RecordStore: Send + Sync {
 
     /// The record, if stored.
     async fn get_record(&self, blake3: &Blake3) -> Result<Option<Record>>;
+
+    /// One page of the records that have a location in `source` (its endpoint and bucket, a
+    /// key under its prefix), ordered by hash. A page starts after the hash `after`, and holds
+    /// at most `limit` records (0 means 50, at most [`crate::RECORDS_MAX_LIMIT`]).
+    async fn list_records(
+        &self,
+        source: &SourceKey,
+        after: Option<&Blake3>,
+        limit: u32,
+    ) -> Result<Vec<Record>>;
 }
 
 /// The typed graph of ADR 0001 section 7 and ADR 0002 section 3.
