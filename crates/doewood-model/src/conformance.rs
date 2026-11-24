@@ -30,6 +30,7 @@ pub async fn run<B: Backend + ?Sized>(a: &B, b: &B) {
     ended_locations(a).await;
     records_by_source(a).await;
     sketches(a).await;
+    aliases(a).await;
     claims(a, b).await;
     leases(a, b).await;
     search(a).await;
@@ -476,6 +477,71 @@ pub async fn ended_locations<B: Backend + ?Sized>(s: &B) {
     let live = s.neighbours(first.document, &query).await.unwrap();
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].edge.edge.valid_to, None);
+}
+
+/// Aliases: the first claim wins, a blocked alias resolves to nobody, a missing node fails.
+///
+/// # Panics
+///
+/// When the backend misbehaves.
+pub async fn aliases<B: Backend + ?Sized>(s: &B) {
+    let one = s
+        .upsert_node(NodeKind::Company, "alias-one", &json!({}))
+        .await
+        .unwrap();
+    let two = s
+        .upsert_node(NodeKind::Company, "alias-two", &json!({}))
+        .await
+        .unwrap();
+    let kind = NodeKind::Company;
+    assert_eq!(s.alias(kind, "id:rs_pib:101").await.unwrap(), None);
+    let got = s
+        .claim_alias(kind, "id:rs_pib:101", one, &json!({"conf": 0.95}))
+        .await
+        .unwrap();
+    assert_eq!(got.node, Some(one));
+    assert_eq!(got.props, json!({"conf": 0.95}));
+    // A second claim finds the first owner and changes nothing.
+    let got = s
+        .claim_alias(kind, "id:rs_pib:101", two, &json!({"conf": 0.5}))
+        .await
+        .unwrap();
+    assert_eq!((got.node, got.props), (Some(one), json!({"conf": 0.95})));
+    assert_eq!(
+        s.alias(kind, "id:rs_pib:101").await.unwrap().unwrap().node,
+        Some(one)
+    );
+    // The same alias under another kind is another alias.
+    assert_eq!(
+        s.alias(NodeKind::Document, "id:rs_pib:101").await.unwrap(),
+        None
+    );
+    s.block_alias(kind, "name:acme", &json!({"why": "two companies"}))
+        .await
+        .unwrap();
+    let blocked = s.alias(kind, "name:acme").await.unwrap().unwrap();
+    assert_eq!(blocked.node, None);
+    let got = s
+        .claim_alias(kind, "name:acme", two, &json!({}))
+        .await
+        .unwrap();
+    assert_eq!(got.node, None, "a blocked alias stays blocked");
+    s.block_alias(kind, "id:rs_pib:101", &json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        s.alias(kind, "id:rs_pib:101").await.unwrap().unwrap().node,
+        None
+    );
+    assert!(
+        s.claim_alias(kind, "x", Uuid::now_v7(), &json!({}))
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        s.claim_alias(kind, "", one, &json!({})).await,
+        Err(Error::Invalid(_))
+    ));
 }
 
 /// The LSH band index: candidates by shared bands, replacement, the excluded document.

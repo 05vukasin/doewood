@@ -17,5 +17,19 @@ CREATE TABLE sketch_bands (
 
 CREATE INDEX sketch_bands_by_doc ON sketch_bands (blake3);
 
+-- Aliases of nodes: the identifiers and name keys a company is matched by (ADR 0002,
+-- section 1). One owner per alias, the first claim wins; a blocked alias has no owner.
+CREATE TABLE node_aliases (
+    kind       TEXT NOT NULL CHECK (kind IN ('document', 'location', 'company')),
+    alias      TEXT NOT NULL,
+    node_id    TEXT REFERENCES nodes (id) ON DELETE CASCADE,
+    props_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(props_json)),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (kind, alias)
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX node_aliases_by_node ON node_aliases (node_id);
+
 -- Ingest picks pending objects up in key order, per source.
 CREATE INDEX objects_seen_pending ON objects_seen (source_id, status, key);

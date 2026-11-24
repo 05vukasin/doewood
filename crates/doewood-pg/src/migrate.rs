@@ -9,7 +9,7 @@ use crate::backend::pg;
 /// Never edit a released migration: add a new one.
 const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_init.sql"),
-    include_str!("migrations/0002_sketches.sql"),
+    include_str!("migrations/0002_ingest.sql"),
 ];
 
 /// The schema version this binary writes.

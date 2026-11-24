@@ -8,10 +8,11 @@ use deadpool_postgres::{Object, Pool, PoolError};
 use doewood_core::InstanceId;
 use doewood_model::{
     Backend, Blake3, ClaimStore, Direction, Edge, EdgeKind, EdgeSource, Error, GraphStore, Located,
-    LocationEnded, Neighbour, NeighbourQuery, Node, NodeKind, ObjectLocation, PutOutcome, Record,
-    RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore, Sketch,
-    SketchStore, SourceClaim, SourceKey, StepVersions, StoredEdge, band_to_i64, records_limit,
-    sketch_limit, validate_node, validate_sketch, versions_from_json, versions_to_json,
+    LocationEnded, Neighbour, NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation,
+    PutOutcome, Record, RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery,
+    SearchStore, Sketch, SketchStore, SourceClaim, SourceKey, StepVersions, StoredEdge,
+    band_to_i64, records_limit, sketch_limit, validate_alias, validate_node, validate_sketch,
+    versions_from_json, versions_to_json,
 };
 use serde_json::Value;
 use time::Date;
@@ -479,6 +480,62 @@ impl GraphStore for PgStore {
             location,
             remaining: u32::try_from(remaining).unwrap_or(u32::MAX),
         }))
+    }
+
+    async fn claim_alias(
+        &self,
+        kind: NodeKind,
+        alias: &str,
+        node: Uuid,
+        props: &Value,
+    ) -> Result<NodeAlias> {
+        validate_alias(alias, props)?;
+        let c = client(&self.pool).await?;
+        // A no-op update on conflict, so the stored row always comes back.
+        let row = c
+            .query_one(
+                "INSERT INTO node_aliases (kind, alias, node_id, props) VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (kind, alias) DO UPDATE SET kind = node_aliases.kind \
+                 RETURNING node_id, props",
+                &[&kind.as_str(), &alias, &node, props],
+            )
+            .await
+            .map_err(pg)?;
+        Ok(NodeAlias {
+            node: row.try_get(0).map_err(pg)?,
+            props: row.try_get(1).map_err(pg)?,
+        })
+    }
+
+    async fn alias(&self, kind: NodeKind, alias: &str) -> Result<Option<NodeAlias>> {
+        let c = client(&self.pool).await?;
+        c.query_opt(
+            "SELECT node_id, props FROM node_aliases WHERE kind = $1 AND alias = $2",
+            &[&kind.as_str(), &alias],
+        )
+        .await
+        .map_err(pg)?
+        .map(|r| {
+            Ok(NodeAlias {
+                node: r.try_get(0).map_err(pg)?,
+                props: r.try_get(1).map_err(pg)?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn block_alias(&self, kind: NodeKind, alias: &str, props: &Value) -> Result<()> {
+        validate_alias(alias, props)?;
+        let c = client(&self.pool).await?;
+        c.execute(
+            "INSERT INTO node_aliases (kind, alias, node_id, props) VALUES ($1, $2, NULL, $3) \
+             ON CONFLICT (kind, alias) DO UPDATE SET node_id = NULL, props = EXCLUDED.props, \
+             updated_at = now()",
+            &[&kind.as_str(), &alias, props],
+        )
+        .await
+        .map_err(pg)?;
+        Ok(())
     }
 }
 

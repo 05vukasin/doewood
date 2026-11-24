@@ -12,7 +12,7 @@ use time::Date;
 use uuid::Uuid;
 
 use crate::{
-    Blake3, Edge, Located, LocationEnded, Neighbour, NeighbourQuery, Node, NodeKind,
+    Blake3, Edge, Located, LocationEnded, Neighbour, NeighbourQuery, Node, NodeAlias, NodeKind,
     ObjectLocation, PutOutcome, Record, Result, SearchDoc, SearchHit, SearchQuery, Sketch,
     SourceClaim, SourceKey, StepVersions,
 };
@@ -81,6 +81,25 @@ pub trait GraphStore: Send + Sync {
         location: &ObjectLocation,
         on: Date,
     ) -> Result<Option<LocationEnded>>;
+
+    /// Claims `alias` (an identifier or a name key that resolves to one node, ADR 0002
+    /// section 1) for `node`, with `props` (evidence, confidence). The first claim wins: the
+    /// result is the alias as stored, owned by `node` or by whoever claimed it before (or by
+    /// nobody when it is blocked). The node must exist.
+    async fn claim_alias(
+        &self,
+        kind: NodeKind,
+        alias: &str,
+        node: Uuid,
+        props: &Value,
+    ) -> Result<NodeAlias>;
+
+    /// The alias, if claimed or blocked.
+    async fn alias(&self, kind: NodeKind, alias: &str) -> Result<Option<NodeAlias>>;
+
+    /// Blocks an alias: it resolves to no node from now on (a key that turned out to belong
+    /// to more than one), with `props` saying why.
+    async fn block_alias(&self, kind: NodeKind, alias: &str, props: &Value) -> Result<()>;
 }
 
 /// The `MinHash` LSH band index behind `similar_to` edges: candidates come from a lookup by

@@ -578,6 +578,30 @@ pub struct LocationEnded {
     pub remaining: u32,
 }
 
+/// An alias of a node: an identifier or a name key that resolves to it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodeAlias {
+    /// The node it resolves to; `None` when the alias is blocked.
+    pub node: Option<Uuid>,
+    /// Why: the evidence and confidence of the claim (a JSON object).
+    pub props: Value,
+}
+
+/// Checks an alias before it reaches a backend: the same rules as a node key.
+pub fn validate_alias(alias: &str, props: &Value) -> Result<(), Error> {
+    if alias.is_empty() || alias.len() > NODE_KEY_MAX_LEN || alias.contains('\0') {
+        return Err(Error::Invalid(format!(
+            "an alias is 1 to {NODE_KEY_MAX_LEN} bytes without NUL"
+        )));
+    }
+    if !props.is_object() {
+        return Err(Error::Invalid(
+            "alias props must be a JSON object".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// A document's `MinHash` signature in the LSH band index, as a candidate lookup returns it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sketch {

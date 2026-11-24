@@ -295,6 +295,7 @@ mod tests {
                 "edges",
                 "jobs",
                 "locations",
+                "node_aliases",
                 "nodes",
                 "objects_seen",
                 "records",

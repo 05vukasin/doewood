@@ -10,10 +10,11 @@ use async_trait::async_trait;
 use doewood_core::InstanceId;
 use doewood_model::{
     Backend, Blake3, ClaimStore, Direction, Edge, EdgeKind, EdgeSource, Error, GraphStore, Located,
-    LocationEnded, Neighbour, NeighbourQuery, Node, NodeKind, ObjectLocation, PutOutcome, Record,
-    RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore, Sketch,
-    SketchStore, SourceClaim, SourceKey, StepVersions, StoredEdge, band_to_i64, records_limit,
-    sketch_limit, validate_node, validate_sketch, versions_from_json, versions_to_json,
+    LocationEnded, Neighbour, NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation,
+    PutOutcome, Record, RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery,
+    SearchStore, Sketch, SketchStore, SourceClaim, SourceKey, StepVersions, StoredEdge,
+    band_to_i64, records_limit, sketch_limit, validate_alias, validate_node, validate_sketch,
+    versions_from_json, versions_to_json,
 };
 use rusqlite::types::Value as Sql;
 use rusqlite::{Connection, OptionalExtension as _, Row, params, params_from_iter};
@@ -587,6 +588,73 @@ impl GraphStore for Standalone {
                 location: uuid(&location)?,
                 remaining: u32::try_from(remaining).unwrap_or(u32::MAX),
             }))
+        })
+        .await
+    }
+
+    async fn claim_alias(
+        &self,
+        kind: NodeKind,
+        alias: &str,
+        node: Uuid,
+        props: &Value,
+    ) -> Result<NodeAlias> {
+        validate_alias(alias, props)?;
+        let (alias, props) = (alias.to_owned(), props.to_string());
+        self.run(move |conn| {
+            let (node, props): (Option<String>, String) = conn
+                .query_row(
+                    "INSERT INTO node_aliases (kind, alias, node_id, props_json, created_at, \
+                     updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5) \
+                     ON CONFLICT (kind, alias) DO UPDATE SET kind = node_aliases.kind \
+                     RETURNING node_id, props_json",
+                    params![kind.as_str(), alias, node.to_string(), props, now()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(sql)?;
+            Ok(NodeAlias {
+                node: node.as_deref().map(uuid).transpose()?,
+                props: json(&props)?,
+            })
+        })
+        .await
+    }
+
+    async fn alias(&self, kind: NodeKind, alias: &str) -> Result<Option<NodeAlias>> {
+        let alias = alias.to_owned();
+        self.run(move |conn| {
+            let row: Option<(Option<String>, String)> = conn
+                .query_row(
+                    "SELECT node_id, props_json FROM node_aliases WHERE kind = ?1 AND alias = ?2",
+                    params![kind.as_str(), alias],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .map_err(sql)?;
+            row.map(|(node, props)| {
+                Ok(NodeAlias {
+                    node: node.as_deref().map(uuid).transpose()?,
+                    props: json(&props)?,
+                })
+            })
+            .transpose()
+        })
+        .await
+    }
+
+    async fn block_alias(&self, kind: NodeKind, alias: &str, props: &Value) -> Result<()> {
+        validate_alias(alias, props)?;
+        let (alias, props) = (alias.to_owned(), props.to_string());
+        self.run(move |conn| {
+            conn.execute(
+                "INSERT INTO node_aliases (kind, alias, node_id, props_json, created_at, \
+                 updated_at) VALUES (?1, ?2, NULL, ?3, ?4, ?4) \
+                 ON CONFLICT (kind, alias) DO UPDATE SET node_id = NULL, \
+                 props_json = excluded.props_json, updated_at = excluded.updated_at",
+                params![kind.as_str(), alias, props, now()],
+            )
+            .map_err(sql)?;
+            Ok(())
         })
         .await
     }
