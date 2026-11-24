@@ -133,7 +133,8 @@ jobs:
       - name: Smoke test
         run: |
           docker run --rm doewood:ci version
-          docker run -d --name dw -p 7444:7444 --tmpfs /data:uid=10001,gid=10001 doewood:ci
+          docker run -d --name dw -p 7444:7444 --read-only --cap-drop ALL --tmpfs /tmp \
+            --tmpfs /data:uid=10001,gid=10001 doewood:ci
           for i in $(seq 1 60); do
             curl -sf 127.0.0.1:7444/readyz && break
             sleep 1
@@ -141,8 +142,8 @@ jobs:
           curl -sf 127.0.0.1:7444/healthz
           curl -sf 127.0.0.1:7444/readyz
           test "$(docker exec dw id -u)" = 10001
-          # The OCR models of the image are found (no "missing" warning).
-          ! docker logs dw 2>&1 | grep -q "OCR model files missing"
+          # OCR runs with the models of the image.
+          docker logs dw 2>&1 | grep -q '"ocr":"Ready'
           docker rm -f dw
       - uses: azure/setup-helm@v4
         with: { version: v3.19.2 }
