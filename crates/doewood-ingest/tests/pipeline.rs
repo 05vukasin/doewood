@@ -102,7 +102,7 @@ impl Harness {
             .add_source(&NewSource::new(ENDPOINT, BUCKET), None)
             .unwrap();
         let fetch = Arc::new(MemFetch::default());
-        let mut config = IngestConfig::new(Some(jobs), &PathBuf::from("/nonexistent"), 0.8);
+        let mut config = IngestConfig::new(Some(jobs), &PathBuf::from("/nonexistent"));
         config.retry_base = retry;
         config.sweep_interval = Duration::from_millis(200);
         config.reprocess_poll = Duration::from_millis(20);
@@ -751,6 +751,72 @@ async fn shutdown_leaves_unfinished_work_pending() {
         .unwrap();
     assert_eq!(s.status, "pending");
     assert!(s.attempts >= 1);
+}
+
+/// The `similar_to` threshold is the runtime setting in the instance store, read for every
+/// file: a change applies to the next file, without restarting ingest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn similarity_uses_the_stored_threshold() {
+    use doewood_store::IngestSettingsPatch;
+
+    let store = Arc::new(Store::open_in_memory(&MasterKey::from_bytes([7; 32])).unwrap());
+    let backend: Arc<dyn Backend> = Arc::new(Standalone::new(Arc::clone(&store)));
+    let h = Harness::start(
+        Arc::clone(&store),
+        Arc::clone(&backend),
+        2,
+        Duration::from_millis(10),
+    );
+    let similar = |n: uuid::Uuid| {
+        let b = Arc::clone(&backend);
+        async move {
+            b.neighbours(
+                n,
+                &NeighbourQuery {
+                    edge_kinds: vec![EdgeKind::SimilarTo],
+                    ..NeighbourQuery::default()
+                },
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let set = |x: f64| {
+        store
+            .set_ingest_settings(&IngestSettingsPatch {
+                similar_min_jaccard: Some(x),
+            })
+            .unwrap();
+    };
+
+    // Only identical sketches pass 1.0: the near copy gets no edge.
+    set(1.0);
+    h.put(&[("in/a.txt", common::prose(7, 600).into_bytes(), true)])
+        .await;
+    h.settle().await;
+    h.put(&[("in/b.txt", near_copy(7), true)]).await;
+    h.settle().await;
+    let (a, b) = (h.doc("in/a.txt").await, h.doc("in/b.txt").await);
+    assert!(similar(a).await.is_empty());
+    assert!(similar(b).await.is_empty());
+
+    // Lowered at run time: the next near copy links to both.
+    set(0.8);
+    let text = common::prose(7, 600);
+    let mut words: Vec<&str> = text.split(' ').collect();
+    for i in [50, 250, 450] {
+        words[i] = "altered";
+    }
+    h.put(&[("in/c.txt", words.join(" ").into_bytes(), true)])
+        .await;
+    h.settle().await;
+    let c = h.doc("in/c.txt").await;
+    let mut linked: Vec<_> = similar(c).await.iter().map(|n| n.node.id).collect();
+    linked.sort();
+    let mut want = vec![a, b];
+    want.sort();
+    assert_eq!(linked, want);
+    h.stop().await;
 }
 
 /// Files per second through the whole pipeline (fetch from memory, analyze, SQLite records,

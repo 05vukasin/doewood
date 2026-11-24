@@ -5,9 +5,9 @@ doewood has two kinds of settings, and each setting has exactly one source
 
 - **Bootstrap values** come from environment variables, listed below. Every one has a default,
   so `doewood serve` starts with no environment at all.
-- **Runtime settings** (S3 sources and credentials, AI providers, policies, schedules) are set
-  through the [gRPC API](api.md) and kept in the instance's SQLite store. Secrets are encrypted
-  with the master key and are write-only: the API never returns them.
+- **Runtime settings** (S3 sources and credentials, AI providers, policies, schedules, ingest
+  tuning) are set through the [gRPC API](api.md) and kept in the instance's SQLite store.
+  Secrets are encrypted with the master key and are write-only: the API never returns them.
 
 ## Runtime settings
 
@@ -21,6 +21,7 @@ Set through the API, kept in `doewood.sqlite`, applied without a restart:
 | AI providers: preset, model, base URL | `SetAiProvider` | setting `ai.provider.<name>` |
 | An AI provider's API key | `SetAiProvider` | secret `ai/<name>/api_key` (sealed, write-only) |
 | The default AI provider (the LLM queue's) | `SetAiProvider` (`make_default`; the first one set) | setting `ai.default_provider` |
+| Ingest: least MinHash Jaccard estimate for a `similar_to` edge (above 0, at most 1, default `0.8`). Read for every file, so a change applies to the next file ingested. Edges already written are kept; `ReprocessJob` with `force` compares a source's documents again (a lower value adds edges, a higher one removes none). | `SetIngestSettings`, read with `GetIngestSettings` | setting `ingest.similar_min_jaccard` |
 
 The LLM queue's state is in the store too: `llm_jobs` (queued documents) and `llm_usage` (each
 source's spend per UTC day). The provider variables quail and hedgehog read (`AI_PROVIDER`,
@@ -40,9 +41,24 @@ from the store. See [llm.md](llm.md).
 | `DOEWOOD_API_MAX_MESSAGE_MIB` | `64` | Largest gRPC message the API decodes or encodes, in MiB (1 to 1024). Leaves room for a file sent to `Summarize`. |
 | `DOEWOOD_INGEST_JOBS` | from the CPUs and memory | Files ingest analyzes at the same time (1 to 256). The default is one per CPU, at most what half the available memory holds at 512 MiB each (a cgroup limit counts), at most 32. See [ingest.md](ingest.md). |
 | `DOEWOOD_OCR_MODELS` | `<data>/ocr-models` | Directory of quail's OCR model files (`quail models fetch` downloads them). Missing models are a `WARN` at start, never an error: scanned pages are then flagged `needs_ocr`. |
-| `DOEWOOD_SIMILAR_MIN_JACCARD` | `0.8` | Least MinHash Jaccard estimate for a `similar_to` edge (above 0, at most 1). |
 
 `RUST_LOG` sets the log filter (default `info`), for example `RUST_LOG=doewood=debug,info`.
+
+### Why the ingest variables stay bootstrap values
+
+Tuning values that change what ingest writes are runtime settings. Two ingest variables are
+not, because the API cannot set them:
+
+- `DOEWOOD_INGEST_JOBS` sizes the process: the worker pool and the engine's threads are built
+  once at start, before the API is up, and must fit the CPU and memory limits the deployment
+  gives the container. It belongs with those limits, in the deployment.
+- `DOEWOOD_OCR_MODELS` is part of the image layout: a path to model files that the image (or a
+  volume mounted into it) provides. It is fixed by how the container is built, not by an
+  operator at run time, and the analyzer checks the models once at start.
+
+`DOEWOOD_SIMILAR_MIN_JACCARD`, read by earlier versions, is the runtime setting
+`similar_min_jaccard` now. If it is still set, doewood ignores it and logs a `WARN` at start
+(also shown by `doewood config check`) saying to use `ConfigService.SetIngestSettings`.
 
 ### Rules
 

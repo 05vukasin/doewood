@@ -30,11 +30,7 @@ pub async fn build(
     backend: watch::Receiver<Option<Arc<dyn Backend>>>,
     progress: &Arc<Progress>,
 ) -> Option<(Ingest, Summaries)> {
-    let ingest_config = IngestConfig::new(
-        config.ingest_jobs,
-        &config.ocr_models,
-        config.similar_min_jaccard,
-    );
+    let ingest_config = IngestConfig::new(config.ingest_jobs, &config.ocr_models);
     let analyzer_config = ingest_config.analyzer.clone();
     // Checking the OCR models reads (and hashes) them: off the async threads.
     let analyzer = tokio::task::spawn_blocking(move || Analyzer::new(&analyzer_config)).await;

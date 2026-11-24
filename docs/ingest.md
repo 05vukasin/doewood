@@ -91,7 +91,9 @@ The record is the quail record JSON, keyed by BLAKE3, with step versions: one pe
   its own number (`ref.doc_number`); until that document is known, the edge goes to a pending
   Document node `ref:<number>`, and moves to the real document when it arrives.
 - **`similar_to`** from quail's MinHash LSH bands: candidates come from the band index (a lookup
-  by band key), each confirmed by its Jaccard estimate (`DOEWOOD_SIMILAR_MIN_JACCARD`, 0.8).
+  by band key), each confirmed by its Jaccard estimate (the runtime setting
+  `similar_min_jaccard`, default 0.8, set with `ConfigService.SetIngestSettings`; it is read
+  for every file, so a change applies to the next file without a restart).
 - **Search:** title (`ref.title`, else the card's, the file's own, the file name), body (the
   summary card, the extractive summary, keywords, sheet text), kind, date and amount.
 

@@ -25,7 +25,7 @@ pub(crate) fn model(e: doewood_model::Error) -> Status {
 pub(crate) fn store(e: StoreError) -> Status {
     match e {
         StoreError::NoSuchSource(id) => Status::not_found(format!("source {id} does not exist")),
-        StoreError::InvalidSource(m) => Status::invalid_argument(m),
+        StoreError::InvalidSource(m) | StoreError::InvalidSetting(m) => Status::invalid_argument(m),
         StoreError::InvalidSecretName { .. } | StoreError::SecretTooLarge(_) => {
             Status::invalid_argument(e.to_string())
         }

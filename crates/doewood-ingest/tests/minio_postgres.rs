@@ -169,7 +169,7 @@ async fn s3_put_to_postgres_record() {
     .await
     .unwrap();
     let (_backend_tx, backend_rx) = watch::channel(Some(Arc::clone(&pg)));
-    let mut config = IngestConfig::new(Some(2), &PathBuf::from("/nonexistent"), 0.8);
+    let mut config = IngestConfig::new(Some(2), &PathBuf::from("/nonexistent"));
     config.sweep_interval = Duration::from_millis(500);
     let ingest = Ingest::new(IngestParts {
         store: Arc::clone(&store),

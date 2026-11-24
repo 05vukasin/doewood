@@ -26,6 +26,10 @@ pub use store::ai::{
     AI_PRESETS, AiProvider, AiProviderInput, ApiKey, DEFAULT_AI_PROVIDER, KeyChange,
     valid_provider_name,
 };
+pub use store::ingest::{
+    DEFAULT_SIMILAR_MIN_JACCARD, IngestSettings, IngestSettingsPatch, SIMILAR_MIN_JACCARD,
+    valid_min_jaccard,
+};
 pub use store::llm::{LlmCounts, LlmJob, LlmJobStatus, LlmUsage, SECONDS_PER_DAY, utc_day};
 pub use store::objects::{IngestOutcome, IngestStatus, ObjectChange, ScanCheckpoint, SeenObject};
 pub use store::sources::{
