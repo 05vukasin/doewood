@@ -23,6 +23,18 @@ use uuid::Uuid;
 
 use crate::PgStore;
 
+/// One page of a source's records: `$1` endpoint, `$2` bucket, `$3` prefix, `$4` the hash the
+/// page starts after (or NULL), `$5` the page size. The `after` bound is repeated inside the
+/// EXISTS: Postgres plans this as a merge semi join over `records_pkey` and
+/// `locations_by_blake3` and does not carry the bound across, so without it the locations side
+/// reads every row before `after` and walking all pages is quadratic (issue #13, docs/api.md).
+pub(crate) const LIST_RECORDS: &str = "SELECT r.blake3, r.record, r.versions, extract(epoch FROM r.updated_at)::bigint \
+     FROM records r WHERE ($4::bytea IS NULL OR r.blake3 > $4) \
+     AND EXISTS (SELECT 1 FROM locations l WHERE l.blake3 = r.blake3 \
+     AND l.endpoint = $1 AND l.bucket = $2 AND starts_with(l.object_key, $3) \
+     AND ($4::bytea IS NULL OR l.blake3 > $4)) \
+     ORDER BY r.blake3 LIMIT $5";
+
 /// Claim attempts when the owner releases between our insert and our read.
 const CLAIM_ATTEMPTS: usize = 3;
 
@@ -267,11 +279,7 @@ impl RecordStore for PgStore {
         let after = after.map(|h| h.as_bytes().to_vec());
         let rows = c
             .query(
-                "SELECT r.blake3, r.record, r.versions, extract(epoch FROM r.updated_at)::bigint \
-                 FROM records r WHERE ($4::bytea IS NULL OR r.blake3 > $4) \
-                 AND EXISTS (SELECT 1 FROM locations l WHERE l.blake3 = r.blake3 \
-                 AND l.endpoint = $1 AND l.bucket = $2 AND starts_with(l.object_key, $3)) \
-                 ORDER BY r.blake3 LIMIT $5",
+                LIST_RECORDS,
                 &[
                     &source.endpoint(),
                     &source.bucket(),

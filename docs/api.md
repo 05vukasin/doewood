@@ -287,6 +287,57 @@ mc event add local/docs arn:minio:sqs::doewood:webhook --event put,delete --pref
 validation and claim), without a running server; `serve` then scans it. See
 [sources.md](sources.md#trying-it-locally).
 
+## ListRecords on Postgres
+
+`ListRecords` is one query: the records with a location in the source (`EXISTS` over
+`locations`), after the page token, ordered by hash. Postgres runs it as a merge semi join over
+`records_pkey` and `locations_by_blake3`. It does not carry the `after` bound over to the
+`locations` side, so before issue #13 each page read every location before the page token, and
+walking all pages of a source was quadratic. The bound is now in the `EXISTS` as well. The
+results are the same (`list_records_matches_the_query_before_issue_13` in
+`crates/doewood-pg/src/tests/list_records.rs` walks both queries over six filters and four page
+sizes).
+
+```
+DOEWOOD_TEST_POSTGRES_URL=postgres://postgres:pw@127.0.0.1:5432/postgres DOEWOOD_BENCH_RECORDS=50000 \
+  cargo test -p doewood-pg list_records_timings -- --ignored --nocapture
+```
+
+The data is generated: each record has about 1 KB of JSON and one location, in one of four
+buckets (`b0` to `b3`). Every 5th record is also in `b4`, every 7th has two keys in its
+bucket, every 13th is on another endpoint and every 11th has no location. The query runs
+against bucket `b0`. Times are medians of 15 runs (5 for full walks), in ms, measured from the
+client. The setup: `pgvector/pgvector:pg17` (17.12) in Docker on the 4-core server, test
+profile, commit `fa9f72f` plus this change.
+
+| case | 5,000 before | 5,000 after | 50,000 before | 50,000 after |
+|---|---|---|---|---|
+| bucket, first page (50) | 2.06 | 1.95 | 1.02 | 0.98 |
+| bucket, page halfway (50) | 2.38 | 1.24 | 13.30 | 1.17 |
+| bucket, 1000 per page | 9.61 | 10.07 | 15.72 | 13.67 |
+| prefix with 5 %, first page | 1.51 | 1.72 | 1.72 | 1.61 |
+| rare prefix (49 records) | 2.03 | 2.22 | 12.53 | 13.07 |
+| prefix matching nothing | 1.37 | 0.89 | 9.80 | 9.44 |
+| all pages of the bucket, 50 each | 44.0 | 31.5 | 2,793 | 341 |
+| all pages of the bucket, 1000 each | 10.3 | 11.2 | 241 | 184 |
+| all pages of the 5 % prefix, 50 each | 9.8 | 9.6 | 628 | 203 |
+
+With 50,000 records, the page halfway through read 32,024 buffers before and 485 after: the
+`locations` index scan starts at the page token now. A prefix that matches few or no keys
+gets a sequential scan of `locations`, which grows with the table: about 10 ms at 60,000
+locations. The default collation does not let `starts_with` use the
+`(endpoint, bucket, object_key)` index. An index on `(endpoint, bucket, object_key COLLATE
+"C")` brings these cases under 1.2 ms in a trial. It needs a schema migration, though, and a
+database migrated by a newer doewood is refused by older instances
+([configuration.md](configuration.md#the-shared-postgres)). So it is left for a release that
+upgrades every instance together.
+
+Standalone SQLite probes `locations` once per record, but `?4 IS NULL OR r.blake3 > ?4` kept
+it from starting at the page token, so it too read every record before the page. It now
+compares with `coalesce(?4, x'')` and searches the primary key from the token. In a trial with
+Python's sqlite3 (3.46.1, in memory, 50,000 records, the same query), walking a bucket 50 per
+page took 471 ms before and 69 ms after, with the same results.
+
 ## Tests
 
 `cargo test -p doewood-api` starts in-process servers and calls every RPC with a tonic client:
