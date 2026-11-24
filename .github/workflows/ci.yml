@@ -17,6 +17,30 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+  # The shared store against a real Postgres with pgvector; elsewhere those tests skip.
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_PASSWORD: pw
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      DOEWOOD_TEST_POSTGRES_URL: postgres://postgres:pw@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: Swatinem/rust-cache@v2
+      # Fails if any Postgres test skipped instead of running.
+      - run: |
+          cargo test -p doewood-pg -p doewood -- --nocapture 2>&1 | tee test.log
+          ! grep -q "skipping: DOEWOOD_TEST_POSTGRES_URL" test.log
   deny:
     runs-on: ubuntu-latest
     steps:
@@ -47,4 +71,7 @@ jobs:
             sleep 1
           done
           exit 1
-      - run: cargo test -p doewood-s3 --test minio -- --nocapture
+      # Fails if any MinIO test skipped instead of running.
+      - run: |
+          cargo test -p doewood-s3 --test minio -- --nocapture 2>&1 | tee test.log
+          ! grep -q "DOEWOOD_TEST_S3_ENDPOINT is not set: skipped" test.log

@@ -1,7 +1,7 @@
 //! The ops HTTP server for Kubernetes: `/healthz`, `/readyz` and `/metrics`.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
@@ -14,6 +14,8 @@ use prometheus::{Encoder as _, Gauge, IntCounterVec, IntGauge, IntGaugeVec, Opts
 /// Shared state of the ops endpoints.
 pub struct OpsState {
     ready: AtomicBool,
+    /// Why the instance is not ready, for `/readyz`.
+    reason: Mutex<String>,
     metrics: Metrics,
 }
 
@@ -27,18 +29,35 @@ impl OpsState {
     pub fn new(instance_id: &str, standalone: bool) -> Self {
         Self {
             ready: AtomicBool::new(false),
+            reason: Mutex::new("starting".to_owned()),
             metrics: Metrics::new(instance_id, standalone),
         }
     }
 
-    /// Marks the instance ready (or not) for `/readyz`.
-    pub fn set_ready(&self, ready: bool) {
-        self.ready.store(ready, Ordering::SeqCst);
-        self.metrics.ready.set(i64::from(ready));
+    /// Marks the instance ready for `/readyz`.
+    pub fn set_ready(&self) {
+        let mut reason = self.reason();
+        reason.clear();
+        self.ready.store(true, Ordering::SeqCst);
+        self.metrics.ready.set(1);
     }
 
-    fn is_ready(&self) -> bool {
-        self.ready.load(Ordering::SeqCst)
+    /// Marks the instance not ready; `/readyz` shows the reason. It must not hold a secret.
+    pub fn set_not_ready(&self, why: impl Into<String>) {
+        let mut reason = self.reason();
+        *reason = why.into();
+        self.ready.store(false, Ordering::SeqCst);
+        self.metrics.ready.set(0);
+    }
+
+    fn reason(&self) -> MutexGuard<'_, String> {
+        self.reason.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// `None` when ready, otherwise why not.
+    fn not_ready(&self) -> Option<String> {
+        let reason = self.reason();
+        (!self.ready.load(Ordering::SeqCst)).then(|| reason.clone())
     }
 }
 
@@ -110,13 +129,16 @@ async fn healthz(State(s): State<Arc<OpsState>>) -> &'static str {
     "ok\n"
 }
 
-/// Ready: the store is open, and the instance is not shutting down.
-async fn readyz(State(s): State<Arc<OpsState>>) -> (StatusCode, &'static str) {
+/// Ready: the local store is open, the shared store (when configured) answers, and the
+/// instance is not shutting down. Otherwise 503 with the reason.
+async fn readyz(State(s): State<Arc<OpsState>>) -> (StatusCode, String) {
     s.metrics.requests.with_label_values(&["/readyz"]).inc();
-    if s.is_ready() {
-        (StatusCode::OK, "ready\n")
-    } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "not ready\n")
+    match s.not_ready() {
+        None => (StatusCode::OK, "ready\n".to_owned()),
+        Some(reason) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("not ready: {reason}\n"),
+        ),
     }
 }
 

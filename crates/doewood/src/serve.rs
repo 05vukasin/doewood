@@ -6,8 +6,11 @@
 //! 3. register the signal handlers, so a SIGTERM during startup still shuts down cleanly;
 //! 4. start the ops server (`/healthz` answers, `/readyz` says not ready);
 //! 5. resolve the master key and open the store;
-//! 6. start one scanner per active S3 source (none configured: nothing starts), then report
-//!    ready.
+//! 6. standalone: serve records, graph and search from the store and report ready. With
+//!    `DOEWOOD_POSTGRES_URL`: connect to the shared Postgres in the background, and report ready
+//!    once it answers. Until then the instance runs degraded: `/readyz` says why, and the
+//!    connection is retried with backoff (see [`crate::shared`]).
+//! 7. start one scanner per active S3 source (none configured: nothing starts).
 //!
 //! On SIGTERM or SIGINT: report not ready, stop the servers and the scanners (each keeps its
 //! checkpoint), close the store, exit 0.
@@ -16,14 +19,16 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use doewood_core::{BootstrapConfig, Loaded, MasterKey, MasterKeySource};
+use doewood_model::Backend;
 use doewood_s3::{Discovery, DiscoveryOptions, EVENT_CHANNEL_CAPACITY, ObjectEvent};
 use doewood_store::keyfile::{self, KeyFileState};
-use doewood_store::{STORE_FILE, Store};
+use doewood_store::{STORE_FILE, Standalone, Store};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::ops::{self, OpsState};
+use crate::shared;
 
 /// Builds the runtime and runs the service until a shutdown signal.
 pub fn main(loaded: Loaded) -> ExitCode {
@@ -104,47 +109,47 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
         }
     };
 
-    // Step 4 of the plan (ingest) consumes the events; until then they are logged and dropped.
-    let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-    let sink = tokio::spawn(log_events(events_rx));
-    let discovery = match Discovery::start(
-        Arc::clone(&store),
-        events_tx,
-        shutdown_rx.clone(),
-        DiscoveryOptions::default(),
-    )
-    .await
-    {
-        Ok(d) => {
-            info!(scanners = d.len(), "discovery started");
-            Some(d)
-        }
-        Err(e) => {
-            error!(error = %e, "discovery did not start; no source is scanned");
-            None
-        }
+    // Records, graph, claims and search: the shared Postgres when configured, else this file.
+    let (backend_tx, backend_rx) = watch::channel::<Option<Arc<dyn Backend>>>(None);
+    let supervisor = if let Some(url) = config.postgres_url.clone() {
+        // Degraded until the supervisor connects; it retries for as long as it takes.
+        Some(tokio::spawn(shared::supervise(
+            url,
+            Arc::clone(&state),
+            backend_tx,
+            shutdown_rx.clone(),
+        )))
+    } else {
+        backend_tx.send_replace(Some(Arc::new(Standalone::new(Arc::clone(&store)))));
+        // The value stays readable through `backend_rx`.
+        drop(backend_tx);
+        state.set_ready();
+        info!(addr = %ops_addr, "ready");
+        None
     };
 
-    state.set_ready(true);
-    info!(addr = %ops_addr, "ready");
+    let discovery = start_discovery(Arc::clone(&store), shutdown_rx.clone()).await;
 
     let signal = signals.recv().await;
     info!(signal, "shutting down");
-    state.set_ready(false);
+    state.set_not_ready("shutting down");
     let _ = shutdown_tx.send(true);
     match ops_server.await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => warn!(error = %e, "ops server ended with an error"),
         Err(e) => warn!(error = %e, "ops server task failed"),
     }
-    if let Some(discovery) = discovery {
-        discovery.join().await;
-        info!("scanners stopped");
+    discovery.stop().await;
+    if let Some(task) = supervisor
+        && let Err(e) = task.await
+    {
+        warn!(error = %e, "shared store supervisor failed");
     }
-    // Every sender is gone once the scanners have stopped.
-    let _ = sink.await;
+    let backend = backend_rx.borrow().as_ref().map(|b| b.name());
+    info!(backend, "servers stopped");
+    drop(backend_rx);
 
-    // Nothing else holds the store once the servers have stopped.
+    // Nothing else holds the store once the servers and the backend are gone.
     let store = Arc::try_unwrap(store).map_err(|_| "store still in use at shutdown".to_owned())?;
     tokio::task::spawn_blocking(move || store.close())
         .await
@@ -200,6 +205,43 @@ pub(crate) fn master_key(source: MasterKeySource) -> Result<MasterKey, String> {
             Ok(key)
         }
     }
+}
+
+/// The scanners and the task that takes their events.
+struct Scanning {
+    discovery: Option<Discovery>,
+    sink: tokio::task::JoinHandle<()>,
+}
+
+impl Scanning {
+    /// Waits for the scanners (told to stop by the shutdown signal), then for the sink.
+    async fn stop(self) {
+        if let Some(discovery) = self.discovery {
+            discovery.join().await;
+            info!("scanners stopped");
+        }
+        // Every sender is gone once the scanners have stopped.
+        let _ = self.sink.await;
+    }
+}
+
+/// Starts one scanner per active source.
+async fn start_discovery(store: Arc<Store>, shutdown: watch::Receiver<bool>) -> Scanning {
+    // Step 4 of the plan (ingest) consumes the events; until then they are logged and dropped.
+    let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+    let sink = tokio::spawn(log_events(events_rx));
+    let discovery =
+        match Discovery::start(store, events_tx, shutdown, DiscoveryOptions::default()).await {
+            Ok(d) => {
+                info!(scanners = d.len(), "discovery started");
+                Some(d)
+            }
+            Err(e) => {
+                error!(error = %e, "discovery did not start; no source is scanned");
+                None
+            }
+        };
+    Scanning { discovery, sink }
 }
 
 async fn log_events(mut events: mpsc::Receiver<ObjectEvent>) {

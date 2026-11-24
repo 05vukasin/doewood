@@ -74,7 +74,7 @@ impl Store {
         Ok(store)
     }
 
-    fn conn(&self) -> MutexGuard<'_, Connection> {
+    pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
         // A panic while holding the lock leaves SQLite consistent (statements are atomic).
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -248,7 +248,7 @@ fn validate_secret_name(name: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
@@ -272,11 +272,23 @@ mod tests {
         assert_eq!(
             store.tables().unwrap(),
             [
+                "company_leases",
+                "edges",
                 "jobs",
+                "locations",
+                "nodes",
                 "objects_seen",
+                "records",
                 "scan_checkpoints",
+                "search_fts",
+                "search_fts_config",
+                "search_fts_data",
+                "search_fts_docsize",
+                "search_fts_idx",
+                "search_index",
                 "secrets",
                 "settings",
+                "source_claims",
                 "sources"
             ]
         );

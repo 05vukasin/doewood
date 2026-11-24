@@ -8,7 +8,8 @@ use crate::StoreError;
 /// Never edit a released migration: add a new one.
 const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_init.sql"),
-    include_str!("migrations/0002_sources.sql"),
+    include_str!("migrations/0002_standalone_model.sql"),
+    include_str!("migrations/0003_sources.sql"),
 ];
 
 /// The schema version this binary writes.

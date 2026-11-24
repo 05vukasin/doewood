@@ -1,6 +1,6 @@
 [package]
 name = "doewood-store"
-description = "doewood's instance-local SQLite store: settings, encrypted secrets, sources, jobs, progress"
+description = "doewood's instance-local SQLite store: settings, encrypted secrets, sources, jobs, progress, and the standalone records, graph and search"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,16 +8,23 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 chacha20poly1305 = "0.10"
 doewood-core.workspace = true
-# `bundled` compiles SQLite into the binary: no system library is needed.
+doewood-model.workspace = true
+# `bundled` compiles SQLite (with FTS5) into the binary: no system library is needed.
 rusqlite = { version = "0.41", features = ["bundled"] }
-serde_json = "1"
+serde_json.workspace = true
 thiserror.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+uuid.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+doewood-model = { workspace = true, features = ["conformance"] }
 tempfile = "3.20"
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]
 workspace = true

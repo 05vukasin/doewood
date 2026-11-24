@@ -48,12 +48,15 @@ The gRPC API (`127.0.0.1:7443`) arrives in a later step.
 ```
 crates/
   doewood-core    bootstrap config, errors, ids, the master key type
-  doewood-store   the instance-local SQLite store: settings, encrypted secrets, sources, jobs
+  doewood-model   records, graph, claims, search: the store traits and their conformance suite
+  doewood-store   the instance-local SQLite store: settings, encrypted secrets, sources, jobs,
+                  and the standalone backend of the store traits (FTS5 search)
+  doewood-pg      the shared Postgres (+ pgvector) backend of the store traits
   doewood-s3      S3 sources: a light SigV4 client, the incremental scanner, event inlets
   doewood         the binary: serve, version, config check
 ```
 
-Planned: `doewood-pg` (shared Postgres), `doewood-ingest`
+Planned: `doewood-ingest`
 (quail/hedgehog), `doewood-api` (gRPC) and `doewood-enrich` (registries, ADR 0002).
 
 ## Development
@@ -64,6 +67,15 @@ The rules follow quail's: Rust 2024 on the pinned toolchain (1.97.1), clippy ped
 ```sh
 make check     # fmt, clippy, tests
 make deny      # licenses, advisories, bans
+```
+
+The Postgres tests skip unless `DOEWOOD_TEST_POSTGRES_URL` is set (the `postgres` CI job sets
+it). Locally:
+
+```sh
+docker run --rm -d --name dw-pg -p 55432:5432 -e POSTGRES_PASSWORD=pw pgvector/pgvector:pg17
+DOEWOOD_TEST_POSTGRES_URL=postgres://postgres:pw@127.0.0.1:55432/postgres make test
+docker stop dw-pg
 ```
 
 ## License

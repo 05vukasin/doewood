@@ -1,4 +1,4 @@
--- doewood instance store, schema 2: source states and S3 options, scan checkpoints.
+-- doewood instance store, schema 3: source states and S3 options, scan checkpoints.
 
 -- SQLite cannot change a CHECK constraint, so `sources` is rebuilt (the documented
 -- create-copy-drop-rename procedure; migrations run with foreign keys off, and the migration
