@@ -102,7 +102,7 @@ pub struct Fetcher {
     transport: Arc<dyn Transport>,
     cache: Arc<dyn Cache>,
     clock: Arc<dyn Clock>,
-    bucket: TokenBucket,
+    bucket: Arc<TokenBucket>,
     policy: FetchPolicy,
 }
 
@@ -118,6 +118,19 @@ impl Fetcher {
         bucket: TokenBucket,
         policy: FetchPolicy,
     ) -> Self {
+        Self::sharing(registry, transport, cache, clock, Arc::new(bucket), policy)
+    }
+
+    /// A fetcher whose token bucket is shared with other fetchers: one limit over several
+    /// endpoints or document types of a registry, each with its own policy (EDGAR).
+    pub fn sharing(
+        registry: Registry,
+        transport: Arc<dyn Transport>,
+        cache: Arc<dyn Cache>,
+        clock: Arc<dyn Clock>,
+        bucket: Arc<TokenBucket>,
+        policy: FetchPolicy,
+    ) -> Self {
         Self {
             registry,
             transport,
@@ -126,6 +139,11 @@ impl Fetcher {
             bucket,
             policy,
         }
+    }
+
+    /// The cached answer under `key` while it is fresh, without sending anything.
+    pub async fn cached(&self, key: &str) -> Option<Fetch> {
+        self.fresh(&self.key(key)).await
     }
 
     /// The cached answer under `key` while fresh, else `GET url`. A fresh answer is not cached

@@ -2,16 +2,16 @@
 
 `crates/doewood-registry` holds the public registry clients of
 [ADR 0002](adr/0002-company-enrichment.md), section 2. `doewood-enrich` stays pure (no I/O);
-this crate does the requests and parses the answers into types. GLEIF, VIES and Wikidata are
-done; EDGAR, APR and Companies House follow, one at a time.
+this crate does the requests and parses the answers into types. GLEIF, VIES, Wikidata and
+SEC EDGAR are done; APR and Companies House follow, one at a time.
 
 Nothing calls the clients yet: the enrichment job (ADR 0002 section 6) that turns their answers
 into company identifiers and dated edges comes later.
 
 ## What is sent
 
-Only identifiers and names: an LEI, a VAT number, a Wikidata item id, or a legal name and a
-country code. Document
+Only identifiers and names: an LEI, a VAT number, a Wikidata item id, an EDGAR CIK and
+accession number, or a legal name and a country code. Document
 content never leaves the instance (ADR 0002, the privacy rule). An identifier is validated before
 it is sent: an LEI must pass ISO 17442 (`doewood_enrich::check::lei`), a VAT number its
 country's format and check digits (`doewood_enrich::check::vat`), so a typo or a placeholder is
@@ -23,8 +23,8 @@ Every client is built on the same request loop (`Fetcher`):
 
 - **Failure-soft.** Every failure is a typed `Warning { registry, kind }`, never a panic or a
   failed ingest. The kinds: `Disabled`, `Config`, `InvalidInput`, `Timeout`, `Transport`,
-  `TooLarge`, `RateLimited`, `Status`, `Malformed`, `Vies` (a VIES error code) and `Wikidata`
-  (a Wikidata API error code). The loop
+  `TooLarge`, `RateLimited`, `Status`, `Malformed`, `Vies` (a VIES error code), `Wikidata`
+  (a Wikidata API error code) and `Edgar` (the SEC refused the request). The loop
   logs each one at `WARN`.
 - **Length-capped.** The body is read chunk by chunk and dropped as soon as it passes the cap
   (a larger `Content-Length` is refused before reading). It is never parsed.
@@ -43,9 +43,11 @@ Every client is built on the same request loop (`Fetcher`):
 - **`GET` or JSON `POST`.** The transport sends either; VIES's documented endpoint is a `POST`.
 - **User-Agent.** Every request sends `doewood/<version> (+https://github.com/05vukasin/doewood)`
   (`USER_AGENT`): generic, with the project's URL as the contact, as the Wikimedia User-Agent
-  policy asks. Never a person's name or email.
-- **Trust tier.** `Registry::tier()` is `TrustTier::Official` for GLEIF and VIES (and the
-  national registries to come) and `TrustTier::Community` for Wikidata, the lowest tier of ADR
+  policy asks. Never a person's name or email in the code. EDGAR is the one exception: the SEC
+  asks for the requester's name and email, which the operator configures (see
+  [EDGAR](#sec-edgar)).
+- **Trust tier.** `Registry::tier()` is `TrustTier::Official` for GLEIF, VIES and EDGAR (and
+  the national registries to come) and `TrustTier::Community` for Wikidata, the lowest tier of ADR
   0002 section 2 (`Community < Official`).
 - **Timeouts.** One for connecting, and one for the whole request, body included.
 - **Cached, with a fetch date.** Answers are cached by request under keys like
@@ -265,12 +267,121 @@ tell an existing item from an unknown id), how unknown values appear (blank node
 `.well-known/genid` IRIs: both are skipped), and that the WDQS v1 endpoint stays where it is
 (the manual mentions a v2 service; `sparql_url` is a setting).
 
+## SEC EDGAR
+
+SEC EDGAR, keyless, `TrustTier::Official` (SEC filings). Two hosts: `data.sec.gov` for the
+submissions API, `www.sec.gov` for the company tickers file and the filing archives.
+
+| call | requests | gives |
+|---|---|---|
+| `company(cik)` | `GET data.sec.gov/submissions/CIK##########.json` | `Company`, or `None` (404) |
+| `ticker(symbol)` | `GET www.sec.gov/files/company_tickers.json` | the entry (CIK, ticker, name), or `None` |
+| `search(name)` | the same file | entries whose name has every word of `name` |
+| `exhibit21(cik, accession)` | `GET www.sec.gov/Archives/edgar/data/<cik>/<accession digits>/<accession>-index.htm`, then the exhibit | `Exhibit21`, or `None` when the filing has none |
+| `subsidiaries(cik)` | `company`, then `exhibit21` of the newest 10-K | `Exhibit21` with the 10-K's filing date |
+| `acquisition_text(cik, filing)` | `GET` the filing's primary document | the text from "Item 2.01" on, or `None` |
+
+- **A company** (`Company`): the CIK, name, entity type, SIC code and description, tickers and
+  exchanges, state of incorporation, fiscal year end, **former names** with their `from` / `to`
+  days, and the recent filings (the SEC lists at least a year, or the last 1,000): form, filing
+  and report dates, accession number, 8-K items, primary document. The older filings' file
+  names are kept (`older_filing_files`) but not fetched. The answer must be about the CIK asked,
+  else `Malformed`. Filings with an invalid accession number are skipped, and a primary document
+  name that is not a plain file name (`A-Z a-z 0-9 . _ -`) is dropped.
+- **Completed acquisitions.** `Company::acquisitions()` gives the 8-K and 8-K/A filings whose
+  items include `2.01` ("Completion of Acquisition or Disposition of Assets"), with the filing
+  date and accession number: the dated `acquired` events of ADR 0002 section 3. The text window
+  (`acquisition_text`) is best-effort: the primary document's text from the first "Item 2.01"
+  followed by "Completion" (else the first "Item 2.01"), cut before the next "Item N.NN" and at
+  `item_chars` characters.
+- **Exhibit 21** (subsidiaries of the registrant). The filing index page's document table is
+  read (columns found by their `Document` and `Type` headers, else EDGAR's order), and the first
+  document of type `EX-21` or `EX-21.<n>` is fetched. Its rows are **best-effort**
+  (`Exhibit21::extraction`): HTML table rows give the name in the first cell and the
+  jurisdiction in the last one that is not an ownership share; without tables, lines are read
+  (`Name (Delaware)`, `Name, a Delaware corporation`, `Name - Delaware`, tab, dot-leader or
+  wide-space separated, or a name alone). Headers, titles, numbering and page numbers are
+  skipped. At most `max_subsidiaries` rows (`truncated` says there were more). Formats vary
+  widely, so a row is a candidate to corroborate before it becomes an edge. The HTML reader is a
+  small bounded routine in the crate (no new dependency); odd or garbage input gives fewer rows,
+  never a panic.
+- **Name and ticker lookup.** The tickers file lists only companies with a listed ticker. It is
+  fetched whole (capped at 4 MiB) and searched on the instance, so the name is never sent.
+- **Before sending.** A CIK is 1 to 10 digits (optionally after `CIK`), not zero, and sent
+  zero-padded to 10 digits; an accession number is `0000000000-00-000000` or its 18 digits; a
+  document name is a plain file name from the filing index or the submissions. Anything else is
+  `InvalidInput`, and nothing is sent. No other text reaches a URL.
+- **User-Agent and contact.** The SEC's fair-access policy asks automated clients to declare a
+  User-Agent with the requester's name and a contact email (its example: `Sample Company Name
+  AdminContact@<sample company domain>.com`). This contact is runtime configuration (ADR 0002
+  section 7), `EdgarConfig::contact`, set by the operator: then every EDGAR request sends
+  `<contact> doewood/<version> (+https://github.com/05vukasin/doewood)`. With none set, EDGAR
+  runs with the generic `USER_AGENT` (ADR 0002 section 7). The SEC may refuse that with a 403;
+  **operators should set their own contact.** The contact is printable ASCII, at most 200
+  characters (else a `Config` warning). doewood ships no contact, and never a person's name or
+  email.
+- **Fair access.** The SEC allows at most 10 requests a second per user, across all its hosts
+  and machines. Every EDGAR request of a client (submissions, tickers, indexes, documents)
+  shares one token bucket: 300 a minute (5 a second) with a burst of 2, so at most 7 in any
+  second. A 429 and 5xx get the shared backoff and `Retry-After` handling.
+- **403.** The SEC answers 403 for an undeclared User-Agent and when the rate threshold is
+  exceeded. A 403 is never retried: it is `Edgar(UndeclaredUserAgent)`, `Edgar(RateThreshold)`
+  or `Edgar(Forbidden)` (from the page text), and the client then sends nothing for `pause`
+  (10 minutes); requests meanwhile are `RateLimited` with the time left. Cached answers are
+  still served.
+- **Cached** under `edgar:submissions/CIK##########` for 1 day (found or 404),
+  `edgar:files/company_tickers.json` for 1 day, and `edgar:Archives/edgar/data/...` (index
+  pages, exhibits, 8-K documents) for 30 days: a filing under an accession number does not
+  change. A missing index or exhibit is a `Status(404)` warning and is not cached; a missing 8-K
+  document is `None`, cached for a day.
+- **Refresh.** ADR 0002 refreshes EDGAR "when new filings appear (RSS)". Without the feed, the
+  1-day submissions TTL bounds how late a new filing is seen. Reading EDGAR's RSS (or the
+  daily index) to refresh only the companies with new filings is an open item, for the
+  enrichment job (ADR 0002 section 6).
+
+### Settings
+
+`EdgarConfig`, whose defaults are the production values:
+
+| field | default |
+|---|---|
+| `enabled` | `true` (keyless, ADR 0002 section 7) |
+| `contact` | none: the generic `USER_AGENT` (set your own, such as `Example Ops ops@example.invalid`) |
+| `data_url` / `www_url` | `https://data.sec.gov/` / `https://www.sec.gov/` |
+| `timeout` / `connect_timeout` | 20 s / 5 s |
+| `per_minute` / `burst` | 300 / 2, one bucket for every EDGAR request |
+| `max_submissions` / `max_tickers` / `max_index` / `max_exhibit` / `max_document` | 4 MiB / 4 MiB / 1 MiB / 2 MiB / 4 MiB |
+| `max_retries` / `backoff` / `max_retry_after` | 2 / 1 s, doubling / 60 s |
+| `pause` | 10 minutes after a 403 |
+| `ttl_submissions` / `ttl_tickers` / `ttl_archive` | 1 day / 1 day / 30 days |
+| `search_size` | 10 (at most 100) |
+| `max_subsidiaries` / `item_chars` | 5,000 / 2,000 |
+
+Confirmed from the SEC's developer pages: the submissions URL (`CIK` and 10 digits), that it
+holds the current and former names, tickers and exchanges, at least a year or 1,000 filings in
+columnar arrays plus files for older ones; the 10 requests a second; the declared User-Agent
+and its sample form. Assumed, and handled defensively: the JSON field names (`formerNames`
+with `name` / `from` / `to`, `filings.recent.accessionNumber`, `items`, `primaryDocument`, ...;
+every field optional), the tickers file's shape (`cik_str`, `ticker`, `title`), the filing index
+page's table and its `Document` / `Type` columns, the 403 page texts ("Undeclared Automated
+Tool", "Request Rate Threshold Exceeded"; any other 403 is `Forbidden`), and the length of the
+SEC's block (the default pause is 10 minutes).
+
 ## Tests
 
 `cargo test -p doewood-registry`. The tests never reach a real registry: a mock HTTP server on
 127.0.0.1 answers with fixtures written by hand in the test code (invented companies and
 addresses, LEIs and VAT numbers built with valid check digits, invented relationships, and
-invented Wikidata items from Q999000001 up). For Wikidata they cover the LEI and Q-id lookups
+invented Wikidata items from Q999000001 up, and invented EDGAR companies, CIKs from 9990000001
+up, filings, filing indexes and Exhibit 21 documents, with `example.invalid` contacts). For
+EDGAR they cover the lookup by CIK with former names, tickers and filings, the cache's day,
+404 and answers about another CIK, CIKs and tickers that are never sent, the ticker and name
+lookup (the file fetched once, no name sent), the filing index with and without an EX-21,
+Exhibit 21 tables, paragraphs, plain text, garbage input and the row cap, 8-K Item 2.01
+detection and its capped text, the 403 for an undeclared User-Agent and the pause after it,
+the rate-threshold 403, 429 and 5xx backoff, oversize documents, one rate limit over every
+document, and that the configured contact is in the User-Agent while the default is the
+generic one. For Wikidata they cover the LEI and Q-id lookups
 with relations, dates and precisions, missing qualifiers, several parents, deprecated and
 unknown values, empty results, answers about another entity, malformed JSON, oversize bodies,
 429 with `Retry-After`, 5xx retries, timeouts, hostile ids, LEIs and names (quotes, braces,
