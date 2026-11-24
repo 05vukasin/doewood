@@ -1279,6 +1279,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "doewood-registry"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "doewood-enrich",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "doewood-s3"
 version = "0.1.0"
 dependencies = [

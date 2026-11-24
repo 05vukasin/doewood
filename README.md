@@ -66,6 +66,8 @@ crates/
   doewood-s3      S3 sources: a light SigV4 client, the incremental scanner, event inlets
   doewood-enrich  company identity (ADR 0002 section 1), pure: names, legal forms, aliases,
                   identifier checks, the fuzzy score, evidence fusion, uuid5 group ids
+  doewood-registry public registry clients (ADR 0002 section 2): failure-soft, capped,
+                  rate-limited, cached; GLEIF (LEI records, Level 2 parents, successors)
   doewood-ingest  ingest: fetch, quail and hedgehog, records, the graph (companies, references,
                   similar documents) and search; feature `ocr` (on in the binary)
   doewood-api     the gRPC API (tonic, gRPC-Web, health, reflection); protos in proto/doewood/v1
@@ -74,7 +76,8 @@ charts/doewood    the Helm chart (StatefulSet, one volume per instance)
 Dockerfile        the image, with OCR
 ```
 
-Planned: the registry clients of `doewood-enrich` (ADR 0002 section 2).
+Planned: the other registry clients in `doewood-registry` (VIES, Wikidata, EDGAR, APR,
+Companies House), and the enrichment job that uses them. See [docs/registries.md](docs/registries.md).
 
 The `.proto` files compile with `protox` (pure Rust) in `doewood-api`'s build script, so
 `cargo build` needs no `protoc`.

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-# Planned crates (ADR 0001), added one per step: the registry clients of doewood-enrich (ADR 0002
-# section 2) are next.
+# Planned crates (ADR 0001), added one per step. The registry clients (ADR 0002 section 2) live in
+# doewood-registry, one client per step: GLEIF first.
 members = ["crates/*"]
 
 [workspace.package]
@@ -19,6 +19,7 @@ doewood-enrich = { path = "crates/doewood-enrich" }
 doewood-ingest = { path = "crates/doewood-ingest", default-features = false }
 doewood-model = { path = "crates/doewood-model" }
 doewood-pg = { path = "crates/doewood-pg" }
+doewood-registry = { path = "crates/doewood-registry" }
 doewood-s3 = { path = "crates/doewood-s3" }
 doewood-store = { path = "crates/doewood-store" }
 async-trait = "0.1"

@@ -1,0 +1,34 @@
+[package]
+name = "doewood-registry"
+description = "doewood's public registry clients (ADR 0002 section 2): failure-soft, length-capped, rate-limited and cached. GLEIF first."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# The network side of company enrichment. doewood-enrich stays pure (no I/O); this crate does
+# the requests and parses the answers into types. Only identifiers and names are sent, never
+# document content (ADR 0002, the privacy rule).
+[dependencies]
+async-trait.workspace = true
+# LEI validation (ISO 17442) before any request.
+doewood-enrich.workspace = true
+# HTTP/1.1, rustls with the `ring` provider, no proxy discovery, no decompression: the same
+# build as doewood-s3's.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+tracing.workspace = true
+url = "2.5"
+
+[dev-dependencies]
+# The mock registry server of the tests listens on 127.0.0.1 only.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+
+[lints]
+workspace = true
