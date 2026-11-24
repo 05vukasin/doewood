@@ -20,6 +20,11 @@ ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS} \
     # The toolchain of the image, without the clippy and rustfmt components the toolchain file
     # asks for (only development needs them).
     RUSTUP_TOOLCHAIN=${RUST_VERSION}
+# The `ort` build script downloads ONNX Runtime through native-tls (OpenSSL); the binary itself
+# uses rustls.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends pkg-config libssl-dev \
+ && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY rust-toolchain.toml ./
 RUN want="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"; \
