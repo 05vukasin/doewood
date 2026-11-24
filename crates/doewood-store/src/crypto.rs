@@ -1,7 +1,7 @@
 //! Sealing secrets: XChaCha20-Poly1305 with a random 192-bit nonce per write. The secret's
 //! name is bound as associated data, so a ciphertext copied into another row does not open.
 
-use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use doewood_core::MasterKey;
 use zeroize::Zeroizing;
@@ -25,19 +25,20 @@ impl Cipher {
         name: &str,
         plaintext: &[u8],
     ) -> Result<([u8; NONCE_LEN], Vec<u8>), StoreError> {
-        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let mut nonce = [0u8; NONCE_LEN];
+        getrandom::fill(&mut nonce).map_err(|_| StoreError::Random)?;
         let aad = aad(name);
         let ciphertext = self
             .0
             .encrypt(
-                &nonce,
+                &XNonce::from(nonce),
                 Payload {
                     msg: plaintext,
                     aad: &aad,
                 },
             )
             .map_err(|_| StoreError::Random)?;
-        Ok((nonce.into(), ciphertext))
+        Ok((nonce, ciphertext))
     }
 
     pub(crate) fn open(
@@ -51,7 +52,7 @@ impl Cipher {
         let aad = aad(name);
         self.0
             .decrypt(
-                XNonce::from_slice(&nonce),
+                &XNonce::from(nonce),
                 Payload {
                     msg: ciphertext,
                     aad: &aad,
@@ -92,6 +93,24 @@ mod tests {
         let (n2, c2) = c.seal("a", b"same").unwrap();
         assert_ne!(n1, n2);
         assert_ne!(c1, c2);
+    }
+
+    /// A secret sealed by an earlier build (chacha20poly1305 0.10) still opens: dependency
+    /// upgrades must never make stored secrets unreadable.
+    #[test]
+    fn opens_secrets_sealed_by_earlier_builds() {
+        fn unhex(s: &str) -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect()
+        }
+        let nonce = unhex("2e02437d6a0a0f609f37fcfb60f283e59ddddcea40b41654");
+        let ct = unhex("77eb21111539d6013b4d01f91fb2e420ce691631584b965f1c8211546b84b345c4");
+        assert_eq!(
+            cipher(7).open("s3/main", &nonce, &ct).unwrap().as_slice(),
+            b"doewood secret v1"
+        );
     }
 
     #[test]

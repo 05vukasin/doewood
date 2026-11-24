@@ -9,9 +9,10 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 doewood-core.workspace = true
 doewood-model.workspace = true
+getrandom = "0.4"
 # `bundled` compiles SQLite (with FTS5) into the binary: no system library is needed.
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde_json.workspace = true
