@@ -152,3 +152,23 @@ are there for enrichment, and no document merges on a fuzzy match yet.
   deletes and reprocessing. `throughput` (ignored) measures files per second.
 - `tests/minio_postgres.rs`: an S3 put in MinIO to a record in Postgres, with both
   `DOEWOOD_TEST_S3_ENDPOINT` and `DOEWOOD_TEST_POSTGRES_URL` set (CI's `ingest-e2e` job).
+
+## Throughput
+
+`throughput` in `tests/pipeline.rs`: 2000 generated files (PDF, DOCX, TXT, XLSX in equal parts,
+4.7 MiB), fetched from memory, analyzed without OCR, stored in in-memory SQLite (records, graph,
+search). Test profile (dependencies at opt-level 2). The worker count is `default_jobs()` (CPUs
+and memory); the test does not read `DOEWOOD_INGEST_JOBS`.
+
+```
+DOEWOOD_BENCH_FILES=2000 cargo test -p doewood-ingest --test pipeline -- --ignored --nocapture throughput
+```
+
+| machine | cores, RAM | workers | files/s | notes |
+|---|---|---|---|---|
+| laptop | 16, 14 GiB | 9 | 409 | from PR #5 |
+| server (AMD EPYC-Genoa) | 4, 7.6 GiB | 4 | 313 | median of 317, 313, 311 |
+| server, `taskset -c 0,1` | 2 | 2 | 228 | median of 242, 226, 228 |
+
+Server: Linux 7.0.0-30, rustc 1.97.1, commit `ba0b963`. Throughput grows less than linearly
+with workers here (2 to 4 workers: 1.4x).
