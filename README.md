@@ -8,7 +8,7 @@ serves it all over gRPC.
 The name comes from Košutnjak, a Belgrade forest: *košuta* (a doe) + wood. It joins the hedgehog
 and the quail.
 
-**Status:** design accepted, implementation starting. See [ADR 0002](docs/adr/0002-company-enrichment.md) (company identity and registries) and
+**Status:** step 1 (skeleton: configuration, local store, ops endpoints) in progress. See [ADR 0002](docs/adr/0002-company-enrichment.md) (company identity and registries) and
 [ADR 0001](docs/adr/0001-architecture.md).
 
 - **One binary.** It starts with no configuration at all; everything else is set at runtime
@@ -18,6 +18,51 @@ and the quail.
 - **Any S3-compatible store**, watched continuously.
 - **AI models through APIs:** OpenAI, Anthropic, Bedrock, OpenRouter, Groq, vLLM or Ollama, using
   the same presets as hedgehog.
+
+## Quickstart
+
+```sh
+cargo run -- serve
+```
+
+With no environment at all, this:
+
+- creates `./doewood-data/` with the SQLite store and a development master key (and warns
+  loudly that the key file is for development only);
+- serves `/healthz`, `/readyz` and `/metrics` on `127.0.0.1:7444`;
+- runs standalone, without a shared Postgres;
+- logs JSON to stderr (`RUST_LOG` sets the filter) and stops cleanly on Ctrl-C or SIGTERM.
+
+```sh
+curl -s 127.0.0.1:7444/readyz     # ready
+cargo run -- config check         # effective configuration, secrets redacted
+cargo run -- version
+```
+
+The bootstrap variables are listed in [docs/configuration.md](docs/configuration.md).
+The gRPC API (`127.0.0.1:7443`) arrives in a later step.
+
+## Layout
+
+```
+crates/
+  doewood-core    bootstrap config, errors, ids, the master key type
+  doewood-store   the instance-local SQLite store: settings, encrypted secrets, sources, jobs
+  doewood         the binary: serve, version, config check
+```
+
+Planned: `doewood-pg` (shared Postgres), `doewood-s3` (sources), `doewood-ingest`
+(quail/hedgehog), `doewood-api` (gRPC) and `doewood-enrich` (registries, ADR 0002).
+
+## Development
+
+The rules follow quail's: Rust 2024 on the pinned toolchain (1.97.1), clippy pedantic with
+`-D warnings`, `unsafe` denied, CI on Linux, macOS, Windows and Linux ARM, plus `cargo deny`.
+
+```sh
+make check     # fmt, clippy, tests
+make deny      # licenses, advisories, bans
+```
 
 ## License
 
