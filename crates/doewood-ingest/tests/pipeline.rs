@@ -751,3 +751,87 @@ async fn shutdown_leaves_unfinished_work_pending() {
     assert_eq!(s.status, "pending");
     assert!(s.attempts >= 1);
 }
+
+/// Files per second through the whole pipeline (fetch from memory, analyze, SQLite records,
+/// graph and search) on a generated mix of PDF, DOCX, TXT and XLSX, every file distinct.
+/// `cargo test -p doewood-ingest --test pipeline -- --ignored --nocapture throughput`
+/// (`DOEWOOD_BENCH_FILES` sets the count, default 400).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "a measurement, not a check"]
+async fn throughput() {
+    let n: usize = std::env::var("DOEWOOD_BENCH_FILES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(400);
+    let jobs = doewood_ingest::default_jobs();
+    let store = Arc::new(Store::open_in_memory(&MasterKey::from_bytes([8; 32])).unwrap());
+    let backend: Arc<dyn Backend> = Arc::new(Standalone::new(Arc::clone(&store)));
+    let h = Harness::start(Arc::clone(&store), backend, jobs, Duration::from_millis(10));
+    let mut files = Vec::with_capacity(n);
+    let mut bytes = 0usize;
+    for i in 0..n {
+        let pib = common::pib(&format!("{:08}", 10_000_000 + i));
+        let body = common::prose(i as u64, 300);
+        let (key, data) = match i % 4 {
+            0 => (
+                format!("bench/{i}.pdf"),
+                common::pdf(
+                    &[
+                        &format!("UGOVOR br. {i}/26"),
+                        &format!("Dobavljac: Firma {i} d.o.o. Beograd, PIB {pib}"),
+                        "Narucilac: Kupac Grupa a.d. Novi Sad",
+                        &body[..90],
+                    ],
+                    "Ugovor",
+                ),
+            ),
+            1 => (
+                format!("bench/{i}.docx"),
+                common::docx(
+                    &format!("Aneks {i}"),
+                    &[&format!("ANEKS uz Ugovor br. {}/26", i - 1), &body],
+                ),
+            ),
+            2 => (
+                format!("bench/{i}.txt"),
+                format!(
+                    "INVOICE No. INV-{i}\nSupplier: Vendor {i} LLC\n{body}\nTotal: EUR {i}.50\n"
+                )
+                .into_bytes(),
+            ),
+            _ => (
+                format!("bench/{i}.xlsx"),
+                common::xlsx(
+                    "Data",
+                    &[
+                        &["Item", "Qty"],
+                        &[&format!("Part {i}"), "3"],
+                        &["Bolts", "10"],
+                    ],
+                ),
+            ),
+        };
+        bytes += data.len();
+        files.push((key, data));
+    }
+    let started = std::time::Instant::now();
+    for chunk in files.chunks(64) {
+        let batch: Vec<(&str, Vec<u8>, bool)> = chunk
+            .iter()
+            .map(|(k, d)| (k.as_str(), d.clone(), true))
+            .collect();
+        h.put(&batch).await;
+    }
+    h.settle().await;
+    let secs = started.elapsed().as_secs_f64();
+    let c = store.object_counts(h.source).unwrap();
+    #[allow(clippy::cast_precision_loss)]
+    let (rate, mib) = (n as f64 / secs, bytes as f64 / f64::from(1 << 20));
+    println!(
+        "throughput: {n} files ({mib:.1} MiB) with {jobs} workers in {secs:.2}s = {rate:.0} \
+         files/s (done {}, skipped {}, failed {})",
+        c.done, c.skipped, c.failed
+    );
+    assert_eq!(c.done, n as u64);
+    h.stop().await;
+}

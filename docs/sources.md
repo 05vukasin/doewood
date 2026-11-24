@@ -48,8 +48,8 @@ with the `objects_seen` table:
 
 - a key not seen before is **New**, a key whose ETag or size differs is **Changed**, and a seen
   key the listing no longer has is **Deleted**;
-- the events go to a bounded channel (1024 events) that ingest (step 4) consumes; a scanner waits
-  while the channel is full. Until ingest exists, `serve` logs them at `debug`.
+- the events go to a bounded channel (1024 events) that [ingest](ingest.md) consumes; a scanner
+  waits while the channel is full, so a busy ingest slows the scan down instead of queueing.
 
 The first pass is full: every key is new. Later passes emit only the differences.
 

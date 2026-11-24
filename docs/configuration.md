@@ -20,6 +20,9 @@ doewood has two kinds of settings, and each setting has exactly one source
 | `DOEWOOD_MASTER_KEY` | the key file `<data>/master.key` | Base64 of 32 random bytes. Encrypts the secrets in the store. |
 | `DOEWOOD_INSTANCE_ID` | the hostname | Name of this instance: 1 to 63 ASCII letters, digits, `-`, `_`, `.`. On Kubernetes, the `StatefulSet` pod name. It is the owner named on the sources this instance claims. |
 | `DOEWOOD_API_MAX_MESSAGE_MIB` | `64` | Largest gRPC message the API decodes or encodes, in MiB (1 to 1024). Leaves room for a file sent to `Summarize`. |
+| `DOEWOOD_INGEST_JOBS` | from the CPUs and memory | Files ingest analyzes at the same time (1 to 256). The default is one per CPU, at most what half the available memory holds at 512 MiB each (a cgroup limit counts), at most 32. See [ingest.md](ingest.md). |
+| `DOEWOOD_OCR_MODELS` | `<data>/ocr-models` | Directory of quail's OCR model files (`quail models fetch` downloads them). Missing models are a `WARN` at start, never an error: scanned pages are then flagged `needs_ocr`. |
+| `DOEWOOD_SIMILAR_MIN_JACCARD` | `0.8` | Least MinHash Jaccard estimate for a `similar_to` edge (above 0, at most 1). |
 
 `RUST_LOG` sets the log filter (default `info`), for example `RUST_LOG=doewood=debug,info`.
 
