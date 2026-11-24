@@ -1,0 +1,25 @@
+[package]
+name = "doewood-model"
+description = "doewood's shared data model: records, the graph, source claims and search, and the store traits both backends implement"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# The backend conformance suite: one generic test run against every backend.
+conformance = []
+
+[dependencies]
+async-trait.workspace = true
+doewood-core.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+
+[lints]
+workspace = true

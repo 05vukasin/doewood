@@ -5,7 +5,11 @@
 //! 2. prepare the data directory (the only fatal configuration check);
 //! 3. register the signal handlers, so a SIGTERM during startup still shuts down cleanly;
 //! 4. start the ops server (`/healthz` answers, `/readyz` says not ready);
-//! 5. resolve the master key and open the store, then report ready.
+//! 5. resolve the master key and open the store;
+//! 6. standalone: serve records, graph and search from the store and report ready. With
+//!    `DOEWOOD_POSTGRES_URL`: connect to the shared Postgres in the background, and report ready
+//!    once it answers. Until then the instance runs degraded: `/readyz` says why, and the
+//!    connection is retried with backoff (see [`crate::shared`]).
 //!
 //! On SIGTERM or SIGINT: report not ready, stop the servers, close the store, exit 0.
 
@@ -13,13 +17,15 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use doewood_core::{BootstrapConfig, Loaded, MasterKey, MasterKeySource};
+use doewood_model::Backend;
 use doewood_store::keyfile::{self, KeyFileState};
-use doewood_store::{STORE_FILE, Store};
+use doewood_store::{STORE_FILE, Standalone, Store};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 use crate::ops::{self, OpsState};
+use crate::shared;
 
 /// Builds the runtime and runs the service until a shutdown signal.
 pub fn main(loaded: Loaded) -> ExitCode {
@@ -99,20 +105,45 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
             return Err(e);
         }
     };
-    state.set_ready(true);
-    info!(addr = %ops_addr, "ready");
+
+    // Records, graph, claims and search: the shared Postgres when configured, else this file.
+    let (backend_tx, backend_rx) = watch::channel::<Option<Arc<dyn Backend>>>(None);
+    let supervisor = if let Some(url) = config.postgres_url.clone() {
+        // Degraded until the supervisor connects; it retries for as long as it takes.
+        Some(tokio::spawn(shared::supervise(
+            url,
+            Arc::clone(&state),
+            backend_tx,
+            shutdown_rx.clone(),
+        )))
+    } else {
+        backend_tx.send_replace(Some(Arc::new(Standalone::new(Arc::clone(&store)))));
+        // The value stays readable through `backend_rx`.
+        drop(backend_tx);
+        state.set_ready();
+        info!(addr = %ops_addr, "ready");
+        None
+    };
 
     let signal = signals.recv().await;
     info!(signal, "shutting down");
-    state.set_ready(false);
+    state.set_not_ready("shutting down");
     let _ = shutdown_tx.send(true);
     match ops_server.await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => warn!(error = %e, "ops server ended with an error"),
         Err(e) => warn!(error = %e, "ops server task failed"),
     }
+    if let Some(task) = supervisor
+        && let Err(e) = task.await
+    {
+        warn!(error = %e, "shared store supervisor failed");
+    }
+    let backend = backend_rx.borrow().as_ref().map(|b| b.name());
+    info!(backend, "servers stopped");
+    drop(backend_rx);
 
-    // Nothing else holds the store once the servers have stopped.
+    // Nothing else holds the store once the servers and the backend are gone.
     let store = Arc::try_unwrap(store).map_err(|_| "store still in use at shutdown".to_owned())?;
     tokio::task::spawn_blocking(move || store.close())
         .await

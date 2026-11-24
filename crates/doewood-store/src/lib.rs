@@ -1,6 +1,9 @@
 //! The instance-local SQLite store (ADR 0001, section 1): runtime settings, encrypted secrets,
 //! sources, jobs and per-object progress.
 //!
+//! In standalone mode (no shared Postgres) the same file also holds the records, the graph,
+//! source claims and search: [`Standalone`] implements the `doewood-model` store traits over it.
+//!
 //! - One SQLite file per instance, opened in WAL mode with a busy timeout.
 //! - A single writer: every statement goes through one connection behind a mutex.
 //! - The schema is migrated on open from SQL embedded in the binary.
@@ -12,8 +15,10 @@ mod crypto;
 mod error;
 pub mod keyfile;
 mod migrate;
+mod standalone;
 mod store;
 
 pub use error::StoreError;
 pub use migrate::SCHEMA_VERSION;
+pub use standalone::Standalone;
 pub use store::{SECRET_MAX_LEN, STORE_FILE, Store};

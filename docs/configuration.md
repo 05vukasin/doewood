@@ -35,6 +35,26 @@ doewood has two kinds of settings, and each setting has exactly one source
   master key that differs from the one the store was created with, and an ops address that
   cannot be bound.
 
+### The shared Postgres
+
+With `DOEWOOD_POSTGRES_URL` set, records, the graph, source claims and search live in that
+database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
+
+- **Never fatal.** If the database cannot be reached, the instance still starts, runs degraded
+  and retries with backoff (1 s doubling to 60 s, with jitter). `/readyz` answers 503 with the
+  reason, for example `not ready: shared Postgres unreachable: ... (retrying in 4s)`. A connected
+  store is pinged every 15 s; while it does not answer, `/readyz` is 503 again.
+- **Migrations** run on connect, under an advisory lock, so instances starting together migrate
+  once. The version is in the `doewood_schema` table. A database migrated by a newer doewood is
+  refused (not ready) until this one is upgraded.
+- **pgvector** is used when the server has it: doewood creates the extension (this needs a role
+  allowed to) and adds `search_index.embedding`. Without it, this is logged once and search runs
+  on full text only.
+- **TLS** follows the URL's `sslmode` (`disable`, `prefer` (the default) or `require`), via
+  rustls. The server certificate is always verified, against the system roots plus the Mozilla
+  roots; put a private CA into the system store.
+- Unset parameters get defaults: `connect_timeout=5`, `application_name=doewood`.
+
 ### The master key
 
 In production, set `DOEWOOD_MASTER_KEY` from a secret store (a Kubernetes `Secret`):
