@@ -11,8 +11,10 @@ and the quail.
 **Status:** the skeleton (configuration, local store, ops endpoints), the shared store, S3
 discovery, the gRPC API, ingest (quail and hedgehog into records, the graph and search), the
 LLM queue (per-source policy, concurrency cap, daily budget, on-demand `Summarize`; see
-[docs/llm.md](docs/llm.md)) and the container image with a Helm chart (see
-[docs/deploy.md](docs/deploy.md)) are in; registry enrichment is next. See
+[docs/llm.md](docs/llm.md)), the container image with a Helm chart (see
+[docs/deploy.md](docs/deploy.md)), the company identity rules, the six registry clients and the
+favicon proxy (see [docs/registries.md](docs/registries.md)) are in. The enrichment job that runs the
+registry clients during ingest is next. See
 [ADR 0002](docs/adr/0002-company-enrichment.md) (company identity and registries) and
 [ADR 0001](docs/adr/0001-architecture.md).
 
@@ -68,8 +70,8 @@ crates/
   doewood-enrich  company identity (ADR 0002 section 1), pure: names, legal forms, aliases,
                   identifier checks, the fuzzy score, evidence fusion, uuid5 group ids
   doewood-registry public registry clients (ADR 0002 section 2): failure-soft, capped,
-                  rate-limited, cached; GLEIF (LEI records, Level 2 parents, successors);
-                  the favicon resolver with its SSRF guard (ADR 0002 section 5)
+                  rate-limited, cached; GLEIF, VIES, Wikidata, SEC EDGAR, APR and Companies
+                  House; the favicon resolver with its SSRF guard (ADR 0002 section 5)
   doewood-ingest  ingest: fetch, quail and hedgehog, records, the graph (companies, references,
                   similar documents) and search; feature `ocr` (on in the binary)
   doewood-api     the gRPC API (tonic, gRPC-Web, health, reflection) and GET /icons/{domain};
@@ -79,8 +81,8 @@ charts/doewood    the Helm chart (StatefulSet, one volume per instance)
 Dockerfile        the image, with OCR
 ```
 
-Planned: the other registry clients in `doewood-registry` (VIES, Wikidata, EDGAR, APR,
-Companies House), and the enrichment job that uses them. See [docs/registries.md](docs/registries.md).
+Planned: the enrichment job that uses the registry clients, with their shared Postgres cache and
+their runtime settings (on/off, keys, the EDGAR contact). See [docs/registries.md](docs/registries.md).
 
 The `.proto` files compile with `protox` (pure Rust) in `doewood-api`'s build script, so
 `cargo build` needs no `protoc`.
