@@ -124,7 +124,7 @@ impl Evidence {
 }
 
 /// The noisy-OR over distinct sources: the strongest hit of each source, then
-/// `1 - Π (1 - r)`. No evidence gives 0.
+/// `1 - Π (1 - r)` (ADR 0002 section 1.6). No evidence gives 0.
 pub fn fuse(evidence: &[Evidence]) -> f64 {
     let mut best: BTreeMap<Source, f64> = BTreeMap::new();
     for e in evidence {
@@ -134,7 +134,9 @@ pub fn fuse(evidence: &[Evidence]) -> f64 {
             *slot = r;
         }
     }
-    1.0 - best.values().map(|r| 1.0 - r).product::<f64>()
+    let p = 1.0 - best.values().map(|r| 1.0 - r).product::<f64>();
+    // Rounded to 12 decimals, so float noise never moves a hit across a gate threshold.
+    (p * 1e12).round() / 1e12
 }
 
 /// A known company that may be the party, with its fused probability.
@@ -184,5 +186,170 @@ pub fn decide<Id: Clone>(candidates: &[Candidate<Id>]) -> Decision<Id> {
         (Some(c), None) => Decision::Merge(c.id.clone()),
         (None, _) if candidates.iter().all(|c| c.probability < NEW_BELOW) => Decision::New,
         (None, _) => Decision::Review(ReviewReason::Uncertain),
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::float_cmp,
+    reason = "the gate thresholds are compared as written"
+)]
+mod tests {
+    use super::*;
+    use crate::fuzzy::{self, FuzzyVerdict};
+    use crate::name::CompanyName;
+
+    fn one(p: f64) -> Decision<&'static str> {
+        decide(&[Candidate {
+            id: "a",
+            probability: p,
+        }])
+    }
+
+    #[test]
+    fn reliabilities_are_the_adr_table() {
+        let table: Vec<(Source, f64)> = Source::ALL.iter().map(|s| (*s, s.reliability())).collect();
+        assert_eq!(
+            table,
+            [
+                (Source::RegistryId, 0.95),
+                (Source::ParentContract, 0.95),
+                (Source::EmailDomain, 0.90),
+                (Source::NameLadder, 0.90),
+                (Source::Filename, 0.85),
+                (Source::InvoiceLayout, 0.75),
+                (Source::SemanticSimilarity, 0.55),
+            ]
+        );
+        assert_eq!(Source::InvoiceLayout.as_str(), "invoice_layout");
+    }
+
+    #[test]
+    fn noisy_or_over_distinct_sources() {
+        assert_eq!(fuse(&[]), 0.0);
+        assert_eq!(fuse(&[Evidence::new(Source::Filename)]), 0.85);
+        // 1 - 0.05 * 0.10
+        assert_eq!(
+            fuse(&[
+                Evidence::new(Source::RegistryId),
+                Evidence::new(Source::NameLadder)
+            ]),
+            0.995
+        );
+        // 1 - 0.25 * 0.45
+        assert_eq!(
+            fuse(&[
+                Evidence::new(Source::InvoiceLayout),
+                Evidence::new(Source::SemanticSimilarity)
+            ]),
+            0.8875
+        );
+        // The same source twice counts once, at its strongest hit.
+        let weak = Evidence {
+            source: Source::NameLadder,
+            reliability: 0.5,
+        };
+        assert_eq!(fuse(&[weak, weak, weak]), 0.5);
+        assert_eq!(fuse(&[weak, Evidence::new(Source::NameLadder), weak]), 0.90);
+        // Out-of-range reliabilities are clamped.
+        let silly = Evidence {
+            source: Source::Filename,
+            reliability: 1.7,
+        };
+        assert_eq!(fuse(&[silly]), 1.0);
+        let negative = Evidence {
+            source: Source::Filename,
+            reliability: -0.3,
+        };
+        assert_eq!(fuse(&[negative]), 0.0);
+    }
+
+    #[test]
+    fn gate_boundaries() {
+        assert_eq!(one(0.4999), Decision::New);
+        assert_eq!(one(0.50), Decision::Review(ReviewReason::Uncertain));
+        assert_eq!(one(0.8999), Decision::Review(ReviewReason::Uncertain));
+        assert_eq!(one(0.90), Decision::Merge("a"));
+        assert_eq!(one(1.0), Decision::Merge("a"));
+        assert_eq!(one(0.0), Decision::New);
+        assert_eq!(decide::<&str>(&[]), Decision::New);
+    }
+
+    #[test]
+    fn gate_over_several_candidates() {
+        let c = |id, probability| Candidate { id, probability };
+        // Every candidate below 0.50: a new company.
+        assert_eq!(decide(&[c("a", 0.3), c("b", 0.4999)]), Decision::New);
+        // One in between: review.
+        assert_eq!(
+            decide(&[c("a", 0.3), c("b", 0.5)]),
+            Decision::Review(ReviewReason::Uncertain)
+        );
+        // One high hit and weaker others: merge into it.
+        assert_eq!(decide(&[c("a", 0.6), c("b", 0.95)]), Decision::Merge("b"));
+        // Two conflicting high-precision hits: always review.
+        assert_eq!(
+            decide(&[c("a", 0.95), c("b", 0.90)]),
+            Decision::Review(ReviewReason::Conflict)
+        );
+        assert_eq!(
+            decide(&[c("a", 0.99), c("b", 0.2), c("c", 0.995)]),
+            Decision::Review(ReviewReason::Conflict)
+        );
+    }
+
+    #[test]
+    fn ladder_and_fuzzy_evidence() {
+        // A deterministic name match alone merges; a registry identifier is 0.95.
+        assert_eq!(fuse(&[Evidence::ladder(LadderStep::Normalized)]), 0.90);
+        assert_eq!(
+            decide(&[Candidate::new(
+                "a",
+                &[Evidence::ladder(LadderStep::Normalized)]
+            )]),
+            Decision::Merge("a")
+        );
+        assert_eq!(
+            Evidence::ladder(LadderStep::Identifier).source,
+            Source::RegistryId
+        );
+        assert_eq!(fuse(&[Evidence::ladder(LadderStep::Identifier)]), 0.95);
+        // The looser steps alone go to review, with a second source they merge.
+        let blind = Evidence::ladder(LadderStep::FormBlind);
+        assert_eq!(fuse(&[blind]), 0.85);
+        assert_eq!(
+            decide(&[Candidate::new("a", &[blind])]),
+            Decision::Review(ReviewReason::Uncertain)
+        );
+        assert_eq!(
+            decide(&[Candidate::new(
+                "a",
+                &[blind, Evidence::new(Source::Filename)]
+            )]),
+            Decision::Merge("a")
+        );
+        // Two name steps are one source: no double counting.
+        assert_eq!(fuse(&[blind, Evidence::ladder(LadderStep::Squashed)]), 0.88);
+
+        // A fuzzy subset match: 0.90 * 2/3 = 0.6, review.
+        let a = CompanyName::parse("Primer Gradnja Inženjering d.o.o.").unwrap();
+        let b = CompanyName::parse("Пример Градња д.о.о.").unwrap();
+        let FuzzyVerdict::Match(m) = fuzzy::score(&a, Some("RS"), &b, Some("RS")) else {
+            panic!("should match");
+        };
+        let e = Evidence::fuzzy(&m);
+        assert!((e.reliability - 0.6).abs() < 1e-12);
+        assert_eq!(
+            decide(&[Candidate::new("a", &[e])]),
+            Decision::Review(ReviewReason::Uncertain)
+        );
+        // Semantic similarity alone never merges.
+        assert_eq!(
+            decide(&[Candidate::new(
+                "a",
+                &[Evidence::new(Source::SemanticSimilarity)]
+            )]),
+            Decision::Review(ReviewReason::Uncertain)
+        );
     }
 }

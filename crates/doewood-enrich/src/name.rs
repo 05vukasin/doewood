@@ -612,3 +612,235 @@ fn skip_words(s: &str, n: usize) -> String {
     }
     rest.to_owned()
 }
+
+#[cfg(test)]
+#[allow(clippy::float_cmp, reason = "the constants are compared as written")]
+mod tests {
+    use super::*;
+
+    fn parse(s: &str) -> CompanyName {
+        CompanyName::parse(s).unwrap_or_else(|| panic!("{s} should parse"))
+    }
+
+    #[test]
+    fn serbian_cyrillic_and_latin_share_key_and_form() {
+        let latin = [
+            "Preduzece Primer doo",
+            "Preduzeće Primer d.o.o.",
+            "PREDUZEĆE PRIMER D.O.O.",
+            "Preduzeće Primer društvo sa ograničenom odgovornošću",
+            "Preduzeće Primer d. o. o. Beograd",
+        ];
+        let cyrillic = [
+            "Предузеће Пример д.о.о.",
+            "ПРЕДУЗЕЋЕ ПРИМЕР ДОО",
+            "Предузеће Пример друштво са ограниченом одговорношћу",
+        ];
+        for s in latin.iter().chain(&cyrillic) {
+            let n = parse(s);
+            assert_eq!(n.key, "preduzece primer", "{s}");
+            assert_eq!(n.squashed, "preduzeceprimer", "{s}");
+            assert_eq!(n.legal_form, Some("d.o.o."), "{s}");
+            assert_eq!(n.original, s.trim());
+        }
+        let a = parse(cyrillic[0]).ladder_keys();
+        let b = parse(latin[0]).ladder_keys();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn transliteration_covers_every_serbian_letter() {
+        assert_eq!(
+            normalize("абвгдђежзијклљмнњопрстћуфхцчџш"),
+            "abvgddjezzijklljmnnjoprstcufhccdzs"
+        );
+        assert_eq!(normalize("Ђурђевак"), normalize("Đurđevak"));
+        assert_eq!(normalize("Љубичица Њива Џеп"), "ljubicica njiva dzep");
+        assert_eq!(
+            normalize("Шљива Жица Ћуприја"),
+            normalize("Šljiva Žica Ćuprija")
+        );
+        // Mixed scripts in one name.
+        assert_eq!(normalize("Пример Trade"), "primer trade");
+    }
+
+    #[test]
+    fn other_balkan_forms_in_both_scripts() {
+        for (s, key, form) in [
+            ("Пример а.д.", "primer", "a.d."),
+            ("Primer akcionarsko društvo", "primer", "a.d."),
+            ("Примерко ДООЕЛ Скопје", "primerko", "dooel"),
+            ("Јавно предузеће Пример Вода", "primer voda", "j.p."),
+            ("ЈКП Пример Топлана", "primer toplana", "j.k.p."),
+            ("Primer d.d.", "primer", "d.d."),
+            ("Primer dioničko društvo", "primer", "d.d."),
+            ("Primer o.d.", "primer", "o.d."),
+            ("Primer k.d.", "primer", "k.d."),
+            ("Primer Usluge PR", "primer usluge", "PR"),
+            ("Primer Usluge preduzetnik", "primer usluge", "PR"),
+            ("Primer s.p.", "primer", "s.p."),
+            ("Примерен ООД", "primeren", "ood"),
+            ("Примерен ЕООД", "primeren", "eood"),
+            ("Primer GmbH & Co. KG", "primer", "GmbH & Co. KG"),
+            ("Primer Incorporated", "primer", "Inc."),
+            ("Primer S.p.A.", "primer", "S.p.A."),
+        ] {
+            let n = parse(s);
+            assert_eq!((n.key.as_str(), n.legal_form), (key, Some(form)), "{s}");
+        }
+        // No legal form.
+        assert_eq!(parse("Primer Trgovina").legal_form, None);
+    }
+
+    #[test]
+    fn noise_and_seat_words_leave_the_key_but_never_empty_it() {
+        assert_eq!(parse("The Primer and Partner d.o.o.").key, "primer partner");
+        assert_eq!(parse("Primer d.o.o. Novi Sad").key, "primer");
+        assert_eq!(parse("Пример д.о.о. Ниш").key, "primer");
+        // Only a seat word: kept.
+        assert_eq!(parse("Subotica d.o.o.").key, "subotica");
+        // A city inside the name stays.
+        assert_eq!(parse("Beograd Primer d.o.o.").key, "beograd primer");
+    }
+
+    #[test]
+    fn nothing_distinctive_is_no_company() {
+        for s in [
+            "",
+            "   ",
+            "d.o.o.",
+            "Д.О.О.",
+            "LLC",
+            "(formerly Primer)",
+            "Kupac",
+            "КУПАЦ",
+            "Izvođač",
+            "Supplier",
+            "The Buyer",
+            "Ugovorna strana",
+        ] {
+            assert!(CompanyName::parse(s).is_none(), "{s:?}");
+        }
+        assert!(is_role_term("Наручилац"));
+        assert!(!is_role_term(""));
+        assert!(!is_role_term("Primer Kupac d.o.o."));
+    }
+
+    #[test]
+    fn aliases_from_parentheses_in_both_scripts() {
+        let n = parse("Пример д.о.о. (раније Стари Пример д.о.о.)");
+        assert_eq!(n.key, "primer");
+        assert_eq!(
+            n.aliases,
+            [Alias {
+                text: "Стари Пример д.о.о.".into(),
+                kind: AliasKind::FormerName
+            }]
+        );
+        // A role term defined in Cyrillic is dropped.
+        let n = parse("Пример д.о.о. (у даљем тексту: Купац)");
+        assert!(n.aliases.is_empty());
+        assert_eq!(n.key, "primer");
+        for (s, kind, text) in [
+            (
+                "Primer Ltd (formerly known as Old Primer Ltd)",
+                AliasKind::FormerName,
+                "Old Primer Ltd",
+            ),
+            (
+                "Primer Ltd (previously known as Prior Ltd)",
+                AliasKind::FormerName,
+                "Prior Ltd",
+            ),
+            (
+                "Primer Ltd (prethodno Primer Stari d.o.o.)",
+                AliasKind::FormerName,
+                "Primer Stari d.o.o.",
+            ),
+            (
+                "Primer Ltd (doing business as PrimerShop)",
+                AliasKind::TradingName,
+                "PrimerShop",
+            ),
+            (
+                "Primer Ltd (t/a PrimerShop)",
+                AliasKind::TradingName,
+                "PrimerShop",
+            ),
+            (
+                "Primer Ltd (now known as Novi Primer Ltd)",
+                AliasKind::NowKnownAs,
+                "Novi Primer Ltd",
+            ),
+            (
+                "Primer Ltd (hereinafter: \"Primer\")",
+                AliasKind::DefinedTerm,
+                "Primer",
+            ),
+            (
+                "Primer d.o.o. (u daljnjem tekstu: „Primer”)",
+                AliasKind::DefinedTerm,
+                "Primer",
+            ),
+            (
+                "Primer d.o.o. [ogranak Niš]",
+                AliasKind::Annotation,
+                "ogranak Niš",
+            ),
+            (
+                "Primer d.o.o. f/k/a Stari Primer d.o.o.",
+                AliasKind::FormerName,
+                "Stari Primer d.o.o.",
+            ),
+            (
+                "Primer d.o.o. n/k/a Novi Primer d.o.o.",
+                AliasKind::NowKnownAs,
+                "Novi Primer d.o.o.",
+            ),
+            (
+                "Primer Inc. trading as PrimerShop",
+                AliasKind::TradingName,
+                "PrimerShop",
+            ),
+        ] {
+            let n = parse(s);
+            assert_eq!(n.aliases.len(), 1, "{s}");
+            assert_eq!(
+                (n.aliases[0].kind, n.aliases[0].text.as_str()),
+                (kind, text),
+                "{s}"
+            );
+            assert_eq!(n.key, "primer", "{s}");
+        }
+        // Nested and unclosed brackets stay out of the base.
+        let (base, aliases) = split_aliases("Primer d.o.o. (ranije (Stari) Primer");
+        assert_eq!(base, "Primer d.o.o.");
+        assert_eq!(aliases[0].text, "(Stari) Primer");
+        let (base, aliases) = split_aliases("Primer (a (b) c) d.o.o.");
+        assert_eq!(base, "Primer d.o.o.");
+        assert_eq!(aliases[0].kind, AliasKind::Annotation);
+        // Empty brackets give no alias.
+        assert!(split_aliases("Primer () d.o.o.").1.is_empty());
+    }
+
+    #[test]
+    fn ladder_steps_keep_their_reliability() {
+        assert_eq!(LadderStep::Identifier.reliability(), 0.95);
+        assert_eq!(LadderStep::Normalized.reliability(), 0.90);
+        assert_eq!(LadderStep::LearnedAlias.reliability(), 0.90);
+        assert_eq!(LadderStep::Squashed.reliability(), 0.88);
+        assert_eq!(LadderStep::FormBlind.reliability(), 0.85);
+        assert_eq!(LadderStep::Normalized.confidence(), 0.90_f32);
+        assert_eq!(LadderStep::FormBlind.as_str(), "legal_form_blind");
+        let n = parse("Пример Градња д.о.о.");
+        assert_eq!(
+            n.ladder_keys().map(|(s, _)| s),
+            [
+                LadderStep::Normalized,
+                LadderStep::Squashed,
+                LadderStep::FormBlind
+            ]
+        );
+        assert_eq!(n.ladder_keys()[0].1, "name:primer gradnja|d.o.o.");
+    }
+}

@@ -17,6 +17,8 @@ pub mod fuzzy;
 pub mod group;
 pub mod id;
 pub mod name;
+#[cfg(test)]
+mod testids;
 
 pub use fusion::{Candidate, Decision, Evidence, ReviewReason, Source, decide, fuse};
 pub use fuzzy::{FuzzyMatch, FuzzyVerdict};

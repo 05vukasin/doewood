@@ -53,3 +53,90 @@ pub fn group_id_of(ids: &[Identifier]) -> Option<Uuid> {
             .and_then(group_id)
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testids::{iban, lei, mb, mod_11_10};
+
+    fn id(kind: IdKind, raw: &str) -> Identifier {
+        Identifier::parse(kind, raw).unwrap_or_else(|| panic!("{raw} should be a {kind:?}"))
+    }
+
+    #[test]
+    fn namespace_is_derived_from_its_name() {
+        assert_eq!(
+            NAMESPACE,
+            Uuid::new_v5(&Uuid::NAMESPACE_URL, NAMESPACE_NAME.as_bytes())
+        );
+    }
+
+    #[test]
+    fn group_ids_are_stable() {
+        let l = id(IdKind::Lei, &lei("8945002TQV7RMXEW3K"));
+        let g = group_id(&l).unwrap();
+        assert_eq!(g.get_version_num(), 5);
+        assert_eq!(g, Uuid::new_v5(&NAMESPACE, l.value.as_bytes()));
+        // Pinned (cross-checked with Python's uuid.uuid5): a change here would split every
+        // group already stored.
+        assert_eq!(g.to_string(), "714ed58a-db87-5b32-b394-4de4d6ce8577");
+        let m = id(IdKind::RsMb, &mb("2108734"));
+        assert_eq!(
+            group_id(&m).unwrap().to_string(),
+            "9240447e-dec6-52c8-866a-108889ccbad6"
+        );
+        // The same LEI written differently gives the same id.
+        let written = l.value.to_lowercase();
+        let again = id(
+            IdKind::Lei,
+            &format!("{} {}", &written[..10], &written[10..]),
+        );
+        assert_eq!(group_id(&again), Some(g));
+    }
+
+    #[test]
+    fn strongest_registry_id_keys_the_group() {
+        let l = id(IdKind::Lei, &lei("8945002TQV7RMXEW3K"));
+        let m = id(IdKind::RsMb, &mb("2108734"));
+        let p = id(IdKind::RsPib, &mod_11_10("10873452"));
+        let account = id(IdKind::Iban, &iban("RS", "265000000837164209"));
+        let duns = id(IdKind::Duns, "150483782");
+        let all = [
+            account.clone(),
+            p.clone(),
+            m.clone(),
+            l.clone(),
+            duns.clone(),
+        ];
+        assert_eq!(group_id_of(&all), group_id(&l));
+        let mut reversed = all.clone();
+        reversed.reverse();
+        assert_eq!(group_id_of(&reversed), group_id(&l));
+        assert_eq!(group_id_of(&[p.clone(), m.clone()]), group_id(&m));
+        assert_eq!(group_id_of(std::slice::from_ref(&p)), group_id(&p));
+        // IBAN and DUNS never key a group.
+        assert_eq!(group_id(&account), None);
+        assert_eq!(group_id(&duns), None);
+        assert_eq!(group_id_of(&[account, duns]), None);
+        assert_eq!(group_id_of(&[]), None);
+        // Two LEIs (a branch has its own): the smaller one, whatever the order.
+        let other = id(IdKind::Lei, &lei("254900PRIMER0000A1"));
+        let first = group_id_of(&[l.clone(), other.clone()]);
+        assert_eq!(first, group_id_of(&[other.clone(), l.clone()]));
+        let smaller = if l.value <= other.value { &l } else { &other };
+        assert_eq!(first, group_id(smaller));
+    }
+
+    #[test]
+    fn kinds_with_the_same_digits_get_different_ids() {
+        // A nine-digit PIB and the same digits as a VAT body are different names.
+        let pib = mod_11_10("10873452");
+        let p = id(IdKind::RsPib, &pib);
+        let v = id(IdKind::Vat, &format!("RS{pib}"));
+        assert_ne!(group_id(&p), group_id(&v));
+        assert_eq!(
+            group_id(&p),
+            Some(Uuid::new_v5(&NAMESPACE, format!("rs_pib:{pib}").as_bytes()))
+        );
+    }
+}

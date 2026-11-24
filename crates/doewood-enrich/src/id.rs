@@ -114,3 +114,117 @@ fn placeholder(v: &str) -> bool {
     }
     v.chars().all(|c| c.is_ascii_alphabetic())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testids::{broken, iban, lei, mb, mod_11, mod_11_10};
+
+    fn ok(kind: IdKind, raw: &str) -> String {
+        Identifier::parse(kind, raw)
+            .unwrap_or_else(|| panic!("{raw} should be a valid {kind:?}"))
+            .value
+    }
+
+    fn bad(kind: IdKind, raw: &str) -> bool {
+        Identifier::parse(kind, raw).is_none()
+    }
+
+    #[test]
+    fn every_kind_valid_and_invalid() {
+        let pib = mod_11_10("10873452");
+        let m = mb("2108734");
+        let oib = mod_11_10("6087345219");
+        let l = lei("8945002TQV7RMXEW3K");
+        let account = iban("RS", "265000000837164209");
+        let de = format!("DE{}", mod_11_10("31745208"));
+        for (kind, valid) in [
+            (IdKind::RsPib, pib.as_str()),
+            (IdKind::RsMb, m.as_str()),
+            (IdKind::HrOib, oib.as_str()),
+            (IdKind::Lei, l.as_str()),
+            (IdKind::Iban, account.as_str()),
+            (IdKind::Vat, de.as_str()),
+        ] {
+            assert_eq!(ok(kind, valid), valid, "{kind:?}");
+            assert!(bad(kind, &broken(valid)), "{kind:?} {valid}");
+        }
+        assert_eq!(ok(IdKind::Duns, "15-048-3782"), "150483782");
+        assert!(bad(IdKind::Duns, "15048378"));
+    }
+
+    #[test]
+    fn values_are_compacted_and_uppercased() {
+        let pib = mod_11_10("10873452");
+        let spaced = format!("{} {} {}", &pib[..3], &pib[3..6], &pib[6..]);
+        assert_eq!(ok(IdKind::RsPib, &spaced), pib);
+        let account = iban("RS", "265000000837164209");
+        let written = format!(
+            "{} {} {}",
+            account[..4].to_lowercase(),
+            &account[4..12],
+            &account[12..]
+        );
+        assert_eq!(ok(IdKind::Iban, &written), account);
+        let l = lei("254900PRIMER0000A1");
+        assert_eq!(ok(IdKind::Lei, &l.to_lowercase()), l);
+        assert_eq!(ok(IdKind::Vat, &format!("rs {pib}")), format!("RS{pib}"));
+        let id = Identifier::parse(IdKind::Lei, &l).unwrap();
+        assert_eq!(id.alias(), format!("id:lei:{l}"));
+    }
+
+    #[test]
+    fn vat_of_serbia_norway_and_switzerland() {
+        let pib = mod_11_10("10873452");
+        assert_eq!(ok(IdKind::Vat, &format!("RS{pib}")), format!("RS{pib}"));
+        assert!(bad(IdKind::Vat, &format!("RS{}", broken(&pib))));
+        let no = (91_734_520u32..)
+            .find_map(|n| mod_11(&format!("{n:08}"), [3, 2, 7, 6, 5, 4, 3, 2]))
+            .unwrap();
+        assert!(Identifier::parse(IdKind::Vat, &format!("NO {no} MVA")).is_some());
+        let ch = (20_837_164u32..)
+            .find_map(|n| mod_11(&format!("{n:08}"), [5, 4, 3, 2, 7, 6, 5, 4]))
+            .unwrap();
+        let written = format!("CHE-{}.{}.{} MWST", &ch[..3], &ch[3..6], &ch[6..]);
+        assert_eq!(ok(IdKind::Vat, &written), format!("CHE{ch}MWST"));
+        // A format-only member state passes, a checksum one with a wrong digit does not.
+        assert!(Identifier::parse(IdKind::Vat, "EE100837164").is_some());
+        assert!(bad(
+            IdKind::Vat,
+            &format!("DE{}", broken(&mod_11_10("31745208")))
+        ));
+    }
+
+    #[test]
+    fn placeholders_and_label_text_are_refused() {
+        for (kind, raw) in [
+            (IdKind::RsPib, "000000000"),
+            (IdKind::RsPib, "111111111"),
+            (IdKind::Duns, "123456789"),
+            (IdKind::Duns, "999999999"),
+            (IdKind::RsMb, "12345678"),
+            (IdKind::Vat, "RS123456789"),
+            (IdKind::Vat, "VAT NUMBER"),
+            (IdKind::Lei, "LEINOTAVAILABLEHERE"),
+            (IdKind::Iban, "IBAN"),
+            (IdKind::RsPib, "PIB"),
+            (IdKind::RsPib, ""),
+            (IdKind::RsPib, " - / . "),
+        ] {
+            assert!(bad(kind, raw), "{kind:?} {raw:?}");
+        }
+    }
+
+    #[test]
+    fn fact_keys_and_names() {
+        for kind in IdKind::ALL {
+            let key = format!("signal.{}", kind.as_str());
+            assert_eq!(IdKind::from_fact_key(&key), Some(kind));
+        }
+        assert_eq!(IdKind::from_fact_key("signal.bic"), None);
+        // Strongest first.
+        let mut sorted = IdKind::ALL;
+        sorted.sort();
+        assert_eq!(sorted, IdKind::ALL);
+    }
+}

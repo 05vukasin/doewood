@@ -210,3 +210,180 @@ fn cjk(c: char) -> bool {
         | 0xFF66..=0xFF9F
         | 0x20000..=0x2FA1F)
 }
+
+#[cfg(test)]
+#[allow(clippy::float_cmp, reason = "the scores are small exact fractions")]
+mod tests {
+    use super::*;
+
+    fn name(s: &str) -> CompanyName {
+        CompanyName::parse(s).unwrap_or_else(|| panic!("{s} should parse"))
+    }
+
+    fn verdict(a: &str, ca: Option<&str>, b: &str, cb: Option<&str>) -> FuzzyVerdict {
+        let v = score(&name(a), ca, &name(b), cb);
+        // Symmetric.
+        assert_eq!(v, score(&name(b), cb, &name(a), ca), "{a} / {b}");
+        v
+    }
+
+    fn matched(a: &str, b: &str) -> FuzzyMatch {
+        match verdict(a, None, b, None) {
+            FuzzyVerdict::Match(m) => m,
+            v => panic!("{a} / {b}: {v:?}"),
+        }
+    }
+
+    fn no_match(a: &str, b: &str) -> bool {
+        verdict(a, None, b, None) == FuzzyVerdict::NoMatch
+    }
+
+    #[test]
+    fn one_edit_on_long_tokens() {
+        assert!(typo_pair("gradnja", "gradja"), "deletion");
+        assert!(typo_pair("gradja", "gradnja"), "insertion");
+        assert!(typo_pair("primer", "primar"), "substitution");
+        assert!(typo_pair("kovacki", "kovakci"), "transposition");
+        assert!(typo_pair("primer", "primers"), "at the end");
+        assert!(typo_pair("primer", "xprimer"), "at the start");
+        assert!(!typo_pair("primer", "primer"), "equal is not a typo");
+        assert!(!typo_pair("gradnja", "gradaj"), "two edits");
+        assert!(!typo_pair("primer", "pmirer"), "a transposition two apart");
+        assert!(!typo_pair("primer", "prim"), "two deletions");
+        // Tokens under 5 characters get no fuzziness.
+        assert!(!typo_pair("beta", "bera"));
+        assert!(!typo_pair("alfa", "alfaa"), "both must have 5+");
+        assert!(typo_pair("alfaa", "alfab"));
+        // Nor do CJK tokens.
+        assert!(!typo_pair("東京電力会", "東京電力社"));
+        assert!(!typo_pair("primer東京", "primer東都"));
+    }
+
+    #[test]
+    fn exact_and_typo_pairs() {
+        let m = matched("Primer Gradnja d.o.o.", "Пример Градња д.о.о.");
+        assert_eq!((m.score, m.exact, m.typo, m.subset), (1.0, 2, 0, false));
+        let m = matched("Primer Gradnja d.o.o.", "Primer Gradja doo");
+        assert_eq!((m.score, m.exact, m.typo, m.subset), (1.0, 1, 1, false));
+        let m = matched("Kovacki Metal Servis", "Kovakci Metal Servis");
+        assert_eq!((m.exact, m.typo), (2, 1));
+        // Order does not matter.
+        assert_eq!(matched("Gradnja Primer", "Primer Gradnja").score, 1.0);
+    }
+
+    #[test]
+    fn typo_only_overlap_is_not_enough() {
+        assert!(no_match("Gradnja Montaza", "Gradja Montaze"));
+        assert!(no_match("Primerko", "Primerka"));
+    }
+
+    #[test]
+    fn subset_adds_at_most_one_token_and_shares_two() {
+        let m = matched("Primer Gradnja Inzenjering", "Primer Gradnja");
+        assert!(m.subset);
+        assert!((m.score - 2.0 / 3.0).abs() < 1e-12);
+        let m = matched("Primer Gradja Inzenjering", "Primer Gradnja");
+        assert!(m.subset && m.typo == 1);
+        // Two tokens added.
+        assert!(no_match(
+            "Primer Gradnja Inzenjering Servis",
+            "Primer Gradnja"
+        ));
+        // Only one shared.
+        assert!(no_match("Primer Holding", "Primer"));
+    }
+
+    #[test]
+    fn jaccard_at_least_0_6_otherwise() {
+        // 3 paired of 5 distinct: exactly 0.6.
+        let m = matched("Alfa Beta Gama Delta", "Alfa Beta Gama Omega");
+        assert_eq!(m.score, 0.6);
+        assert!(!m.subset);
+        // 2 of 4: 0.5.
+        assert!(no_match("Bank of America", "Bank of China"));
+        // 3 of 6.
+        assert!(no_match("Alfa Beta Gama Delta Ro", "Alfa Beta Gama Omega"));
+        // Nothing shared.
+        assert!(no_match("Primer Gradnja", "Drugi Metal"));
+    }
+
+    #[test]
+    fn jurisdiction_veto() {
+        let us_cn = verdict("Bank of America", Some("US"), "Bank of China", Some("CN"));
+        assert_eq!(us_cn, FuzzyVerdict::Veto);
+        // One core word, different countries: different companies even with equal names.
+        assert_eq!(
+            verdict("Delta d.o.o.", Some("RS"), "Delta GmbH", Some("DE")),
+            FuzzyVerdict::Veto
+        );
+        assert_eq!(
+            verdict("Пример д.о.о.", Some("RS"), "Primer d.o.o.", Some("HR")),
+            FuzzyVerdict::Veto
+        );
+        // Same country, or a country unknown: no veto.
+        assert!(matches!(
+            verdict("Delta d.o.o.", Some("RS"), "Delta doo", Some("rs")),
+            FuzzyVerdict::Match(_)
+        ));
+        assert!(matches!(
+            verdict("Delta d.o.o.", Some("RS"), "Delta GmbH", None),
+            FuzzyVerdict::Match(_)
+        ));
+        // Two core words shared: the veto does not apply.
+        assert!(matches!(
+            verdict(
+                "Primer Gradnja d.o.o.",
+                Some("RS"),
+                "Primer Gradnja GmbH",
+                Some("AT")
+            ),
+            FuzzyVerdict::Match(_)
+        ));
+        // A typo pair counts as a shared core word.
+        assert!(matches!(
+            verdict(
+                "Primer Gradnja d.o.o.",
+                Some("RS"),
+                "Primer Gradja d.o.o.",
+                Some("BA")
+            ),
+            FuzzyVerdict::Match(_)
+        ));
+        // Function words are not core words: "Banka za Primer" shares one with "Banka za Drugi".
+        assert_eq!(
+            score_tokens(
+                &["banka", "za", "primer"],
+                Some("RS"),
+                &["banka", "za", "drugi"],
+                Some("ME")
+            ),
+            FuzzyVerdict::Veto
+        );
+    }
+
+    #[test]
+    fn empty_tokens_never_match() {
+        assert_eq!(
+            score_tokens(&[], None, &["primer"], None),
+            FuzzyVerdict::NoMatch
+        );
+        assert_eq!(
+            score_tokens(&["primer"], None, &[], None),
+            FuzzyVerdict::NoMatch
+        );
+    }
+
+    #[test]
+    fn pairs_are_one_to_one() {
+        // "primer primer" has two tokens; the other side has one to pair.
+        let v = score_tokens(&["primer", "primer"], None, &["primer"], None);
+        assert_eq!(v, FuzzyVerdict::NoMatch, "a subset sharing one token");
+        let v = score_tokens(
+            &["primer", "primer", "gradnja"],
+            None,
+            &["primer", "gradnja"],
+            None,
+        );
+        assert!(matches!(v, FuzzyVerdict::Match(m) if m.subset && m.exact == 2));
+    }
+}
