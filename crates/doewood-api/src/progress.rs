@@ -126,12 +126,18 @@ impl Watch {
             let now = match self.snapshot().await {
                 Ok(now) => now,
                 Err(status) => {
-                    let _ = tx.send(Err(status)).await;
+                    let _ = tx.try_send(Err(status));
                     return;
                 }
             };
             for update in diff(&last, &now, first) {
-                if tx.send(Ok(update)).await.is_err() {
+                // A client that stops reading must not hold the task (and the store) past
+                // shutdown.
+                let sent = tokio::select! {
+                    sent = tx.send(Ok(update)) => sent.is_ok(),
+                    _ = self.shutdown.wait_for(|s| *s) => false,
+                };
+                if !sent {
                     return;
                 }
             }

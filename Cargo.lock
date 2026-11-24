@@ -481,6 +481,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "clap",
+ "doewood-api",
  "doewood-core",
  "doewood-model",
  "doewood-pg",
