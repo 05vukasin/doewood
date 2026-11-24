@@ -6,7 +6,10 @@ use crate::StoreError;
 
 /// The migrations, in order. Migration `i` takes the schema from version `i` to `i + 1`.
 /// Never edit a released migration: add a new one.
-const MIGRATIONS: &[&str] = &[include_str!("migrations/0001_init.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("migrations/0001_init.sql"),
+    include_str!("migrations/0002_standalone_model.sql"),
+];
 
 /// The schema version this binary writes.
 #[allow(clippy::cast_possible_wrap)]
