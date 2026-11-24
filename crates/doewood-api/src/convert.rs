@@ -74,6 +74,12 @@ pub(crate) fn ai_provider(p: &AiProvider) -> pb::AiProvider {
     }
 }
 
+pub(crate) fn ingest_settings(s: &doewood_store::IngestSettings) -> pb::IngestSettings {
+    pb::IngestSettings {
+        similar_min_jaccard: s.similar_min_jaccard,
+    }
+}
+
 pub(crate) fn record(r: &Record) -> pb::Record {
     pb::Record {
         blake3: r.blake3.to_hex(),

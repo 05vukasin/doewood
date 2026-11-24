@@ -32,11 +32,16 @@ pub mod vars {
     pub const INGEST_JOBS: &str = "DOEWOOD_INGEST_JOBS";
     /// Directory of the OCR model files; defaults to `<data>/ocr-models`.
     pub const OCR_MODELS: &str = "DOEWOOD_OCR_MODELS";
-    /// Least `MinHash` Jaccard estimate for a `similar_to` edge.
-    pub const SIMILAR_MIN_JACCARD: &str = "DOEWOOD_SIMILAR_MIN_JACCARD";
+
+    /// Variables earlier versions read that are runtime settings now (ADR 0001, section 3),
+    /// with where each is set instead. A leftover one is ignored with a warning.
+    pub const RETIRED: [(&str, &str); 1] = [(
+        "DOEWOOD_SIMILAR_MIN_JACCARD",
+        "the runtime setting similar_min_jaccard: set it with ConfigService.SetIngestSettings",
+    )];
 
     /// Every bootstrap variable, in the order they are reported.
-    pub const ALL: [&str; 10] = [
+    pub const ALL: [&str; 9] = [
         DATA_DIR,
         LISTEN,
         OPS_LISTEN,
@@ -46,7 +51,6 @@ pub mod vars {
         API_MAX_MESSAGE_MIB,
         INGEST_JOBS,
         OCR_MODELS,
-        SIMILAR_MIN_JACCARD,
     ];
 }
 
@@ -68,8 +72,6 @@ pub const MAX_API_MAX_MESSAGE_MIB: u32 = 1024;
 pub const MAX_INGEST_JOBS: usize = 256;
 /// Default of `DOEWOOD_OCR_MODELS`, inside the data directory.
 pub const OCR_MODELS_DIR: &str = "ocr-models";
-/// Default of `DOEWOOD_SIMILAR_MIN_JACCARD`.
-pub const DEFAULT_SIMILAR_MIN_JACCARD: f64 = 0.8;
 
 const fn addr(ip: [u8; 4], port: u16) -> SocketAddr {
     SocketAddr::V4(std::net::SocketAddrV4::new(
@@ -225,7 +227,6 @@ struct Origins {
     api_max_message: Origin,
     ingest_jobs: Origin,
     ocr_models: Origin,
-    similar_min_jaccard: Origin,
 }
 
 /// The effective bootstrap configuration.
@@ -249,8 +250,6 @@ pub struct BootstrapConfig {
     pub ingest_jobs: Option<usize>,
     /// Directory of the OCR model files.
     pub ocr_models: PathBuf,
-    /// Least `MinHash` Jaccard estimate for a `similar_to` edge.
-    pub similar_min_jaccard: f64,
     origins: Origins,
 }
 
@@ -299,8 +298,11 @@ impl BootstrapConfig {
             Some(v) => (PathBuf::from(v), Origin::Env),
             None => (data_dir.join(OCR_MODELS_DIR), Origin::Default),
         };
-        let (similar_min_jaccard, similar_origin) =
-            parse_jaccard(get(vars::SIMILAR_MIN_JACCARD), &mut w);
+        for (var, now) in vars::RETIRED {
+            if get(var).is_some() {
+                warn(&mut w, var, format!("ignored: this is {now}"));
+            }
+        }
 
         Loaded {
             config: Self {
@@ -315,7 +317,6 @@ impl BootstrapConfig {
                     .saturating_mul(1024 * 1024),
                 ingest_jobs,
                 ocr_models,
-                similar_min_jaccard,
                 origins: Origins {
                     data_dir: data_dir_origin,
                     listen: listen_origin,
@@ -326,7 +327,6 @@ impl BootstrapConfig {
                     api_max_message: api_max_message_origin,
                     ingest_jobs: ingest_jobs_origin,
                     ocr_models: ocr_models_origin,
-                    similar_min_jaccard: similar_origin,
                 },
             },
             warnings: w,
@@ -410,11 +410,6 @@ impl BootstrapConfig {
                 var: vars::OCR_MODELS,
                 value: self.ocr_models.display().to_string(),
                 origin: o.ocr_models,
-            },
-            Entry {
-                var: vars::SIMILAR_MIN_JACCARD,
-                value: self.similar_min_jaccard.to_string(),
-                origin: o.similar_min_jaccard,
             },
         ]
     }
@@ -579,27 +574,6 @@ fn parse_jobs(value: Option<OsString>, w: &mut Vec<ConfigWarning>) -> (Option<us
     }
 }
 
-fn parse_jaccard(value: Option<OsString>, w: &mut Vec<ConfigWarning>) -> (f64, Origin) {
-    let Some(v) = value else {
-        return (DEFAULT_SIMILAR_MIN_JACCARD, Origin::Default);
-    };
-    match v.to_str().map(|s| s.trim().parse::<f64>()) {
-        Some(Ok(x)) if x > 0.0 && x <= 1.0 => (x, Origin::Env),
-        _ => {
-            let shown = v.to_string_lossy();
-            warn(
-                w,
-                vars::SIMILAR_MIN_JACCARD,
-                format!(
-                    "{shown:?} is not a number above 0 and at most 1; using \
-                     {DEFAULT_SIMILAR_MIN_JACCARD}"
-                ),
-            );
-            (DEFAULT_SIMILAR_MIN_JACCARD, Origin::Fallback)
-        }
-    }
-}
-
 fn prepare_dir(path: &Path) -> Result<(), Error> {
     let fail = |source| Error::DataDir {
         path: path.to_owned(),
@@ -632,33 +606,42 @@ mod tests {
         assert!(warnings.is_empty());
         assert_eq!(config.ingest_jobs, None);
         assert_eq!(config.ocr_models, PathBuf::from("/d/ocr-models"));
-        assert!((config.similar_min_jaccard - 0.8).abs() < f64::EPSILON);
         let Loaded { config, warnings } = load(
-            &[
-                ("DOEWOOD_INGEST_JOBS", "6"),
-                ("DOEWOOD_OCR_MODELS", "/models"),
-                ("DOEWOOD_SIMILAR_MIN_JACCARD", "0.9"),
-            ],
+            &[("DOEWOOD_INGEST_JOBS", "6"), ("DOEWOOD_OCR_MODELS", "/models")],
             Some("h"),
         );
         assert!(warnings.is_empty());
         assert_eq!(config.ingest_jobs, Some(6));
         assert_eq!(config.ocr_models, PathBuf::from("/models"));
-        assert!((config.similar_min_jaccard - 0.9).abs() < f64::EPSILON);
-        let Loaded { config, warnings } = load(
-            &[
-                ("DOEWOOD_INGEST_JOBS", "0"),
-                ("DOEWOOD_SIMILAR_MIN_JACCARD", "1.5"),
-            ],
-            Some("h"),
-        );
+        let Loaded { config, warnings } = load(&[("DOEWOOD_INGEST_JOBS", "0")], Some("h"));
         assert_eq!(
             warnings.iter().map(|w| w.var).collect::<Vec<_>>(),
-            ["DOEWOOD_INGEST_JOBS", "DOEWOOD_SIMILAR_MIN_JACCARD"]
+            ["DOEWOOD_INGEST_JOBS"]
         );
         assert_eq!(config.ingest_jobs, None);
-        assert!((config.similar_min_jaccard - 0.8).abs() < f64::EPSILON);
         assert_eq!(config.entries().len(), vars::ALL.len());
+    }
+
+    #[test]
+    fn retired_variables_are_ignored_with_a_warning() {
+        let Loaded { config, warnings } =
+            load(&[("DOEWOOD_SIMILAR_MIN_JACCARD", "0.9")], Some("h"));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].var, "DOEWOOD_SIMILAR_MIN_JACCARD");
+        let text = warnings[0].to_string();
+        assert!(text.contains("ignored"), "{text}");
+        assert!(text.contains("SetIngestSettings"), "{text}");
+        assert!(text.contains("similar_min_jaccard"), "{text}");
+        // It is no bootstrap value: not reported as one.
+        assert!(
+            config
+                .entries()
+                .iter()
+                .all(|e| e.var != "DOEWOOD_SIMILAR_MIN_JACCARD")
+        );
+        // Empty counts as unset: no warning.
+        let Loaded { warnings, .. } = load(&[("DOEWOOD_SIMILAR_MIN_JACCARD", " ")], Some("h"));
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]
@@ -694,7 +677,6 @@ mod tests {
                 ("DOEWOOD_API_MAX_MESSAGE_MIB", "8"),
                 ("DOEWOOD_INGEST_JOBS", "3"),
                 ("DOEWOOD_OCR_MODELS", "/opt/ocr"),
-                ("DOEWOOD_SIMILAR_MIN_JACCARD", "0.75"),
             ],
             Some("ignored"),
         );
@@ -773,7 +755,6 @@ mod tests {
                 Origin::Fallback,
                 Origin::Fallback,
                 Origin::Fallback,
-                Origin::Default,
                 Origin::Default,
                 Origin::Default,
             ]

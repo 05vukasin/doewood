@@ -1,21 +1,22 @@
-//! `ConfigService`: sources, LLM policies and AI providers. Every change applies without a
+//! `ConfigService`: sources, LLM policies, AI providers and ingest's settings. Every change applies without a
 //! restart; secrets are write-only.
 
 use doewood_core::SourceId;
 use doewood_model::SourceKey;
 use doewood_store::{
-    AI_PRESETS, AiProviderInput, ApiKey, KeyChange, NewSource, S3Credentials, SourcePatch,
-    SourceState, UrlStyle, valid_provider_name,
+    AI_PRESETS, AiProviderInput, ApiKey, IngestSettingsPatch, KeyChange, NewSource,
+    S3Credentials, SourcePatch, SourceState, UrlStyle, valid_min_jaccard, valid_provider_name,
 };
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
 use crate::pb::config_service_server::ConfigService;
 use crate::pb::{
-    AddSourceRequest, AiProvider, GetSourceRequest, ListAiProvidersRequest,
-    ListAiProvidersResponse, ListSourcesRequest, ListSourcesResponse, PauseSourceRequest,
-    RemoveSourceRequest, RemoveSourceResponse, ResumeSourceRequest, SetAiProviderRequest,
-    SetLlmPolicyRequest, Source, UpdateSourceRequest,
+    AddSourceRequest, AiProvider, GetIngestSettingsRequest, GetSourceRequest, IngestSettings,
+    ListAiProvidersRequest, ListAiProvidersResponse, ListSourcesRequest, ListSourcesResponse,
+    PauseSourceRequest, RemoveSourceRequest, RemoveSourceResponse, ResumeSourceRequest,
+    SetAiProviderRequest, SetIngestSettingsRequest, SetLlmPolicyRequest, Source,
+    UpdateSourceRequest,
 };
 use crate::validate::{self, Violations};
 use crate::{Api, ApiState, convert, error};
@@ -416,5 +417,39 @@ impl ConfigService for Api {
             providers: providers.iter().map(convert::ai_provider).collect(),
             presets: AI_PRESETS.iter().map(|p| (*p).to_owned()).collect(),
         }))
+    }
+
+    async fn get_ingest_settings(
+        &self,
+        _request: Request<GetIngestSettingsRequest>,
+    ) -> Result<Response<IngestSettings>, Status> {
+        let settings = self.state.db(doewood_store::Store::ingest_settings).await?;
+        Ok(Response::new(convert::ingest_settings(&settings)))
+    }
+
+    async fn set_ingest_settings(
+        &self,
+        request: Request<SetIngestSettingsRequest>,
+    ) -> Result<Response<IngestSettings>, Status> {
+        let req = request.get_ref();
+        let mut v = Violations::default();
+        if let Some(x) = req.similar_min_jaccard
+            && !valid_min_jaccard(x)
+        {
+            v.add("similar_min_jaccard", "must be above 0 and at most 1");
+        }
+        v.check()?;
+        let patch = IngestSettingsPatch {
+            similar_min_jaccard: req.similar_min_jaccard,
+        };
+        let settings = self
+            .state
+            .db(move |s| s.set_ingest_settings(&patch))
+            .await?;
+        info!(
+            similar_min_jaccard = settings.similar_min_jaccard,
+            "ingest settings set"
+        );
+        Ok(Response::new(convert::ingest_settings(&settings)))
     }
 }

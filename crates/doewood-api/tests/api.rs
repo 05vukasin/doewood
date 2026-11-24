@@ -657,6 +657,62 @@ async fn ai_providers_are_write_only() {
     a.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ingest_settings_round_trip_and_validation() {
+    let a = Instance::start("inst-a", Some(Shared::sqlite().backend)).await;
+    let ch = a.channel().await;
+    let get = || async {
+        config(&ch)
+            .get_ingest_settings(pb::GetIngestSettingsRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+    };
+    let eq = |a: f64, b: f64| (a - b).abs() < f64::EPSILON;
+    // The default, before anything is set.
+    assert!(eq(get().await.similar_min_jaccard, 0.8));
+
+    let set = config(&ch)
+        .set_ingest_settings(pb::SetIngestSettingsRequest {
+            similar_min_jaccard: Some(0.65),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(eq(set.similar_min_jaccard, 0.65));
+    assert!(eq(get().await.similar_min_jaccard, 0.65));
+    // Kept in the instance store, where ingest reads it.
+    assert!(eq(a.store.ingest_settings().unwrap().similar_min_jaccard, 0.65));
+    // An unset field keeps the stored value; 1 is allowed.
+    let kept = config(&ch)
+        .set_ingest_settings(pb::SetIngestSettingsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(eq(kept.similar_min_jaccard, 0.65));
+    let one = config(&ch)
+        .set_ingest_settings(pb::SetIngestSettingsRequest {
+            similar_min_jaccard: Some(1.0),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(eq(one.similar_min_jaccard, 1.0));
+
+    for bad in [0.0, -0.5, 1.01, f64::NAN, f64::INFINITY] {
+        let err = config(&ch)
+            .set_ingest_settings(pb::SetIngestSettingsRequest {
+                similar_min_jaccard: Some(bad),
+            })
+            .await
+            .unwrap_err();
+        invalid(&err, &["similar_min_jaccard"]);
+    }
+    // A refused value changes nothing.
+    assert!(eq(get().await.similar_min_jaccard, 1.0));
+    a.stop().await;
+}
+
 fn hash(n: u8) -> Blake3 {
     Blake3([n; 32])
 }

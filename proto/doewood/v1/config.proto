@@ -1,5 +1,5 @@
-// Runtime configuration: S3 sources, their LLM policies and the AI providers (ADR 0001,
-// sections 3, 5 and 6). Changes apply without a restart. Secrets (S3 credentials, API keys)
+// Runtime configuration: S3 sources, their LLM policies, the AI providers and ingest's
+// settings (ADR 0001, sections 3, 5 and 6). Changes apply without a restart. Secrets (S3 credentials, API keys)
 // are write-only: no response ever carries one, only whether one is set.
 syntax = "proto3";
 
@@ -34,6 +34,12 @@ service ConfigService {
   rpc SetAiProvider(SetAiProviderRequest) returns (AiProvider);
   // The configured AI providers (never their keys).
   rpc ListAiProviders(ListAiProvidersRequest) returns (ListAiProvidersResponse);
+  // Ingest's settings, with the defaults filled in.
+  rpc GetIngestSettings(GetIngestSettingsRequest) returns (IngestSettings);
+  // Changes ingest's settings; an unset field keeps its value. Applies to the next file
+  // ingested, without a restart. Documents already in the graph keep their edges until they
+  // are reprocessed.
+  rpc SetIngestSettings(SetIngestSettingsRequest) returns (IngestSettings);
 }
 
 // How bucket URLs are built.
@@ -220,4 +226,16 @@ message ListAiProvidersResponse {
   repeated AiProvider providers = 1;
   // Every preset name SetAiProvider accepts.
   repeated string presets = 2;
+}
+
+message IngestSettings {
+  // Least MinHash Jaccard estimate for a `similar_to` edge: above 0, at most 1. Default 0.8.
+  double similar_min_jaccard = 1;
+}
+
+message GetIngestSettingsRequest {}
+
+message SetIngestSettingsRequest {
+  // Above 0 and at most 1; anything else is INVALID_ARGUMENT. Unset keeps the stored value.
+  optional double similar_min_jaccard = 1;
 }

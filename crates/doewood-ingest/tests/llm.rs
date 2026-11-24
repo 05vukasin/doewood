@@ -300,7 +300,7 @@ impl Harness {
             clock: Arc::clone(&clock) as Arc<dyn Clock>,
             on_change: Arc::new(|_| {}),
         });
-        let mut config = IngestConfig::new(Some(2), &PathBuf::from("/nonexistent"), 0.8);
+        let mut config = IngestConfig::new(Some(2), &PathBuf::from("/nonexistent"));
         config.sweep_interval = Duration::from_millis(200);
         let queue = summaries.clone();
         let ingest = Ingest::new(IngestParts {

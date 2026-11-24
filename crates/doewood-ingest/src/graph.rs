@@ -30,11 +30,10 @@ use uuid::Uuid;
 use crate::company::{AliasKind, CompanyName, LadderStep};
 use crate::facts::{DocFacts, Party};
 
-/// How `similar_to` edges are found.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// How `similar_to` candidates are found. The least Jaccard estimate for an edge is a runtime
+/// setting (`IngestSettings::similar_min_jaccard`), passed to [`GraphWriter::write`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SimilarityConfig {
-    /// Least Jaccard estimate for an edge.
-    pub min_jaccard: f64,
     /// Most candidates looked at per document.
     pub max_candidates: u32,
 }
@@ -42,7 +41,6 @@ pub struct SimilarityConfig {
 impl Default for SimilarityConfig {
     fn default() -> Self {
         Self {
-            min_jaccard: 0.8,
             max_candidates: 100,
         }
     }
@@ -117,13 +115,15 @@ impl GraphWriter {
     }
 
     /// Writes one document found at `location`. Its record must already be stored.
-    /// `name` is the file name, the title of last resort.
+    /// `name` is the file name, the title of last resort. `min_jaccard` is the least Jaccard
+    /// estimate for a `similar_to` edge.
     pub async fn write(
         &self,
         blake3: &Blake3,
         location: &ObjectLocation,
         facts: &DocFacts,
         name: &str,
+        min_jaccard: f64,
     ) -> Result<WriteStats> {
         let b = &self.backend;
         let hex = blake3.to_hex();
@@ -144,7 +144,8 @@ impl GraphWriter {
         self.numbers(doc, &hex, facts, &mut stats).await?;
         self.parties(doc, &hex, facts, &mut stats).await?;
         self.cites(doc, &hex, facts, &mut stats).await?;
-        self.similar(blake3, doc, facts, &mut stats).await?;
+        self.similar(blake3, doc, facts, min_jaccard, &mut stats)
+            .await?;
         b.index_document(&SearchDoc {
             blake3: *blake3,
             title,
@@ -260,6 +261,7 @@ impl GraphWriter {
         blake3: &Blake3,
         doc: Uuid,
         facts: &DocFacts,
+        min_jaccard: f64,
         stats: &mut WriteStats,
     ) -> Result<()> {
         let Some((sig, bands)) = &facts.minhash else {
@@ -272,7 +274,7 @@ impl GraphWriter {
             .await?;
         for c in candidates {
             let score = quail_sketch::jaccard_estimate(sig, &c.signature);
-            if score < self.similarity.min_jaccard {
+            if score < min_jaccard {
                 continue;
             }
             let other = document_node(&**b, &c.blake3).await?;
