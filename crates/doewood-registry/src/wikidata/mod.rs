@@ -282,7 +282,7 @@ impl Wikidata {
         let key = format!("search?{}", url.query().unwrap_or_default());
         let fetch = self.api.send(&key, &url, API_ACCEPT, &api_inspect).await?;
         let Body::Found(b) = &fetch.body else {
-            return Err(malformed("404 from the API".to_owned()));
+            return Err(warning(WarningKind::Status(404)));
         };
         let hits = model::search(b).map_err(malformed)?;
         self.api.fetcher.remember(&key, &fetch).await;
