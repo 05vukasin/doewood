@@ -295,6 +295,7 @@ mod tests {
                 "edges",
                 "jobs",
                 "locations",
+                "node_aliases",
                 "nodes",
                 "objects_seen",
                 "records",
@@ -307,6 +308,8 @@ mod tests {
                 "search_index",
                 "secrets",
                 "settings",
+                "sketch_bands",
+                "sketches",
                 "source_claims",
                 "sources"
             ]

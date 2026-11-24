@@ -1,27 +1,34 @@
-//! `JobsService`: the progress stream, and reprocessing (not built yet).
+//! `JobsService`: the progress stream, and reprocessing.
 
 use std::pin::Pin;
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
+use uuid::Uuid;
 
 use crate::Api;
 use crate::pb::jobs_service_server::JobsService;
-use crate::pb::{ProgressUpdate, ReprocessJobRequest, ReprocessJobResponse, WatchProgressRequest};
+use crate::pb::{
+    ProgressUpdate, ReprocessJobRequest, ReprocessJobResponse, ReprocessProgress,
+    WatchProgressRequest, WatchReprocessRequest, reprocess_progress,
+};
 use crate::progress::Watch;
+use crate::reprocess::{ReprocessPhase, ReprocessView};
 use crate::validate::{self, Violations};
 
 /// Most sources one watch names.
 const MAX_WATCHED: usize = 1000;
 
 type ProgressStream = Pin<Box<dyn Stream<Item = Result<ProgressUpdate, Status>> + Send>>;
+type ReprocessStream = Pin<Box<dyn Stream<Item = Result<ReprocessProgress, Status>> + Send>>;
 
 #[tonic::async_trait]
 impl JobsService for Api {
     type WatchProgressStream = ProgressStream;
+    type WatchReprocessStream = ReprocessStream;
 
     async fn watch_progress(
         &self,
@@ -61,15 +68,103 @@ impl JobsService for Api {
         &self,
         request: Request<ReprocessJobRequest>,
     ) -> Result<Response<ReprocessJobResponse>, Status> {
+        let req = request.get_ref();
         let mut v = Violations::default();
-        let id = validate::source_id(&mut v, "source_id", &request.get_ref().source_id);
+        let id = validate::source_id(&mut v, "source_id", &req.source_id);
         v.check()?;
-        if let Some(id) = id {
-            self.state.source(id).await?;
+        let Some(id) = id else {
+            return Err(Status::invalid_argument("source_id: required"));
+        };
+        self.state.source(id).await?;
+        let Some(reprocess) = self.state.parts().reprocess.clone() else {
+            return Err(Status::unavailable(
+                "ingest is not running on this instance, so nothing can be reprocessed",
+            ));
+        };
+        let job = reprocess.start(id, req.force).borrow().job;
+        Ok(Response::new(ReprocessJobResponse {
+            job_id: job.to_string(),
+        }))
+    }
+
+    async fn watch_reprocess(
+        &self,
+        request: Request<WatchReprocessRequest>,
+    ) -> Result<Response<Self::WatchReprocessStream>, Status> {
+        let raw = request.get_ref().job_id.trim();
+        let mut v = Violations::default();
+        let job = match Uuid::parse_str(raw) {
+            Ok(j) => Some(j),
+            Err(_) if raw.is_empty() => {
+                v.add("job_id", "required");
+                None
+            }
+            Err(_) => {
+                v.add("job_id", "not a job id (a UUID)");
+                None
+            }
+        };
+        v.check()?;
+        let job = job.ok_or_else(|| Status::invalid_argument("job_id: required"))?;
+        let rx = self
+            .state
+            .parts()
+            .reprocess
+            .as_ref()
+            .and_then(|r| r.watch(job))
+            .ok_or_else(|| Status::not_found(format!("reprocess job {job} is not known here")))?;
+        let (tx, out) = mpsc::channel(16);
+        tokio::spawn(stream_job(rx, tx, self.state.parts().shutdown.clone()));
+        Ok(Response::new(Box::pin(ReceiverStream::new(out))))
+    }
+}
+
+/// Sends the job's state now and after every change, until its last state, the client going
+/// away, or shutdown.
+async fn stream_job(
+    mut rx: watch::Receiver<ReprocessView>,
+    tx: mpsc::Sender<Result<ReprocessProgress, Status>>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        let view = rx.borrow_and_update().clone();
+        let last = view.phase.is_final();
+        let sent = tokio::select! {
+            sent = tx.send(Ok(progress(&view))) => sent.is_ok(),
+            _ = shutdown.wait_for(|s| *s) => false,
+        };
+        if !sent || last {
+            return;
         }
-        Err(Status::unimplemented(
-            "ReprocessJob is not available yet: it arrives with ingest (step 4), which records \
-             the quail/hedgehog step versions it compares",
-        ))
+        tokio::select! {
+            changed = rx.changed() => if changed.is_err() { return },
+            () = tx.closed() => return,
+            _ = shutdown.wait_for(|s| *s) => return,
+        }
+    }
+}
+
+fn progress(v: &ReprocessView) -> ReprocessProgress {
+    use reprocess_progress::State;
+    let state = match v.phase {
+        ReprocessPhase::Selecting => State::Selecting,
+        ReprocessPhase::Running => State::Running,
+        ReprocessPhase::Done => State::Done,
+        ReprocessPhase::Failed => State::Failed,
+    };
+    ReprocessProgress {
+        job_id: v.job.to_string(),
+        source_id: v.source.to_string(),
+        state: state as i32,
+        force: v.force,
+        examined: v.examined,
+        selected: v.selected,
+        processed: v.processed,
+        failed: v.failed,
+        pending: v.pending,
+        error: v.error.clone().unwrap_or_default(),
+        at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)),
     }
 }

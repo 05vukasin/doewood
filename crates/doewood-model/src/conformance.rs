@@ -27,7 +27,10 @@ pub async fn run<B: Backend + ?Sized>(a: &B, b: &B) {
     graph(a).await;
     dated_edges(a).await;
     locations(a).await;
+    ended_locations(a).await;
     records_by_source(a).await;
+    sketches(a).await;
+    aliases(a).await;
     claims(a, b).await;
     leases(a, b).await;
     search(a).await;
@@ -395,6 +398,212 @@ pub async fn locations<B: Backend + ?Sized>(s: &B) {
         .expect("old edge kept");
     assert_eq!(old.edge.edge.state, EdgeState::Superseded);
     assert_eq!(old.edge.edge.source, EdgeSource::Storage);
+}
+
+/// Ended locations: the edge is superseded and dated, the document and its other copies stay,
+/// and source listings stop at the gone copy.
+///
+/// # Panics
+///
+/// When the backend misbehaves.
+pub async fn ended_locations<B: Backend + ?Sized>(s: &B) {
+    let at = |key: &str| ObjectLocation {
+        endpoint: "http://end.test:9000".to_owned(),
+        bucket: "docs".to_owned(),
+        key: key.to_owned(),
+    };
+    let doc = hash(41);
+    s.put_record(&doc, &json!({"n": 41}), &versions("1"))
+        .await
+        .unwrap();
+    let first = s.upsert_location(&doc, &at("in/a.pdf")).await.unwrap();
+    let second = s.upsert_location(&doc, &at("in/b.pdf")).await.unwrap();
+    assert_eq!(first.document, second.document);
+    assert_eq!(
+        s.end_location(&at("in/never.pdf"), day(2026, 1, 1))
+            .await
+            .unwrap(),
+        None
+    );
+    let ended = s
+        .end_location(&at("in/a.pdf"), day(2026, 3, 1))
+        .await
+        .unwrap()
+        .expect("recorded");
+    assert_eq!(
+        (ended.document, ended.location),
+        (first.document, first.location)
+    );
+    assert_eq!(ended.remaining, 1);
+    let query = NeighbourQuery {
+        direction: Direction::Out,
+        edge_kinds: vec![EdgeKind::LocatedAt],
+        include_inactive: true,
+        ..NeighbourQuery::default()
+    };
+    let edges = s.neighbours(first.document, &query).await.unwrap();
+    let gone = edges
+        .iter()
+        .find(|n| n.node.id == first.location)
+        .expect("edge kept");
+    assert_eq!(gone.edge.edge.state, EdgeState::Superseded);
+    assert_eq!(gone.edge.edge.valid_to, Some(day(2026, 3, 1)));
+    assert!(s.node(first.document).await.unwrap().is_some());
+    let src = SourceKey::new("http://end.test:9000", "docs", "in/a").unwrap();
+    assert!(s.list_records(&src, None, 0).await.unwrap().is_empty());
+    let src = SourceKey::new("http://end.test:9000", "docs", "in/").unwrap();
+    assert_eq!(s.list_records(&src, None, 0).await.unwrap().len(), 1);
+    // Again: nothing left to end there.
+    let again = s
+        .end_location(&at("in/a.pdf"), day(2026, 3, 2))
+        .await
+        .unwrap();
+    assert_eq!(again, None);
+    let last = s
+        .end_location(&at("in/b.pdf"), day(2026, 3, 1))
+        .await
+        .unwrap()
+        .expect("recorded");
+    assert_eq!(last.remaining, 0);
+    assert!(s.get_record(&doc).await.unwrap().is_some(), "record kept");
+    // The object comes back: the edge is live again.
+    let back = s.upsert_location(&doc, &at("in/a.pdf")).await.unwrap();
+    assert_eq!(back, first);
+    let query = NeighbourQuery {
+        direction: Direction::Out,
+        edge_kinds: vec![EdgeKind::LocatedAt],
+        ..NeighbourQuery::default()
+    };
+    let live = s.neighbours(first.document, &query).await.unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].edge.edge.valid_to, None);
+}
+
+/// Aliases: the first claim wins, a blocked alias resolves to nobody, a missing node fails.
+///
+/// # Panics
+///
+/// When the backend misbehaves.
+pub async fn aliases<B: Backend + ?Sized>(s: &B) {
+    let one = s
+        .upsert_node(NodeKind::Company, "alias-one", &json!({}))
+        .await
+        .unwrap();
+    let two = s
+        .upsert_node(NodeKind::Company, "alias-two", &json!({}))
+        .await
+        .unwrap();
+    let kind = NodeKind::Company;
+    assert_eq!(s.alias(kind, "id:rs_pib:101").await.unwrap(), None);
+    let got = s
+        .claim_alias(kind, "id:rs_pib:101", one, &json!({"conf": 0.95}))
+        .await
+        .unwrap();
+    assert_eq!(got.node, Some(one));
+    assert_eq!(got.props, json!({"conf": 0.95}));
+    // A second claim finds the first owner and changes nothing.
+    let got = s
+        .claim_alias(kind, "id:rs_pib:101", two, &json!({"conf": 0.5}))
+        .await
+        .unwrap();
+    assert_eq!((got.node, got.props), (Some(one), json!({"conf": 0.95})));
+    assert_eq!(
+        s.alias(kind, "id:rs_pib:101").await.unwrap().unwrap().node,
+        Some(one)
+    );
+    // The same alias under another kind is another alias.
+    assert_eq!(
+        s.alias(NodeKind::Document, "id:rs_pib:101").await.unwrap(),
+        None
+    );
+    s.block_alias(kind, "name:acme", &json!({"why": "two companies"}))
+        .await
+        .unwrap();
+    let blocked = s.alias(kind, "name:acme").await.unwrap().unwrap();
+    assert_eq!(blocked.node, None);
+    let got = s
+        .claim_alias(kind, "name:acme", two, &json!({}))
+        .await
+        .unwrap();
+    assert_eq!(got.node, None, "a blocked alias stays blocked");
+    s.block_alias(kind, "id:rs_pib:101", &json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        s.alias(kind, "id:rs_pib:101").await.unwrap().unwrap().node,
+        None
+    );
+    assert!(
+        s.claim_alias(kind, "x", Uuid::now_v7(), &json!({}))
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        s.claim_alias(kind, "", one, &json!({})).await,
+        Err(Error::Invalid(_))
+    ));
+}
+
+/// The LSH band index: candidates by shared bands, replacement, the excluded document.
+///
+/// # Panics
+///
+/// When the backend misbehaves.
+pub async fn sketches<B: Backend + ?Sized>(s: &B) {
+    for n in 51..=54 {
+        s.put_record(&hash(n), &json!({"n": n}), &versions("1"))
+            .await
+            .unwrap();
+    }
+    let big = u64::MAX - 7;
+    s.put_sketch(&hash(51), &[1, 2, 3], &[10, 11, big])
+        .await
+        .unwrap();
+    s.put_sketch(&hash(52), &[4, 5], &[10, 99]).await.unwrap();
+    s.put_sketch(&hash(53), &[6], &[77]).await.unwrap();
+    let got = s
+        .sketch_candidates(&[10, 11, big], &hash(54), 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        got.iter()
+            .map(|c| (c.blake3, c.shared_bands))
+            .collect::<Vec<_>>(),
+        [(hash(51), 3), (hash(52), 1)]
+    );
+    assert_eq!(got[0].signature, [1, 2, 3]);
+    // The document itself is never its own candidate.
+    let got = s.sketch_candidates(&[10], &hash(51), 0).await.unwrap();
+    assert_eq!(got.iter().map(|c| c.blake3).collect::<Vec<_>>(), [hash(52)]);
+    assert_eq!(
+        s.sketch_candidates(&[10], &hash(54), 1)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        s.sketch_candidates(&[], &hash(54), 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // Replacing a sketch replaces its bands.
+    s.put_sketch(&hash(51), &[9], &[77]).await.unwrap();
+    let got = s.sketch_candidates(&[11], &hash(54), 0).await.unwrap();
+    assert!(got.is_empty());
+    let got = s.sketch_candidates(&[77], &hash(54), 0).await.unwrap();
+    assert_eq!(
+        got.iter().map(|c| c.blake3).collect::<Vec<_>>(),
+        [hash(51), hash(53)]
+    );
+    assert_eq!(got[0].signature, [9]);
+    // A sketch without a record, and an empty signature, are refused.
+    assert!(s.put_sketch(&hash(55), &[1], &[1]).await.is_err());
+    assert!(matches!(
+        s.put_sketch(&hash(52), &[], &[1]).await,
+        Err(Error::Invalid(_))
+    ));
 }
 
 /// Records listed by source: the bucket and prefix filter, hash order and paging.

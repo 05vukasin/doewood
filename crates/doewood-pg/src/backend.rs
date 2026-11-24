@@ -8,11 +8,14 @@ use deadpool_postgres::{Object, Pool, PoolError};
 use doewood_core::InstanceId;
 use doewood_model::{
     Backend, Blake3, ClaimStore, Direction, Edge, EdgeKind, EdgeSource, Error, GraphStore, Located,
-    Neighbour, NeighbourQuery, Node, NodeKind, ObjectLocation, PutOutcome, Record, RecordStore,
-    Result, SearchDoc, SearchHit, SearchQuery, SearchStore, SourceClaim, SourceKey, StepVersions,
-    StoredEdge, records_limit, validate_node, versions_from_json, versions_to_json,
+    LocationEnded, Neighbour, NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation,
+    PutOutcome, Record, RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery,
+    SearchStore, Sketch, SketchStore, SourceClaim, SourceKey, StepVersions, StoredEdge,
+    band_to_i64, records_limit, sketch_limit, validate_alias, validate_node, validate_sketch,
+    versions_from_json, versions_to_json,
 };
 use serde_json::Value;
+use time::Date;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{GenericClient, Row};
@@ -433,6 +436,178 @@ impl GraphStore for PgStore {
         .await?;
         tx.commit().await.map_err(pg)?;
         Ok(Located { document, location })
+    }
+
+    async fn end_location(&self, at: &ObjectLocation, on: Date) -> Result<Option<LocationEnded>> {
+        let at = &at.checked()?;
+        let mut c = client(&self.pool).await?;
+        let tx = c.transaction().await.map_err(pg)?;
+        let Some(row) = tx
+            .query_opt(
+                "DELETE FROM locations WHERE endpoint = $1 AND bucket = $2 AND object_key = $3 \
+                 RETURNING node_id, document_id",
+                &[&at.endpoint, &at.bucket, &at.key],
+            )
+            .await
+            .map_err(pg)?
+        else {
+            return Ok(None);
+        };
+        let (location, document): (Uuid, Uuid) =
+            (row.try_get(0).map_err(pg)?, row.try_get(1).map_err(pg)?);
+        tx.execute(
+            "UPDATE edges SET state = 'superseded', \
+             valid_to = greatest(coalesce(valid_from, $2), $2), updated_at = now() \
+             WHERE dst = $1 AND kind = 'located_at' \
+             AND state NOT IN ('retracted', 'superseded')",
+            &[&location, &on],
+        )
+        .await
+        .map_err(pg)?;
+        let remaining: i64 = tx
+            .query_one(
+                "SELECT count(*) FROM edges WHERE src = $1 AND kind = 'located_at' \
+                 AND state NOT IN ('retracted', 'superseded')",
+                &[&document],
+            )
+            .await
+            .map_err(pg)?
+            .try_get(0)
+            .map_err(pg)?;
+        tx.commit().await.map_err(pg)?;
+        Ok(Some(LocationEnded {
+            document,
+            location,
+            remaining: u32::try_from(remaining).unwrap_or(u32::MAX),
+        }))
+    }
+
+    async fn claim_alias(
+        &self,
+        kind: NodeKind,
+        alias: &str,
+        node: Uuid,
+        props: &Value,
+    ) -> Result<NodeAlias> {
+        validate_alias(alias, props)?;
+        let c = client(&self.pool).await?;
+        // A no-op update on conflict, so the stored row always comes back.
+        let row = c
+            .query_one(
+                "INSERT INTO node_aliases (kind, alias, node_id, props) VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (kind, alias) DO UPDATE SET kind = node_aliases.kind \
+                 RETURNING node_id, props",
+                &[&kind.as_str(), &alias, &node, props],
+            )
+            .await
+            .map_err(pg)?;
+        Ok(NodeAlias {
+            node: row.try_get(0).map_err(pg)?,
+            props: row.try_get(1).map_err(pg)?,
+        })
+    }
+
+    async fn alias(&self, kind: NodeKind, alias: &str) -> Result<Option<NodeAlias>> {
+        let c = client(&self.pool).await?;
+        c.query_opt(
+            "SELECT node_id, props FROM node_aliases WHERE kind = $1 AND alias = $2",
+            &[&kind.as_str(), &alias],
+        )
+        .await
+        .map_err(pg)?
+        .map(|r| {
+            Ok(NodeAlias {
+                node: r.try_get(0).map_err(pg)?,
+                props: r.try_get(1).map_err(pg)?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn block_alias(&self, kind: NodeKind, alias: &str, props: &Value) -> Result<()> {
+        validate_alias(alias, props)?;
+        let c = client(&self.pool).await?;
+        c.execute(
+            "INSERT INTO node_aliases (kind, alias, node_id, props) VALUES ($1, $2, NULL, $3) \
+             ON CONFLICT (kind, alias) DO UPDATE SET node_id = NULL, props = EXCLUDED.props, \
+             updated_at = now()",
+            &[&kind.as_str(), &alias, props],
+        )
+        .await
+        .map_err(pg)?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl SketchStore for PgStore {
+    async fn put_sketch(&self, blake3: &Blake3, signature: &[u8], bands: &[u64]) -> Result<()> {
+        validate_sketch(signature, bands)?;
+        let key = blake3.as_bytes().as_slice();
+        let bands: Vec<i64> = bands.iter().map(|b| band_to_i64(*b)).collect();
+        let mut c = client(&self.pool).await?;
+        let tx = c.transaction().await.map_err(pg)?;
+        tx.execute(
+            "INSERT INTO sketches (blake3, signature) VALUES ($1, $2) \
+             ON CONFLICT (blake3) DO UPDATE SET signature = EXCLUDED.signature, \
+             updated_at = now()",
+            &[&key, &signature],
+        )
+        .await
+        .map_err(pg)?;
+        tx.execute("DELETE FROM sketch_bands WHERE blake3 = $1", &[&key])
+            .await
+            .map_err(pg)?;
+        tx.execute(
+            "INSERT INTO sketch_bands (band, blake3) \
+             SELECT DISTINCT b, $2::bytea FROM unnest($1::bigint[]) AS b",
+            &[&bands, &key],
+        )
+        .await
+        .map_err(pg)?;
+        tx.commit().await.map_err(pg)
+    }
+
+    async fn sketch_candidates(
+        &self,
+        bands: &[u64],
+        exclude: &Blake3,
+        limit: u32,
+    ) -> Result<Vec<Sketch>> {
+        if bands.is_empty() {
+            return Ok(Vec::new());
+        }
+        if bands.len() > SKETCH_MAX_BANDS {
+            return Err(Error::Invalid(format!(
+                "at most {SKETCH_MAX_BANDS} band keys per lookup"
+            )));
+        }
+        let bands: Vec<i64> = bands.iter().map(|b| band_to_i64(*b)).collect();
+        let c = client(&self.pool).await?;
+        let rows = c
+            .query(
+                "SELECT b.blake3, s.signature, count(DISTINCT b.band) AS shared \
+                 FROM sketch_bands b JOIN sketches s ON s.blake3 = b.blake3 \
+                 WHERE b.band = ANY($1) AND b.blake3 <> $2 \
+                 GROUP BY b.blake3, s.signature ORDER BY shared DESC, b.blake3 LIMIT $3",
+                &[
+                    &bands,
+                    &exclude.as_bytes().as_slice(),
+                    &i64::from(sketch_limit(limit)),
+                ],
+            )
+            .await
+            .map_err(pg)?;
+        rows.iter()
+            .map(|r| {
+                Ok(Sketch {
+                    blake3: Blake3::from_slice(r.try_get::<_, &[u8]>(0).map_err(pg)?)?,
+                    signature: r.try_get(1).map_err(pg)?,
+                    shared_bands: u32::try_from(r.try_get::<_, i64>(2).map_err(pg)?)
+                        .unwrap_or(u32::MAX),
+                })
+            })
+            .collect()
     }
 }
 

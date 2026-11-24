@@ -29,7 +29,7 @@ The S3 event webhook is not part of the gRPC API: it is on the ops server (see
 | service | RPCs |
 |---|---|
 | `ConfigService` | `AddSource`, `UpdateSource`, `PauseSource`, `ResumeSource`, `RemoveSource`, `ListSources`, `GetSource`, `SetLlmPolicy`, `SetAiProvider`, `ListAiProviders` |
-| `JobsService` | `WatchProgress` (server stream), `ReprocessJob` (not built yet) |
+| `JobsService` | `WatchProgress` (server stream), `ReprocessJob`, `WatchReprocess` (server stream) |
 | `RecordsService` | `GetRecord`, `ListRecords` |
 | `GraphService` | `GetNode`, `Neighbours`, `CompanyDocuments` |
 | `SearchService` | `Search` |
@@ -83,7 +83,7 @@ every source, including ones added later.
 |---|---|
 | `seen` | objects under the prefix that discovery knows about |
 | `new`, `changed`, `deleted` | discovery events since this instance started (scans and the webhook) |
-| `processed`, `failed`, `pending` | objects ingested, failed, and not ingested yet (ingest arrives in step 4) |
+| `processed`, `failed`, `pending` | objects ingested (`done`), failed (after their retries), and not ingested yet |
 | `queued_llm` | documents in the LLM queue (0 until step 6) |
 
 ### Records, graph and search
@@ -100,11 +100,29 @@ every source, including ones added later.
 
 Dates are `YYYY-MM-DD` strings; JSON props and evidence are strings holding JSON.
 
+### Reprocessing
+
+- **ReprocessJob** starts a one-shot job for a source and answers at once with its `job_id`. It
+  puts back in the ingest queue every ingested file whose stored step versions differ from the
+  running engine's (`doewood.ingest`, the quail plan fingerprint, and the hedgehog revision for
+  spreadsheets); with `force: true`, every live file of the source. Without ingest on the
+  instance it answers `UNAVAILABLE`.
+- **WatchReprocess** streams the job's progress: `STATE_SELECTING` (with `examined` and
+  `selected` growing), `STATE_RUNNING` (the source's `processed`, `failed` and `pending`), and
+  last `STATE_DONE` (nothing of the source pending) or `STATE_FAILED` with `error`; then the
+  stream ends. Jobs live in the instance that started them, until it restarts (`NOT_FOUND`
+  after that).
+
+```sh
+JOB=$(grpcurl -plaintext -d "{\"source_id\": \"$ID\"}" 127.0.0.1:7443 \
+    doewood.v1.JobsService/ReprocessJob | jq -r .jobId)
+grpcurl -plaintext -d "{\"job_id\": \"$JOB\"}" 127.0.0.1:7443 doewood.v1.JobsService/WatchReprocess
+```
+
 ### Not built yet
 
-`ReprocessJob` (step 4) and `Summarize` (step 6) are defined, so the API is stable, and they
-validate their requests. A valid request answers `UNIMPLEMENTED` with a message saying which
-step brings it.
+`Summarize` (step 6) is defined, so the API is stable, and it validates its requests. A valid
+request answers `UNIMPLEMENTED` with a message saying which step brings it.
 
 ## Errors
 
@@ -113,9 +131,9 @@ step brings it.
 | `INVALID_ARGUMENT` | a field is wrong. Every problem is reported at once: the message lists `field: reason` pairs, and a `google.rpc.BadRequest` detail carries the same field paths (`credentials.access_key_id`, `llm_policy.kinds[2]`, ...). |
 | `NOT_FOUND` | the source, record, node or provider does not exist |
 | `ALREADY_EXISTS` | the source exists on this instance, or another instance has claimed it (named in the message) |
-| `UNAVAILABLE` | the shared Postgres is not connected (yet), or a call to it failed; retry |
+| `UNAVAILABLE` | the shared Postgres is not connected (yet), or a call to it failed; retry. `ReprocessJob` on an instance without ingest |
 | `FAILED_PRECONDITION` | the shared database was migrated by a newer doewood |
-| `UNIMPLEMENTED` | `ReprocessJob`, `Summarize` |
+| `UNIMPLEMENTED` | `Summarize` |
 | `OUT_OF_RANGE` | a message larger than the limit |
 | `INTERNAL` | anything else; the details are in the server log, not in the message |
 

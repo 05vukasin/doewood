@@ -7,11 +7,18 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["ocr"]
+# OCR of scanned pages in ingest (ONNX Runtime; the image ships with it). Without it, or without
+# the model files, scanned pages are flagged `needs_ocr`.
+ocr = ["doewood-ingest/ocr"]
+
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 clap = { version = "4.5", features = ["derive"] }
 doewood-api.workspace = true
 doewood-core.workspace = true
+doewood-ingest.workspace = true
 doewood-model.workspace = true
 doewood-pg.workspace = true
 doewood-s3.workspace = true
@@ -20,6 +27,7 @@ doewood-store.workspace = true
 prometheus = { version = "0.14", default-features = false }
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 tracing = "0.1"
+uuid.workspace = true
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "json", "env-filter", "ansi"] }
 
 [dev-dependencies]

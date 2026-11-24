@@ -8,11 +8,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use doewood_core::InstanceId;
 use serde_json::Value;
+use time::Date;
 use uuid::Uuid;
 
 use crate::{
-    Blake3, Edge, Located, Neighbour, NeighbourQuery, Node, NodeKind, ObjectLocation, PutOutcome,
-    Record, Result, SearchDoc, SearchHit, SearchQuery, SourceClaim, SourceKey, StepVersions,
+    Blake3, Edge, Located, LocationEnded, Neighbour, NeighbourQuery, Node, NodeAlias, NodeKind,
+    ObjectLocation, PutOutcome, Record, Result, SearchDoc, SearchHit, SearchQuery, Sketch,
+    SourceClaim, SourceKey, StepVersions,
 };
 
 /// quail and hedgehog records, keyed by BLAKE3.
@@ -69,6 +71,60 @@ pub trait GraphStore: Send + Sync {
     /// and Location nodes and the `located_at` edge, and supersedes any `located_at` edge from
     /// another document to that location (the object was overwritten).
     async fn upsert_location(&self, blake3: &Blake3, location: &ObjectLocation) -> Result<Located>;
+
+    /// Records that the object at a location is gone (deleted from its bucket), in one
+    /// transaction: the live `located_at` edges to it become superseded with `valid_to = on`,
+    /// and the location no longer counts for source filters. The Document node, its record and
+    /// its other locations stay. `None` when the location was never recorded.
+    async fn end_location(
+        &self,
+        location: &ObjectLocation,
+        on: Date,
+    ) -> Result<Option<LocationEnded>>;
+
+    /// Claims `alias` (an identifier or a name key that resolves to one node, ADR 0002
+    /// section 1) for `node`, with `props` (evidence, confidence). The first claim wins: the
+    /// result is the alias as stored, owned by `node` or by whoever claimed it before (or by
+    /// nobody when it is blocked). The node must exist.
+    async fn claim_alias(
+        &self,
+        kind: NodeKind,
+        alias: &str,
+        node: Uuid,
+        props: &Value,
+    ) -> Result<NodeAlias>;
+
+    /// The alias, if claimed or blocked.
+    async fn alias(&self, kind: NodeKind, alias: &str) -> Result<Option<NodeAlias>>;
+
+    /// Blocks an alias: it resolves to no node from now on (a key that turned out to belong
+    /// to more than one), with `props` saying why.
+    async fn block_alias(&self, kind: NodeKind, alias: &str, props: &Value) -> Result<()>;
+}
+
+/// The `MinHash` LSH band index behind `similar_to` edges: candidates come from a lookup by
+/// band key, never from a scan of every document.
+#[async_trait]
+pub trait SketchStore: Send + Sync {
+    /// Stores (or replaces) a document's signature and band keys. Its record must exist.
+    async fn put_sketch(&self, blake3: &Blake3, signature: &[u8], bands: &[u64]) -> Result<()>;
+
+    /// Documents other than `exclude` that share at least one of `bands`, most shared bands
+    /// first, then by hash; at most `limit` (0 means 100, at most 1000).
+    async fn sketch_candidates(
+        &self,
+        bands: &[u64],
+        exclude: &Blake3,
+        limit: u32,
+    ) -> Result<Vec<Sketch>>;
+}
+
+/// The page size [`SketchStore::sketch_candidates`] uses for `limit`.
+pub fn sketch_limit(limit: u32) -> u32 {
+    match limit {
+        0 => 100,
+        n => n.min(1000),
+    }
 }
 
 /// Ownership of sources between instances, and the enrichment leases on companies
@@ -107,7 +163,7 @@ pub trait SearchStore: Send + Sync {
 
 /// A complete backend: everything the service needs from its store.
 #[async_trait]
-pub trait Backend: RecordStore + GraphStore + ClaimStore + SearchStore {
+pub trait Backend: RecordStore + GraphStore + ClaimStore + SearchStore + SketchStore {
     /// `postgres` or `sqlite`.
     fn name(&self) -> &'static str;
 
