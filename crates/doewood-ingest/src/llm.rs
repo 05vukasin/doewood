@@ -24,9 +24,16 @@
 //! - **`Summarize`** ([`Summaries::summarize`]) skips the queue and stores nothing: it reads
 //!   the file (the bytes given, or an object of a source whose policy is not `off`), analyzes
 //!   it without storing the record, and summarizes it with the named or default provider.
+//! - **`Summarize` cap.** At most `IngestSettings::summarize_max_concurrent` calls (runtime
+//!   setting, default 2, read for every call) read and analyze a file at once. The slot is
+//!   taken before the object is read and freed when the analysis ends (also when the client
+//!   went away or the call timed out: the slot goes with the blocking analysis, not with the
+//!   call). The provider call that follows holds no slot: it is bounded by
+//!   [`QueueConfig::max_concurrent`]. A call that finds no free slot fails at once with
+//!   [`SummarizeError::ResourceExhausted`]; nothing queues.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -129,6 +136,8 @@ pub enum SummarizeError {
     FailedPrecondition(String),
     /// Reading the object failed, or a dependency is away.
     Unavailable(String),
+    /// As many `Summarize` analyses as the cap allows are in flight: retry later.
+    ResourceExhausted(String),
     /// Anything else.
     Internal(String),
 }
@@ -140,6 +149,7 @@ impl std::fmt::Display for SummarizeError {
             | Self::NotFound(m)
             | Self::FailedPrecondition(m)
             | Self::Unavailable(m)
+            | Self::ResourceExhausted(m)
             | Self::Internal(m) => f.write_str(m),
         }
     }
@@ -219,6 +229,37 @@ struct Inner {
     calls: AtomicU64,
     /// The last reason the queue could not run, logged once until it changes.
     blocked: Mutex<Option<String>>,
+    /// `Summarize` analyses in flight, and the calls refused for want of a slot.
+    slots: Arc<Slots>,
+}
+
+/// The `Summarize` cap's counters. The cap itself is a runtime setting, read for every call,
+/// so it is a counter checked against it rather than a semaphore of fixed size.
+#[derive(Default)]
+struct Slots {
+    in_flight: AtomicUsize,
+    rejected: AtomicU64,
+}
+
+impl Slots {
+    /// A slot when fewer than `cap` are taken.
+    fn try_take(self: &Arc<Self>, cap: usize) -> Option<Slot> {
+        self.in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < cap).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| Slot(Arc::clone(self)))
+    }
+}
+
+/// One `Summarize` slot; dropping it frees it, on every path (error, timeout, cancel).
+struct Slot(Arc<Slots>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[derive(Default)]
@@ -265,6 +306,7 @@ impl Summaries {
                 sched: Mutex::new(Sched::default()),
                 calls: AtomicU64::new(0),
                 blocked: Mutex::new(None),
+                slots: Arc::new(Slots::default()),
             }),
         }
     }
@@ -282,6 +324,16 @@ impl Summaries {
     /// Summaries in flight now.
     pub fn in_flight(&self) -> usize {
         lock(&self.inner.sched).running.len()
+    }
+
+    /// `Summarize` calls reading or analyzing a file now (each holds a slot of the cap).
+    pub fn summarize_in_flight(&self) -> usize {
+        self.inner.slots.in_flight.load(Ordering::Acquire)
+    }
+
+    /// `Summarize` calls refused since start because the cap was reached.
+    pub fn summarize_rejected(&self) -> u64 {
+        self.inner.slots.rejected.load(Ordering::Relaxed)
     }
 
     /// Runs the queue until shutdown. Summaries in flight then are abandoned (their jobs stay
@@ -603,12 +655,14 @@ impl Summaries {
     }
 
     /// The record of a file, not stored: the stored one when `from_store` and it is current,
-    /// else a fresh analysis.
+    /// else a fresh analysis. `slot` is freed when the analysis ends, even if this call is
+    /// dropped or times out first.
     async fn record_of(
         &self,
         bytes: Vec<u8>,
         name: String,
         from_store: bool,
+        slot: Slot,
     ) -> Result<(Blake3, Json), SummarizeError> {
         let blake3 = Blake3(*blake3::hash(&bytes).as_bytes());
         // An object already stored with current step versions is read from its record.
@@ -632,7 +686,10 @@ impl Summaries {
         } else {
             let analyzer = Arc::clone(&self.inner.analyzer);
             let limit = analyzer.limits().timeout_cap() + Duration::from_mins(1);
-            let task = tokio::task::spawn_blocking(move || analyzer.analyze(bytes, &name).body);
+            let task = tokio::task::spawn_blocking(move || {
+                let _slot = slot;
+                analyzer.analyze(bytes, &name).body
+            });
             match tokio::time::timeout(limit, task).await {
                 Ok(Ok(b)) => b,
                 Ok(Err(e)) => {
@@ -649,16 +706,61 @@ impl Summaries {
         Ok((blake3, body))
     }
 
+    /// A `Summarize` slot, or [`SummarizeError::ResourceExhausted`] at once when the cap
+    /// (read from the store now) is reached.
+    async fn take_slot(&self) -> Result<Slot, SummarizeError> {
+        let cap = self
+            .db(Store::ingest_settings)
+            .await?
+            .summarize_max_concurrent;
+        let cap = usize::try_from(cap).unwrap_or(usize::MAX);
+        if let Some(slot) = self.inner.slots.try_take(cap) {
+            debug!(
+                in_flight = self.summarize_in_flight(),
+                cap, "Summarize analysis started"
+            );
+            return Ok(slot);
+        }
+        let rejected = self.inner.slots.rejected.fetch_add(1, Ordering::Relaxed) + 1;
+        warn!(
+            in_flight = self.summarize_in_flight(),
+            cap, rejected, "Summarize refused: the cap of analyses in flight is reached"
+        );
+        Err(SummarizeError::ResourceExhausted(format!(
+            "{cap} Summarize analyses are in flight, the most this instance runs at once \
+             (ConfigService.SetIngestSettings summarize_max_concurrent): retry later"
+        )))
+    }
+
+    /// Refuses a file larger than the analyzer reads (ingest's `Limits::max_bytes`): it would
+    /// get no text.
+    fn check_size(&self, len: usize) -> Result<(), SummarizeError> {
+        let max = self.inner.analyzer.limits().max_bytes;
+        if u64::try_from(len).unwrap_or(u64::MAX) > max {
+            return Err(SummarizeError::FailedPrecondition(format!(
+                "the file is {len} bytes, larger than the {max} bytes ingest analyzes"
+            )));
+        }
+        Ok(())
+    }
+
     /// `Summarize`: one summary now, outside the queue. Stores nothing: not the record, not a
     /// job, not the spend (the daily budget governs the queue only).
+    ///
+    /// Reading the object and the analysis hold a slot of the `Summarize` cap; without a free
+    /// one the call fails at once with [`SummarizeError::ResourceExhausted`].
     pub async fn summarize(
         &self,
         input: SummarizeInput,
         provider: Option<&str>,
     ) -> Result<OnDemandSummary, SummarizeError> {
         let provider = self.provider(provider).await?;
-        let (bytes, name, from_store) = match input {
-            SummarizeInput::Content { bytes, name } => (bytes, name, false),
+        let (bytes, name, from_store, slot) = match input {
+            SummarizeInput::Content { bytes, name } => {
+                self.check_size(bytes.len())?;
+                let slot = self.take_slot().await?;
+                (bytes, name, false, slot)
+            }
             SummarizeInput::Location { source, key } => {
                 let src = self.db(move |s| s.source(source)).await?.ok_or_else(|| {
                     SummarizeError::NotFound(format!("source {source} does not exist"))
@@ -669,17 +771,19 @@ impl Summaries {
                          or kinds) with ConfigService.SetLlmPolicy to summarize its files"
                     )));
                 }
+                let slot = self.take_slot().await?;
                 let bytes = self
                     .inner
                     .fetch
                     .fetch(&src, &key)
                     .await
                     .map_err(|e| SummarizeError::Unavailable(e.message))?;
+                self.check_size(bytes.len())?;
                 let name = key.rsplit('/').next().unwrap_or(&key).to_owned();
-                (bytes, name, true)
+                (bytes, name, true, slot)
             }
         };
-        let (blake3, body) = self.record_of(bytes, name, from_store).await?;
+        let (blake3, body) = self.record_of(bytes, name, from_store, slot).await?;
         let kind = DocFacts::from_record(&body).kind.unwrap_or_default();
         let mut out = OnDemandSummary {
             blake3: blake3.to_hex(),

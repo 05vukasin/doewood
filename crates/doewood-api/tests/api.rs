@@ -856,6 +856,7 @@ async fn ingest_settings_round_trip_and_validation() {
     let set = config(&ch)
         .set_ingest_settings(pb::SetIngestSettingsRequest {
             similar_min_jaccard: Some(0.65),
+            ..pb::SetIngestSettingsRequest::default()
         })
         .await
         .unwrap()
@@ -877,6 +878,7 @@ async fn ingest_settings_round_trip_and_validation() {
     let one = config(&ch)
         .set_ingest_settings(pb::SetIngestSettingsRequest {
             similar_min_jaccard: Some(1.0),
+            ..pb::SetIngestSettingsRequest::default()
         })
         .await
         .unwrap()
@@ -887,6 +889,7 @@ async fn ingest_settings_round_trip_and_validation() {
         let err = config(&ch)
             .set_ingest_settings(pb::SetIngestSettingsRequest {
                 similar_min_jaccard: Some(bad),
+                ..pb::SetIngestSettingsRequest::default()
             })
             .await
             .unwrap_err();
@@ -894,6 +897,36 @@ async fn ingest_settings_round_trip_and_validation() {
     }
     // A refused value changes nothing.
     assert!(eq(get().await.similar_min_jaccard, 1.0));
+
+    // The on-demand Summarize cap: default 2, 1 to 16, kept apart from the threshold.
+    assert_eq!(get().await.summarize_max_concurrent, 2);
+    let set = config(&ch)
+        .set_ingest_settings(pb::SetIngestSettingsRequest {
+            summarize_max_concurrent: Some(4),
+            ..pb::SetIngestSettingsRequest::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(set.summarize_max_concurrent, 4);
+    assert!(eq(set.similar_min_jaccard, 1.0));
+    assert_eq!(
+        a.store.ingest_settings().unwrap().summarize_max_concurrent,
+        4
+    );
+    for bad in [0, 17] {
+        let err = config(&ch)
+            .set_ingest_settings(pb::SetIngestSettingsRequest {
+                similar_min_jaccard: Some(0.9),
+                summarize_max_concurrent: Some(bad),
+            })
+            .await
+            .unwrap_err();
+        invalid(&err, &["summarize_max_concurrent"]);
+    }
+    let now = get().await;
+    assert_eq!(now.summarize_max_concurrent, 4);
+    assert!(eq(now.similar_min_jaccard, 1.0));
     a.stop().await;
 }
 
@@ -1903,7 +1936,13 @@ impl doewood_api::OnDemand for FakeOnDemand {
     {
         Box::pin(async move {
             let fail = matches!(&input, doewood_api::OnDemandInput::Content { name, .. } if name == "fail.txt");
+            let busy = matches!(&input, doewood_api::OnDemandInput::Content { name, .. } if name == "busy.txt");
             self.seen.lock().unwrap().push((input, provider.clone()));
+            if busy {
+                return Err(doewood_api::OnDemandError::ResourceExhausted(
+                    "2 Summarize analyses are in flight, the most this instance runs at once: retry later".into(),
+                ));
+            }
             if fail {
                 return Err(doewood_api::OnDemandError::NoProvider(
                     "no AI provider is configured: add one with ConfigService.SetAiProvider".into(),
@@ -2026,6 +2065,17 @@ async fn summarize_hands_requests_to_ingest() {
         .unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition);
     assert!(err.message().contains("SetAiProvider"), "{}", err.message());
+    // Over the cap: RESOURCE_EXHAUSTED, with the reason.
+    let err = sum
+        .summarize(pb::SummarizeRequest {
+            input: Some(pb::summarize_request::Input::Content(b"text".to_vec())),
+            name: "busy.txt".into(),
+            provider: String::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::ResourceExhausted);
+    assert!(err.message().contains("retry later"), "{}", err.message());
     a.stop().await;
 }
 
