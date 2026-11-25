@@ -13,9 +13,9 @@
 //! ingest does after each file. A call shed with `UNAVAILABLE` is retried as docs/api.md
 //! advises (100 ms doubling to 10 s, with jitter), or after a fixed
 //! `DOEWOOD_BENCH_BACKOFF_MS`; with `DOEWOOD_BENCH_PUSHBACK=1` a client waits the server's
-//! `grpc-retry-pushback-ms` instead when the refusal carries one (issue #104). Seeding is followed by `ANALYZE` (Postgres) and a 2 s warm-up
-//! that is not reported. At the end a burst of idle connections measures memory per
-//! connection.
+//! `grpc-retry-pushback-ms` instead when the refusal carries one (issue #104). Seeding is
+//! followed by `ANALYZE` (Postgres) and a 2 s warm-up that is not reported. At the end a
+//! burst of idle connections measures memory per connection.
 //!
 //! Settings: `DOEWOOD_BENCH_CLIENTS` (comma-separated, default `10,100,500,1000`),
 //! `DOEWOOD_BENCH_PER_CONN` (clients per connection, default 1), `DOEWOOD_BENCH_WATCH_PCT`

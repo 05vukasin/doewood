@@ -573,9 +573,10 @@ machine above, on a Docker network created with `--internal`; ranges of 3 runs:
 | `fastupdate = off` | 0 | 6,840 to 7,347 | 1.29 to 1.38 ms | 2.7 to 3.1 ms |
 
 Writing cost. `throughput` (`DOEWOOD_BENCH_JOBS=4 DOEWOOD_BENCH_FILES=2000`, test profile,
-medians of 3, before the fewer round trips of #103): 246 files/s before (238 to 249), 242 with 256 kB (240 to 250), 240 with
-`fastupdate = off` (238 to 250): within the noise,
-because the graph stage's round trips dominate there (see [ingest.md](ingest.md)). Inserts
+medians of 3, before the fewer round trips of #103): 246 files/s before (238 to 249), 242
+with 256 kB (240 to 250), 240 with `fastupdate = off` (238 to 250): within the noise,
+because the graph stage's round trips dominated there (see
+[Ingest on Postgres](#ingest-on-postgres-issue-69)). Inserts
 alone, `pgbench` (20 s, one run each) with 4 clients each inserting one search row per
 statement into a copy of the table (generated text, the tsvector built in the insert):
 
@@ -586,7 +587,7 @@ statement into a copy of the table (generated text, the tsvector built in the in
 
 - **The pending list was the cause**: the same data with the list merged (`VACUUM`) answers
   `Search` 2.5x faster, and a full list made every run slow. With 256 kB the list holds at
-  most about 32 pages, so a search stays within about 15% of the merged index whatever
+  most about 32 pages, so a search stays within about 20% of the merged index whatever
   autovacuum did.
 - **Why not `fastupdate = off`:** it gives the same search latency but makes every insert
   update the GIN entries directly, about 40% fewer search rows a second with concurrent
