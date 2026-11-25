@@ -108,8 +108,8 @@ pub struct IngestConfig {
 impl IngestConfig {
     /// The configuration for an instance: `jobs` from `DOEWOOD_INGEST_JOBS` (`None`: from the
     /// CPUs and memory), the memory budget and the spreadsheet cell cap from the jobs and
-    /// memory, and the OCR models directory. Tuning values such as the `similar_to` threshold are runtime settings, read
-    /// from the store for every file.
+    /// memory, and the OCR models directory. Tuning values such as the `similar_to` threshold
+    /// are runtime settings, read from the store for every file.
     pub fn new(jobs: Option<usize>, ocr_models: &Path) -> Self {
         let jobs = jobs.unwrap_or_else(default_jobs).max(1);
         let memory = available_memory();
