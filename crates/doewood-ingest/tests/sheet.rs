@@ -19,7 +19,10 @@ fn workbook() -> Vec<u8> {
 fn a_read_past_the_deadline_fails_the_workbook() {
     let out = sheet::analyze(&workbook(), "p.xlsx", "xlsx", Some(Instant::now()));
     let failed = out.failed.expect("the read fails");
-    assert!(failed.starts_with("sheet.read: "), "{failed}");
+    assert!(
+        failed.starts_with(&format!("{}: ", sheet::READ_ID)),
+        "{failed}"
+    );
     assert!(failed.contains("time limit"), "{failed}");
     assert!(out.facts.is_empty());
 }

@@ -1011,7 +1011,8 @@ async fn throughput() {
 
 /// Peak and current RSS while a few spreadsheets too big for their file timeout go through:
 /// `cargo test -p doewood-ingest --test pipeline -- --ignored --nocapture timed_out_spreadsheets`
-/// (`DOEWOOD_BENCH_ROWS` rows of 26 numbers each, default 200,000; 1 s file timeout).
+/// (`DOEWOOD_BENCH_ROWS` rows of 26 numbers each, default 200,000; `DOEWOOD_BENCH_TIMEOUT_MS`
+/// file timeout, default 300).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "a measurement, not a check"]
 async fn timed_out_spreadsheets() {
@@ -1030,6 +1031,10 @@ async fn timed_out_spreadsheets() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(200_000);
+    let timeout: u64 = std::env::var("DOEWOOD_BENCH_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
     let files: Vec<(String, Vec<u8>)> = (0..3u64)
         .map(|i| (format!("big/{i}.xlsx"), common::big_xlsx(rows, 26, i)))
         .collect();
@@ -1041,7 +1046,7 @@ async fn timed_out_spreadsheets() {
         backend,
         2,
         Duration::from_millis(10),
-        Some(Duration::from_secs(1)),
+        Some(Duration::from_millis(timeout)),
     );
     let base = rss_kib();
     let (peak, stop) = (
@@ -1062,7 +1067,6 @@ async fn timed_out_spreadsheets() {
         .iter()
         .map(|(k, d)| (k.as_str(), d.clone(), true))
         .collect();
-    drop(files);
     h.put(&batch).await;
     drop(batch);
     h.settle().await;
@@ -1076,11 +1080,15 @@ async fn timed_out_spreadsheets() {
         errors.push(format!("{} {:?}", s.status, s.last_error));
     }
     #[allow(clippy::cast_precision_loss)]
-    let mib = |kib: u64| kib as f64 / 1024.0;
-    println!(
-        "timed_out_spreadsheets: 3 x {rows} rows ({:.1} MiB in all), 2 workers, {secs:.2}s; \
-         RSS before {:.0} MiB, peak {:.0} MiB, after {:.0} MiB; done {} failed {}; {errors:?}",
+    let (mib, total) = (
+        |kib: u64| kib as f64 / 1024.0,
         size as f64 / f64::from(1 << 20),
+    );
+    println!(
+        "timed_out_spreadsheets: 3 x {rows} rows ({:.1} MiB in all), {timeout} ms timeout, \
+         2 workers, {secs:.2}s; \
+         RSS before {:.0} MiB, peak {:.0} MiB, after {:.0} MiB; done {} failed {}; {errors:?}",
+        total,
         mib(base),
         mib(peak.load(Ordering::Relaxed)),
         mib(rss_kib()),

@@ -68,7 +68,8 @@ pub struct SheetOutcome {
 
 /// Reads and analyzes a workbook, stopping at `deadline` (the file's): hedgehog's read checks
 /// it per sheet and every 65,536 cells, its normalizer per sheet. A read past it fails the
-/// workbook (`sheet.read: ...time limit`); tables past it are a problem (`sheet.tables: ...`).
+/// workbook (`sheet.read@1: file refused: ...time limit`); tables past it are a problem
+/// (`sheet.tables@1: ...`).
 pub fn analyze(bytes: &[u8], name: &str, format: &str, deadline: Option<Instant>) -> SheetOutcome {
     let mut out = SheetOutcome::default();
     // Only the deadline changes: cells and decompressed bytes keep hedgehog's limits.

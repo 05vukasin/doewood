@@ -64,8 +64,9 @@ object over the cap fails without a retry.
   go); hedgehog's read (`ReadOptions.limits.deadline`, checked per sheet and every 65,536 cells)
   and its normalizer (`NormalizeOptions.deadline`) get the same instant. A spreadsheet takes at
   most the file timeout, not quail's plus hedgehog's. A read past it fails the file
-  (`sheet.read: ... time limit`); tables past it are a problem of a partial record. The other
-  hedgehog limits (cells, decompressed bytes) are its defaults. The fetch is not under it: the
+  (`sheet.read@1: file refused: reading took longer than the time limit`); tables past it are
+  a problem of a partial record. The other hedgehog limits (cells, decompressed bytes) are its
+  defaults. The fetch is not under it: the
   S3 read timeout bounds a stalled transfer, and a large object takes as long as it takes.
 - **The watchdog.** A step that does not stop on time (a native call that never checks) is
   backed up by a watchdog of the file's time cap (the timeout, or more with OCR) plus 1 minute
@@ -267,3 +268,20 @@ DOEWOOD_BENCH_FILES=2000 cargo test -p doewood-ingest --test pipeline -- --ignor
 
 Server: Linux 7.0.0-30, rustc 1.97.1, commit `ba0b963`. Throughput grows less than linearly
 with workers here (2 to 4 workers: 1.4x).
+
+## Timed-out spreadsheets
+
+`timed_out_spreadsheets` in `tests/pipeline.rs`: three generated XLSX of 200,000 rows x 26
+numbers (492 MiB in all) with a 300 ms file timeout, 2 workers, peak RSS sampled every 10 ms.
+Server as above, test profile, median of 2 runs.
+
+```
+DOEWOOD_BENCH_ROWS=200000 cargo test -p doewood-ingest --test pipeline -- --ignored --nocapture timed_out_spreadsheets
+```
+
+| | wall | peak RSS | outcome |
+|---|---|---|---|
+| before (hedgehog's read without a deadline) | 4.1 s | 2066 MiB | `done` (each read to the end) |
+| after (one deadline per file) | 1.8 s | 1548 MiB | `failed`: `sheet.read@1: file refused: reading took longer than the time limit` |
+
+The RSS before the run (574 MiB) is the test's own copies of the files.
