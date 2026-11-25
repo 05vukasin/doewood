@@ -62,7 +62,13 @@ impl Shared {
             .unwrap();
         let sep = if url.contains('?') { '&' } else { '?' };
         let scoped = format!("{url}{sep}options=-c%20search_path%3D{schema}");
-        let pg = doewood_pg::PgStore::connect(&doewood_core::PostgresUrl::parse(&scoped).unwrap())
+        // `DOEWOOD_BENCH_POOL`: the pool's size, for measurements (default as `serve`).
+        let pool = std::env::var("DOEWOOD_BENCH_POOL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(doewood_pg::default_pool_size);
+        let url = doewood_core::PostgresUrl::parse(&scoped).unwrap();
+        let pg = doewood_pg::PgStore::connect_with_pool(&url, pool)
             .await
             .unwrap();
         Some(Self {
@@ -956,7 +962,8 @@ async fn similarity_uses_the_stored_threshold() {
 /// default from the CPUs; `DOEWOOD_BENCH_WATCHERS` open `WatchProgress` streams, default 0).
 /// `DOEWOOD_BENCH_READERS=n` puts the instance store in a file with `n` read-only connections
 /// (0: on disk, every read on the writer) and times a `ListRecords` page every millisecond
-/// while ingest runs. Besides files/s it prints where the workers' time went
+/// while ingest runs (from `DOEWOOD_BENCH_READ_CLIENTS` clients at once, default 1;
+/// `DOEWOOD_BENCH_POOL` sets the Postgres pool's size). Besides files/s it prints where the workers' time went
 /// ([`doewood_ingest::StageTimes`]: the company lock's wait and hold among them) and, on
 /// Postgres with `pg_stat_statements` loaded, the statements per file and the costliest
 /// statements.
@@ -998,7 +1005,8 @@ async fn throughput() {
     };
     let api = bench::Api::start(&store, &backend, &progress, watchers).await;
     let probe = bench::Probe::start(&store);
-    let reads = readers.map(|_| bench::ReadProbe::start(api.addr, h.source));
+    let read_clients: usize = var("DOEWOOD_BENCH_READ_CLIENTS").unwrap_or(1);
+    let reads = readers.map(|_| bench::ReadProbe::start(api.addr, h.source, read_clients));
     let cpu = bench::cpu_seconds();
     let mut files = Vec::with_capacity(n);
     let mut bytes = 0usize;
@@ -1073,7 +1081,7 @@ async fn throughput() {
         "throughput: {backend_name}, {n} files ({mib:.1} MiB) with {jobs} workers in \
          {secs:.2}s = {rate:.0} files/s (done {}, skipped {}, failed {}); {watchers} progress \
          watchers ({messages} messages); CPU {cpu:.2}s; store lock wait {wait}; readers {}: \
-         ListRecords {reads}",
+         ListRecords from {read_clients} clients {reads}",
         c.done,
         c.skipped,
         c.failed,
@@ -1237,45 +1245,57 @@ mod bench {
     /// Times a `ListRecords` page of 100 of a source every millisecond, through the API.
     pub struct ReadProbe {
         stop: Arc<AtomicBool>,
-        task: tokio::task::JoinHandle<Vec<Duration>>,
+        tasks: Vec<tokio::task::JoinHandle<Vec<Duration>>>,
     }
 
     impl ReadProbe {
-        pub fn start(addr: std::net::SocketAddr, source: doewood_core::SourceId) -> Self {
+        /// `clients` loops, each on its own connection.
+        pub fn start(
+            addr: std::net::SocketAddr,
+            source: doewood_core::SourceId,
+            clients: usize,
+        ) -> Self {
             let stop = Arc::new(AtomicBool::new(false));
-            let task = {
-                let stop = Arc::clone(&stop);
-                tokio::spawn(async move {
-                    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
-                        .unwrap()
-                        .connect()
-                        .await
-                        .unwrap();
-                    let mut client = RecordsServiceClient::new(channel);
-                    let mut waits = Vec::new();
-                    while !stop.load(Ordering::Relaxed) {
-                        let t = Instant::now();
-                        client
-                            .list_records(pb::ListRecordsRequest {
-                                source_id: source.to_string(),
-                                page_size: 100,
-                                page_token: String::new(),
-                            })
-                            .await
-                            .unwrap();
-                        waits.push(t.elapsed());
-                        tokio::time::sleep(Duration::from_millis(1)).await;
-                    }
-                    waits
+            let tasks = (0..clients.max(1))
+                .map(|_| {
+                    let stop = Arc::clone(&stop);
+                    tokio::spawn(async move {
+                        let channel =
+                            tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+                                .unwrap()
+                                .connect()
+                                .await
+                                .unwrap();
+                        let mut client = RecordsServiceClient::new(channel);
+                        let mut waits = Vec::new();
+                        while !stop.load(Ordering::Relaxed) {
+                            let t = Instant::now();
+                            client
+                                .list_records(pb::ListRecordsRequest {
+                                    source_id: source.to_string(),
+                                    page_size: 100,
+                                    page_token: String::new(),
+                                })
+                                .await
+                                .unwrap();
+                            waits.push(t.elapsed());
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                        waits
+                    })
                 })
-            };
-            Self { stop, task }
+                .collect();
+            Self { stop, tasks }
         }
 
         /// Mean, 99th percentile and maximum.
         pub async fn stop(self) -> String {
             self.stop.store(true, Ordering::Relaxed);
-            stats(self.task.await.unwrap())
+            let mut all = Vec::new();
+            for t in self.tasks {
+                all.extend(t.await.unwrap());
+            }
+            stats(all)
         }
     }
 
