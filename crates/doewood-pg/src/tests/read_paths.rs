@@ -154,7 +154,7 @@ async fn unchanged_writes_write_nothing() {
     let h = Blake3([7; 32]);
     s.put_record(
         &h,
-        &serde_json::json!({}),
+        &serde_json::value::RawValue::from_string("{}".into()).unwrap(),
         &doewood_model::StepVersions::new(),
     )
     .await
@@ -239,7 +239,8 @@ async fn email_domains_before(s: &PgStore, company: Uuid) -> Vec<(Blake3, String
     {
         let hash: Blake3 = doc.key.parse().unwrap();
         let record = s.get_record(&hash).await.unwrap().unwrap();
-        for fact in record.body["facts"].as_array().unwrap() {
+        let body = record.body_value().unwrap();
+        for fact in body["facts"].as_array().unwrap() {
             if fact["key"] == "signal.email_domain"
                 && let Some(d) = fact["value"]["v"].as_str()
             {

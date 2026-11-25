@@ -1,9 +1,12 @@
 //! What the graph and search need from a record, read from the record's JSON (the form both
 //! stores keep), so a record analyzed now and one read back from the store go the same way.
 
+use std::borrow::Cow;
+
 use quail_core::{Evidence, Money, Value};
 use serde::Deserialize;
-use serde_json::Value as Json;
+use serde::de::{Deserializer as _, IgnoredAny, MapAccess, Visitor};
+use serde_json::value::RawValue;
 use time::{Date, Month};
 
 use crate::company::{IdKind, Identifier};
@@ -15,22 +18,161 @@ pub const ATTACH_WINDOW: u32 = 400;
 /// Most search body kept, in bytes.
 const MAX_BODY: usize = 32 * 1024;
 
+/// A record's JSON as it is read: borrowed from the text, each fact's value left as text
+/// until it is needed (issue #98). Unknown fields are skipped without being built.
 #[derive(Deserialize)]
+struct RawRecord<'a> {
+    #[serde(default, borrow)]
+    format: Cow<'a, str>,
+    #[serde(default, borrow)]
+    facts: Vec<RawFact<'a>>,
+}
+
+/// One fact of a [`RawRecord`].
+#[derive(Deserialize)]
+struct RawFact<'a> {
+    #[serde(borrow)]
+    key: Cow<'a, str>,
+    #[serde(borrow)]
+    value: &'a RawValue,
+    #[serde(default)]
+    conf: f32,
+    #[serde(default, borrow)]
+    evidence: Option<&'a RawValue>,
+}
+
+impl<'a> RawRecord<'a> {
+    /// The record, or `None` if `body` is not one.
+    fn read(body: &'a RawValue) -> Option<Self> {
+        serde_json::from_str(body.get()).ok()
+    }
+}
+
+impl RawFact<'_> {
+    /// The fact's value, or `None` if it is not a quail value.
+    fn value(&self) -> Option<Value> {
+        serde_json::from_str(self.value.get()).ok()
+    }
+
+    /// The fact's value and evidence read, or `None` if either is not quail's.
+    fn view(&self) -> Option<FactView> {
+        Some(FactView {
+            key: self.key.clone().into_owned(),
+            value: self.value()?,
+            conf: self.conf,
+            evidence: match self.evidence {
+                Some(e) => serde_json::from_str(e.get()).ok()?,
+                None => None,
+            },
+        })
+    }
+}
+
+/// `raw[name]`, as `Value` indexing reads it: the member's text if `raw` is an object with
+/// it (the last one, if repeated), without building the object.
+pub(crate) fn member<'a>(raw: &'a RawValue, name: &str) -> Option<&'a RawValue> {
+    struct Find<'n>(&'n str);
+    impl<'de> Visitor<'de> for Find<'_> {
+        type Value = Option<&'de RawValue>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("an object")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut found = None;
+            while let Some(k) = map.next_key::<Text<'de>>()? {
+                if k.0 == self.0 {
+                    found = Some(map.next_value::<&'de RawValue>()?);
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(found)
+        }
+    }
+    serde_json::Deserializer::from_str(raw.get())
+        .deserialize_map(Find(name))
+        .ok()
+        .flatten()
+}
+
+/// A JSON string, borrowed from the text when it has no escapes.
+#[derive(Deserialize)]
+pub(crate) struct Text<'a>(#[serde(borrow)] pub Cow<'a, str>);
+
+/// `raw.as_str()`: the text of a JSON string, `None` for anything else.
+pub(crate) fn text(raw: Option<&RawValue>) -> Option<Cow<'_, str>> {
+    serde_json::from_str::<Text<'_>>(raw?.get())
+        .ok()
+        .map(|t| t.0)
+}
+
+/// The elements of `raw` if it is an array (`raw.as_array()`).
+pub(crate) fn elements(raw: Option<&RawValue>) -> Vec<&RawValue> {
+    raw.and_then(|r| serde_json::from_str(r.get()).ok())
+        .unwrap_or_default()
+}
+
 struct RecordView {
-    #[serde(default)]
     format: String,
-    #[serde(default)]
     facts: Vec<FactView>,
 }
 
-#[derive(Deserialize)]
 struct FactView {
     key: String,
     value: Value,
-    #[serde(default)]
     conf: f32,
-    #[serde(default)]
     evidence: Option<Evidence>,
+}
+
+/// The fact keys [`DocFacts`] reads (and the `signal.*` identifiers, see [`wanted`]).
+const KEYS: &[&str] = &[
+    "summary.card",
+    "summary.card_text",
+    "summary.extractive",
+    "summary.keywords",
+    "ref.title",
+    "ref.instrument_kind",
+    "ref.doc_number",
+    "ref.cites",
+    "pdf.title",
+    "docx.title",
+    "sheet.table",
+    "sheet.text",
+    "signal.date_invoice",
+    "signal.date_signed",
+    "signal.date_effective",
+    "signal.date",
+    "signal.amount_total",
+    "signal.amount_gross",
+    "signal.amount",
+    "party.candidates",
+    "party.company",
+    "party.alias_of",
+    "sketch.minhash",
+    "sketch.minhash_bands",
+];
+
+/// Whether [`DocFacts`] reads facts of this key: only those are read into quail values.
+fn wanted(key: &str) -> bool {
+    KEYS.contains(&key) || IdKind::from_fact_key(key).is_some()
+}
+
+impl RecordView {
+    /// The record with the facts `keep` lets through read; `None` if it is not a record, or
+    /// one of those facts is not quail's (as when every fact was read).
+    fn read(body: &RawValue, keep: impl Fn(&str) -> bool) -> Option<Self> {
+        let r = RawRecord::read(body)?;
+        let facts = r
+            .facts
+            .iter()
+            .filter(|f| keep(&f.key))
+            .map(RawFact::view)
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            format: r.format.into_owned(),
+            facts,
+        })
+    }
 }
 
 /// A company a document names.
@@ -106,11 +248,20 @@ pub struct DocFacts {
 }
 
 impl DocFacts {
-    /// Reads a record's JSON. A body that is not a record gives empty facts.
-    pub fn from_record(body: &Json) -> Self {
-        let Ok(r) = RecordView::deserialize(body) else {
-            return Self::default();
-        };
+    /// Reads a record's JSON. A body that is not a record gives empty facts. Only the facts
+    /// it uses are read into quail values; the rest are skipped as text (issue #98).
+    pub fn from_record(body: &RawValue) -> Self {
+        RecordView::read(body, wanted).map_or_else(Self::default, |r| Self::from_view(&r))
+    }
+
+    /// [`from_record`](Self::from_record) reading every fact, as before issue #98: for the
+    /// tests that check the facts it skips change nothing.
+    #[doc(hidden)]
+    pub fn from_record_every_fact(body: &RawValue) -> Self {
+        RecordView::read(body, |_| true).map_or_else(Self::default, |r| Self::from_view(&r))
+    }
+
+    fn from_view(r: &RecordView) -> Self {
         let mut d = Self {
             format: r.format.clone(),
             ..Self::default()
@@ -152,8 +303,8 @@ impl DocFacts {
             .into_iter()
             .find_map(|k| best(k).and_then(|f| money(&f.value)))
         });
-        d.body = body_text(&r);
-        d.parties = parties(&r);
+        d.body = body_text(r);
+        d.parties = parties(r);
         d.statements = all("party.alias_of")
             .filter_map(|f| {
                 Some(NameStatement {
@@ -419,8 +570,19 @@ mod tests {
         }
     }
 
-    fn record(facts: &[Fact]) -> Json {
-        json!({"schema": 1, "format": "pdf", "facts": facts})
+    fn record(facts: &[Fact]) -> Box<RawValue> {
+        raw(&json!({"schema": 1, "format": "pdf", "facts": facts}))
+    }
+
+    fn raw(v: &serde_json::Value) -> Box<RawValue> {
+        doewood_model::canonical::to_canonical(v).unwrap()
+    }
+
+    /// [`DocFacts::from_record`], checked against reading every fact (as before #98).
+    fn read(body: &RawValue) -> DocFacts {
+        let d = DocFacts::from_record(body);
+        assert_eq!(d, DocFacts::from_record_every_fact(body));
+        d
     }
 
     fn candidate(key: &str, surface: &str, score: f64, role: &str) -> Value {
@@ -481,7 +643,7 @@ mod tests {
             fact("signal.rs_pib", Value::text("000000000"), 0, (115, 124)),
             fact("signal.rs_mb", Value::text("10000009"), 3, (101, 109)),
         ]);
-        let d = DocFacts::from_record(&body);
+        let d = read(&body);
         assert_eq!(d.parties.len(), 2);
         let alpha = &d.parties[0];
         assert_eq!(
@@ -517,7 +679,7 @@ mod tests {
             fact("party.company", mention("beta", "a.d."), 0, (130, 140)),
             fact("signal.rs_pib", Value::text(p1.as_str()), 0, (115, 125)),
         ]);
-        let d = DocFacts::from_record(&body);
+        let d = read(&body);
         assert!(d.parties.iter().all(|p| p.ids.is_empty()));
     }
 
@@ -595,7 +757,7 @@ mod tests {
                 (0, 0),
             ),
         ]);
-        let d = DocFacts::from_record(&body);
+        let d = read(&body);
         assert_eq!(d.title.as_deref(), Some("Invoice 7/2026"));
         assert_eq!(d.kind.as_deref(), Some("invoice"));
         assert_eq!(
@@ -617,9 +779,9 @@ mod tests {
 
     #[test]
     fn a_record_without_facts_is_empty() {
-        let d = DocFacts::from_record(&json!({"format": "unknown", "facts": []}));
+        let d = read(&raw(&json!({"format": "unknown", "facts": []})));
         assert_eq!(d.format, "unknown");
         assert!(d.parties.is_empty() && d.title.is_none() && d.minhash.is_none());
-        assert_eq!(DocFacts::from_record(&json!(42)), DocFacts::default());
+        assert_eq!(read(&raw(&json!(42))), DocFacts::default());
     }
 }

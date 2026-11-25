@@ -139,7 +139,7 @@ async fn list_records_matches_the_query_before_issue_13() {
                     .unwrap();
                 let got: Vec<(Vec<u8>, serde_json::Value)> = got
                     .iter()
-                    .map(|r| (r.blake3.as_bytes().to_vec(), r.body.clone()))
+                    .map(|r| (r.blake3.as_bytes().to_vec(), r.body_value().unwrap()))
                     .collect();
                 assert_eq!(&got, p, "{filter:?}, limit {limit}");
                 after = Some(Blake3::from_slice(&p.last().unwrap().0).unwrap());

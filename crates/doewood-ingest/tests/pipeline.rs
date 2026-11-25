@@ -41,9 +41,15 @@ impl Shared {
             backend: Arc::new(Standalone::new(Arc::clone(store))),
             cleanup: None,
         }];
+        out.extend(Self::postgres().await);
+        out
+    }
+
+    /// A fresh schema on the test database, when `DOEWOOD_TEST_POSTGRES_URL` is set.
+    async fn postgres() -> Option<Self> {
         let Some(url) = std::env::var(PG_VAR).ok().filter(|v| !v.trim().is_empty()) else {
             eprintln!("skipping: {PG_VAR} is not set; the Postgres variant did not run");
-            return out;
+            return None;
         };
         let (admin, conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
             .await
@@ -59,12 +65,11 @@ impl Shared {
         let pg = doewood_pg::PgStore::connect(&doewood_core::PostgresUrl::parse(&scoped).unwrap())
             .await
             .unwrap();
-        out.push(Self {
+        Some(Self {
             name: "postgres",
             backend: Arc::new(pg),
             cleanup: Some((admin, schema)),
-        });
-        out
+        })
     }
 
     async fn drop_schema(self) {
@@ -412,8 +417,9 @@ async fn scenario(store: Arc<Store>, shared: &Shared) {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(xl.body["format"], "xlsx", "{name}");
-    let keys: Vec<&str> = xl.body["facts"]
+    let xl_body = xl.body_value().unwrap();
+    assert_eq!(xl_body["format"], "xlsx", "{name}");
+    let keys: Vec<&str> = xl_body["facts"]
         .as_array()
         .unwrap()
         .iter()
@@ -431,8 +437,9 @@ async fn scenario(store: Arc<Store>, shared: &Shared) {
     assert_eq!(xl.versions["hedgehog"], "fac6eba");
     assert_eq!(xl.versions["doewood.ingest"], "1");
     let blob_rec = b.get_record(&h.hash("in/blob.bin")).await.unwrap().unwrap();
-    assert_eq!(blob_rec.body["format"], "unknown", "{name}");
-    let blob_keys: Vec<&str> = blob_rec.body["facts"]
+    let blob_body = blob_rec.body_value().unwrap();
+    assert_eq!(blob_body["format"], "unknown", "{name}");
+    let blob_keys: Vec<&str> = blob_body["facts"]
         .as_array()
         .unwrap()
         .iter()
@@ -771,7 +778,7 @@ async fn a_dismissal_keeps_a_split_off_document_apart() {
             let h = Blake3([n; 32]);
             b.put_record(
                 &h,
-                &serde_json::json!({}),
+                &doewood_model::canonical::to_canonical(&serde_json::json!({})).unwrap(),
                 &doewood_model::StepVersions::new(),
             )
             .await
@@ -942,28 +949,28 @@ async fn similarity_uses_the_stored_threshold() {
     h.stop().await;
 }
 
-/// Files per second through the whole pipeline (fetch from memory, analyze, SQLite records,
-/// graph and search) on a generated mix of PDF, DOCX, TXT and XLSX, every file distinct.
-/// `cargo test -p doewood-ingest --test pipeline -- --ignored --nocapture throughput`
-/// (`DOEWOOD_BENCH_FILES` sets the count, default 400). `DOEWOOD_BENCH_READERS=n` puts the
-/// store in a file with `n` read-only connections (0: on disk, every read on the writer) and
-/// times a `ListRecords` page every millisecond while ingest runs.
+/// Files per second through the whole pipeline (fetch from memory, analyze, records, graph
+/// and search) on a generated mix of PDF, DOCX, TXT and XLSX, every file distinct. The shared
+/// store is the instance's SQLite store, or Postgres (a schema of its own) when
+/// `DOEWOOD_TEST_POSTGRES_URL` is set.
+/// `cargo test -p doewood-ingest --test pipeline -- --ignored --nocapture --exact throughput`
+/// (`DOEWOOD_BENCH_FILES` sets the count, default 400; `DOEWOOD_BENCH_JOBS` the workers,
+/// default from the CPUs; `DOEWOOD_BENCH_WATCHERS` open `WatchProgress` streams, default 0).
+/// `DOEWOOD_BENCH_READERS=n` puts the instance store in a file with `n` read-only connections
+/// (0: on disk, every read on the writer) and times a `ListRecords` page every millisecond
+/// while ingest runs. Besides files/s it prints where the workers' time went
+/// ([`doewood_ingest::StageTimes`]: the company lock's wait and hold among them) and, on
+/// Postgres with `pg_stat_statements` loaded, the statements per file and the costliest
+/// statements.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "a measurement, not a check"]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 async fn throughput() {
-    let n: usize = std::env::var("DOEWOOD_BENCH_FILES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(400);
-    let watchers: usize = std::env::var("DOEWOOD_BENCH_WATCHERS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let readers: Option<usize> = std::env::var("DOEWOOD_BENCH_READERS")
-        .ok()
-        .and_then(|v| v.parse().ok());
-    let jobs = doewood_ingest::default_jobs();
+    let var = |name: &str| std::env::var(name).ok().and_then(|v| v.parse().ok());
+    let n: usize = var("DOEWOOD_BENCH_FILES").unwrap_or(400);
+    let watchers: usize = var("DOEWOOD_BENCH_WATCHERS").unwrap_or(0);
+    let readers: Option<usize> = var("DOEWOOD_BENCH_READERS");
+    let jobs: usize = var("DOEWOOD_BENCH_JOBS").unwrap_or_else(doewood_ingest::default_jobs);
     let dir = std::env::temp_dir().join(format!("doewood-throughput-{}", std::process::id()));
     let key = MasterKey::from_bytes([8; 32]);
     let store = Arc::new(match readers {
@@ -973,7 +980,12 @@ async fn throughput() {
             Store::open_with_readers(&dir.join(doewood_store::STORE_FILE), &key, n).unwrap()
         }
     });
-    let backend: Arc<dyn Backend> = Arc::new(Standalone::new(Arc::clone(&store)));
+    let pg = Shared::postgres().await;
+    let backend: Arc<dyn Backend> = match &pg {
+        Some(pg) => Arc::clone(&pg.backend),
+        None => Arc::new(Standalone::new(Arc::clone(&store))),
+    };
+    let statements = bench::Statements::start(pg.as_ref()).await;
     let progress = Arc::new(doewood_api::Progress::new());
     let h = {
         let progress = Arc::clone(&progress);
@@ -1055,26 +1067,55 @@ async fn throughput() {
     };
     let messages = api.stop().await;
     let c = store.object_counts(h.source).unwrap();
-    #[allow(clippy::cast_precision_loss)]
+    let time = h.ingest.stats().time;
+    let statements = bench::Statements::stop(statements, n).await;
     let (rate, mib) = (n as f64 / secs, bytes as f64 / f64::from(1 << 20));
+    let backend_name = if pg.is_some() { "postgres" } else { "sqlite" };
     println!(
-        "throughput: {n} files ({mib:.1} MiB) with {jobs} workers in {secs:.2}s = {rate:.0} \
-         files/s (done {}, skipped {}, failed {}); {watchers} progress watchers \
-         ({messages} messages); CPU {cpu:.2}s; store lock wait {wait}; readers {}: \
+        "throughput: {backend_name}, {n} files ({mib:.1} MiB) with {jobs} workers in \
+         {secs:.2}s = {rate:.0} files/s (done {}, skipped {}, failed {}); {watchers} progress \
+         watchers ({messages} messages); CPU {cpu:.2}s; store lock wait {wait}; readers {}: \
          ListRecords {reads}",
         c.done,
         c.skipped,
         c.failed,
         readers.map_or_else(|| "in memory".to_owned(), |n| n.to_string()),
     );
+    let worker_secs = secs * jobs as f64;
+    let share = |d: Duration| {
+        format!(
+            "{:.1}s ({:.0}%, {:.2} ms/file)",
+            d.as_secs_f64(),
+            100.0 * d.as_secs_f64() / worker_secs,
+            d.as_secs_f64() * 1e3 / n as f64
+        )
+    };
+    println!(
+        "throughput: worker time {worker_secs:.1}s: store {}, fetch {}, analyze {}, record {}, \
+         graph {} (company lock: wait {}, held {})",
+        share(time.store),
+        share(time.fetch),
+        share(time.analyze),
+        share(time.record),
+        share(time.graph),
+        share(time.company_lock_wait),
+        share(time.company_lock_hold),
+    );
+    if let Some(statements) = statements {
+        println!("throughput: {statements}");
+    }
     assert_eq!(c.done, n as u64);
     h.stop().await;
+    if let Some(pg) = pg {
+        pg.drop_schema().await;
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The `throughput` measurement's helpers: `WatchProgress` streams on a real API server, and
 /// how long a trivial store call waits for the store's lock.
 mod bench {
+    use std::fmt::Write as _;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
@@ -1256,6 +1297,58 @@ mod bench {
             w[w.len() - 1].as_secs_f64() * 1e3,
             w.len()
         )
+    }
+
+    /// Statements the database ran during the measurement, from `pg_stat_statements` (when
+    /// the server loads it: `shared_preload_libraries=pg_stat_statements`).
+    pub struct Statements<'a> {
+        admin: &'a tokio_postgres::Client,
+    }
+
+    impl<'a> Statements<'a> {
+        /// Resets the counters; `None` without Postgres or without the extension.
+        pub async fn start(pg: Option<&'a super::Shared>) -> Option<Self> {
+            let admin = &pg?.cleanup.as_ref()?.0;
+            let ready = admin
+                .batch_execute(
+                    "CREATE EXTENSION IF NOT EXISTS pg_stat_statements SCHEMA public; \
+                     SELECT public.pg_stat_statements_reset();",
+                )
+                .await;
+            if let Err(e) = ready {
+                eprintln!("pg_stat_statements is not available ({e}); no statement counts");
+                return None;
+            }
+            Some(Self { admin })
+        }
+
+        /// Statements per file, time in the database, and the five costliest statements.
+        pub async fn stop(this: Option<Self>, files: usize) -> Option<String> {
+            let admin = this?.admin;
+            let rows = admin
+                .query(
+                    "SELECT calls, total_exec_time, left(regexp_replace(query, '\\s+', ' ', 'g'), 90) \
+                     FROM public.pg_stat_statements \
+                     WHERE query NOT ILIKE '%pg_stat_statements%' \
+                     ORDER BY total_exec_time DESC",
+                    &[],
+                )
+                .await
+                .ok()?;
+            let calls: i64 = rows.iter().map(|r| r.get::<_, i64>(0)).sum();
+            let ms: f64 = rows.iter().map(|r| r.get::<_, f64>(1)).sum();
+            #[allow(clippy::cast_precision_loss)]
+            let mut out = format!(
+                "{calls} statements ({:.1} per file), {:.1}s executing in Postgres; costliest:",
+                calls as f64 / files as f64,
+                ms / 1e3
+            );
+            for r in rows.iter().take(5) {
+                let (c, t, q): (i64, f64, String) = (r.get(0), r.get(1), r.get(2));
+                let _ = write!(out, "\n  {c:>7} calls {t:>7.0} ms  {q}");
+            }
+            Some(out)
+        }
     }
 
     /// User and system CPU time of this process (Linux), in seconds; 0 elsewhere.

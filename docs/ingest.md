@@ -23,7 +23,8 @@ pending sweep (objects_seen)┘                                         (cap)   
 - **Workers:** `DOEWOOD_INGEST_JOBS`, else one per CPU, at most what half the available memory
   holds at 512 MiB a worker (a cgroup v2 limit counts), at most 32. Every analysis runs on a
   blocking thread; the quail engine is shared. Big files also wait for the
-  [memory budget](#memory).
+  [memory budget](#memory). A spreadsheet may borrow idle workers' CPUs
+  ([Memory](#memory), Threads).
 - **Shutdown:** each worker finishes the file in hand; the rest stays pending for the next start.
 
 ## Fetch
@@ -135,9 +136,41 @@ more), so none of them can abort the instance with an out-of-memory error.
   ingest worker)`. The cap in use is logged at start (`sheet_max_cells` in `ingest started`).
   Raise it only with the memory for it: about 320 bytes a cell for each worker that may read
   such a workbook at once.
-- **One thread per analysis.** Each worker's hedgehog normalizer runs with `threads: Some(1)`,
-  and since hedgehog `fac6eba` every inner fan-out honours it, so a worker's analysis really is
-  single-threaded: the workers, not hedgehog, decide how many CPUs ingest uses.
+- **Threads: one per analysis, more for a spreadsheet when the instance is idle** (issue
+  #101). The instance has CPU slots: its CPUs (`available_parallelism`, which follows a cgroup
+  CPU quota), at most the workers. Each running analysis holds one slot until it returns (an
+  analysis the watchdog gave up on too). When a spreadsheet's hedgehog normalizer starts, it
+  borrows the slots nobody holds, so it runs with `threads: Some(1 + free slots)`, at most 4
+  threads in all (`MAX_SHEET_THREADS`; hedgehog's row model streams on at most 4). It gives
+  them back when the call returns, fails or panics. Since hedgehog `fac6eba` every inner
+  fan-out honours `threads`, so under load each analysis is single-threaded and the workers
+  decide how many CPUs ingest uses.
+  - A loan only takes slots that are free at that moment, so lending never takes the count
+    over the CPUs. An analysis that starts while slots are lent does not wait: it runs beside
+    them, one thread, until that normalize returns, and the next normalize borrows nothing.
+  - The output does not depend on the threads (hedgehog's determinism guarantee; checked by
+    `lent_threads_give_the_same_tables` in `tests/sheet.rs`).
+  - Memory: the lent threads did not raise the peak measurably (below). A lent slot is an idle
+    worker's, so its 512 MiB plan is not in use meanwhile; with fewer workers than CPUs
+    (a memory-sized instance) only the workers' slots are lent.
+
+  `lent_threads_measure` in `tests/sheet.rs` (generated XLSX, 38,462 rows x 26 cells, every
+  other one text: 1,000,012 cells; read and tables; 4 vCPU server, test profile; RSS is the
+  peak above the start):
+
+  | | slots | threads per workbook | wall, run 1 / 2 | peak RSS, run 1 / 2 |
+  |---|---|---|---|---|
+  | 1 workbook, before | 1 | 1 | 1.91 / 1.90 s | +210 / +209 MiB |
+  | 1 workbook, after | 4 | 4 | 1.33 / 1.30 s | +201 / +203 MiB |
+  | 4 workbooks at once, before | 1 | 1 each | 2.59 / 2.51 s | +696 / +717 MiB |
+  | 4 workbooks at once, after | 4 | 1 each | 2.53 / 2.46 s | +667 / +666 MiB |
+
+  The read (calamine) stays on one thread; only the tables step is lent threads. With numbers
+  only, one workbook took 0.76 s before and 0.60 s after.
+
+  ```
+  DOEWOOD_BENCH_TEXT=1 DOEWOOD_BENCH_FILES=1 cargo test -p doewood-ingest --test sheet -- --ignored --nocapture lent_threads_measure
+  ```
 - **quail's limits** stay its defaults: 256 MiB decompressed and 64 MiB of text per file, 40
   million pixels a rendered page, which already fit a worker. OCR has its own budget (quail's
   OCR permits, about 1 GiB an engine; see [deploy.md](deploy.md#sizing)).
@@ -154,6 +187,14 @@ The record is the quail record JSON, keyed by BLAKE3, with step versions: one pe
 | `doewood.ingest` | doewood's own conversion |
 | `quail.plan` | `<profile>:<digest of every planned step and its version>` |
 | `hedgehog` | the hedgehog revision (spreadsheets) |
+
+The record is written as JSON text straight from quail's record (`doewood_model::canonical`),
+with no `serde_json::Value` tree in between: compact, object keys sorted, byte for byte the text
+the tree wrote before issue #98. Both stores take and return that text (`Record::body` is a
+`RawValue`; SQLite keeps it as it is, Postgres as jsonb and gives it back in the same form), and
+readers deserialize only what they use: `DocFacts` reads the facts it needs into quail values
+and skips the rest as text, the outcome of a stored record reads `format` and `status` only.
+Numbers are in [Sizing, Records](deploy.md#records).
 
 ## The graph
 
@@ -312,6 +353,10 @@ are there for enrichment, and no document merges on a fuzzy match yet.
   the watchdog: a second big file waits for the budget until that analysis ends, small files
   flow meanwhile, and a file bigger than the budget takes all of it. `tests/sheet.rs`:
   hedgehog's read past the deadline, or over the cell cap, fails the workbook.
+- `tests/record_text.rs`: generated files of every kind (PDF, DOCX, XLSX, text, CSV, image,
+  ZIP, unknown, empty, broken PDF and XLSX): the record text is the `Value` tree's text byte for
+  byte, `DocFacts` reads the same as reading every fact, and SQLite (and Postgres with
+  `DOEWOOD_TEST_POSTGRES_URL`) store it and give that text back, a second write unchanged.
 - `tests/minio_postgres.rs`: an S3 put in MinIO to a record in Postgres, with both
   `DOEWOOD_TEST_S3_ENDPOINT` and `DOEWOOD_TEST_POSTGRES_URL` set (CI's `ingest-e2e` job).
 
@@ -319,15 +364,21 @@ are there for enrichment, and no document merges on a fuzzy match yet.
 
 `throughput` in `tests/pipeline.rs`: 2000 generated files (PDF, DOCX, TXT, XLSX in equal parts,
 4.7 MiB), fetched from memory, analyzed without OCR, stored in in-memory SQLite (records, graph,
-search). Test profile (dependencies at opt-level 2). The worker count is `default_jobs()` (CPUs
-and memory); the test does not read `DOEWOOD_INGEST_JOBS`. `DOEWOOD_BENCH_WATCHERS=n` opens n
-`WatchProgress` streams on a real API server during the run, and the test also prints the
-process CPU time and how long a trivial store call waits for the store's lock (sampled every
-millisecond). `crates/doewood-api/tests/progress_bench.rs` (ignored) measures the same with
+search), or in Postgres (a schema of its own) when `DOEWOOD_TEST_POSTGRES_URL` is set. Test
+profile (dependencies at opt-level 2). The worker count is `default_jobs()` (CPUs and memory),
+or `DOEWOOD_BENCH_JOBS`; the test does not read `DOEWOOD_INGEST_JOBS`.
+`DOEWOOD_BENCH_WATCHERS=n` opens n `WatchProgress` streams on a real API server during the
+run, and the test also prints the process CPU time, how long a trivial store call waits for
+the store's lock (sampled every millisecond), and where the workers' time went
+(`Stats::time`: instance store, fetch, analyze, record, graph, and the company lock's wait and
+hold). On Postgres with `pg_stat_statements` loaded (`-c
+shared_preload_libraries=pg_stat_statements`) it also prints the statements per file and the
+costliest ones. `crates/doewood-api/tests/progress_bench.rs` (ignored) measures the same with
 n streams on a 200 000-object source while the watchers are woken every millisecond.
 
 ```
-DOEWOOD_BENCH_FILES=2000 cargo test -p doewood-ingest --test pipeline -- --ignored --nocapture throughput
+DOEWOOD_BENCH_FILES=2000 cargo test -p doewood-ingest --test pipeline -- --ignored --nocapture --exact throughput
+DOEWOOD_TEST_POSTGRES_URL=postgres://... DOEWOOD_BENCH_JOBS=4 DOEWOOD_BENCH_FILES=2000 cargo test -p doewood-ingest --test pipeline -- --ignored --nocapture --exact throughput
 ```
 
 | machine | cores, RAM | workers | files/s | notes |
@@ -335,9 +386,17 @@ DOEWOOD_BENCH_FILES=2000 cargo test -p doewood-ingest --test pipeline -- --ignor
 | laptop | 16, 14 GiB | 9 | 409 | from PR #5 |
 | server (AMD EPYC-Genoa) | 4, 7.6 GiB | 4 | 313 | median of 317, 313, 311 |
 | server, `taskset -c 0,1` | 2 | 2 | 228 | median of 242, 226, 228 |
+| server, SQLite (issue #69) | 4, 7.6 GiB | 1 / 2 / 4 | 111 / 253 / 324 | medians of 3 |
+| server, Postgres 17.12 (issue #69) | 4, 7.6 GiB | 1 / 2 / 4 | 56 / 136 / 246 | medians of 3; 47 statements per file |
+| server, Postgres, `taskset -c 0,1` | 2 | 2 | 122 | median of 122, 115, 124 |
+| server, Postgres, fewer round trips (issue #103) | 4, 7.6 GiB | 1 / 2 / 4 | 61 / 194 / 277 | one run each; 44 / 150 / 206 for `main` in the same session; 11.3 statements per file (24.1 before) |
 
-Server: Linux 7.0.0-30, rustc 1.97.1, commit `ba0b963`. Throughput grows less than linearly
-with workers here (2 to 4 workers: 1.4x).
+Server: Linux 7.0.0-30, rustc 1.97.1, commit `ba0b963` for the first rows, `f8c6e3a` (with
+the stage counters) for the issue #69 rows. Throughput grows less than linearly with workers
+here (2 to 4 workers: 1.3x on SQLite, 1.8x on Postgres). On Postgres the time goes to round
+trips, and the company lock is not the limit at 4 workers: see
+[deploy.md](deploy.md#ingest-on-postgres-issue-69) and, for the round trips cut by issue #103,
+[deploy.md](deploy.md#fewer-round-trips-per-file-on-postgres-issue-103).
 
 ## Read paths
 

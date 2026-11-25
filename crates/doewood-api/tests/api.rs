@@ -1180,7 +1180,7 @@ async fn records_graph_and_search() {
         ] {
             be.put_record(
                 &hash(n),
-                &json!({"title": title, "n": n}),
+                &doewood_model::canonical::to_canonical(&json!({"title": title, "n": n})).unwrap(),
                 &[("quail".to_owned(), "1.2.3".to_owned())].into(),
             )
             .await

@@ -42,6 +42,10 @@ pub struct Options {
     pub icons: Option<Arc<dyn Icons>>,
     /// As `serve` with a shared store: sources are re-claimed at start.
     pub shared_claims: bool,
+    /// How often `WatchProgress` looks at the store unprompted (50 ms here, 1 s in `serve`).
+    pub progress_interval: Duration,
+    /// The instance store; a new in-memory one when `None`.
+    pub store: Option<Arc<Store>>,
 }
 
 impl Default for Options {
@@ -52,6 +56,8 @@ impl Default for Options {
             summarize: None,
             icons: None,
             shared_claims: false,
+            progress_interval: Duration::from_millis(50),
+            store: None,
         }
     }
 }
@@ -66,7 +72,9 @@ impl Instance {
         backend: Option<Arc<dyn Backend>>,
         options: Options,
     ) -> Self {
-        let store = Arc::new(Store::open_in_memory(&MasterKey::from_bytes([7; 32])).unwrap());
+        let store = options.store.clone().unwrap_or_else(|| {
+            Arc::new(Store::open_in_memory(&MasterKey::from_bytes([7; 32])).unwrap())
+        });
         let (shutdown, shutdown_rx) = watch::channel(false);
         let (events, mut events_rx) = mpsc::channel(1024);
         let progress = Arc::new(Progress::new());
@@ -109,7 +117,7 @@ impl Instance {
             icons: options.icons,
             options: ApiOptions {
                 max_message_bytes: options.max_message_bytes,
-                progress_interval: Duration::from_millis(50),
+                progress_interval: options.progress_interval,
                 shared_claims: options.shared_claims,
             },
             shutdown: shutdown_rx.clone(),
@@ -210,6 +218,26 @@ impl Shared {
         let mut out = vec![Self::sqlite()];
         out.extend(Self::postgres().await);
         out
+    }
+
+    /// Postgres: `ANALYZE` the schema's tables (after seeding, as autovacuum would).
+    pub async fn analyze(&self) {
+        if let Some((admin, schema)) = &self.cleanup {
+            let tables = admin
+                .query(
+                    "SELECT tablename FROM pg_tables WHERE schemaname = $1",
+                    &[schema],
+                )
+                .await
+                .unwrap();
+            for t in tables {
+                let table: String = t.get(0);
+                admin
+                    .batch_execute(&format!("ANALYZE {schema}.{table}"))
+                    .await
+                    .unwrap();
+            }
+        }
     }
 
     pub async fn drop_schema(self) {

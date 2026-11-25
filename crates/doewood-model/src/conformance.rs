@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use doewood_core::InstanceId;
 use serde_json::json;
+use serde_json::value::RawValue;
 use time::{Date, Month};
 use uuid::Uuid;
 
@@ -38,6 +39,7 @@ pub async fn run<B: Backend + ?Sized>(a: &B, b: &B) {
     records_by_source(a).await;
     sketches(a).await;
     aliases(a).await;
+    alias_batches(a).await;
     claims(a, b).await;
     leases(a, b).await;
     search(a).await;
@@ -64,6 +66,11 @@ fn instance(name: &str) -> InstanceId {
     InstanceId::new(name).expect("instance id")
 }
 
+/// A record body as the stores take it.
+fn raw(v: &serde_json::Value) -> Box<RawValue> {
+    crate::canonical::to_canonical(v).expect("JSON")
+}
+
 fn versions(quail: &str) -> StepVersions {
     StepVersions::from([("quail".to_owned(), quail.to_owned())])
 }
@@ -78,30 +85,43 @@ pub async fn records<B: Backend + ?Sized>(s: &B) {
     let body = json!({"kind": "invoice", "facts": {"amount": 12.5, "parties": ["ACME"]}});
     assert_eq!(s.get_record(&h).await.unwrap(), None);
     assert_eq!(
-        s.put_record(&h, &body, &versions("1.0")).await.unwrap(),
+        s.put_record(&h, &raw(&body), &versions("1.0"))
+            .await
+            .unwrap(),
         PutOutcome::Inserted
     );
     assert_eq!(
-        s.put_record(&h, &body, &versions("1.0")).await.unwrap(),
+        s.put_record(&h, &raw(&body), &versions("1.0"))
+            .await
+            .unwrap(),
         PutOutcome::Unchanged
     );
     let got = s.get_record(&h).await.unwrap().expect("stored");
     assert_eq!(got.blake3, h);
-    assert_eq!(got.body, body);
+    assert_eq!(got.body_value().unwrap(), body);
+    // Stored as written: the compact, key-sorted text.
+    assert_eq!(got.body.get(), body.to_string());
     assert_eq!(got.versions, versions("1.0"));
     assert!(got.updated_at > 1_700_000_000, "{}", got.updated_at);
     // A new step version alone is a change.
     assert_eq!(
-        s.put_record(&h, &body, &versions("1.1")).await.unwrap(),
+        s.put_record(&h, &raw(&body), &versions("1.1"))
+            .await
+            .unwrap(),
         PutOutcome::Updated
     );
     let body2 = json!({"kind": "invoice", "facts": {}});
     assert_eq!(
-        s.put_record(&h, &body2, &versions("1.1")).await.unwrap(),
+        s.put_record(&h, &raw(&body2), &versions("1.1"))
+            .await
+            .unwrap(),
         PutOutcome::Updated
     );
     let got = s.get_record(&h).await.unwrap().expect("stored");
-    assert_eq!((got.body, got.versions), (body2, versions("1.1")));
+    assert_eq!(
+        (got.body_value().unwrap(), got.versions),
+        (body2, versions("1.1"))
+    );
     record_versions(s).await;
     fact_texts(s).await;
 }
@@ -113,10 +133,12 @@ async fn record_versions<B: Backend + ?Sized>(s: &B) {
         ("quail".to_owned(), "2.0".to_owned()),
         ("hedgehog".to_owned(), "0.3".to_owned()),
     ]);
-    s.put_record(&a, &json!({"n": 2}), &versions("1.0"))
+    s.put_record(&a, &raw(&json!({"n": 2})), &versions("1.0"))
         .await
         .unwrap();
-    s.put_record(&b, &json!({"n": 3}), &two).await.unwrap();
+    s.put_record(&b, &raw(&json!({"n": 3})), &two)
+        .await
+        .unwrap();
     let got = s.record_versions(&[a, missing, b, a]).await.unwrap();
     assert_eq!(
         got.into_iter().collect::<Vec<_>>(),
@@ -139,7 +161,7 @@ async fn fact_texts<B: Backend + ?Sized>(s: &B) {
     let fact = |k: &str, v: serde_json::Value| json!({"key": k, "value": v, "conf": 0.9});
     s.put_record(
         &many,
-        &json!({"facts": [
+        &raw(&json!({"facts": [
             fact(key, json!({"t": "text", "v": "Acme.example"})),
             fact(key, json!({"t": "text", "v": "acme.example"})),
             fact("signal.phone", json!({"t": "text", "v": "+381"})),
@@ -148,14 +170,14 @@ async fn fact_texts<B: Backend + ?Sized>(s: &B) {
             "not an object",
             {"value": {"v": "no key"}},
             {"key": 7, "value": {"v": "number key"}},
-        ]}),
+        ]})),
         &versions("1"),
     )
     .await
     .unwrap();
     s.put_record(
         &one,
-        &json!({"facts": [fact(key, json!({"t": "text", "v": " b.example "}))]}),
+        &raw(&json!({"facts": [fact(key, json!({"t": "text", "v": " b.example "}))]})),
         &versions("1"),
     )
     .await
@@ -163,12 +185,12 @@ async fn fact_texts<B: Backend + ?Sized>(s: &B) {
     // `facts` that is not an array has no facts.
     s.put_record(
         &flat,
-        &json!({"facts": fact(key, json!({"v": "c.example"}))}),
+        &raw(&json!({"facts": fact(key, json!({"v": "c.example"}))})),
         &versions("1"),
     )
     .await
     .unwrap();
-    s.put_record(&blob, &json!({"kind": "blob"}), &versions("1"))
+    s.put_record(&blob, &raw(&json!({"kind": "blob"})), &versions("1"))
         .await
         .unwrap();
     let mut got = s
@@ -690,7 +712,7 @@ pub async fn ended_locations<B: Backend + ?Sized>(s: &B) {
         key: key.to_owned(),
     };
     let doc = hash(41);
-    s.put_record(&doc, &json!({"n": 41}), &versions("1"))
+    s.put_record(&doc, &raw(&json!({"n": 41})), &versions("1"))
         .await
         .unwrap();
     let first = s.upsert_location(&doc, &at("in/a.pdf")).await.unwrap();
@@ -821,6 +843,88 @@ pub async fn aliases<B: Backend + ?Sized>(s: &B) {
     ));
 }
 
+/// [`crate::GraphStore::claim_aliases`] and [`crate::GraphStore::aliases`] (issue #103): in
+/// order, as one call after the other; an alias given twice is claimed by its first entry.
+///
+/// # Panics
+///
+/// When the backend misbehaves.
+pub async fn alias_batches<B: Backend + ?Sized>(s: &B) {
+    let kind = NodeKind::Company;
+    let one = s.upsert_node(kind, "batch-one", &json!({})).await.unwrap();
+    let two = s.upsert_node(kind, "batch-two", &json!({})).await.unwrap();
+    s.block_alias(kind, "name:batch-blocked", &json!({"why": "two companies"}))
+        .await
+        .unwrap();
+    let claims = [
+        ("name:batch-b".to_owned(), json!({"n": 1})),
+        ("name:batch-a".to_owned(), json!({"n": 2})),
+        ("name:batch-blocked".to_owned(), json!({"n": 3})),
+        ("name:batch-b".to_owned(), json!({"n": 4})),
+    ];
+    let got = s.claim_aliases(kind, two, &claims).await.unwrap();
+    let got: Vec<_> = got.into_iter().map(|a| (a.node, a.props)).collect();
+    assert_eq!(
+        got,
+        [
+            (Some(two), json!({"n": 1})),
+            (Some(two), json!({"n": 2})),
+            (None, json!({"why": "two companies"})),
+            (Some(two), json!({"n": 1})),
+        ]
+    );
+    let got = s
+        .claim_aliases(kind, one, &[("name:batch-a".to_owned(), json!({}))])
+        .await
+        .unwrap();
+    assert_eq!(
+        got[0].node,
+        Some(two),
+        "the first claim wins in a batch too"
+    );
+    assert!(s.claim_aliases(kind, one, &[]).await.unwrap().is_empty());
+    let keys: Vec<String> = [
+        "name:batch-a",
+        "name:none",
+        "name:batch-blocked",
+        "name:batch-a",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let found = s.aliases(kind, &keys).await.unwrap();
+    assert_eq!(
+        found
+            .iter()
+            .map(|a| a.as_ref().map(|a| a.node))
+            .collect::<Vec<_>>(),
+        [Some(Some(two)), None, Some(None), Some(Some(two))]
+    );
+    assert_eq!(found[0].as_ref().unwrap().props, json!({"n": 2}));
+    assert!(
+        s.aliases(NodeKind::Document, &keys)
+            .await
+            .unwrap()
+            .iter()
+            .all(Option::is_none)
+    );
+    assert!(s.aliases(kind, &[]).await.unwrap().is_empty());
+    let many = vec!["name:x".to_owned(); crate::ALIASES_MAX + 1];
+    assert!(matches!(
+        s.aliases(kind, &many).await,
+        Err(Error::Invalid(_))
+    ));
+    assert!(
+        s.claim_aliases(kind, Uuid::now_v7(), &[("name:y".to_owned(), json!({}))])
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        s.claim_aliases(kind, one, &[(String::new(), json!({}))])
+            .await,
+        Err(Error::Invalid(_))
+    ));
+}
+
 /// The LSH band index: candidates by shared bands, replacement, the excluded document.
 ///
 /// # Panics
@@ -828,7 +932,7 @@ pub async fn aliases<B: Backend + ?Sized>(s: &B) {
 /// When the backend misbehaves.
 pub async fn sketches<B: Backend + ?Sized>(s: &B) {
     for n in 51..=54 {
-        s.put_record(&hash(n), &json!({"n": n}), &versions("1"))
+        s.put_record(&hash(n), &raw(&json!({"n": n})), &versions("1"))
             .await
             .unwrap();
     }
@@ -931,7 +1035,7 @@ pub async fn records_by_source<B: Backend + ?Sized>(s: &B) {
         ),
         (34, vec![at("other", "in/d.pdf")]),
     ] {
-        s.put_record(&hash(n), &json!({"n": n}), &versions("1"))
+        s.put_record(&hash(n), &raw(&json!({"n": n})), &versions("1"))
             .await
             .unwrap();
         for l in &locations {
@@ -960,7 +1064,7 @@ pub async fn records_by_source<B: Backend + ?Sized>(s: &B) {
     assert!(list("nope/", None, 0).await.is_empty());
     let src = SourceKey::new(endpoint, "docs", "in/").unwrap();
     let page = s.list_records(&src, None, 1).await.unwrap();
-    assert_eq!(page[0].body, json!({"n": 31}));
+    assert_eq!(page[0].body_value().unwrap(), json!({"n": 31}));
     assert_eq!(page[0].versions, versions("1"));
 }
 
@@ -1301,7 +1405,7 @@ pub async fn search<B: Backend + ?Sized>(s: &B) {
         "the record must exist"
     );
     for (h, title, body, kind, date, amount) in &docs {
-        s.put_record(h, &json!({"kind": kind}), &versions("1"))
+        s.put_record(h, &raw(&json!({"kind": kind})), &versions("1"))
             .await
             .unwrap();
         let doc = SearchDoc {

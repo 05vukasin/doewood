@@ -6,6 +6,7 @@ use std::str::FromStr;
 
 use doewood_core::InstanceId;
 use serde_json::Value;
+use serde_json::value::RawValue;
 use time::Date;
 use uuid::Uuid;
 
@@ -196,16 +197,36 @@ pub fn versions_from_json(value: &Value) -> Result<StepVersions, Error> {
 }
 
 /// One quail or hedgehog record, keyed by the file's BLAKE3.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Record {
     /// The file's hash.
     pub blake3: Blake3,
-    /// The record, as JSON.
-    pub body: Value,
+    /// The record, as JSON text (compact, keys sorted: as
+    /// [`crate::canonical::to_canonical`] writes it). Readers deserialize the fields they need
+    /// from it, without a `Value` tree (issue #98).
+    pub body: Box<RawValue>,
     /// The step versions that produced it.
     pub versions: StepVersions,
     /// When it was last written, in Unix seconds.
     pub updated_at: i64,
+}
+
+impl Record {
+    /// The body as a `Value` tree: for tests and the few writers that edit a record.
+    pub fn body_value(&self) -> Result<Value, Error> {
+        serde_json::from_str(self.body.get())
+            .map_err(|e| Error::Invalid(format!("record body is not JSON: {e}")))
+    }
+}
+
+/// Records are equal when their hashes, versions, times and body texts are.
+impl PartialEq for Record {
+    fn eq(&self, other: &Self) -> bool {
+        self.blake3 == other.blake3
+            && self.body.get() == other.body.get()
+            && self.versions == other.versions
+            && self.updated_at == other.updated_at
+    }
 }
 
 /// Largest page of [`crate::RecordStore::list_records`].
@@ -670,6 +691,19 @@ pub struct NodeAlias {
     pub node: Option<Uuid>,
     /// Why: the evidence and confidence of the claim (a JSON object).
     pub props: Value,
+}
+
+/// Most aliases per [`crate::GraphStore::aliases`] or [`crate::GraphStore::claim_aliases`] call.
+pub const ALIASES_MAX: usize = 1000;
+
+/// Refuses more than [`ALIASES_MAX`] aliases in one call.
+pub fn validate_alias_count(n: usize) -> Result<(), Error> {
+    if n > ALIASES_MAX {
+        return Err(Error::Invalid(format!(
+            "at most {ALIASES_MAX} aliases per call"
+        )));
+    }
+    Ok(())
 }
 
 /// Checks an alias before it reaches a backend: the same rules as a node key.
