@@ -38,6 +38,18 @@ pub enum IconFormat {
 }
 
 impl IconFormat {
+    /// The short name stored with a cached icon: `ico`, `png`, `gif`, `jpeg`, `webp`, `avif`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ico => "ico",
+            Self::Png => "png",
+            Self::Gif => "gif",
+            Self::Jpeg => "jpeg",
+            Self::Webp => "webp",
+            Self::Avif => "avif",
+        }
+    }
+
     /// The `Content-Type` doewood serves it with.
     pub fn content_type(self) -> &'static str {
         match self {

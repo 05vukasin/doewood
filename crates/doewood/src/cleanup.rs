@@ -1,0 +1,94 @@
+//! The cache purge (ADR 0002 sections 2 and 5): the backend never returns an expired registry
+//! answer or icon, and this task deletes them, a minute after the start and then every hour.
+//! With a shared store every instance runs it; the delete is idempotent.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use doewood_model::Backend;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use tracing::{debug, info, warn};
+
+/// The first purge, after the start.
+const FIRST: Duration = Duration::from_mins(1);
+/// Between purges.
+pub const INTERVAL: Duration = Duration::from_hours(1);
+
+/// Purges the backend's expired cache rows once. Returns how many went.
+pub async fn purge(backend: &dyn Backend) -> u64 {
+    match backend.purge_expired().await {
+        Ok(0) => {
+            debug!("no expired cache rows");
+            0
+        }
+        Ok(n) => {
+            info!(rows = n, "expired cache rows purged");
+            n
+        }
+        Err(e) => {
+            warn!(error = %e, "cache purge failed; retried at the next interval");
+            0
+        }
+    }
+}
+
+/// Runs [`purge`] on whatever backend `backend` holds, until shutdown.
+pub fn start(
+    backend: watch::Receiver<Option<Arc<dyn Backend>>>,
+    mut shutdown: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut wait = FIRST;
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(wait) => {}
+                _ = shutdown.wait_for(|stop| *stop) => return,
+            }
+            wait = INTERVAL;
+            let current = backend.borrow().clone();
+            if let Some(b) = current {
+                purge(b.as_ref()).await;
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use doewood_core::MasterKey;
+    use doewood_model::CacheRow;
+    use doewood_store::{Standalone, Store};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn purges_expired_rows_and_stops_on_shutdown() {
+        let store = Store::open_in_memory(&MasterKey::from_bytes([9; 32])).unwrap();
+        let backend: Arc<dyn Backend> = Arc::new(Standalone::new(Arc::new(store)));
+        let row = |key: &str, expires_at| CacheRow {
+            registry: "gleif".to_owned(),
+            key: key.to_owned(),
+            body: None,
+            fetched_at: 1,
+            expires_at,
+        };
+        backend.cache_put(&row("old", 2)).await.unwrap();
+        backend
+            .cache_put(&row("new", doewood_model::MAX_TIME))
+            .await
+            .unwrap();
+        assert_eq!(purge(backend.as_ref()).await, 1);
+        assert_eq!(purge(backend.as_ref()).await, 0);
+        assert!(backend.cache_get("gleif", "new").await.unwrap().is_some());
+
+        let (_backend_tx, backend_rx) = watch::channel(Some(backend));
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let task = start(backend_rx, stop_rx);
+        stop_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("stops")
+            .unwrap();
+    }
+}

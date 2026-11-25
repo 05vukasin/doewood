@@ -178,14 +178,11 @@ impl Fetcher {
         if fetch.cached {
             return;
         }
-        let value = match &fetch.body {
-            Body::Found(b) => Cached::Found(b.clone()),
-            Body::NotFound => Cached::NotFound,
+        let (value, ttl) = match &fetch.body {
+            Body::Found(b) => (Cached::Found(b.clone()), self.policy.ttl_found),
+            Body::NotFound => (Cached::NotFound, self.policy.ttl_missing),
         };
-        let entry = CacheEntry {
-            value,
-            fetched_at: fetch.fetched_at,
-        };
+        let entry = CacheEntry::new(value, fetch.fetched_at, ttl);
         self.cache.put(&self.key(key), entry).await;
     }
 

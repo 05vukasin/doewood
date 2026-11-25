@@ -1,6 +1,7 @@
 //! The `doewood` binary: `serve`, `version` and `config check` (plus the hidden `dev` tools for
 //! local testing).
 
+mod cleanup;
 mod dev;
 mod icons;
 mod ingest;
