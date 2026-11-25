@@ -10,11 +10,11 @@
 //!   match keeps its step, confidence and evidence, on the `party` edge and the company. Fuzzy
 //!   steps are not taken here: nothing merges on a fuzzy match.
 //! - **Merges** (ADR 0002 section 1.8): ingest never merges two company nodes. When a party's
-//!   identifier and its name point at different companies, those are two conflicting
-//!   high-precision hits, which the gate sends to review; merges come from enrichment or a
-//!   person, through the merge log. A match never lands on a merged-away company (it follows
-//!   `merged_into`), and a document split off a company with a dismissal is not attached back
-//!   to it: a dismissal is permanent.
+//!   identifier and its name point at different companies, the identifier's company gets the
+//!   party: two conflicting high-precision hits are for review, never an automatic merge.
+//!   Merges come from enrichment or a person, through the merge log. A match never lands on a
+//!   merged-away company (it follows `merged_into`), and a document split off a company with a
+//!   dismissal is not attached back to it: a dismissal is permanent.
 //! - **References**: a cited number resolves to the document that has it as its own number
 //!   (an alias `number:<key>`); when that document is not known yet, the edge goes to a pending
 //!   Document node `ref:<key>`, and the edges move to the real document once it arrives.

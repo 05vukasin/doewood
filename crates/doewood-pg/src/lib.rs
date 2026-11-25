@@ -1,7 +1,7 @@
 //! doewood's shared store (ADR 0001, section 2): one Postgres database that every instance
 //! uses for records, the graph, source claims, company leases, search, and the enrichment
-//! job's registry and favicon caches and company freshness (ADR 0002 sections 2, 5 and 6). It
-//! implements the `doewood-model` store traits.
+//! job's registry and favicon caches and company freshness (ADR 0002 sections 2, 5 and 6), and
+//! the merge log and dismissals (section 1.8). It implements the `doewood-model` store traits.
 //!
 //! - **No database at build time:** plain `tokio-postgres` with run-time SQL, no macros.
 //! - **TLS** through rustls (ring), trusting the system roots plus the Mozilla roots. The URL's

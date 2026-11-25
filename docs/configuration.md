@@ -87,11 +87,13 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
 - **Migrations** run on connect, under an advisory lock, so instances starting together migrate
   once. The version is in the `doewood_schema` table. A database migrated by a newer doewood is
   refused (not ready) until this one is upgraded.
-- **Schema 3** (the enrichment storage: the registry and favicon caches, company freshness,
-  and the prefix index on `locations`) is the current version. An instance from before it
-  refuses a database migrated to 3, so **upgrade every instance that shares the database
-  together**: once one new instance has started, the older ones stay not ready until they are
-  upgraded. The instance's own SQLite file goes to schema 6 at the same time.
+- **Schema 4** (the merge log and dismissals of ADR 0002 section 1.8: the new tables
+  `company_merges` and `company_dismissals`; nothing else changes) is the current version.
+  Schema 3 added the enrichment storage (the registry and favicon caches, company freshness,
+  and the prefix index on `locations`). An instance from before a schema refuses a database
+  migrated to it, so **upgrade every instance that shares the database together**: once one
+  new instance has started, the older ones stay not ready until they are upgraded. The
+  instance's own SQLite file goes to schema 7 at the same time (the same two tables).
 - **Cache purge.** Every hour (first a minute after the start), each instance deletes the
   expired registry answers and icons. Every instance does it; the delete is idempotent.
 - **pgvector** is used when the server has it: doewood creates the extension (this needs a role
