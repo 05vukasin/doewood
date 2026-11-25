@@ -9,6 +9,12 @@
 //!   the first claim wins; an identifier another company owns is refused, never moved. Every
 //!   match keeps its step, confidence and evidence, on the `party` edge and the company. Fuzzy
 //!   steps are not taken here: nothing merges on a fuzzy match.
+//! - **Merges** (ADR 0002 section 1.8): ingest never merges two company nodes. When a party's
+//!   identifier and its name point at different companies, those are two conflicting
+//!   high-precision hits, which the gate sends to review; merges come from enrichment or a
+//!   person, through the merge log. A match never lands on a merged-away company (it follows
+//!   `merged_into`), and a document split off a company with a dismissal is not attached back
+//!   to it: a dismissal is permanent.
 //! - **References**: a cited number resolves to the document that has it as its own number
 //!   (an alias `number:<key>`); when that document is not known yet, the edge goes to a pending
 //!   Document node `ref:<key>`, and the edges move to the real document once it arrives.
@@ -16,12 +22,12 @@
 //!   estimate. One edge per pair, from the smaller hash to the larger.
 //! - **Search**: title, the summary card and keywords as the body, kind, date and amount.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use doewood_model::{
     Backend, Blake3, Direction, Edge, EdgeKind, EdgeSource, EdgeState, NeighbourQuery, NodeKind,
-    ObjectLocation, PENDING_REF_PREFIX, Result, SearchDoc,
+    ObjectLocation, PENDING_REF_PREFIX, Result, SearchDoc, merged_into,
 };
 use serde_json::{Map, Value, json};
 use tokio::sync::Mutex;
@@ -52,6 +58,8 @@ const MAX_IDS: usize = 10;
 const MAX_MATCHES: usize = 20;
 /// Most mentions cited in a party edge's evidence.
 const MAX_MENTIONS: usize = 5;
+/// Most `merged_into` hops followed from a merged-away company.
+const MAX_HOPS: usize = 64;
 
 /// What one document added.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -81,6 +89,9 @@ pub struct Match {
     pub confidence: f32,
     /// Identifiers that point at other companies (to review; never merged).
     pub conflicts: Vec<String>,
+    /// The company the ladder found, when a dismissal sent the party elsewhere: the document
+    /// was split off that company and the pair dismissed, so it is not attached back.
+    pub dismissed: Option<Uuid>,
 }
 
 /// Writes documents into a backend. Company resolution is serialized within the instance.
@@ -304,11 +315,12 @@ impl GraphWriter {
         // One edge per company: candidates that resolve to the same one merge their roles.
         let mut edges: BTreeMap<Uuid, (Party, Match)> = BTreeMap::new();
         let serial = self.companies.lock().await;
+        let attached = self.attached(doc).await?;
         for p in &facts.parties {
             let Some(name) = CompanyName::parse(&p.surface) else {
                 continue;
             };
-            let (m, created) = self.resolve(&name, p, hex).await?;
+            let (m, created) = self.resolve(&name, p, hex, &attached).await?;
             if created {
                 stats.new_companies += 1;
             }
@@ -350,6 +362,7 @@ impl GraphWriter {
                         "alias": m.alias,
                         "confidence": m.confidence,
                         "conflicts": m.conflicts,
+                        "dismissed": m.dismissed.map(|d| d.to_string()),
                     },
                 }))
                 .with_evidence(json!([{
@@ -365,8 +378,61 @@ impl GraphWriter {
         Ok(())
     }
 
+    /// The companies the document has a live `party` edge to now.
+    async fn attached(&self, doc: Uuid) -> Result<BTreeSet<Uuid>> {
+        let query = NeighbourQuery {
+            direction: Direction::Out,
+            edge_kinds: vec![EdgeKind::Party],
+            node_kind: Some(NodeKind::Company),
+            ..NeighbourQuery::default()
+        };
+        Ok(self
+            .backend
+            .neighbours(doc, &query)
+            .await?
+            .into_iter()
+            .map(|n| n.node.id)
+            .collect())
+    }
+
+    /// The live company a company node stands for: itself, or the company it was merged
+    /// into (ADR 0002 section 1.8), so nothing attaches to a merged-away husk.
+    async fn live(&self, mut id: Uuid) -> Result<Uuid> {
+        for _ in 0..MAX_HOPS {
+            match self.backend.node(id).await?.as_ref().and_then(merged_into) {
+                Some(next) => id = next,
+                None => break,
+            }
+        }
+        Ok(id)
+    }
+
+    /// A dismissal is permanent: when the ladder finds a company the document is not attached
+    /// to, while it is attached to a company dismissed from that one (a person split it off),
+    /// the party stays with the company it is attached to.
+    async fn honour_dismissals(&self, m: &mut Match, attached: &BTreeSet<Uuid>) -> Result<()> {
+        if attached.contains(&m.company) {
+            return Ok(());
+        }
+        for other in attached {
+            if self.backend.dismissal(m.company, *other).await?.is_some() {
+                m.dismissed = Some(m.company);
+                m.company = *other;
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
     /// The match ladder for one party. Returns the match and whether the company is new.
-    async fn resolve(&self, name: &CompanyName, p: &Party, hex: &str) -> Result<(Match, bool)> {
+    /// `attached` are the companies the document is a party to now.
+    async fn resolve(
+        &self,
+        name: &CompanyName,
+        p: &Party,
+        hex: &str,
+        attached: &BTreeSet<Uuid>,
+    ) -> Result<(Match, bool)> {
         let b = &self.backend;
         // 1. Identifiers, strongest first. Ones that point elsewhere are conflicts.
         let mut found: Option<Match> = None;
@@ -387,6 +453,7 @@ impl GraphWriter {
                         alias,
                         confidence: LadderStep::Identifier.confidence(),
                         conflicts: Vec::new(),
+                        dismissed: None,
                     });
                 }
                 Some(m) if m.company != owner => m.conflicts.push(alias),
@@ -415,6 +482,7 @@ impl GraphWriter {
                     alias: key,
                     confidence: step.confidence(),
                     conflicts: Vec::new(),
+                    dismissed: None,
                 });
                 break;
             }
@@ -423,6 +491,10 @@ impl GraphWriter {
             Some(m) => (m, false),
             None => self.create(name, p).await?,
         };
+        if !created {
+            m.company = self.live(m.company).await?;
+            self.honour_dismissals(&mut m, attached).await?;
+        }
         self.claim(&mut m, name, p, hex).await?;
         self.update_company(&m, name, p, hex).await?;
         Ok((m, created))
@@ -444,6 +516,7 @@ impl GraphWriter {
                     alias: key,
                     confidence: LadderStep::Normalized.confidence(),
                     conflicts: Vec::new(),
+                    dismissed: None,
                 },
                 false,
             ));
@@ -462,6 +535,7 @@ impl GraphWriter {
                 alias: key,
                 confidence: 1.0,
                 conflicts: Vec::new(),
+                dismissed: None,
             },
             true,
         ))
