@@ -117,7 +117,13 @@ pub(crate) fn sparql(subject: Subject<'_>, lang: &str) -> String {
                 lei.len() == 20 && lei.bytes().all(|b| b.is_ascii_alphanumeric()),
                 "LEI not validated"
             );
-            format!("?item wdt:P1278 \"{lei}\" .")
+            // Every non-deprecated LEI statement, not only the best-rank (truthy) one that
+            // `wdt:` matches; DISTINCT keeps one row set per item.
+            format!(
+                "{{ SELECT DISTINCT ?item WHERE {{ ?item p:P1278 ?leiSt . \
+                 ?leiSt ps:P1278 \"{lei}\" ; wikibase:rank ?leiRank . \
+                 FILTER(?leiRank != wikibase:DeprecatedRank) }} }}"
+            )
         }
     };
     let mut values = String::new();
@@ -233,7 +239,9 @@ mod tests {
         assert!(q.contains("FILTER(LANG(?l1) = \"en\")"));
         assert!(q.contains("(\"P749\" p:P749 ps:P749)"));
         let q = sparql(Subject::Lei("FAKE0000000000000101"), "sr-el");
-        assert!(q.contains("?item wdt:P1278 \"FAKE0000000000000101\" ."));
+        assert!(q.contains("?leiSt ps:P1278 \"FAKE0000000000000101\" ;"));
+        assert!(q.contains("FILTER(?leiRank != wikibase:DeprecatedRank)"));
+        assert!(!q.contains("wdt:P1278"));
         // Braces are balanced: nothing opened a block it did not close.
         let opens = q.matches('{').count();
         assert_eq!(opens, q.matches('}').count());

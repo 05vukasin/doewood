@@ -716,6 +716,211 @@ async fn ingest_settings_round_trip_and_validation() {
     a.stop().await;
 }
 
+/// A throwaway self-signed certificate made for these tests (its key was discarded): not a
+/// real CA.
+const TEST_ROOT_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBrzCCAVWgAwIBAgIUaYELWlw7QeVdyYce7dI/nXVWFqwwCgYIKoZIzj0EAwIw\n\
+LDEqMCgGA1UEAwwhZG9ld29vZCB0ZXN0IHJvb3QgKG5vdCBhIHJlYWwgQ0EpMCAX\n\
+DTI2MTEyNTA2MTAwNVoYDzIxMjYxMTAxMDYxMDA1WjAsMSowKAYDVQQDDCFkb2V3\n\
+b29kIHRlc3Qgcm9vdCAobm90IGEgcmVhbCBDQSkwWTATBgcqhkjOPQIBBggqhkjO\n\
+PQMBBwNCAATYqcUgrvtY3A3jxscNSCGujoppdopW6a18MYEyWotlOGE0KtzRp7B5\n\
+0GToB5wGb/QziTbGR2CheugNsVR+Jhnyo1MwUTAdBgNVHQ4EFgQUBzS5SQayIVCE\n\
+YjOvGTr1kuzYEt8wHwYDVR0jBBgwFoAUBzS5SQayIVCEYjOvGTr1kuzYEt8wDwYD\n\
+VR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiEA8F1BYV2yWkduhFJQpQ5Q\n\
+qBsrIl0ifX/gzMCRRz8fb8oCIH8fQvRNlgoozch12VIte5yxqOVzFfB0oDbceu5+\n\
+3muB\n\
+-----END CERTIFICATE-----\n\
+";
+const CH_KEY: &str = "test-ch-key-not-real-1111";
+const OC_KEY: &str = "test-oc-key-not-real-2222";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn enrichment_settings_round_trip_and_secrets_stay_write_only() {
+    let a = Instance::start("inst-a", Some(Shared::sqlite().backend)).await;
+    let ch = a.channel().await;
+    let get = || async {
+        config(&ch)
+            .get_enrichment_settings(pb::GetEnrichmentSettingsRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+    };
+    let leaks = |what: &str, text: &str| {
+        for secret in [CH_KEY, OC_KEY, "MIIBrzCCAVWg"] {
+            assert!(!text.contains(secret), "{what} leaks a secret: {text}");
+        }
+    };
+    // The defaults (ADR 0002 section 7): the keyless registries on, Companies House waiting
+    // for a key, the favicon fallback off.
+    let defaults = get().await;
+    assert_eq!(
+        defaults,
+        pb::EnrichmentSettings {
+            gleif_enabled: true,
+            vies_enabled: true,
+            wikidata_enabled: true,
+            edgar_enabled: true,
+            apr_enabled: true,
+            companies_house_enabled: true,
+            ..pb::EnrichmentSettings::default()
+        }
+    );
+    assert!(!defaults.companies_house_active && !defaults.favicon_fallback);
+    assert!(!a.store.enrichment_config().unwrap().companies_house);
+
+    let set = config(&ch)
+        .set_enrichment_settings(pb::SetEnrichmentSettingsRequest {
+            wikidata_enabled: Some(false),
+            companies_house_api_key: format!(" {CH_KEY} "),
+            opencorporates_api_key: OC_KEY.into(),
+            edgar_contact: Some(" Example Ops ops@example.invalid ".into()),
+            apr_extra_roots_pem: TEST_ROOT_PEM.into(),
+            favicon_fallback: Some(true),
+            favicon_egress_proxy: Some("http://egress.svc:3128".into()),
+            ..pb::SetEnrichmentSettingsRequest::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    leaks("SetEnrichmentSettings", &format!("{set:?}"));
+    assert!(!set.wikidata_enabled && set.gleif_enabled);
+    assert!(set.companies_house_api_key_set && set.companies_house_active);
+    assert!(set.opencorporates_api_key_set && set.apr_extra_roots_set);
+    assert_eq!(set.edgar_contact, "Example Ops ops@example.invalid");
+    assert!(set.favicon_fallback);
+    assert_eq!(set.favicon_egress_proxy, "http://egress.svc:3128");
+    let got = get().await;
+    leaks("GetEnrichmentSettings", &format!("{got:?}"));
+    assert_eq!(got, set);
+    // The job's view has the keys (trimmed); the favicon proxy reads the same rows.
+    let job = a.store.enrichment_config().unwrap();
+    assert!(job.companies_house && !job.wikidata);
+    assert_eq!(job.companies_house_key.as_ref().unwrap().expose(), CH_KEY);
+    assert_eq!(job.opencorporates_key.as_ref().unwrap().expose(), OC_KEY);
+    assert_eq!(
+        job.apr_extra_roots.as_ref().unwrap().expose(),
+        TEST_ROOT_PEM
+    );
+    leaks("EnrichmentConfig", &format!("{job:?}"));
+    let favicon = a.store.favicon_settings().unwrap();
+    assert!(favicon.fallback);
+    assert_eq!(
+        favicon.egress_proxy.as_deref(),
+        Some("http://egress.svc:3128")
+    );
+
+    // An empty request keeps everything.
+    let kept = config(&ch)
+        .set_enrichment_settings(pb::SetEnrichmentSettingsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(kept, set);
+
+    // Refused values, all reported at once, without echoing a secret; nothing changes.
+    let err = config(&ch)
+        .set_enrichment_settings(pb::SetEnrichmentSettingsRequest {
+            gleif_enabled: Some(false),
+            companies_house_api_key: "short".into(),
+            opencorporates_api_key: format!("{OC_KEY}:x"),
+            clear_opencorporates_api_key: true,
+            edgar_contact: Some("Ops\r\nX-Evil: 1".into()),
+            apr_extra_roots_pem:
+                "-----BEGIN CERTIFICATE-----\nMIIBrzCCAVWgnope\n-----END CERTIFICATE-----\n".into(),
+            favicon_egress_proxy: Some("socks5://egress.svc:1080".into()),
+            ..pb::SetEnrichmentSettingsRequest::default()
+        })
+        .await
+        .unwrap_err();
+    invalid(
+        &err,
+        &[
+            "companies_house_api_key",
+            "clear_opencorporates_api_key",
+            "edgar_contact",
+            "apr_extra_roots_pem",
+            "favicon_egress_proxy",
+        ],
+    );
+    leaks("the error", &format!("{err:?}"));
+    for (field, bad) in [
+        ("opencorporates_api_key", format!("{OC_KEY}:x")),
+        ("companies_house_api_key", format!("{CH_KEY} with spaces")),
+    ] {
+        let mut req = pb::SetEnrichmentSettingsRequest::default();
+        if field == "opencorporates_api_key" {
+            req.opencorporates_api_key = bad;
+        } else {
+            req.companies_house_api_key = bad;
+        }
+        let err = config(&ch).set_enrichment_settings(req).await.unwrap_err();
+        invalid(&err, &[field]);
+        leaks("the error", &format!("{err:?}"));
+    }
+    for bad in [
+        "egress.svc:3128",
+        "http://user:pw@egress.svc:3128",
+        "http://",
+        "ftp://egress.svc",
+    ] {
+        let err = config(&ch)
+            .set_enrichment_settings(pb::SetEnrichmentSettingsRequest {
+                favicon_egress_proxy: Some(bad.into()),
+                ..pb::SetEnrichmentSettingsRequest::default()
+            })
+            .await
+            .unwrap_err();
+        invalid(&err, &["favicon_egress_proxy"]);
+        assert!(!err.message().contains("pw@"), "{}", err.message());
+    }
+    for bad in ["not a certificate", "x"] {
+        let err = config(&ch)
+            .set_enrichment_settings(pb::SetEnrichmentSettingsRequest {
+                apr_extra_roots_pem: bad.into(),
+                ..pb::SetEnrichmentSettingsRequest::default()
+            })
+            .await
+            .unwrap_err();
+        invalid(&err, &["apr_extra_roots_pem"]);
+    }
+    let err = config(&ch)
+        .set_enrichment_settings(pb::SetEnrichmentSettingsRequest {
+            edgar_contact: Some("x".repeat(201)),
+            ..pb::SetEnrichmentSettingsRequest::default()
+        })
+        .await
+        .unwrap_err();
+    invalid(&err, &["edgar_contact"]);
+    assert_eq!(get().await, set);
+
+    // Clearing: the keys, the roots, the contact and the proxy go; Companies House is off
+    // again until a key is set.
+    let cleared = config(&ch)
+        .set_enrichment_settings(pb::SetEnrichmentSettingsRequest {
+            clear_companies_house_api_key: true,
+            clear_opencorporates_api_key: true,
+            clear_apr_extra_roots_pem: true,
+            edgar_contact: Some(String::new()),
+            favicon_fallback: Some(false),
+            favicon_egress_proxy: Some(String::new()),
+            ..pb::SetEnrichmentSettingsRequest::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(cleared.companies_house_enabled && !cleared.companies_house_active);
+    assert!(!cleared.companies_house_api_key_set && !cleared.opencorporates_api_key_set);
+    assert!(!cleared.apr_extra_roots_set && !cleared.favicon_fallback);
+    assert!(cleared.edgar_contact.is_empty() && cleared.favicon_egress_proxy.is_empty());
+    let job = a.store.enrichment_config().unwrap();
+    assert!(!job.companies_house && job.companies_house_key.is_none());
+    assert_eq!(
+        a.store.favicon_settings().unwrap(),
+        doewood_store::FaviconSettings::default()
+    );
+    a.stop().await;
+}
+
 fn hash(n: u8) -> Blake3 {
     Blake3([n; 32])
 }

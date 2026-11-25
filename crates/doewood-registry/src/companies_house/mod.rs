@@ -8,8 +8,10 @@
 //! - [`CompaniesHouse::significant_control`]: its people with significant control (PSCs),
 //!   every page: individuals, corporate entities (with their registration number, to follow
 //!   ownership chains), legal persons and super-secure PSCs.
-//! - [`CompaniesHouse::filing_events`]: the name changes and merger filings of its filing
-//!   history, with dates.
+//! - [`CompaniesHouse::psc_statements`]: its PSC statements, which tell "no PSC" from "a PSC
+//!   exists but is unidentified".
+//! - [`CompaniesHouse::filing_events`]: the name changes, merger and conversion filings of its
+//!   filing history, with dates.
 //! - [`CompaniesHouse::search`]: companies by name: candidates only (matching is
 //!   doewood-enrich's).
 //!
@@ -38,9 +40,9 @@ use url::Url;
 
 pub use model::{
     Company, CompanyNumber, Filing, FilingEvent, Listing, Office, Officer, PreviousName, Psc,
-    PscKind, Registration, SearchHit, Status,
+    PscKind, PscStatement, Registration, SearchHit, StatementKind, Status,
 };
-use model::{KeptFiling, KeptOfficer, KeptPsc, Stored};
+use model::{KeptFiling, KeptOfficer, KeptPsc, KeptStatement, Stored};
 
 use crate::cache::Cache;
 use crate::clock::{Clock, SystemClock};
@@ -67,6 +69,16 @@ const JSON: &str = "application/json";
 const MAX_NAME_CHARS: usize = 256;
 
 const DAY: u64 = 24 * 60 * 60;
+
+/// The filing-history categories asked for by default: where the name changes
+/// (`change-of-name`, `resolution`), the SE formations and conversions (`incorporation`) and
+/// the schemes of arrangement and cross-border mergers (`miscellaneous`) are filed.
+pub const DEFAULT_FILING_CATEGORIES: [&str; 4] = [
+    "change-of-name",
+    "incorporation",
+    "resolution",
+    "miscellaneous",
+];
 
 /// The Companies House client's settings. The defaults are the production values.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,6 +120,10 @@ pub struct CompaniesHouseConfig {
     /// The most filings read to find the name changes and mergers (default 2,000, newest
     /// first).
     pub max_filings: usize,
+    /// The filing-history `category` filter, sent comma-separated (default
+    /// [`DEFAULT_FILING_CATEGORIES`]). Empty asks for the whole history. Only lowercase
+    /// letters and `-` are allowed.
+    pub filing_categories: Vec<String>,
     /// Candidates a name search returns (default 10, at most 100).
     pub search_size: u32,
 }
@@ -132,6 +148,10 @@ impl Default for CompaniesHouseConfig {
             page_size: 100,
             max_items: 1000,
             max_filings: 2000,
+            filing_categories: DEFAULT_FILING_CATEGORIES
+                .iter()
+                .map(|c| (*c).to_owned())
+                .collect(),
             search_size: 10,
         }
     }
@@ -146,6 +166,8 @@ pub struct CompaniesHouse {
     page_size: usize,
     max_items: usize,
     max_filings: usize,
+    /// The `category` filter value (comma-separated), or `None` for the whole history.
+    filing_categories: Option<String>,
     search_size: usize,
     key_pause: Duration,
     clock: Arc<dyn Clock>,
@@ -175,6 +197,15 @@ impl CompaniesHouse {
         clock: Arc<dyn Clock>,
     ) -> Result<Self, Warning> {
         let base = root(&config.base_url)?;
+        if let Some(bad) = config.filing_categories.iter().find(|c| {
+            c.is_empty() || c.len() > 64 || !c.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+        }) {
+            return Err(warning(WarningKind::Config(format!(
+                "not a filing-history category: {bad:?}"
+            ))));
+        }
+        let filing_categories =
+            (!config.filing_categories.is_empty()).then(|| config.filing_categories.join(","));
         let policy = FetchPolicy {
             max_body: config.max_body,
             max_retries: config.max_retries,
@@ -198,6 +229,7 @@ impl CompaniesHouse {
             page_size: config.page_size.clamp(1, 100) as usize,
             max_items: config.max_items.max(1),
             max_filings: config.max_filings.max(1),
+            filing_categories,
             search_size: config.search_size.clamp(1, 100) as usize,
             key_pause: config.key_pause,
             clock,
@@ -236,6 +268,7 @@ impl CompaniesHouse {
                 .list(
                     key,
                     &format!("company/{number}/officers"),
+                    &[],
                     self.max_items,
                     KeptOfficer::minimise,
                 )
@@ -259,6 +292,7 @@ impl CompaniesHouse {
                 .list(
                     key,
                     &format!("company/{number}/persons-with-significant-control"),
+                    &[],
                     self.max_items,
                     KeptPsc::minimise,
                 )
@@ -268,16 +302,53 @@ impl CompaniesHouse {
         r.await.map_err(|w| self.redact(w))
     }
 
-    /// The name changes and merger filings in the filing history of company `number`, newest
-    /// first, from at most [`CompaniesHouseConfig::max_filings`] filings. The dated renames
-    /// themselves are also in [`Company::previous_names`].
-    pub async fn filing_events(&self, number: &str) -> Result<Fetched<Listing<Filing>>, Warning> {
+    /// The PSC statements of company `number`, current and ceased, every page up to
+    /// [`CompaniesHouseConfig::max_items`]. A company with no PSC normally has a statement
+    /// saying why ([`StatementKind::NoPsc`], [`StatementKind::Unidentified`]). An unknown
+    /// company, or one with no statement, gives an empty list.
+    pub async fn psc_statements(
+        &self,
+        number: &str,
+    ) -> Result<Fetched<Listing<PscStatement>>, Warning> {
         let r = async {
             let (key, number) = self.ready(number)?;
             let read = self
                 .list(
                     key,
+                    &format!("company/{number}/persons-with-significant-control-statements"),
+                    &[],
+                    self.max_items,
+                    KeptStatement::minimise,
+                )
+                .await?;
+            Ok(read.listing(|items| {
+                items
+                    .into_iter()
+                    .filter_map(KeptStatement::statement)
+                    .collect()
+            }))
+        };
+        r.await.map_err(|w| self.redact(w))
+    }
+
+    /// The name changes, merger and conversion filings in the filing history of company
+    /// `number`, newest first, from at most [`CompaniesHouseConfig::max_filings`] filings of
+    /// the [`CompaniesHouseConfig::filing_categories`]. The dated renames themselves are also
+    /// in [`Company::previous_names`].
+    pub async fn filing_events(&self, number: &str) -> Result<Fetched<Listing<Filing>>, Warning> {
+        let r = async {
+            let (key, number) = self.ready(number)?;
+            let filter: Vec<(&str, &str)> = self
+                .filing_categories
+                .as_deref()
+                .map(|c| ("category", c))
+                .into_iter()
+                .collect();
+            let read = self
+                .list(
+                    key,
                     &format!("company/{number}/filing-history"),
+                    &filter,
                     self.max_filings,
                     KeptFiling::minimise,
                 )
@@ -327,12 +398,14 @@ impl CompaniesHouse {
         r.await.map_err(|w| self.redact(w))
     }
 
-    /// Every page of the list at `path`, each item read as `T` and kept by `minimise`, up to
-    /// `cap` raw items. Each page is cached as the kept items only.
+    /// Every page of the list at `path` (with the `filter` query parameters), each item read
+    /// as `T` and kept by `minimise`, up to `cap` raw items. Each page is cached as the kept
+    /// items only.
     async fn list<T, F>(
         &self,
         key: &ApiKey,
         path: &str,
+        filter: &[(&str, &str)],
         cap: usize,
         minimise: F,
     ) -> Result<Read<T>, Warning>
@@ -347,7 +420,8 @@ impl CompaniesHouse {
         let size = self.page_size.to_string();
         let mut truncated = loop {
             let index = start.to_string();
-            let query = [("items_per_page", size.as_str()), ("start_index", &index)];
+            let mut query = filter.to_vec();
+            query.extend([("items_per_page", size.as_str()), ("start_index", &index)]);
             let url = self.url(path, &query)?;
             let cache_key = format!("{path}?{}", url.query().unwrap_or_default());
             let fetch = self.send(key, &cache_key, &url).await?;

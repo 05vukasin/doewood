@@ -13,7 +13,7 @@ use doewood_registry::edgar::{
 };
 use doewood_registry::{Clock, HttpTransport, ManualClock, MemoryCache, USER_AGENT, WarningKind};
 use serde_json::{Value, json};
-use support::{MockServer, Reply};
+use support::{MockServer, Reply, bad_lei, lei};
 use time::{Date, Month, OffsetDateTime};
 
 const CIK: &str = "9990000001";
@@ -229,6 +229,9 @@ async fn company_by_cik() {
         assert_eq!(k.filing_date, day(2026, Month::February, 20));
         assert_eq!(c.filings[1].items, ["2.01", "9.01"]);
         assert_eq!(c.filings[1].report_date, day(2026, Month::January, 12));
+        // An all-zero EIN and a missing LEI are none.
+        assert_eq!(c.ein, None);
+        assert_eq!(c.lei, None);
     }
     // Cached: one request for the three lookups.
     assert_eq!(
@@ -239,6 +242,30 @@ async fn company_by_cik() {
         server.header_values("accept"),
         [Some("application/json".to_owned())]
     );
+}
+
+#[tokio::test]
+async fn lei_and_ein_of_the_filer() {
+    let filer = lei("EDGARFILER");
+    for (raw_lei, ein, want_lei, want_ein) in [
+        (
+            json!(filer),
+            json!("999000001"),
+            Some(filer.clone()),
+            Some("999000001"),
+        ),
+        (json!(bad_lei("EDGARFILER")), json!("99-900001"), None, None),
+        (Value::Null, json!(999_000_002), None, Some("999000002")),
+    ] {
+        let mut body = submissions();
+        body["lei"] = raw_lei;
+        body["ein"] = ein;
+        let server = MockServer::start(move |_, _| Reply::json(&body)).await;
+        let s = setup(&server, |_| {});
+        let c = s.edgar.company(CIK).await.unwrap().value.unwrap();
+        assert_eq!(c.lei.map(|l| l.value), want_lei);
+        assert_eq!(c.ein.as_deref(), want_ein);
+    }
 }
 
 #[tokio::test]
@@ -393,6 +420,76 @@ async fn filing_without_exhibit_21() {
     let missing = Accession::parse("000999000024000001").unwrap();
     let w = s.edgar.exhibit21(cik, &missing).await.unwrap_err();
     assert_eq!(w.kind, WarningKind::Status(404));
+}
+
+#[tokio::test]
+async fn exhibit_8_of_the_latest_20f() {
+    let mut body = submissions();
+    body["filings"]["recent"]["form"] = json!(["20-F", "6-K", "6-K", "6-K", "20-F", "6-K"]);
+    let server = MockServer::start(move |target, _| match target {
+        "/api/v1/data/submissions/CIK9990000001.json" => Reply::json(&body),
+        t if t == format!("{ARCHIVE}000999000026000012/0009990000-26-000012-index.htm") => {
+            Reply::raw(
+                200,
+                index(&[
+                    ("20-F", "fict-20f.htm"),
+                    ("EX-2.1", "fict-ex2.htm"),
+                    ("EX-8.1", "fict-ex8.htm"),
+                ]),
+            )
+        }
+        t if t == format!("{ARCHIVE}000999000026000012/fict-ex8.htm") => {
+            Reply::raw(200, EX21_TABLE.replace("21.1", "8.1").into_bytes())
+        }
+        _ => Reply::raw(404, b"Not Found".to_vec()),
+    })
+    .await;
+    let s = setup(&server, |_| {});
+    let ex = s
+        .edgar
+        .subsidiaries(CIK)
+        .await
+        .unwrap()
+        .value
+        .expect("an EX-8");
+    assert_eq!(ex.exhibit_type, "EX-8.1");
+    assert_eq!(ex.document, "fict-ex8.htm");
+    assert_eq!(ex.filing_date, day(2026, Month::February, 20));
+    assert_eq!(ex.subsidiaries, table_rows());
+    // A 10-K's EX-21 reader does not take an EX-8.
+    let acc = Accession::parse("0009990000-26-000012").unwrap();
+    let cik = Cik::parse(CIK).unwrap();
+    assert_eq!(s.edgar.exhibit21(cik, &acc).await.unwrap().value, None);
+}
+
+#[tokio::test]
+async fn filing_index_falls_back_to_index_html() {
+    let server = MockServer::start(|target, _| {
+        if target.ends_with("-index.html") {
+            Reply::raw(200, index(&[("EX-21", "ex21.htm")]))
+        } else if target.ends_with("/ex21.htm") {
+            Reply::raw(200, EX21_TABLE.as_bytes().to_vec())
+        } else {
+            Reply::raw(404, b"Not Found".to_vec())
+        }
+    })
+    .await;
+    let s = setup(&server, |_| {});
+    let acc = Accession::parse("0009990000-26-000001").unwrap();
+    let cik = Cik::parse(CIK).unwrap();
+    let ex = s.edgar.exhibit21(cik, &acc).await.unwrap().value.unwrap();
+    assert_eq!(ex.subsidiaries, table_rows());
+    assert_eq!(
+        server.requests(),
+        [
+            format!("{ARCHIVE}000999000026000001/0009990000-26-000001-index.htm"),
+            format!("{ARCHIVE}000999000026000001/0009990000-26-000001-index.html"),
+            format!("{ARCHIVE}000999000026000001/ex21.htm"),
+        ]
+    );
+    // The found index is cached under its own name: no request again.
+    s.edgar.exhibit21(cik, &acc).await.unwrap();
+    assert_eq!(server.requests().len(), 4, "{:?}", server.requests());
 }
 
 /// A server whose only filing's EX-21 is `body`.

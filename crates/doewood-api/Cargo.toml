@@ -12,6 +12,9 @@ rust-version.workspace = true
 axum = { version = "0.8", default-features = false }
 doewood-core.workspace = true
 doewood-model.workspace = true
+# Enrichment settings are checked with the registry clients' and the favicon guard's own
+# validation (no request is sent from the API).
+doewood-registry.workspace = true
 doewood-s3.workspace = true
 doewood-store.workspace = true
 prost = "0.14"

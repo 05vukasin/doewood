@@ -1,5 +1,5 @@
-// Runtime configuration: S3 sources, their LLM policies, the AI providers and ingest's
-// settings (ADR 0001, sections 3, 5 and 6). Changes apply without a restart. Secrets (S3
+// Runtime configuration: S3 sources, their LLM policies, the AI providers, ingest's settings
+// and company enrichment's (ADR 0001, sections 3, 5 and 6; ADR 0002, section 7). Changes apply without a restart. Secrets (S3
 // credentials, API keys) are write-only: no response ever carries one, only whether one is
 // set.
 syntax = "proto3";
@@ -40,6 +40,13 @@ service ConfigService {
   // Changes ingest's settings; an unset field keeps its value. Applies to the next file
   // ingested, without a restart. Edges already written are kept.
   rpc SetIngestSettings(SetIngestSettingsRequest) returns (IngestSettings);
+  // Company enrichment's settings (ADR 0002 section 7), with the defaults filled in: the
+  // registry switches, the EDGAR contact, the favicon fallback and egress proxy, and whether
+  // each secret is set (never the secret).
+  rpc GetEnrichmentSettings(GetEnrichmentSettingsRequest) returns (EnrichmentSettings);
+  // Changes them, all or nothing; an unset field keeps its value. The enrichment job reads
+  // them on every pass and the favicon proxy on every lookup: no restart.
+  rpc SetEnrichmentSettings(SetEnrichmentSettingsRequest) returns (EnrichmentSettings);
 }
 
 // How bucket URLs are built.
@@ -239,4 +246,69 @@ message GetIngestSettingsRequest {}
 message SetIngestSettingsRequest {
   // Above 0 and at most 1; anything else is INVALID_ARGUMENT. Unset keeps the stored value.
   optional double similar_min_jaccard = 1;
+}
+
+// Company enrichment's settings. Secrets are never returned, only whether one is set.
+message EnrichmentSettings {
+  // The registry switches. All default on (ADR 0002 section 7: the keyless registries run
+  // with nothing configured).
+  bool gleif_enabled = 1;
+  bool vies_enabled = 2;
+  bool wikidata_enabled = 3;
+  bool edgar_enabled = 4;
+  bool apr_enabled = 5;
+  // Companies House's switch. Default on, but it is asked only once a key is set: see
+  // `companies_house_active`.
+  bool companies_house_enabled = 6;
+  // Whether a Companies House API key is stored.
+  bool companies_house_api_key_set = 7;
+  // Whether Companies House is asked: switched on and a key is set.
+  bool companies_house_active = 8;
+  // Whether an OpenCorporates API key is stored (no client uses it yet).
+  bool opencorporates_api_key_set = 9;
+  // The contact sent to the SEC in the `User-Agent` (a name and an email); empty: the
+  // generic `User-Agent`.
+  string edgar_contact = 10;
+  // Whether extra root certificates for APR's download are stored.
+  bool apr_extra_roots_set = 11;
+  // Whether the public favicon fallback service is asked when a site has no usable icon.
+  // Default off: asking it tells that service which domain is looked up.
+  bool favicon_fallback = 12;
+  // The proxy all favicon requests go through; empty: direct.
+  string favicon_egress_proxy = 13;
+}
+
+message GetEnrichmentSettingsRequest {}
+
+message SetEnrichmentSettingsRequest {
+  // The registry switches. Unset keeps the stored value.
+  optional bool gleif_enabled = 1;
+  optional bool vies_enabled = 2;
+  optional bool wikidata_enabled = 3;
+  optional bool edgar_enabled = 4;
+  optional bool apr_enabled = 5;
+  optional bool companies_house_enabled = 6;
+  // WRITE-ONLY. The Companies House API key: 8 to 256 printable ASCII characters without
+  // spaces or `:`. Empty keeps the stored key.
+  string companies_house_api_key = 7;
+  // Deletes the stored Companies House key.
+  bool clear_companies_house_api_key = 8;
+  // WRITE-ONLY. The OpenCorporates API key, same format. Empty keeps the stored key.
+  string opencorporates_api_key = 9;
+  // Deletes the stored OpenCorporates key.
+  bool clear_opencorporates_api_key = 10;
+  // The EDGAR contact: at most 200 printable ASCII characters, such as
+  // `Example Ops ops@example.invalid`. Unset keeps it; empty goes back to the generic
+  // `User-Agent`.
+  optional string edgar_contact = 11;
+  // WRITE-ONLY. Extra root certificates APR's download trusts next to the system's, as a PEM
+  // bundle of at most 64 KiB. Empty keeps the stored ones.
+  string apr_extra_roots_pem = 12;
+  // Deletes the stored extra roots.
+  bool clear_apr_extra_roots_pem = 13;
+  // The favicon fallback switch. Unset keeps it.
+  optional bool favicon_fallback = 14;
+  // The favicon egress proxy: an `http://` or `https://` URL without credentials. Unset
+  // keeps it; empty removes it (direct).
+  optional string favicon_egress_proxy = 15;
 }

@@ -1174,6 +1174,7 @@ dependencies = [
  "doewood-core",
  "doewood-model",
  "doewood-pg",
+ "doewood-registry",
  "doewood-s3",
  "doewood-store",
  "prost",

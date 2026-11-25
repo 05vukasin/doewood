@@ -101,8 +101,10 @@ so a change applies without a restart:
 | `favicon.fallback` | off | ask the public fallback service when the site has no usable icon. That service learns the domain, which is why it is off unless turned on. |
 | `favicon.egress_proxy` | none | an `http://` or `https://` proxy URL, without credentials, that every favicon request goes through |
 
-There is no RPC to set them yet (ADR 0002 does not specify one); the store's
-`set_favicon_settings` is the only writer. Adding them to the gRPC API is a follow-up.
+Set them with `ConfigService.SetEnrichmentSettings` (`favicon_fallback`,
+`favicon_egress_proxy`; an empty proxy removes it) and read them with `GetEnrichmentSettings`
+(see [api.md](api.md#enrichment-settings)). The proxy URL is checked by the guard's own code
+before it is stored. The next icon lookup uses the new values.
 
 ## Tests
 
