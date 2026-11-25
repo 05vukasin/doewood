@@ -14,7 +14,7 @@ use tonic::Status;
 
 use crate::icons::Icons;
 use crate::limits::CallLimits;
-use crate::progress::Progress;
+use crate::progress::{Progress, Snapshots};
 use crate::reprocess::Reprocessor;
 use crate::summarize::OnDemand;
 use crate::{convert, error, pb};
@@ -75,6 +75,8 @@ pub struct ApiState {
 
 struct Inner {
     parts: ApiParts,
+    /// The progress snapshots every `WatchProgress` stream shares.
+    snapshots: Arc<Snapshots>,
     /// Serializes source changes (add, update, remove), so a claim and the row that owns it
     /// never race.
     sources: tokio::sync::Mutex<()>,
@@ -89,9 +91,18 @@ impl ApiState {
     /// The state of an API built from these parts.
     pub fn new(parts: ApiParts) -> Self {
         let claims_checked = AtomicBool::new(!parts.options.shared_claims);
+        let discovery = parts.discovery.clone();
+        let snapshots = Snapshots::new(
+            Arc::clone(&parts.store),
+            Arc::clone(&parts.progress),
+            Arc::new(move |id| discovery.as_ref().is_some_and(|d| d.is_running(id))),
+            parts.options.progress_interval,
+            parts.shutdown.clone(),
+        );
         Self {
             inner: Arc::new(Inner {
                 parts,
+                snapshots,
                 sources: tokio::sync::Mutex::new(()),
                 claims_checked,
                 call_limits: Arc::new(CallLimits::new(doewood_store::ApiSettings::default())),
@@ -147,6 +158,10 @@ impl ApiState {
 
     pub(crate) fn discovery(&self) -> Option<&Discovery> {
         self.inner.parts.discovery.as_ref()
+    }
+
+    pub(crate) fn snapshots(&self) -> &Arc<Snapshots> {
+        &self.inner.snapshots
     }
 
     pub(crate) fn progress(&self) -> &Arc<Progress> {

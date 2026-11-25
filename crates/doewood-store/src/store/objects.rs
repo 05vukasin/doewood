@@ -137,29 +137,32 @@ impl Store {
     ) -> Result<Option<SeenObject>, StoreError> {
         Ok(self
             .conn()
-            .query_row(
+            .prepare_cached(
                 "SELECT key, etag, size, last_modified FROM objects_seen \
                  WHERE source_id = ?1 AND key = ?2 AND status <> 'deleted'",
-                params![source.to_string(), key],
-                |r| {
+            )
+            .and_then(|mut cached| {
+                cached.query_row(params![source.to_string(), key], |r| {
                     Ok(SeenObject {
                         key: r.get(0)?,
                         etag: r.get(1)?,
                         size: u64::try_from(r.get::<_, i64>(2)?).unwrap_or(0),
                         last_modified: r.get(3)?,
                     })
-                },
-            )
+                })
+            })
             .optional()?)
     }
 
     /// The number of live objects of a source.
     pub fn live_object_count(&self, source: SourceId) -> Result<u64, StoreError> {
-        let n: i64 = self.conn().query_row(
-            "SELECT count(*) FROM objects_seen WHERE source_id = ?1 AND status <> 'deleted'",
-            [source.to_string()],
-            |r| r.get(0),
-        )?;
+        let n: i64 = self
+            .conn()
+            .prepare_cached(
+                "SELECT coalesce(sum(n), 0) FROM object_counts \
+                 WHERE source_id = ?1 AND status <> 'deleted'",
+            )?
+            .query_row([source.to_string()], |r| r.get(0))?;
         Ok(u64::try_from(n).unwrap_or(0))
     }
 
@@ -218,8 +221,12 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<SeenObject>, StoreError> {
         let conn = self.conn();
+        // The planner's statistics are averages over the statuses, so it reads the primary
+        // key in key order instead, which walks every ingested row of a mostly ingested
+        // source. The queue index reads only the pending rows, already in key order.
         let mut stmt = conn.prepare_cached(
             "SELECT key, etag, size, last_modified FROM objects_seen \
+             INDEXED BY objects_seen_pending \
              WHERE source_id = ?1 AND status = 'pending' AND (?2 IS NULL OR key > ?2) \
              ORDER BY key LIMIT ?3",
         )?;
@@ -264,21 +271,25 @@ impl Store {
                     Some(i64::from(*attempts)),
                 ),
             };
-        let n = self.conn().execute(
-            "UPDATE objects_seen SET status = ?4, blake3 = coalesce(?5, blake3), \
+        let n = self
+            .conn()
+            .prepare_cached(
+                "UPDATE objects_seen SET status = ?4, blake3 = coalesce(?5, blake3), \
              last_error = ?6, attempts = coalesce(?7, attempts + 1), updated_at = ?8 \
              WHERE source_id = ?1 AND key = ?2 AND etag IS ?3 AND status = 'pending'",
-            params![
-                source.to_string(),
-                key,
-                etag,
-                status,
-                blake3,
-                error,
-                attempts,
-                now()
-            ],
-        )?;
+            )
+            .and_then(|mut cached| {
+                cached.execute(params![
+                    source.to_string(),
+                    key,
+                    etag,
+                    status,
+                    blake3,
+                    error,
+                    attempts,
+                    now()
+                ])
+            })?;
         Ok(n > 0)
     }
 
@@ -291,18 +302,22 @@ impl Store {
         attempts: u32,
         error: &str,
     ) -> Result<bool, StoreError> {
-        let n = self.conn().execute(
-            "UPDATE objects_seen SET attempts = ?4, last_error = ?5, updated_at = ?6 \
+        let n = self
+            .conn()
+            .prepare_cached(
+                "UPDATE objects_seen SET attempts = ?4, last_error = ?5, updated_at = ?6 \
              WHERE source_id = ?1 AND key = ?2 AND etag IS ?3 AND status = 'pending'",
-            params![
-                source.to_string(),
-                key,
-                etag,
-                i64::from(attempts),
-                truncate(error, MAX_ERROR_LEN),
-                now()
-            ],
-        )?;
+            )
+            .and_then(|mut cached| {
+                cached.execute(params![
+                    source.to_string(),
+                    key,
+                    etag,
+                    i64::from(attempts),
+                    truncate(error, MAX_ERROR_LEN),
+                    now()
+                ])
+            })?;
         Ok(n > 0)
     }
 
@@ -314,11 +329,12 @@ impl Store {
     ) -> Result<Option<IngestStatus>, StoreError> {
         Ok(self
             .conn()
-            .query_row(
+            .prepare_cached(
                 "SELECT status, etag, blake3, attempts, last_error FROM objects_seen \
                  WHERE source_id = ?1 AND key = ?2",
-                params![source.to_string(), key],
-                |r| {
+            )
+            .and_then(|mut cached| {
+                cached.query_row(params![source.to_string(), key], |r| {
                     let blake3: Option<Vec<u8>> = r.get(2)?;
                     Ok(IngestStatus {
                         status: r.get(0)?,
@@ -327,8 +343,8 @@ impl Store {
                         attempts: u32::try_from(r.get::<_, i64>(3)?).unwrap_or(0),
                         last_error: r.get(4)?,
                     })
-                },
-            )
+                })
+            })
             .optional()?)
     }
 
@@ -375,11 +391,12 @@ impl Store {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let n = match keys {
-            None => tx.execute(
-                "UPDATE objects_seen SET status = 'pending', attempts = 0, last_error = NULL, \
+            None => tx
+                .prepare_cached(
+                    "UPDATE objects_seen SET status = 'pending', attempts = 0, last_error = NULL, \
                  updated_at = ?2 WHERE source_id = ?1 AND status <> 'deleted'",
-                params![id, now],
-            )?,
+                )
+                .and_then(|mut cached| cached.execute(params![id, now]))?,
             Some(keys) => {
                 let mut stmt = tx.prepare_cached(
                     "UPDATE objects_seen SET status = 'pending', attempts = 0, \
@@ -401,11 +418,12 @@ impl Store {
     pub fn scan_checkpoint(&self, source: SourceId) -> Result<Option<ScanCheckpoint>, StoreError> {
         Ok(self
             .conn()
-            .query_row(
+            .prepare_cached(
                 "SELECT pass, in_progress, start_after, pass_started_at, last_completed_at \
                  FROM scan_checkpoints WHERE source_id = ?1",
-                [source.to_string()],
-                |r| {
+            )
+            .and_then(|mut cached| {
+                cached.query_row([source.to_string()], |r| {
                     Ok(ScanCheckpoint {
                         pass: u64::try_from(r.get::<_, i64>(0)?).unwrap_or(0),
                         in_progress: r.get(1)?,
@@ -413,8 +431,8 @@ impl Store {
                         pass_started_at: r.get(3)?,
                         last_completed_at: r.get(4)?,
                     })
-                },
-            )
+                })
+            })
             .optional()?)
     }
 

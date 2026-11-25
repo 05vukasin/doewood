@@ -29,6 +29,12 @@ pub const SECRET_MAX_LEN: usize = 64 * 1024;
 /// Litestream, the `sqlite3` shell) before it fails.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The WAL file's size after a checkpoint, at most (64 MiB).
+const JOURNAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
+
+/// Prepared statements kept per connection.
+pub(crate) const STATEMENT_CACHE: usize = 128;
+
 /// Reserved secret that proves the master key is the one the store was created with.
 const KEY_CHECK: &str = "_doewood.key_check";
 const KEY_CHECK_VALUE: &[u8] = b"doewood key check v1";
@@ -70,9 +76,16 @@ impl Store {
         let _mode: String =
             conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // After a large transaction the WAL file shrinks back to this at the next checkpoint.
+        conn.pragma_update(None, "journal_size_limit", JOURNAL_SIZE_LIMIT)?;
+        // Every hot statement stays prepared: the store has more than rusqlite's default 16.
+        conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
         // Migrations run with foreign keys off (see `migrate`); they are on from here.
         migrate::migrate(&mut conn)?;
         conn.pragma_update(None, "foreign_keys", true)?;
+        // SQLite's advice for a long-lived connection: analyze what needs it now (bounded
+        // work), then `PRAGMA optimize` every few hours ([`Store::optimize`]).
+        conn.execute_batch("PRAGMA optimize = 0x10002;")?;
         let store = Self {
             conn: Mutex::new(conn),
             cipher: Cipher::new(key),
@@ -215,6 +228,13 @@ impl Store {
             .transpose()
     }
 
+    /// Refreshes the query planner's statistics where they are stale (`PRAGMA optimize`);
+    /// the binary calls it every hour.
+    pub fn optimize(&self) -> Result<(), StoreError> {
+        self.conn().execute_batch("PRAGMA optimize;")?;
+        Ok(())
+    }
+
     /// Checkpoints the WAL into the main file and closes the connection.
     pub fn close(self) -> Result<(), StoreError> {
         let conn = self
@@ -306,11 +326,13 @@ mod tests {
                 "edges",
                 "favicons",
                 "jobs",
+                "llm_job_counts",
                 "llm_jobs",
                 "llm_usage",
                 "locations",
                 "node_aliases",
                 "nodes",
+                "object_counts",
                 "objects_seen",
                 "records",
                 "registry_cache",

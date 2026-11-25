@@ -291,7 +291,11 @@ are there for enrichment, and no document merges on a fuzzy match yet.
 `throughput` in `tests/pipeline.rs`: 2000 generated files (PDF, DOCX, TXT, XLSX in equal parts,
 4.7 MiB), fetched from memory, analyzed without OCR, stored in in-memory SQLite (records, graph,
 search). Test profile (dependencies at opt-level 2). The worker count is `default_jobs()` (CPUs
-and memory); the test does not read `DOEWOOD_INGEST_JOBS`.
+and memory); the test does not read `DOEWOOD_INGEST_JOBS`. `DOEWOOD_BENCH_WATCHERS=n` opens n
+`WatchProgress` streams on a real API server during the run, and the test also prints the
+process CPU time and how long a trivial store call waits for the store's lock (sampled every
+millisecond). `crates/doewood-api/tests/progress_bench.rs` (ignored) measures the same with
+n streams on a 200 000-object source while the watchers are woken every millisecond.
 
 ```
 DOEWOOD_BENCH_FILES=2000 cargo test -p doewood-ingest --test pipeline -- --ignored --nocapture throughput
