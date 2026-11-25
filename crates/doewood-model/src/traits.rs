@@ -70,8 +70,9 @@ pub trait GraphStore: Send + Sync {
     /// [`GraphStore::update_props`], so a create never replaces what another wrote.
     async fn ensure_node(&self, kind: NodeKind, key: &str) -> Result<Uuid>;
 
-    /// Applies `patch` to the node's props atomically: in one transaction, with the node
-    /// locked, on the props as stored. Keys the patch does not name stay as they are, so two
+    /// Applies `patch` to the node's props atomically, on the props as stored (in one
+    /// transaction with the node locked, or as a compare-and-set that applies it again when
+    /// another writer came first). Keys the patch does not name stay as they are, so two
     /// writers changing different keys never lose each other's writes (issue #51). Returns
     /// the node as written, `None` when there is no node `id`.
     async fn update_props(&self, id: Uuid, patch: &PropsPatch) -> Result<Option<Node>>;
