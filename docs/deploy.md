@@ -77,7 +77,7 @@ under the same name, and one another instance owns is reported (state `error`, t
 reason) instead of scanned (see [sources](sources.md#claims)). Talk to
 one instance through the headless Service, for example
 `doewood-0.doewood-headless.<namespace>.svc:7443`; the regular Service spreads calls over all of
-them, which suits only reads of the shared store.
+them, which suits only reads of the shared store (see [Load balancing](#load-balancing)).
 
 | value | default | meaning |
 |---|---|---|
@@ -96,6 +96,42 @@ them, which suits only reads of the shared store.
 
 `/metrics` is on the ops port; add scrape annotations through `podAnnotations` if your
 Prometheus uses them.
+
+## Load balancing
+
+A Kubernetes `ClusterIP` Service balances **TCP connections**, not calls. A gRPC client keeps
+one HTTP/2 connection and sends every call over it, so without help all of a client's calls
+stay on the pod it first reached, and replicas added later get no existing clients. doewood
+therefore ages its connections: at 30 minutes it sends GOAWAY, the client opens a new
+connection for new calls (which the Service may send to another pod), and the old one is
+closed 5 minutes later, open streams included (see [api.md](api.md#limits)). Load spreads
+again within about half an hour after a scale-up or a restart.
+
+Which Service to use:
+
+- **Calls that need one instance** (its sources, settings, `WatchProgress`,
+  `ReprocessJob`): the headless Service, by pod name,
+  `doewood-0.doewood-headless.<namespace>.svc:7443`. Each instance has its own settings and
+  sources; never send these through the regular Service.
+- **Reads of the shared store** (records, graph, search; Postgres mode, several replicas):
+  either the regular Service, and rely on the connection age to spread clients, or
+  client-side balancing for an even spread per call: resolve the headless Service
+  (`dns:///doewood-headless.<namespace>.svc:7443`) and use the `round_robin` policy (in
+  grpc-go `grpc.WithDefaultServiceConfig({"loadBalancingConfig":[{"round_robin":{}}]})`).
+  The headless Service publishes pods that are not ready too (so each pod has a name during
+  start-up), so a client balancing over it should retry `UNAVAILABLE` on another pod. A
+  service mesh or an L7 proxy that understands HTTP/2 (Envoy, Linkerd, an ingress with gRPC
+  support) balances per call as well.
+
+Clients:
+
+- Set a deadline on every unary call, and retry `UNAVAILABLE` with exponential backoff and
+  jitter (for example 100 ms doubling to 10 s, a few attempts). A call shed because the
+  instance is overloaded did not run, so retrying it is safe; with client-side balancing the
+  retry may reach another replica.
+- Watch again when a stream ends with an error; the first message is a full snapshot.
+- HTTP/2 keepalive: the server PINGs idle connections every 30 s and accepts PINGs from
+  clients; a client that wants its own keepalive should not PING more often than every 30 s.
 
 ## Sizing
 

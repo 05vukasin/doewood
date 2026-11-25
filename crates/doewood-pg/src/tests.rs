@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::PgStore;
 
+mod companies_due;
 mod list_records;
 
 const VAR: &str = "DOEWOOD_TEST_POSTGRES_URL";

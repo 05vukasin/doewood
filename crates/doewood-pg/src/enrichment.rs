@@ -23,6 +23,48 @@ const DOCUMENTS: &str = "(SELECT count(DISTINCT e.src) FROM edges e JOIN nodes d
      WHERE e.dst = n.id AND e.kind = 'party' AND d.kind = 'document' \
      AND e.state NOT IN ('retracted', 'superseded'))";
 
+/// The companies due (issue #71: the cheap tests decide first).
+///
+/// The inner query lists the candidates in id order: companies after the page token without
+/// another instance's lease, with their enrichment row. The fence (`OFFSET 0`) keeps the
+/// tests below out of it, so that they run on the candidates in id order and stop at the page
+/// size; left to the planner, they ran on every company before a sort.
+///
+/// A company never enriched, or with a registry due, needs one live document. Any other is
+/// due only when its document count doubled: first a bound from its `party` edges in
+/// `edges_by_dst` alone (an index-only count, stopped at the threshold; it counts every party
+/// edge, so it is never below the document count), and only past that bound the exact count,
+/// stopped at the threshold too. The scalar subqueries (not `EXISTS`) are never turned into
+/// hashes of the whole table, and `CASE` fixes the order of the tests. The exact count is
+/// taken for the returned rows only. `$1` is the caller, `$2` the page token, `$3` the page
+/// size.
+pub(crate) const COMPANIES_DUE: &str = "SELECT s.id, \
+     (SELECT count(DISTINCT e.src) FROM edges e JOIN nodes d ON d.id = e.src \
+     WHERE e.dst = s.id AND e.kind = 'party' AND d.kind = 'document' \
+     AND e.state NOT IN ('retracted', 'superseded')), \
+     s.documents, \
+     ARRAY(SELECT r.registry FROM company_registry_due r \
+     WHERE r.company_id = s.id AND r.next_due_at <= now() \
+     ORDER BY r.registry COLLATE \"C\") \
+     FROM (SELECT n.id, f.company_id AS enriched, f.documents \
+     FROM nodes n LEFT JOIN company_enrichment f ON f.company_id = n.id \
+     WHERE n.kind = 'company' AND ($2::uuid IS NULL OR n.id > $2) \
+     AND NOT EXISTS (SELECT 1 FROM company_leases l WHERE l.company_id = n.id \
+     AND l.owner <> $1 AND l.expires_at > now()) \
+     ORDER BY n.id OFFSET 0) s \
+     WHERE CASE WHEN s.enriched IS NULL OR (SELECT true FROM company_registry_due r \
+     WHERE r.company_id = s.id AND r.next_due_at <= now() LIMIT 1) \
+     THEN (SELECT true FROM edges e JOIN nodes d ON d.id = e.src \
+     WHERE e.dst = s.id AND e.kind = 'party' AND d.kind = 'document' \
+     AND e.state NOT IN ('retracted', 'superseded') LIMIT 1) IS NOT NULL \
+     WHEN (SELECT count(*) FROM (SELECT 1 FROM edges e WHERE e.dst = s.id AND e.kind = 'party' \
+     LIMIT 2 * greatest(s.documents, 1)) b) < 2 * greatest(s.documents, 1) THEN false \
+     ELSE (SELECT count(*) FROM (SELECT DISTINCT e.src FROM edges e JOIN nodes d ON d.id = e.src \
+     WHERE e.dst = s.id AND e.kind = 'party' AND d.kind = 'document' \
+     AND e.state NOT IN ('retracted', 'superseded') LIMIT 2 * greatest(s.documents, 1)) x) \
+     >= 2 * greatest(s.documents, 1) END \
+     ORDER BY s.id LIMIT $3";
+
 fn count(n: i64) -> Result<u64> {
     u64::try_from(n).map_err(|e| bad("count", e))
 }
@@ -276,22 +318,7 @@ impl FreshnessStore for PgStore {
         let c = client(&self.pool).await?;
         let rows = c
             .rows_uncached(
-                &format!(
-                    "SELECT n.id, c.docs, f.documents, \
-                     ARRAY(SELECT r.registry FROM company_registry_due r \
-                     WHERE r.company_id = n.id AND r.next_due_at <= now() \
-                     ORDER BY r.registry COLLATE \"C\") \
-                     FROM nodes n CROSS JOIN LATERAL (SELECT {DOCUMENTS} AS docs) c \
-                     LEFT JOIN company_enrichment f ON f.company_id = n.id \
-                     WHERE n.kind = 'company' AND ($2::uuid IS NULL OR n.id > $2) \
-                     AND c.docs > 0 \
-                     AND NOT EXISTS (SELECT 1 FROM company_leases l WHERE l.company_id = n.id \
-                     AND l.owner <> $1 AND l.expires_at > now()) \
-                     AND (f.company_id IS NULL OR c.docs >= 2 * greatest(f.documents, 1) \
-                     OR EXISTS (SELECT 1 FROM company_registry_due r \
-                     WHERE r.company_id = n.id AND r.next_due_at <= now())) \
-                     ORDER BY n.id LIMIT $3"
-                ),
+                COMPANIES_DUE,
                 &[&owner.as_str(), &after, &i64::from(due_limit(limit))],
             )
             .await?;
