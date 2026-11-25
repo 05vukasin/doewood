@@ -28,7 +28,7 @@ pub fn production_web() -> WebClientFactory {
     })
 }
 
-fn counts(s: EnrichmentStats) -> EnrichmentCounts {
+fn counts(s: &EnrichmentStats) -> EnrichmentCounts {
     EnrichmentCounts {
         enriched: s.enriched,
         merged: s.merged,
@@ -73,7 +73,7 @@ pub fn start(
         feed_templates: FeedTemplates::default(),
         web: production_web(),
         options: EnrichmentOptions::default(),
-        on_change: Arc::new(move |s| progress.set_enrichment(counts(s))),
+        on_change: Arc::new(move |s| progress.set_enrichment(counts(&s))),
     });
     job.start(shutdown)
 }

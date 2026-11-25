@@ -649,33 +649,30 @@ impl Run<'_> {
                 break;
             }
             checked += 1;
-            match client.day(day).await? {
-                Some(index) => {
-                    self.records(index.rows);
-                    let items: Vec<(String, Option<String>)> = index
-                        .filings
-                        .iter()
-                        .map(|(cik, _)| (cik_alias(*cik), Some(format!("submissions/CIK{cik}"))))
-                        .collect();
-                    let n = self.apply(&items).await?;
-                    due += n;
-                    info!(feed = "edgar", day = %day_text(day), rows = index.rows,
+            if let Some(index) = client.day(day).await? {
+                self.records(index.rows);
+                let items: Vec<(String, Option<String>)> = index
+                    .filings
+                    .iter()
+                    .map(|(cik, _)| (cik_alias(*cik), Some(format!("submissions/CIK{cik}"))))
+                    .collect();
+                let n = self.apply(&items).await?;
+                due += n;
+                info!(feed = "edgar", day = %day_text(day), rows = index.rows,
                         filings = index.filings.len(), companies_due = n,
                         truncated = index.truncated, "edgar feed: daily index applied");
+                last = day;
+                self.renew().await?;
+            } else {
+                let weekend = matches!(
+                    day.weekday(),
+                    time::Weekday::Saturday | time::Weekday::Sunday
+                );
+                if (weekend || today - day >= time::Duration::days(5))
+                    && last.next_day() == Some(day)
+                {
+                    debug!(feed = "edgar", day = %day_text(day), "edgar feed: no index that day");
                     last = day;
-                    self.renew().await?;
-                }
-                None => {
-                    let weekend = matches!(
-                        day.weekday(),
-                        time::Weekday::Saturday | time::Weekday::Sunday
-                    );
-                    if (weekend || today - day >= time::Duration::days(5))
-                        && last.next_day() == Some(day)
-                    {
-                        debug!(feed = "edgar", day = %day_text(day), "edgar feed: no index that day");
-                        last = day;
-                    }
                 }
             }
             match day.next_day() {

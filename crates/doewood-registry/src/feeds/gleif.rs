@@ -465,7 +465,10 @@ mod tests {
         let file = zip_file(&[("readme.txt", "x"), ("lei2.csv", &lei2)]);
         let stats = read_zip(file, DataSet::Lei2, &config, &tx).unwrap();
         drop(tx);
-        assert_eq!((stats.records, stats.invalid, stats.truncated), (3, 1, false));
+        assert_eq!(
+            (stats.records, stats.invalid, stats.truncated),
+            (3, 1, false)
+        );
         let mut got = Vec::new();
         while let Ok(batch) = rx.try_recv() {
             assert_eq!(batch.len(), 1);
@@ -493,7 +496,13 @@ mod tests {
             ..GleifFeedConfig::default()
         };
         let (tx, _rx) = mpsc::channel(10);
-        let stats = read_zip(zip_file(&[("lei2.csv", &lei2)]), DataSet::Lei2, &capped, &tx).unwrap();
+        let stats = read_zip(
+            zip_file(&[("lei2.csv", &lei2)]),
+            DataSet::Lei2,
+            &capped,
+            &tx,
+        )
+        .unwrap();
         assert!(stats.truncated && stats.records == 1);
         for file in [
             zip_file(&[("lei2.csv", "Name\nx\n")]),

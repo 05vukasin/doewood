@@ -926,7 +926,7 @@ async fn enrichment_settings_round_trip_and_secrets_stay_write_only() {
             .unwrap()
             .into_inner()
     };
-    const STREAM_KEY: &str = "test-stream-key-not-real-9";
+    let stream_key = "test-stream-key-not-real-9";
     let leaks = |what: &str, text: &str| {
         for secret in [CH_KEY, OC_KEY, "MIIBrzCCAVWg"] {
             assert!(!text.contains(secret), "{what} leaks a secret: {text}");
@@ -965,14 +965,14 @@ async fn enrichment_settings_round_trip_and_secrets_stay_write_only() {
             favicon_egress_proxy: Some("http://egress.svc:3128".into()),
             apr_feed_enabled: Some(false),
             companies_house_feed_enabled: Some(true),
-            companies_house_stream_key: STREAM_KEY.into(),
+            companies_house_stream_key: stream_key.into(),
             ..pb::SetEnrichmentSettingsRequest::default()
         })
         .await
         .unwrap()
         .into_inner();
     leaks("SetEnrichmentSettings", &format!("{set:?}"));
-    assert!(!format!("{set:?}").contains(STREAM_KEY));
+    assert!(!format!("{set:?}").contains(stream_key));
     assert!(set.gleif_feed_enabled && !set.apr_feed_enabled);
     assert!(set.companies_house_stream_key_set && set.companies_house_feed_active);
     assert!(!set.wikidata_enabled && set.gleif_enabled);
@@ -994,10 +994,10 @@ async fn enrichment_settings_round_trip_and_secrets_stay_write_only() {
         TEST_ROOT_PEM
     );
     leaks("EnrichmentConfig", &format!("{job:?}"));
-    assert!(!format!("{job:?}").contains(STREAM_KEY));
+    assert!(!format!("{job:?}").contains(stream_key));
     assert_eq!(
         job.companies_house_stream_key.as_ref().unwrap().expose(),
-        STREAM_KEY
+        stream_key
     );
     assert!(job.feeds.companies_house && !job.feeds.apr);
     let favicon = a.store.favicon_settings().unwrap();

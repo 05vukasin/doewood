@@ -1087,7 +1087,9 @@ pub async fn feeds<B: Backend + ?Sized>(a: &B, b: &B) {
         None
     );
     assert_eq!(
-        b.mark_many_due(&[x, y, Uuid::now_v7()], "gleif").await.unwrap(),
+        b.mark_many_due(&[x, y, Uuid::now_v7()], "gleif")
+            .await
+            .unwrap(),
         1,
         "y was never enriched (it is new anyway)"
     );
