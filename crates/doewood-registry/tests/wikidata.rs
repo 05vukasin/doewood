@@ -315,7 +315,7 @@ async fn lei_lookup_with_relations_and_dates() {
     // The query asked by the LEI, as a literal of the validated, upper-case value.
     let sent = sparql_of(&server.requests()[0]).unwrap();
     assert!(
-        sent.contains(&format!("?item wdt:P1278 \"{l}\" .")),
+        sent.contains(&format!("?leiSt ps:P1278 \"{l}\" ;")),
         "{sent}"
     );
     assert_eq!(
@@ -605,7 +605,7 @@ async fn lei_with_punctuation_is_compacted_never_passed_through() {
     s.wd.by_lei(&messy).await.unwrap();
     let sent = sparql_of(&server.requests()[0]).unwrap();
     assert!(
-        sent.contains(&format!("?item wdt:P1278 \"{l}\" .")),
+        sent.contains(&format!("?leiSt ps:P1278 \"{l}\" ;")),
         "{sent}"
     );
     assert!(!sent.contains(&messy));
