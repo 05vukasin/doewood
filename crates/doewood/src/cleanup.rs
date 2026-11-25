@@ -1,11 +1,13 @@
 //! The cache purge (ADR 0002 sections 2 and 5): the backend never returns an expired registry
 //! answer or icon, and this task deletes them, a minute after the start and then every hour.
-//! With a shared store every instance runs it; the delete is idempotent.
+//! With a shared store every instance runs it; the delete is idempotent. The same task
+//! refreshes the instance store's query planner statistics (`PRAGMA optimize`).
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use doewood_model::Backend;
+use doewood_store::Store;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -33,8 +35,20 @@ pub async fn purge(backend: &dyn Backend) -> u64 {
     }
 }
 
-/// Runs [`purge`] on whatever backend `backend` holds, until shutdown.
+/// Refreshes the instance store's planner statistics where they are stale.
+pub async fn optimize(store: &Arc<Store>) {
+    let store = Arc::clone(store);
+    match tokio::task::spawn_blocking(move || store.optimize()).await {
+        Ok(Ok(())) => debug!("instance store optimized"),
+        Ok(Err(e)) => warn!(error = %e, "PRAGMA optimize failed; retried at the next interval"),
+        Err(e) => warn!(error = %e, "PRAGMA optimize did not finish"),
+    }
+}
+
+/// Runs [`purge`] on whatever backend `backend` holds, and [`optimize`] on the instance
+/// store, until shutdown.
 pub fn start(
+    store: Arc<Store>,
     backend: watch::Receiver<Option<Arc<dyn Backend>>>,
     mut shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
@@ -50,6 +64,7 @@ pub fn start(
             if let Some(b) = current {
                 purge(b.as_ref()).await;
             }
+            optimize(&store).await;
         }
     })
 }
@@ -64,8 +79,8 @@ mod tests {
 
     #[tokio::test]
     async fn purges_expired_rows_and_stops_on_shutdown() {
-        let store = Store::open_in_memory(&MasterKey::from_bytes([9; 32])).unwrap();
-        let backend: Arc<dyn Backend> = Arc::new(Standalone::new(Arc::new(store)));
+        let store = Arc::new(Store::open_in_memory(&MasterKey::from_bytes([9; 32])).unwrap());
+        let backend: Arc<dyn Backend> = Arc::new(Standalone::new(Arc::clone(&store)));
         let row = |key: &str, expires_at| CacheRow {
             registry: "gleif".to_owned(),
             key: key.to_owned(),
@@ -84,7 +99,8 @@ mod tests {
 
         let (_backend_tx, backend_rx) = watch::channel(Some(backend));
         let (stop_tx, stop_rx) = watch::channel(false);
-        let task = start(backend_rx, stop_rx);
+        optimize(&store).await;
+        let task = start(store, backend_rx, stop_rx);
         stop_tx.send(true).unwrap();
         tokio::time::timeout(Duration::from_secs(5), task)
             .await

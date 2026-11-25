@@ -212,39 +212,47 @@ fn edge_from(r: EdgeRow) -> Result<StoredEdge> {
 
 fn upsert_node(conn: &Connection, kind: NodeKind, key: &str, props: &Value) -> Result<Uuid> {
     let id: String = conn
-        .query_row(
+        .prepare_cached(
             "INSERT INTO nodes (id, kind, key, props_json, created_at, updated_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?5) \
              ON CONFLICT (kind, key) DO UPDATE SET props_json = excluded.props_json, \
              updated_at = excluded.updated_at \
              RETURNING id",
-            params![
-                Uuid::now_v7().to_string(),
-                kind.as_str(),
-                key,
-                props.to_string(),
-                now()
-            ],
-            |r| r.get(0),
         )
+        .and_then(|mut cached| {
+            cached.query_row(
+                params![
+                    Uuid::now_v7().to_string(),
+                    kind.as_str(),
+                    key,
+                    props.to_string(),
+                    now()
+                ],
+                |r| r.get(0),
+            )
+        })
         .map_err(sql)?;
     uuid(&id)
 }
 
 /// Inserts the node if it is missing and leaves an existing one untouched.
 fn ensure_node(conn: &Connection, kind: NodeKind, key: &str) -> Result<Uuid> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO nodes (id, kind, key, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4) \
          ON CONFLICT (kind, key) DO NOTHING",
-        params![Uuid::now_v7().to_string(), kind.as_str(), key, now()],
     )
+    .and_then(|mut cached| {
+        cached.execute(params![
+            Uuid::now_v7().to_string(),
+            kind.as_str(),
+            key,
+            now()
+        ])
+    })
     .map_err(sql)?;
     let id: String = conn
-        .query_row(
-            "SELECT id FROM nodes WHERE kind = ?1 AND key = ?2",
-            params![kind.as_str(), key],
-            |r| r.get(0),
-        )
+        .prepare_cached("SELECT id FROM nodes WHERE kind = ?1 AND key = ?2")
+        .and_then(|mut cached| cached.query_row(params![kind.as_str(), key], |r| r.get(0)))
         .map_err(sql)?;
     uuid(&id)
 }
@@ -252,7 +260,7 @@ fn ensure_node(conn: &Connection, kind: NodeKind, key: &str) -> Result<Uuid> {
 fn upsert_edge(conn: &Connection, e: &Edge) -> Result<Uuid> {
     e.validate()?;
     let id: String = conn
-        .query_row(
+        .prepare_cached(
             "INSERT INTO edges (id, src, dst, kind, props_json, evidence_json, confidence, state, \
              valid_from, valid_to, source, created_at, updated_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12) \
@@ -262,22 +270,26 @@ fn upsert_edge(conn: &Connection, e: &Edge) -> Result<Uuid> {
              confidence = excluded.confidence, state = excluded.state, \
              valid_to = excluded.valid_to, updated_at = excluded.updated_at \
              RETURNING id",
-            params![
-                Uuid::now_v7().to_string(),
-                e.src.to_string(),
-                e.dst.to_string(),
-                e.kind.as_str(),
-                e.props.to_string(),
-                e.evidence.to_string(),
-                f64::from(e.confidence),
-                e.state.as_str(),
-                e.valid_from.map(julian),
-                e.valid_to.map(julian),
-                e.source.as_str(),
-                now()
-            ],
-            |r| r.get(0),
         )
+        .and_then(|mut cached| {
+            cached.query_row(
+                params![
+                    Uuid::now_v7().to_string(),
+                    e.src.to_string(),
+                    e.dst.to_string(),
+                    e.kind.as_str(),
+                    e.props.to_string(),
+                    e.evidence.to_string(),
+                    f64::from(e.confidence),
+                    e.state.as_str(),
+                    e.valid_from.map(julian),
+                    e.valid_to.map(julian),
+                    e.source.as_str(),
+                    now()
+                ],
+                |r| r.get(0),
+            )
+        })
         .map_err(sql)?;
     uuid(&id)
 }
@@ -295,11 +307,10 @@ fn update_props(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sql)?;
     let Some(row) = tx
-        .query_row(
-            &format!("SELECT {NODE_COLUMNS} FROM nodes n WHERE n.id = ?1"),
-            [id.to_string()],
-            |r| node_at(r, 0),
-        )
+        .prepare_cached(&format!(
+            "SELECT {NODE_COLUMNS} FROM nodes n WHERE n.id = ?1"
+        ))
+        .and_then(|mut cached| cached.query_row([id.to_string()], |r| node_at(r, 0)))
         .optional()
         .map_err(sql)?
     else {
@@ -317,11 +328,11 @@ fn update_props(
     patch.apply(&mut props);
     node.props = Value::Object(props);
     if node.props != before {
-        tx.execute(
-            "UPDATE nodes SET props_json = ?2, updated_at = ?3 WHERE id = ?1",
-            params![id.to_string(), node.props.to_string(), now()],
-        )
-        .map_err(sql)?;
+        tx.prepare_cached("UPDATE nodes SET props_json = ?2, updated_at = ?3 WHERE id = ?1")
+            .and_then(|mut cached| {
+                cached.execute(params![id.to_string(), node.props.to_string(), now()])
+            })
+            .map_err(sql)?;
     }
     tx.commit().map_err(sql)?;
     Ok(Some(node))
@@ -331,11 +342,8 @@ fn update_props(
 /// Called inside a write transaction, so no merge commits before the caller's write.
 pub(crate) fn check_live(conn: &Connection, id: Uuid) -> Result<bool> {
     let row: Option<Option<String>> = conn
-        .query_row(
-            "SELECT json_extract(props_json, '$.merged_into') FROM nodes WHERE id = ?1",
-            [id.to_string()],
-            |r| r.get(0),
-        )
+        .prepare_cached("SELECT json_extract(props_json, '$.merged_into') FROM nodes WHERE id = ?1")
+        .and_then(|mut cached| cached.query_row([id.to_string()], |r| r.get(0)))
         .optional()
         .map_err(sql)?;
     match row {
@@ -352,11 +360,10 @@ pub(crate) fn check_live(conn: &Connection, id: Uuid) -> Result<bool> {
 fn follow_merges(conn: &Connection, mut id: Uuid, hops: &mut usize) -> Result<Uuid> {
     loop {
         let next: Option<String> = conn
-            .query_row(
+            .prepare_cached(
                 "SELECT json_extract(props_json, '$.merged_into') FROM nodes WHERE id = ?1",
-                [id.to_string()],
-                |r| r.get(0),
             )
+            .and_then(|mut cached| cached.query_row([id.to_string()], |r| r.get(0)))
             .optional()
             .map_err(sql)?
             .flatten();
@@ -384,12 +391,15 @@ fn claim_row(key: &SourceKey, owner: &str, claimed_at: i64) -> Result<SourceClai
 }
 
 fn source_owner(conn: &Connection, key: &SourceKey) -> Result<Option<SourceClaim>> {
-    conn.query_row(
+    conn.prepare_cached(
         "SELECT owner, claimed_at FROM source_claims \
          WHERE endpoint = ?1 AND bucket = ?2 AND prefix = ?3",
-        params![key.endpoint(), key.bucket(), key.prefix()],
-        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
     )
+    .and_then(|mut cached| {
+        cached.query_row(params![key.endpoint(), key.bucket(), key.prefix()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })
+    })
     .optional()
     .map_err(sql)?
     .map(|(owner, at)| claim_row(key, &owner, at))
@@ -408,11 +418,10 @@ impl RecordStore for Standalone {
         self.run(move |conn| {
             let tx = conn.transaction().map_err(sql)?;
             let old: Option<(String, String)> = tx
-                .query_row(
-                    "SELECT body_json, versions_json FROM records WHERE blake3 = ?1",
-                    [h.as_bytes().as_slice()],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
+                .prepare_cached("SELECT body_json, versions_json FROM records WHERE blake3 = ?1")
+                .and_then(|mut cached| {
+                    cached.query_row([h.as_bytes().as_slice()], |r| Ok((r.get(0)?, r.get(1)?)))
+                })
                 .optional()
                 .map_err(sql)?;
             let outcome = match old {
@@ -422,18 +431,20 @@ impl RecordStore for Standalone {
                 Some(_) => PutOutcome::Updated,
                 None => PutOutcome::Inserted,
             };
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO records (blake3, body_json, versions_json, updated_at) \
                  VALUES (?1, ?2, ?3, ?4) \
                  ON CONFLICT (blake3) DO UPDATE SET body_json = excluded.body_json, \
                  versions_json = excluded.versions_json, updated_at = excluded.updated_at",
-                params![
+            )
+            .and_then(|mut cached| {
+                cached.execute(params![
                     h.as_bytes().as_slice(),
                     body.to_string(),
                     versions.to_string(),
                     now()
-                ],
-            )
+                ])
+            })
             .map_err(sql)?;
             tx.commit().map_err(sql)?;
             Ok(outcome)
@@ -445,11 +456,14 @@ impl RecordStore for Standalone {
         let h = *blake3;
         self.run(move |conn| {
             let row: Option<(String, String, i64)> = conn
-                .query_row(
+                .prepare_cached(
                     "SELECT body_json, versions_json, updated_at FROM records WHERE blake3 = ?1",
-                    [h.as_bytes().as_slice()],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
+                .and_then(|mut cached| {
+                    cached.query_row([h.as_bytes().as_slice()], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    })
+                })
                 .optional()
                 .map_err(sql)?;
             row.map(|(body, versions, updated_at)| {
@@ -620,11 +634,10 @@ impl GraphStore for Standalone {
 
     async fn node(&self, id: Uuid) -> Result<Option<Node>> {
         self.run(move |conn| {
-            conn.query_row(
-                &format!("SELECT {NODE_COLUMNS} FROM nodes n WHERE n.id = ?1"),
-                [id.to_string()],
-                |r| node_at(r, 0),
-            )
+            conn.prepare_cached(&format!(
+                "SELECT {NODE_COLUMNS} FROM nodes n WHERE n.id = ?1"
+            ))
+            .and_then(|mut cached| cached.query_row([id.to_string()], |r| node_at(r, 0)))
             .optional()
             .map_err(sql)?
             .map(node_from)
@@ -636,11 +649,10 @@ impl GraphStore for Standalone {
     async fn node_by_key(&self, kind: NodeKind, key: &str) -> Result<Option<Node>> {
         let key = key.to_owned();
         self.run(move |conn| {
-            conn.query_row(
-                &format!("SELECT {NODE_COLUMNS} FROM nodes n WHERE n.kind = ?1 AND n.key = ?2"),
-                params![kind.as_str(), key],
-                |r| node_at(r, 0),
-            )
+            conn.prepare_cached(&format!(
+                "SELECT {NODE_COLUMNS} FROM nodes n WHERE n.kind = ?1 AND n.key = ?2"
+            ))
+            .and_then(|mut cached| cached.query_row(params![kind.as_str(), key], |r| node_at(r, 0)))
             .optional()
             .map_err(sql)?
             .map(node_from)
@@ -775,12 +787,14 @@ impl GraphStore for Standalone {
                 "endpoint": at.endpoint, "bucket": at.bucket, "key": at.key,
             });
             let location = upsert_node(&tx, NodeKind::Location, &at.node_key(), &props)?;
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO locations (node_id, document_id, blake3, endpoint, bucket, \
                  object_key, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
                  ON CONFLICT (node_id) DO UPDATE SET document_id = excluded.document_id, \
                  blake3 = excluded.blake3, updated_at = excluded.updated_at",
-                params![
+            )
+            .and_then(|mut cached| {
+                cached.execute(params![
                     location.to_string(),
                     document.to_string(),
                     h.as_bytes().as_slice(),
@@ -788,14 +802,16 @@ impl GraphStore for Standalone {
                     at.bucket,
                     at.key,
                     now()
-                ],
-            )
+                ])
+            })
             .map_err(sql)?;
-            tx.execute(
+            tx.prepare_cached(
                 "UPDATE edges SET state = 'superseded', updated_at = ?3 \
                  WHERE dst = ?1 AND kind = 'located_at' AND src <> ?2 AND state = 'active'",
-                params![location.to_string(), document.to_string(), now()],
             )
+            .and_then(|mut cached| {
+                cached.execute(params![location.to_string(), document.to_string(), now()])
+            })
             .map_err(sql)?;
             upsert_edge(
                 &tx,
@@ -812,35 +828,38 @@ impl GraphStore for Standalone {
         self.run(move |conn| {
             let tx = conn.transaction().map_err(sql)?;
             let row: Option<(String, String)> = tx
-                .query_row(
+                .prepare_cached(
                     "SELECT node_id, document_id FROM locations \
                      WHERE endpoint = ?1 AND bucket = ?2 AND object_key = ?3",
-                    params![at.endpoint, at.bucket, at.key],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
+                .and_then(|mut cached| {
+                    cached.query_row(params![at.endpoint, at.bucket, at.key], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })
+                })
                 .optional()
                 .map_err(sql)?;
             let Some((location, document)) = row else {
                 return Ok(None);
             };
-            tx.execute(
+            tx.prepare_cached(
                 "UPDATE edges SET state = 'superseded', \
                  valid_to = CASE WHEN valid_from IS NULL OR valid_from <= ?2 THEN ?2 \
                  ELSE valid_from END, updated_at = ?3 \
                  WHERE dst = ?1 AND kind = 'located_at' \
                  AND state NOT IN ('retracted', 'superseded')",
-                params![location, julian(on), now()],
             )
+            .and_then(|mut cached| cached.execute(params![location, julian(on), now()]))
             .map_err(sql)?;
-            tx.execute("DELETE FROM locations WHERE node_id = ?1", [&location])
+            tx.prepare_cached("DELETE FROM locations WHERE node_id = ?1")
+                .and_then(|mut cached| cached.execute([&location]))
                 .map_err(sql)?;
             let remaining: i64 = tx
-                .query_row(
+                .prepare_cached(
                     "SELECT count(*) FROM edges WHERE src = ?1 AND kind = 'located_at' \
                      AND state NOT IN ('retracted', 'superseded')",
-                    [&document],
-                    |r| r.get(0),
                 )
+                .and_then(|mut cached| cached.query_row([&document], |r| r.get(0)))
                 .map_err(sql)?;
             tx.commit().map_err(sql)?;
             Ok(Some(LocationEnded {
@@ -863,14 +882,18 @@ impl GraphStore for Standalone {
         let (alias, props) = (alias.to_owned(), props.to_string());
         self.run(move |conn| {
             let (node, props): (Option<String>, String) = conn
-                .query_row(
+                .prepare_cached(
                     "INSERT INTO node_aliases (kind, alias, node_id, props_json, created_at, \
                      updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5) \
                      ON CONFLICT (kind, alias) DO UPDATE SET kind = node_aliases.kind \
                      RETURNING node_id, props_json",
-                    params![kind.as_str(), alias, node.to_string(), props, now()],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
+                .and_then(|mut cached| {
+                    cached.query_row(
+                        params![kind.as_str(), alias, node.to_string(), props, now()],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                })
                 .map_err(sql)?;
             Ok(NodeAlias {
                 node: node.as_deref().map(uuid).transpose()?,
@@ -897,14 +920,18 @@ impl GraphStore for Standalone {
             // A missing node: the insert below fails as `claim_alias` does.
             check_live(&tx, node)?;
             let (owner, props): (Option<String>, String) = tx
-                .query_row(
+                .prepare_cached(
                     "INSERT INTO node_aliases (kind, alias, node_id, props_json, created_at, \
                      updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5) \
                      ON CONFLICT (kind, alias) DO UPDATE SET kind = node_aliases.kind \
                      RETURNING node_id, props_json",
-                    params![kind.as_str(), alias, node.to_string(), props, now()],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
+                .and_then(|mut cached| {
+                    cached.query_row(
+                        params![kind.as_str(), alias, node.to_string(), props, now()],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                })
                 .map_err(sql)?;
             tx.commit().map_err(sql)?;
             Ok(NodeAlias {
@@ -919,11 +946,14 @@ impl GraphStore for Standalone {
         let alias = alias.to_owned();
         self.run(move |conn| {
             let row: Option<(Option<String>, String)> = conn
-                .query_row(
+                .prepare_cached(
                     "SELECT node_id, props_json FROM node_aliases WHERE kind = ?1 AND alias = ?2",
-                    params![kind.as_str(), alias],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
+                .and_then(|mut cached| {
+                    cached.query_row(params![kind.as_str(), alias], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })
+                })
                 .optional()
                 .map_err(sql)?;
             row.map(|(node, props)| {
@@ -941,13 +971,13 @@ impl GraphStore for Standalone {
         validate_alias(alias, props)?;
         let (alias, props) = (alias.to_owned(), props.to_string());
         self.run(move |conn| {
-            conn.execute(
+            conn.prepare_cached(
                 "INSERT INTO node_aliases (kind, alias, node_id, props_json, created_at, \
                  updated_at) VALUES (?1, ?2, NULL, ?3, ?4, ?4) \
                  ON CONFLICT (kind, alias) DO UPDATE SET node_id = NULL, \
                  props_json = excluded.props_json, updated_at = excluded.updated_at",
-                params![kind.as_str(), alias, props, now()],
             )
+            .and_then(|mut cached| cached.execute(params![kind.as_str(), alias, props, now()]))
             .map_err(sql)?;
             Ok(())
         })
@@ -970,12 +1000,12 @@ impl SketchStore for Standalone {
             let key = h.as_bytes().as_slice();
             // Issue #74: an unchanged sketch writes nothing. The signature row is updated
             // only when it differs, and only the bands that changed are deleted or inserted.
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO sketches (blake3, signature, updated_at) VALUES (?1, ?2, ?3) \
                  ON CONFLICT (blake3) DO UPDATE SET signature = excluded.signature, \
                  updated_at = excluded.updated_at WHERE signature IS NOT excluded.signature",
-                params![key, signature, now()],
             )
+            .and_then(|mut cached| cached.execute(params![key, signature, now()]))
             .map_err(sql)?;
             let stored: BTreeSet<i64> = {
                 let mut stmt = tx
@@ -1069,17 +1099,19 @@ impl ClaimStore for Standalone {
                 };
             }
             let at = now();
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO source_claims (endpoint, bucket, prefix, owner, claimed_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
+            )
+            .and_then(|mut cached| {
+                cached.execute(params![
                     key.endpoint(),
                     key.bucket(),
                     key.prefix(),
                     owner.as_str(),
                     at
-                ],
-            )
+                ])
+            })
             .map_err(sql)?;
             tx.commit().map_err(sql)?;
             claim_row(&key, owner.as_str(), at)
@@ -1098,11 +1130,13 @@ impl ClaimStore for Standalone {
                     owner: claim.owner,
                 }),
                 Some(_) => {
-                    tx.execute(
+                    tx.prepare_cached(
                         "DELETE FROM source_claims \
                          WHERE endpoint = ?1 AND bucket = ?2 AND prefix = ?3",
-                        params![key.endpoint(), key.bucket(), key.prefix()],
                     )
+                    .and_then(|mut cached| {
+                        cached.execute(params![key.endpoint(), key.bucket(), key.prefix()])
+                    })
                     .map_err(sql)?;
                     tx.commit().map_err(sql)?;
                     Ok(true)
@@ -1128,7 +1162,7 @@ impl ClaimStore for Standalone {
             let at = now();
             let expires = at.saturating_add(i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX));
             let won: Option<String> = conn
-                .query_row(
+                .prepare_cached(
                     "INSERT INTO company_leases (company_id, owner, leased_at, expires_at) \
                      VALUES (?1, ?2, ?3, ?4) \
                      ON CONFLICT (company_id) DO UPDATE SET owner = excluded.owner, \
@@ -1136,9 +1170,13 @@ impl ClaimStore for Standalone {
                      WHERE company_leases.owner = excluded.owner \
                      OR company_leases.expires_at <= excluded.leased_at \
                      RETURNING owner",
-                    params![company.to_string(), owner.as_str(), at, expires],
-                    |r| r.get(0),
                 )
+                .and_then(|mut cached| {
+                    cached.query_row(
+                        params![company.to_string(), owner.as_str(), at, expires],
+                        |r| r.get(0),
+                    )
+                })
                 .optional()
                 .map_err(sql)?;
             Ok(won.is_some())
@@ -1150,10 +1188,8 @@ impl ClaimStore for Standalone {
         let owner = owner.clone();
         self.run(move |conn| {
             let n = conn
-                .execute(
-                    "DELETE FROM company_leases WHERE company_id = ?1 AND owner = ?2",
-                    params![company.to_string(), owner.as_str()],
-                )
+                .prepare_cached("DELETE FROM company_leases WHERE company_id = ?1 AND owner = ?2")
+                .and_then(|mut cached| cached.execute(params![company.to_string(), owner.as_str()]))
                 .map_err(sql)?;
             Ok(n > 0)
         })
@@ -1166,7 +1202,7 @@ impl SearchStore for Standalone {
     async fn index_document(&self, doc: &SearchDoc) -> Result<()> {
         let doc = doc.clone();
         self.run(move |conn| {
-            conn.execute(
+            conn.prepare_cached(
                 "INSERT INTO search_index (blake3, title, body, kind, doc_date, amount, \
                  indexed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
                  ON CONFLICT (blake3) DO UPDATE SET title = excluded.title, \
@@ -1175,7 +1211,9 @@ impl SearchStore for Standalone {
                  WHERE title IS NOT excluded.title OR body IS NOT excluded.body \
                  OR kind IS NOT excluded.kind OR doc_date IS NOT excluded.doc_date \
                  OR amount IS NOT excluded.amount",
-                params![
+            )
+            .and_then(|mut cached| {
+                cached.execute(params![
                     doc.blake3.as_bytes().as_slice(),
                     doc.title,
                     doc.body,
@@ -1183,8 +1221,8 @@ impl SearchStore for Standalone {
                     doc.date.map(julian),
                     doc.amount,
                     now()
-                ],
-            )
+                ])
+            })
             .map_err(sql)?;
             Ok(())
         })
@@ -1303,8 +1341,12 @@ impl Backend for Standalone {
     }
 
     async fn ping(&self) -> Result<()> {
-        self.run(|conn| conn.query_row("SELECT 1", [], |_| Ok(())).map_err(sql))
-            .await
+        self.run(|conn| {
+            conn.prepare_cached("SELECT 1")
+                .and_then(|mut cached| cached.query_row([], |_| Ok(())))
+                .map_err(sql)
+        })
+        .await
     }
 }
 
@@ -1317,6 +1359,172 @@ mod tests {
     fn backend() -> Standalone {
         let store = Store::open_in_memory(&MasterKey::from_bytes([1; 32])).unwrap();
         Standalone::new(Arc::new(store))
+    }
+
+    /// Ingest's statements on a warm connection are statement cache hits: each is prepared
+    /// once, then reused. A statement's run counter (`SQLITE_STMTSTATUS_RUN`) starts at 0
+    /// when it is prepared and counts every reuse, so a run that starts at 0 is a prepare.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn hot_statements_are_prepared_once() {
+        use std::collections::BTreeMap;
+        use std::sync::Mutex;
+
+        use rusqlite::StatementStatus;
+        use rusqlite::trace::{TraceEvent, TraceEventCodes};
+
+        use crate::{IngestOutcome, NewSource, ObjectChange, SeenObject};
+
+        let store = Arc::new(Store::open_in_memory(&MasterKey::from_bytes([1; 32])).unwrap());
+        let backend = Standalone::new(Arc::clone(&store));
+        let source = store
+            .add_source(&NewSource::new("http://objects.test:9000", "docs"), None)
+            .unwrap();
+        // SQL text -> (runs, prepares).
+        let seen: Arc<Mutex<BTreeMap<String, (u32, u32)>>> = Arc::default();
+        {
+            let seen = Arc::clone(&seen);
+            store
+                .raw()
+                .trace_v2(
+                    TraceEventCodes::SQLITE_TRACE_STMT,
+                    Some(move |e: TraceEvent<'_>| {
+                        if let TraceEvent::Stmt(stmt, text) = e {
+                            // Trigger programs report themselves as `-- TRIGGER name`.
+                            if text.starts_with("--") {
+                                return;
+                            }
+                            let mut seen = seen.lock().unwrap();
+                            let entry = seen.entry(stmt.sql().into_owned()).or_default();
+                            entry.0 += 1;
+                            if stmt.get_status(StatementStatus::Run) == 0 {
+                                entry.1 += 1;
+                            }
+                        }
+                    }),
+                )
+                .unwrap();
+        }
+        let rounds = 20u8;
+        for i in 0..rounds {
+            let key = format!("docs/{i}.pdf");
+            let hash = Blake3([i; 32]);
+            store
+                .record_objects(
+                    source,
+                    &[ObjectChange::Upsert(SeenObject {
+                        key: key.clone(),
+                        etag: Some("e".into()),
+                        size: 1,
+                        last_modified: None,
+                    })],
+                    None,
+                )
+                .unwrap();
+            store.pending_objects(source, None, 64).unwrap();
+            store.source(source).unwrap();
+            store.ingest_status(source, &key).unwrap();
+            backend
+                .put_record(&hash, &serde_json::json!({ "i": i }), &BTreeMap::new())
+                .await
+                .unwrap();
+            let doc = backend
+                .upsert_node(NodeKind::Document, &hash.to_hex(), &serde_json::json!({}))
+                .await
+                .unwrap();
+            let at = ObjectLocation {
+                endpoint: "http://objects.test:9000".into(),
+                bucket: "docs".into(),
+                key: key.clone(),
+            };
+            backend.upsert_location(&hash, &at).await.unwrap();
+            let company = backend
+                .ensure_node(NodeKind::Company, &format!("pib:{i}"))
+                .await
+                .unwrap();
+            backend
+                .claim_alias(
+                    NodeKind::Company,
+                    &format!("pib:{i}"),
+                    company,
+                    &serde_json::json!({}),
+                )
+                .await
+                .unwrap();
+            backend
+                .alias(NodeKind::Company, &format!("pib:{i}"))
+                .await
+                .unwrap();
+            backend
+                .upsert_edge(&Edge::new(
+                    doc,
+                    company,
+                    EdgeKind::ParentOf,
+                    EdgeSource::Registry,
+                ))
+                .await
+                .unwrap();
+            backend.node(doc).await.unwrap();
+            backend
+                .node_by_key(NodeKind::Document, &hash.to_hex())
+                .await
+                .unwrap();
+            backend
+                .index_document(&SearchDoc {
+                    blake3: hash,
+                    title: format!("t{i}"),
+                    body: "b".into(),
+                    kind: None,
+                    date: None,
+                    amount: None,
+                })
+                .await
+                .unwrap();
+            assert!(
+                store
+                    .finish_object(
+                        source,
+                        &key,
+                        Some("e"),
+                        &IngestOutcome::Done { blake3: hash.0 }
+                    )
+                    .unwrap()
+            );
+            // What a progress snapshot reads.
+            store.sources().unwrap();
+            store.object_counts(source).unwrap();
+            store.scan_checkpoint(source).unwrap();
+            store.llm_counts(source).unwrap();
+            store.llm_usage(source, 0).unwrap();
+        }
+        let seen = seen.lock().unwrap();
+        let (runs, prepares) = seen
+            .iter()
+            .filter(|(sql, _)| !sql.starts_with("BEGIN") && sql.as_str() != "COMMIT")
+            .fold((0, 0), |(r, p), (_, (runs, prep))| (r + runs, p + prep));
+        println!(
+            "{} statements, {runs} runs, {prepares} prepares: {:.1}% cache hits \
+             (BEGIN and COMMIT left out)",
+            seen.len(),
+            f64::from(runs - prepares) * 100.0 / f64::from(runs)
+        );
+        // Transactions begin and end through `execute_batch`, which has no cache.
+        let again: Vec<_> = seen
+            .iter()
+            .filter(|(sql, (runs, prepares))| {
+                *runs >= u32::from(rounds)
+                    && *prepares > 1
+                    && !matches!(
+                        sql.as_str(),
+                        "BEGIN DEFERRED" | "BEGIN IMMEDIATE" | "COMMIT"
+                    )
+            })
+            .collect();
+        assert!(again.is_empty(), "prepared more than once: {again:#?}");
+        assert!(
+            seen.len() <= crate::store::STATEMENT_CACHE,
+            "fits the cache"
+        );
     }
 
     #[tokio::test]

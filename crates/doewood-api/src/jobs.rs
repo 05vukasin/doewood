@@ -49,15 +49,10 @@ impl JobsService for Api {
         for id in &ids {
             self.state.source(*id).await?;
         }
-        let parts = self.state.parts();
-        let discovery = parts.discovery.clone();
         let watch = Watch {
-            store: Arc::clone(&parts.store),
-            progress: Arc::clone(&parts.progress),
-            running: Arc::new(move |id| discovery.as_ref().is_some_and(|d| d.is_running(id))),
+            snapshots: Arc::clone(self.state.snapshots()),
             only: ids,
-            interval: parts.options.progress_interval,
-            shutdown: parts.shutdown.clone(),
+            shutdown: self.state.shutdown(),
         };
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(watch.run(tx));

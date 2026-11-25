@@ -161,7 +161,10 @@ It ends when the client cancels or the server shuts down, or when its connection
 maximum age (at most 35 minutes, see [Limits](#limits)). `source_ids` narrows it; empty
 watches every source, including ones added later. A client watches again when the stream
 ends with an error (for example a transport error when the connection closed): the first message of the new
-stream is a full snapshot, so nothing is lost. `WatchReprocess` behaves the same way.
+stream is a full snapshot, so nothing is lost. `WatchReprocess` behaves the same way. The server
+takes one snapshot of every source for all open streams together (at most every 100 ms while
+something changes, and every second otherwise), and each stream sends what changed for its
+sources; the store's per-status counters make a snapshot cheap however many objects a source holds.
 
 A watch of every source (empty `source_ids`) also carries the instance's enrichment job: a
 `KIND_ENRICHMENT` update with the first snapshot and whenever its counters change, with
