@@ -3,6 +3,7 @@
 //!
 //! Every write is an idempotent upsert: repeating it leaves the store as it was.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -34,6 +35,17 @@ pub trait RecordStore: Send + Sync {
 
     /// The record, if stored.
     async fn get_record(&self, blake3: &Blake3) -> Result<Option<Record>>;
+
+    /// The step versions of the stored records among `hashes`, without their bodies (issue
+    /// #75: reprocess compares versions only). Hashes with no record are missing from the
+    /// map. At most [`crate::RECORDS_MAX_LIMIT`] hashes per call.
+    async fn record_versions(&self, hashes: &[Blake3]) -> Result<BTreeMap<Blake3, StepVersions>>;
+
+    /// The text values of the facts named `key` in the stored records among `hashes`: one
+    /// entry per fact of the record's `facts` array whose `key` is `key` and whose
+    /// `value.v` is a string, in no particular order. Only those values are read, not the
+    /// bodies (issue #75). At most [`crate::RECORDS_MAX_LIMIT`] hashes per call.
+    async fn fact_texts(&self, hashes: &[Blake3], key: &str) -> Result<Vec<(Blake3, String)>>;
 
     /// One page of the records that have a location in `source` (its endpoint and bucket, a
     /// key under its prefix), ordered by hash. A page starts after the hash `after`, and holds
@@ -96,6 +108,14 @@ pub trait GraphStore: Send + Sync {
 
     /// The documents with a live `party` edge to the company, ordered by key.
     async fn company_documents(&self, company: Uuid) -> Result<Vec<Node>>;
+
+    /// The first `limit` of [`GraphStore::company_documents`], in the same order (issue #75:
+    /// internal callers that read a bounded sample).
+    async fn company_documents_first(&self, company: Uuid, limit: u32) -> Result<Vec<Node>>;
+
+    /// How many documents [`GraphStore::company_documents`] returns, counted without loading
+    /// them (issue #75).
+    async fn company_document_count(&self, company: Uuid) -> Result<u64>;
 
     /// Records that a document lives at a location, in one transaction: upserts the Document
     /// and Location nodes and the `located_at` edge, and supersedes any `located_at` edge from

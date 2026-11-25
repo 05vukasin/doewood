@@ -102,6 +102,99 @@ pub async fn records<B: Backend + ?Sized>(s: &B) {
     );
     let got = s.get_record(&h).await.unwrap().expect("stored");
     assert_eq!((got.body, got.versions), (body2, versions("1.1")));
+    record_versions(s).await;
+    fact_texts(s).await;
+}
+
+/// Versions of many records in one call (issue #75): missing hashes are left out.
+async fn record_versions<B: Backend + ?Sized>(s: &B) {
+    let (a, b, missing) = (hash(2), hash(3), hash(4));
+    let two = StepVersions::from([
+        ("quail".to_owned(), "2.0".to_owned()),
+        ("hedgehog".to_owned(), "0.3".to_owned()),
+    ]);
+    s.put_record(&a, &json!({"n": 2}), &versions("1.0"))
+        .await
+        .unwrap();
+    s.put_record(&b, &json!({"n": 3}), &two).await.unwrap();
+    let got = s.record_versions(&[a, missing, b, a]).await.unwrap();
+    assert_eq!(
+        got.into_iter().collect::<Vec<_>>(),
+        [(a, versions("1.0")), (b, two)]
+    );
+    assert!(s.record_versions(&[]).await.unwrap().is_empty());
+    assert!(s.record_versions(&[missing]).await.unwrap().is_empty());
+    let too_many = vec![a; crate::RECORDS_MAX_LIMIT as usize + 1];
+    assert!(matches!(
+        s.record_versions(&too_many).await,
+        Err(Error::Invalid(_))
+    ));
+}
+
+/// The text values of one fact key in many records (issue #75), the same values a reader of
+/// the full bodies finds: only string values of matching facts in a `facts` array.
+async fn fact_texts<B: Backend + ?Sized>(s: &B) {
+    let key = "signal.email_domain";
+    let (many, one, flat, blob, missing) = (hash(5), hash(6), hash(7), hash(8), hash(9));
+    let fact = |k: &str, v: serde_json::Value| json!({"key": k, "value": v, "conf": 0.9});
+    s.put_record(
+        &many,
+        &json!({"facts": [
+            fact(key, json!({"t": "text", "v": "Acme.example"})),
+            fact(key, json!({"t": "text", "v": "acme.example"})),
+            fact("signal.phone", json!({"t": "text", "v": "+381"})),
+            fact(key, json!({"t": "number", "v": 12})),
+            fact(key, json!("bare")),
+            "not an object",
+            {"value": {"v": "no key"}},
+            {"key": 7, "value": {"v": "number key"}},
+        ]}),
+        &versions("1"),
+    )
+    .await
+    .unwrap();
+    s.put_record(
+        &one,
+        &json!({"facts": [fact(key, json!({"t": "text", "v": " b.example "}))]}),
+        &versions("1"),
+    )
+    .await
+    .unwrap();
+    // `facts` that is not an array has no facts.
+    s.put_record(
+        &flat,
+        &json!({"facts": fact(key, json!({"v": "c.example"}))}),
+        &versions("1"),
+    )
+    .await
+    .unwrap();
+    s.put_record(&blob, &json!({"kind": "blob"}), &versions("1"))
+        .await
+        .unwrap();
+    let mut got = s
+        .fact_texts(&[many, one, flat, blob, missing], key)
+        .await
+        .unwrap();
+    got.sort();
+    assert_eq!(
+        got,
+        [
+            (many, "Acme.example".to_owned()),
+            (many, "acme.example".to_owned()),
+            (one, " b.example ".to_owned()),
+        ]
+    );
+    assert_eq!(
+        s.fact_texts(&[many], "signal.phone").await.unwrap(),
+        [(many, "+381".to_owned())]
+    );
+    assert!(s.fact_texts(&[], key).await.unwrap().is_empty());
+    assert!(s.fact_texts(&[many], "signal").await.unwrap().is_empty());
+    assert!(matches!(
+        s.fact_texts(&vec![many; crate::RECORDS_MAX_LIMIT as usize + 1], key)
+            .await,
+        Err(Error::Invalid(_))
+    ));
 }
 
 /// Nodes and edges: idempotent upserts, lookups, party edges and company → documents.
@@ -229,12 +322,29 @@ pub async fn graph<B: Backend + ?Sized>(s: &B) {
             .collect::<Vec<_>>(),
         expected
     );
+    // Two party edges from one document count it once (issue #75).
+    s.upsert_edge(
+        &Edge::new(d1, acme, EdgeKind::Party, EdgeSource::Document)
+            .with_props(json!({"role": "payer"}))
+            .valid(Some(day(2024, 1, 1)), None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(s.company_documents(acme).await.unwrap(), docs);
+    assert_eq!(s.company_document_count(acme).await.unwrap(), 2);
+    assert_eq!(s.company_documents_first(acme, 5).await.unwrap(), docs);
+    assert_eq!(s.company_documents_first(acme, 1).await.unwrap(), docs[..1]);
+    assert!(s.company_documents_first(acme, 0).await.unwrap().is_empty());
+    assert_eq!(s.company_document_count(d1).await.unwrap(), 0);
+    assert_eq!(s.company_document_count(Uuid::now_v7()).await.unwrap(), 0);
     // A retracted party no longer counts.
     s.upsert_edge(&supplier.clone().with_state(EdgeState::Retracted))
         .await
         .unwrap();
     let docs = s.company_documents(acme).await.unwrap();
     assert_eq!(docs.iter().map(|n| n.id).collect::<Vec<_>>(), [d1]);
+    assert_eq!(s.company_document_count(acme).await.unwrap(), 1);
+    assert_eq!(s.company_documents_first(acme, 5).await.unwrap(), docs);
 
     // Edges need both nodes, and valid values.
     assert!(
@@ -755,6 +865,30 @@ pub async fn sketches<B: Backend + ?Sized>(s: &B) {
             .unwrap()
             .is_empty()
     );
+    // Writing the same sketch again changes nothing (issue #74).
+    let before = s
+        .sketch_candidates(&[10, 11, 99, big], &hash(54), 0)
+        .await
+        .unwrap();
+    s.put_sketch(&hash(51), &[1, 2, 3], &[big, 10, 11, 10])
+        .await
+        .unwrap();
+    assert_eq!(
+        s.sketch_candidates(&[10, 11, 99, big], &hash(54), 0)
+            .await
+            .unwrap(),
+        before
+    );
+    // The same signature with other bands still replaces the bands.
+    s.put_sketch(&hash(52), &[4, 5], &[99, 98]).await.unwrap();
+    let got = s.sketch_candidates(&[10, 98], &hash(54), 0).await.unwrap();
+    assert_eq!(
+        got.iter()
+            .map(|c| (c.blake3, c.shared_bands))
+            .collect::<Vec<_>>(),
+        [(hash(51), 1), (hash(52), 1)]
+    );
+    s.put_sketch(&hash(52), &[4, 5], &[10, 99]).await.unwrap();
     // Replacing a sketch replaces its bands.
     s.put_sketch(&hash(51), &[9], &[77]).await.unwrap();
     let got = s.sketch_candidates(&[11], &hash(54), 0).await.unwrap();
@@ -1318,6 +1452,30 @@ pub async fn search<B: Backend + ?Sized>(s: &B) {
     .unwrap();
     assert_eq!(find(text("invoice")).await, [d3]);
     assert_eq!(find(text("credit")).await, [d1]);
+    // The same document again changes nothing (issue #74), and a change of one field alone,
+    // from no value to a value, is written.
+    let credit = SearchDoc {
+        blake3: d1,
+        title: "Credit note 42".to_owned(),
+        body: "Consulting services for ACME".to_owned(),
+        kind: Some("credit_note".to_owned()),
+        date: Some(day(2024, 3, 1)),
+        amount: None,
+    };
+    s.index_document(&credit).await.unwrap();
+    assert_eq!(find(text("credit")).await, [d1]);
+    s.index_document(&SearchDoc {
+        amount: Some(-5.0),
+        ..credit.clone()
+    })
+    .await
+    .unwrap();
+    let negative = SearchQuery {
+        amount_max: Some(0.0),
+        ..SearchQuery::default()
+    };
+    assert_eq!(find(negative).await, [d1]);
+    s.index_document(&credit).await.unwrap();
     let amounts = SearchQuery {
         amount_min: Some(0.0),
         ..SearchQuery::default()

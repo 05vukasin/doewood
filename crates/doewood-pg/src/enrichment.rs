@@ -19,7 +19,7 @@ use crate::backend::{bad, client, lock_live, pg};
 use crate::cached::Cached;
 
 /// A company's document count: documents with a live `party` edge to `n.id`.
-const DOCUMENTS: &str = "(SELECT count(DISTINCT e.src) FROM edges e JOIN nodes d ON d.id = e.src \
+pub(crate) const DOCUMENTS: &str = "(SELECT count(DISTINCT e.src) FROM edges e JOIN nodes d ON d.id = e.src \
      WHERE e.dst = n.id AND e.kind = 'party' AND d.kind = 'document' \
      AND e.state NOT IN ('retracted', 'superseded'))";
 

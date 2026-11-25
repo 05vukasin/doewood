@@ -1,5 +1,6 @@
 //! The store traits over Postgres. Every write is an `INSERT ... ON CONFLICT` upsert.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::time::Duration;
 
@@ -12,8 +13,8 @@ use doewood_model::{
     NodeKind, ObjectLocation, OwnedAlias, PropsPatch, PutOutcome, Record, RecordStore, Result,
     SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore, Sketch, SketchStore,
     SourceClaim, SourceKey, StepVersions, StoredEdge, band_to_i64, merged_into, records_limit,
-    sketch_limit, validate_alias, validate_node, validate_sketch, versions_from_json,
-    versions_to_json,
+    sketch_limit, validate_alias, validate_hashes, validate_node, validate_sketch,
+    versions_from_json, versions_to_json,
 };
 use serde_json::Value;
 use time::Date;
@@ -24,6 +25,27 @@ use uuid::Uuid;
 
 use crate::PgStore;
 use crate::cached::Cached;
+use crate::enrichment::DOCUMENTS;
+
+/// The documents sharing the most bands of `$1`, other than `$2`, at most `$3` (issue #74).
+/// The bands are counted and limited on `sketch_bands` alone (an index-only scan of its
+/// primary key); only the survivors' signatures are read. `count(*)` is the number of shared
+/// bands because `(band, blake3)` is the primary key, and every band row has its sketch (a
+/// foreign key), so the join drops nothing.
+pub(crate) const SKETCH_CANDIDATES: &str = "SELECT c.blake3, s.signature, c.shared \
+     FROM (SELECT blake3, count(*) AS shared FROM sketch_bands \
+     WHERE band = ANY($1) AND blake3 <> $2 \
+     GROUP BY blake3 ORDER BY shared DESC, blake3 LIMIT $3) c \
+     JOIN sketches s ON s.blake3 = c.blake3 ORDER BY c.shared DESC, c.blake3";
+
+/// The `value.v` strings of the facts named `$2` in the records `$1` (`RecordStore::fact_texts`).
+/// A `facts` that is not an array has no facts; a fact that is not an object, or whose key or
+/// `value.v` is not a string, is left out.
+const FACT_TEXTS: &str = "SELECT r.blake3, f->'value'->>'v' FROM records r \
+     CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(r.record->'facts') = 'array' \
+     THEN r.record->'facts' ELSE '[]'::jsonb END) f \
+     WHERE r.blake3 = ANY($1) AND f->'key' = to_jsonb($2::text) \
+     AND jsonb_typeof(f->'value'->'v') = 'string'";
 
 /// One page of a source's records: `$1` endpoint, `$2` bucket, `$3` prefix, `$4` the hash the
 /// page starts after (or NULL), `$5` the page size. The `after` bound is repeated inside the
@@ -411,6 +433,47 @@ impl RecordStore for PgStore {
         .transpose()
     }
 
+    async fn record_versions(&self, hashes: &[Blake3]) -> Result<BTreeMap<Blake3, StepVersions>> {
+        validate_hashes(hashes)?;
+        if hashes.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let keys: Vec<&[u8]> = hashes.iter().map(|h| h.as_bytes().as_slice()).collect();
+        let c = client(&self.pool).await?;
+        c.rows(
+            "SELECT blake3, versions FROM records WHERE blake3 = ANY($1)",
+            &[&keys],
+        )
+        .await?
+        .iter()
+        .map(|r| {
+            Ok((
+                Blake3::from_slice(r.try_get::<_, &[u8]>(0).map_err(pg)?)?,
+                versions_from_json(&r.try_get::<_, Value>(1).map_err(pg)?)?,
+            ))
+        })
+        .collect()
+    }
+
+    async fn fact_texts(&self, hashes: &[Blake3], key: &str) -> Result<Vec<(Blake3, String)>> {
+        validate_hashes(hashes)?;
+        if hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys: Vec<&[u8]> = hashes.iter().map(|h| h.as_bytes().as_slice()).collect();
+        let c = client(&self.pool).await?;
+        c.rows(FACT_TEXTS, &[&keys, &key])
+            .await?
+            .iter()
+            .map(|r| {
+                Ok((
+                    Blake3::from_slice(r.try_get::<_, &[u8]>(0).map_err(pg)?)?,
+                    r.try_get(1).map_err(pg)?,
+                ))
+            })
+            .collect()
+    }
+
     async fn list_records(
         &self,
         source: &SourceKey,
@@ -560,6 +623,39 @@ impl GraphStore for PgStore {
             )
             .await?;
         rows.iter().map(|r| node_at(r, 0)).collect()
+    }
+
+    async fn company_documents_first(&self, company: Uuid, limit: u32) -> Result<Vec<Node>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let c = client(&self.pool).await?;
+        let rows = c
+            .rows(
+                &format!(
+                    "SELECT {NODE_COLUMNS} FROM (SELECT DISTINCT n.id, n.key COLLATE \"C\" AS sort_key \
+                     FROM edges e JOIN nodes n ON n.id = e.src \
+                     WHERE e.dst = $1 AND e.kind = 'party' AND n.kind = 'document' \
+                     AND e.state NOT IN ('retracted', 'superseded') \
+                     ORDER BY sort_key LIMIT $2) t JOIN nodes n ON n.id = t.id ORDER BY t.sort_key"
+                ),
+                &[&company, &i64::from(limit)],
+            )
+            .await?;
+        rows.iter().map(|r| node_at(r, 0)).collect()
+    }
+
+    async fn company_document_count(&self, company: Uuid) -> Result<u64> {
+        let c = client(&self.pool).await?;
+        let n: i64 = c
+            .one(
+                &format!("SELECT {DOCUMENTS} FROM (SELECT $1::uuid AS id) n"),
+                &[&company],
+            )
+            .await?
+            .try_get(0)
+            .map_err(pg)?;
+        Ok(u64::try_from(n).unwrap_or(0))
     }
 
     async fn upsert_location(&self, blake3: &Blake3, at: &ObjectLocation) -> Result<Located> {
@@ -736,18 +832,24 @@ impl SketchStore for PgStore {
         let bands: Vec<i64> = bands.iter().map(|b| band_to_i64(*b)).collect();
         let mut c = client(&self.pool).await?;
         let tx = c.transaction().await.map_err(pg)?;
+        // Issue #74: an unchanged sketch writes nothing. The signature row is updated only
+        // when it differs, and only the bands that changed are deleted or inserted.
         tx.exec(
             "INSERT INTO sketches (blake3, signature) VALUES ($1, $2) \
              ON CONFLICT (blake3) DO UPDATE SET signature = EXCLUDED.signature, \
-             updated_at = now()",
+             updated_at = now() WHERE sketches.signature IS DISTINCT FROM EXCLUDED.signature",
             &[&key, &signature],
         )
         .await?;
-        tx.exec("DELETE FROM sketch_bands WHERE blake3 = $1", &[&key])
-            .await?;
+        tx.exec(
+            "DELETE FROM sketch_bands WHERE blake3 = $1 AND band <> ALL($2::bigint[])",
+            &[&key, &bands],
+        )
+        .await?;
         tx.exec(
             "INSERT INTO sketch_bands (band, blake3) \
-             SELECT DISTINCT b, $2::bytea FROM unnest($1::bigint[]) AS b",
+             SELECT DISTINCT b, $2::bytea FROM unnest($1::bigint[]) AS b \
+             ON CONFLICT DO NOTHING",
             &[&bands, &key],
         )
         .await?;
@@ -772,10 +874,7 @@ impl SketchStore for PgStore {
         let c = client(&self.pool).await?;
         let rows = c
             .rows(
-                "SELECT b.blake3, s.signature, count(DISTINCT b.band) AS shared \
-                 FROM sketch_bands b JOIN sketches s ON s.blake3 = b.blake3 \
-                 WHERE b.band = ANY($1) AND b.blake3 <> $2 \
-                 GROUP BY b.blake3, s.signature ORDER BY shared DESC, b.blake3 LIMIT $3",
+                SKETCH_CANDIDATES,
                 &[
                     &bands,
                     &exclude.as_bytes().as_slice(),
@@ -907,7 +1006,10 @@ impl SearchStore for PgStore {
              VALUES ($1, $2, $3, $4, $5, $6) \
              ON CONFLICT (blake3) DO UPDATE SET title = EXCLUDED.title, body = EXCLUDED.body, \
              kind = EXCLUDED.kind, doc_date = EXCLUDED.doc_date, amount = EXCLUDED.amount, \
-             indexed_at = now()",
+             indexed_at = now() \
+             WHERE (search_index.title, search_index.body, search_index.kind, \
+             search_index.doc_date, search_index.amount) IS DISTINCT FROM \
+             (EXCLUDED.title, EXCLUDED.body, EXCLUDED.kind, EXCLUDED.doc_date, EXCLUDED.amount)",
             &[
                 &doc.blake3.as_bytes().as_slice(),
                 &doc.title,

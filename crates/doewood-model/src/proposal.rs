@@ -412,8 +412,8 @@ pub async fn accept<B: Backend + ?Sized>(
                     )));
                 }
             } else {
-                let dx = b.company_documents(x).await?.len();
-                let dy = b.company_documents(y).await?.len();
+                let dx = b.company_document_count(x).await?;
+                let dy = b.company_document_count(y).await?;
                 if dy > dx { (y, x) } else { (x, y) }
             };
             let entry = b

@@ -1255,16 +1255,18 @@ impl Ingest {
                 let full = page.len() == REPROCESS_PAGE;
                 after = page.last().map(|(k, _)| k.clone());
                 let examined = page.len() as u64;
-                let mut stale = Vec::new();
-                for (key, hash) in page {
-                    let current = backend
-                        .get_record(&Blake3(hash))
-                        .await?
-                        .is_some_and(|r| !self.inner.analyzer.is_stale(&r.versions));
-                    if !current {
-                        stale.push(key);
-                    }
-                }
+                // One query per page, versions only (issue #75).
+                let hashes: Vec<Blake3> = page.iter().map(|(_, h)| Blake3(*h)).collect();
+                let versions = backend.record_versions(&hashes).await?;
+                let stale: Vec<String> = page
+                    .into_iter()
+                    .filter(|(_, hash)| {
+                        versions
+                            .get(&Blake3(*hash))
+                            .is_none_or(|v| self.inner.analyzer.is_stale(v))
+                    })
+                    .map(|(key, _)| key)
+                    .collect();
                 let n = if stale.is_empty() {
                     0
                 } else {

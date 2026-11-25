@@ -18,7 +18,7 @@ use super::{Standalone, backend, check_live, sql, uuid};
 use crate::store::now;
 
 /// A company's document count: documents with a live `party` edge to `n.id`.
-const DOCUMENTS: &str = "(SELECT count(DISTINCT e.src) FROM edges e JOIN nodes d ON d.id = e.src \
+pub(super) const DOCUMENTS: &str = "(SELECT count(DISTINCT e.src) FROM edges e JOIN nodes d ON d.id = e.src \
      WHERE e.dst = n.id AND e.kind = 'party' AND d.kind = 'document' \
      AND e.state NOT IN ('retracted', 'superseded'))";
 

@@ -118,7 +118,7 @@ nothing below 0.50**; two conflicting high-precision hits are always for review.
   number, CIK) or is in another country is never a candidate. At 0.90 or more the two are
   merged through the merge log (`MergeStore::merge_companies`, actor `enrichment`, with the
   evidence, the confidence and the fused probability; the survivor is the one with more
-  documents), so a person can undo it. The review band and conflicts become merge proposals.
+  documents, counted without loading them), so a person can undo it. The review band and conflicts become merge proposals.
 - **Dismissals are permanent.** A dismissed pair (`MergeStore::dismissal`) is never merged
   or proposed, whatever the evidence, and is no candidate at all (so it makes no conflict for
   the others).
@@ -222,8 +222,8 @@ Schema 5 (shared) and 8 (standalone) moved the props lists of earlier versions i
 ADR 0002 section 5:
 
 1. **Candidates:** the official website from Wikidata, then the email domains seen in the
-   company's documents (quail's `signal.email_domain`, most frequent first; free-mail hosts
-   are never one). No domain is guessed from the name, and no search is made.
+   company's first 50 documents by key (quail's `signal.email_domain`, most frequent first;
+   free-mail hosts are never one). No domain is guessed from the name, and no search is made.
 2. **Verified** before it is stored: the domain is not owned by another company (alias
    `domain:<domain>`), it resolves through the favicon SSRF guard (public addresses only,
    redirects re-checked, the configured egress proxy), and the homepage, or the one
