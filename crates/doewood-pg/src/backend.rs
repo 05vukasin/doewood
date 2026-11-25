@@ -13,9 +13,10 @@ use doewood_model::{
     NodeKind, ObjectLocation, OwnedAlias, PropsPatch, PutOutcome, Record, RecordStore, Result,
     SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore, Sketch, SketchStore,
     SourceClaim, SourceKey, StepVersions, StoredEdge, band_to_i64, merged_into, records_limit,
-    sketch_limit, validate_alias, validate_hashes, validate_node, validate_sketch,
-    versions_from_json, versions_to_json,
+    sketch_limit, validate_alias, validate_alias_count, validate_hashes, validate_node,
+    validate_sketch, versions_from_json, versions_to_json,
 };
+use futures_util::future::try_join_all;
 use serde_json::Value;
 use serde_json::value::RawValue;
 use time::Date;
@@ -62,6 +63,48 @@ pub(crate) const LIST_RECORDS: &str = "SELECT r.blake3, r.record, r.versions, ex
      AND l.endpoint = $1 AND l.bucket = $2 AND starts_with(l.object_key COLLATE \"C\", $3) \
      AND ($4::bytea IS NULL OR l.blake3 > $4)) \
      ORDER BY r.blake3 LIMIT $5";
+
+/// [`GraphStore::upsert_location`] in one statement (issue #103; before, a transaction of five):
+/// the Document node (`$1`, `$2`) if missing, the Location node (`$3` to `$5`) with its props,
+/// its `locations` row (`$6` to `$9`), the `located_at` edges from other documents to it
+/// superseded (the object was overwritten), and the `located_at` edge (`$10` to `$16`). The
+/// parts touch different rows, and the foreign keys are checked at the end of the statement,
+/// when the new nodes are there. Followed by [`EDGE_ON_CONFLICT`] and the final select.
+const UPSERT_LOCATION: &str = "WITH doc AS (INSERT INTO nodes (id, kind, key) \
+     VALUES ($1, 'document', $2) \
+     ON CONFLICT ON CONSTRAINT nodes_kind_key DO UPDATE SET kind = EXCLUDED.kind RETURNING id), \
+     loc AS (INSERT INTO nodes (id, kind, key, props) VALUES ($3, 'location', $4, $5) \
+     ON CONFLICT ON CONSTRAINT nodes_kind_key \
+     DO UPDATE SET props = EXCLUDED.props, updated_at = now() RETURNING id), \
+     row AS (INSERT INTO locations (node_id, document_id, blake3, endpoint, bucket, object_key) \
+     SELECT loc.id, doc.id, $6::bytea, $7::text, $8::text, $9::text FROM loc, doc \
+     ON CONFLICT (node_id) DO UPDATE SET document_id = EXCLUDED.document_id, \
+     blake3 = EXCLUDED.blake3, updated_at = now()), \
+     moved AS (UPDATE edges SET state = 'superseded', updated_at = now() \
+     WHERE dst = (SELECT id FROM loc) AND kind = 'located_at' \
+     AND src <> (SELECT id FROM doc) AND state = 'active'), \
+     edge AS (INSERT INTO edges (id, src, dst, kind, props, evidence, confidence, state, \
+     valid_from, valid_to, source) \
+     SELECT $10::uuid, doc.id, loc.id, 'located_at', $11::jsonb, $12::jsonb, $13::real, \
+     $14::text, $15::date, $16::date, 'storage' FROM doc, loc ";
+
+/// [`SketchStore::put_sketch`] in one statement (issue #103; before, a transaction of three):
+/// the signature row, updated only when it differs (issue #74), the bands no longer in `$3`
+/// deleted and the new ones inserted. The deleted and inserted bands are different rows, and
+/// the bands' foreign key is checked at the end of the statement, when the sketch is there.
+const PUT_SKETCH: &str = "WITH sketch AS (INSERT INTO sketches (blake3, signature) VALUES ($1, $2) \
+     ON CONFLICT (blake3) DO UPDATE SET signature = EXCLUDED.signature, \
+     updated_at = now() WHERE sketches.signature IS DISTINCT FROM EXCLUDED.signature), \
+     gone AS (DELETE FROM sketch_bands WHERE blake3 = $1 AND band <> ALL($3::bigint[])) \
+     INSERT INTO sketch_bands (band, blake3) \
+     SELECT DISTINCT b, $1::bytea FROM unnest($3::bigint[]) AS b ON CONFLICT DO NOTHING";
+
+/// One [`GraphStore::claim_alias`]: a no-op update on conflict, so the stored row always comes
+/// back.
+const CLAIM_ALIAS: &str = "INSERT INTO node_aliases (kind, alias, node_id, props) \
+     VALUES ($1, $2, $3, $4) \
+     ON CONFLICT (kind, alias) DO UPDATE SET kind = node_aliases.kind \
+     RETURNING node_id, props";
 
 /// Claim attempts when the owner releases between our insert and our read.
 const CLAIM_ATTEMPTS: usize = 3;
@@ -144,6 +187,14 @@ pub(crate) fn node_at(row: &Row, at: usize) -> Result<Node> {
     })
 }
 
+/// A node alias from columns `at` (`node_id`) and `at + 1` (`props`).
+fn alias_at(row: &Row, at: usize) -> Result<NodeAlias> {
+    Ok(NodeAlias {
+        node: row.try_get(at).map_err(pg)?,
+        props: row.try_get(at + 1).map_err(pg)?,
+    })
+}
+
 pub(crate) const EDGE_COLUMNS: &str = "e.id, e.src, e.dst, e.kind, e.props, e.evidence, e.confidence, \
      e.state, e.valid_from, e.valid_to, e.source";
 
@@ -197,18 +248,22 @@ async fn ensure_node(c: &impl GenericClient, kind: NodeKind, key: &str) -> Resul
     row.try_get(0).map_err(pg)
 }
 
+/// What an edge upsert updates on conflict with the edge of the same identity.
+const EDGE_ON_CONFLICT: &str = "ON CONFLICT ON CONSTRAINT edges_identity DO UPDATE SET \
+     props = EXCLUDED.props, evidence = EXCLUDED.evidence, \
+     confidence = EXCLUDED.confidence, state = EXCLUDED.state, \
+     valid_to = EXCLUDED.valid_to, updated_at = now() \
+     RETURNING id";
+
 async fn upsert_edge(c: &impl GenericClient, e: &Edge) -> Result<Uuid> {
     e.validate()?;
     let row = c
         .one(
-            "INSERT INTO edges (id, src, dst, kind, props, evidence, confidence, state, \
-             valid_from, valid_to, source) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
-             ON CONFLICT ON CONSTRAINT edges_identity DO UPDATE SET \
-             props = EXCLUDED.props, evidence = EXCLUDED.evidence, \
-             confidence = EXCLUDED.confidence, state = EXCLUDED.state, \
-             valid_to = EXCLUDED.valid_to, updated_at = now() \
-             RETURNING id",
+            &format!(
+                "INSERT INTO edges (id, src, dst, kind, props, evidence, confidence, state, \
+                 valid_from, valid_to, source) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) {EDGE_ON_CONFLICT}"
+            ),
             &[
                 &Uuid::now_v7(),
                 &e.src,
@@ -227,66 +282,65 @@ async fn upsert_edge(c: &impl GenericClient, e: &Edge) -> Result<Uuid> {
     row.try_get(0).map_err(pg)
 }
 
-/// Follows `merged_into` from `id` without locks, counting the hops in `hops` (at most
-/// [`MERGE_CHAIN_MAX`]). A missing node is returned as it is: the edge write then fails.
-async fn follow_merges(c: &impl GenericClient, mut id: Uuid, hops: &mut usize) -> Result<Uuid> {
-    loop {
-        let row = c
-            .opt(
-                "SELECT props->>'merged_into' FROM nodes WHERE id = $1",
-                &[&id],
-            )
-            .await?;
-        match row.and_then(|r| merged_into_column(&r)) {
-            Some(next) => {
-                *hops += 1;
-                if *hops > MERGE_CHAIN_MAX {
-                    return Err(Error::Precondition(format!(
-                        "node {id} has more than {MERGE_CHAIN_MAX} merges in a chain"
-                    )));
-                }
-                id = next;
-            }
-            None => return Ok(id),
-        }
-    }
-}
-
-/// Column 0 of `r`, `props->>'merged_into'`, as an id.
-fn merged_into_column(r: &Row) -> Option<Uuid> {
-    r.try_get::<_, Option<&str>>(0)
+/// Column `at` of `r`, a `props->>'merged_into'`, as an id.
+fn merged_into_column(r: &Row, at: usize) -> Option<Uuid> {
+    r.try_get::<_, Option<&str>>(at)
         .ok()
         .flatten()
         .and_then(|s| Uuid::parse_str(s).ok())
 }
 
-/// [`GraphStore::upsert_live_edge`]: find the live ends without locks, then, in one
-/// transaction, lock them `FOR SHARE` and check they are still live before writing. A merge
-/// locks its two companies `FOR UPDATE`, so the share lock waits for a merge in flight and
-/// then reads what it committed; while the lock is held no merge of those companies can
-/// start, so the edge is in place before any later merge moves the edges. When an end was
-/// merged away in between, the transaction is rolled back (no lock is held while waiting for
-/// another) and the walk goes on from there.
-async fn upsert_live_edge(c: &mut Object, edge: &Edge) -> Result<LiveEdge> {
+/// One attempt of [`GraphStore::upsert_live_edge`], in one statement (issue #103): `ends`
+/// locks the edge's ends (`$12`, sorted) `FOR SHARE`, and the edge is written only when
+/// neither is a husk. Returns the edge's id (NULL when it was not written) and each end's
+/// `merged_into`. A merge locks its companies `FOR UPDATE`, so the share lock waits for a
+/// merge in flight and then reads the row as it committed.
+const LIVE_EDGE: &str = "WITH ends AS MATERIALIZED (\
+     SELECT id, props->>'merged_into' AS m FROM nodes WHERE id = ANY($12::uuid[]) \
+     ORDER BY id FOR SHARE), \
+     ins AS (INSERT INTO edges (id, src, dst, kind, props, evidence, confidence, state, \
+     valid_from, valid_to, source) \
+     SELECT $1::uuid, $2::uuid, $3::uuid, $4::text, $5::jsonb, $6::jsonb, $7::real, $8::text, \
+     $9::date, $10::date, $11::text \
+     WHERE NOT EXISTS (SELECT 1 FROM ends WHERE m IS NOT NULL) ";
+
+/// [`GraphStore::upsert_live_edge`]: lock the ends `FOR SHARE` and write the edge when both
+/// are live, in one statement ([`LIVE_EDGE`]); while the lock is held no merge of those
+/// companies can start, so the edge is in place before any later merge moves the edges. When
+/// an end is a husk, nothing is written (no lock is held while waiting for another) and the
+/// attempt is repeated one `merged_into` hop on: the walk and the check are one round trip
+/// per hop, and a write to live ends (nearly every write) is one round trip in all.
+async fn upsert_live_edge(c: &impl GenericClient, edge: &Edge) -> Result<LiveEdge> {
     let mut e = edge.clone();
     let (mut src_hops, mut dst_hops) = (0, 0);
+    let sql = format!(
+        "{LIVE_EDGE}{EDGE_ON_CONFLICT}) SELECT (SELECT id FROM ins), \
+         (SELECT m FROM ends WHERE id = $2), (SELECT m FROM ends WHERE id = $3)"
+    );
     loop {
-        e.src = follow_merges(&*c, e.src, &mut src_hops).await?;
-        e.dst = follow_merges(&*c, e.dst, &mut dst_hops).await?;
-        let tx = c.transaction().await.map_err(pg)?;
         let mut ends = vec![e.src, e.dst];
         ends.sort_unstable();
         ends.dedup();
-        let rows = tx
-            .rows(
-                "SELECT props->>'merged_into' FROM nodes WHERE id = ANY($1) \
-                 ORDER BY id FOR SHARE",
-                &[&ends],
+        let row = c
+            .one(
+                &sql,
+                &[
+                    &Uuid::now_v7(),
+                    &e.src,
+                    &e.dst,
+                    &e.kind.as_str(),
+                    &e.props,
+                    &e.evidence,
+                    &e.confidence,
+                    &e.state.as_str(),
+                    &e.valid_from,
+                    &e.valid_to,
+                    &e.source.as_str(),
+                    &ends,
+                ],
             )
             .await?;
-        if rows.iter().all(|r| merged_into_column(r).is_none()) {
-            let id = upsert_edge(&tx, &e).await?;
-            tx.commit().await.map_err(pg)?;
+        if let Some(id) = row.try_get::<_, Option<Uuid>>(0).map_err(pg)? {
             let redirects = u32::try_from(src_hops + dst_hops).unwrap_or(u32::MAX);
             return Ok(LiveEdge {
                 id,
@@ -295,13 +349,38 @@ async fn upsert_live_edge(c: &mut Object, edge: &Edge) -> Result<LiveEdge> {
                 redirects,
             });
         }
-        // A merge committed between the walk and the lock: roll back, walk on.
-        tx.rollback().await.map_err(pg)?;
+        // An end is a husk: walk on from it.
+        let mut moved = false;
+        for (at, end, hops) in [
+            (1, &mut e.src, &mut src_hops),
+            (2, &mut e.dst, &mut dst_hops),
+        ] {
+            if let Some(next) = merged_into_column(&row, at) {
+                *hops += 1;
+                if *hops > MERGE_CHAIN_MAX {
+                    return Err(Error::Precondition(format!(
+                        "node {end} has more than {MERGE_CHAIN_MAX} merges in a chain"
+                    )));
+                }
+                *end = next;
+                moved = true;
+            }
+        }
+        if !moved {
+            return Err(bad("merged_into", "not a node id"));
+        }
     }
 }
 
 /// [`GraphStore::update_props`]; with `live`, a husk is refused
-/// ([`GraphStore::update_live_props`]), checked under the same row lock as the write.
+/// ([`GraphStore::update_live_props`]).
+///
+/// A compare-and-set, two round trips (issue #103): read the node with its row version
+/// (`xmin`, which every write of the row changes), apply the patch, and write the result only
+/// if the row is still that version. When another writer (another patch, an upsert, a merge)
+/// wrote the row in between, the update waits for its row lock, finds another version and
+/// writes nothing, and the patch is applied again on what that writer committed. So no write is lost, and a merge that marks the node a husk is seen
+/// before anything is written to it. A patch that changes nothing writes nothing.
 async fn update_props(
     pool: &Pool,
     id: Uuid,
@@ -309,39 +388,44 @@ async fn update_props(
     live: bool,
 ) -> Result<Option<Node>> {
     patch.validate()?;
-    let mut c = client(pool).await?;
-    let tx = c.transaction().await.map_err(pg)?;
-    // The row lock orders this after any other writer of the node (another patch, an
-    // upsert, a merge) and lets it read what that writer committed.
-    let Some(row) = tx
-        .opt(
-            &format!("SELECT {NODE_COLUMNS} FROM nodes n WHERE n.id = $1 FOR UPDATE"),
-            &[&id],
-        )
-        .await?
-    else {
-        return Ok(None);
-    };
-    let mut node = node_at(&row, 0)?;
-    if live && let Some(into) = merged_into(&node) {
-        return Err(Error::MergedAway { company: id, into });
+    let c = client(pool).await?;
+    loop {
+        let Some(row) = c
+            .opt(
+                &format!("SELECT {NODE_COLUMNS}, n.xmin::text FROM nodes n WHERE n.id = $1"),
+                &[&id],
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let mut node = node_at(&row, 0)?;
+        let version: &str = row.try_get(4).map_err(pg)?;
+        if live && let Some(into) = merged_into(&node) {
+            return Err(Error::MergedAway { company: id, into });
+        }
+        let before = std::mem::take(&mut node.props);
+        let mut props = match &before {
+            Value::Object(m) => m.clone(),
+            _ => serde_json::Map::new(),
+        };
+        patch.apply(&mut props);
+        node.props = Value::Object(props);
+        if node.props == before {
+            return Ok(Some(node));
+        }
+        let written = c
+            .exec(
+                "UPDATE nodes SET props = $3, updated_at = now() \
+                 WHERE id = $1 AND xmin::text = $2",
+                &[&id, &version, &node.props],
+            )
+            .await?;
+        if written == 1 {
+            return Ok(Some(node));
+        }
+        // Written (or deleted) since the read: read again.
     }
-    let before = std::mem::take(&mut node.props);
-    let mut props = match &before {
-        Value::Object(m) => m.clone(),
-        _ => serde_json::Map::new(),
-    };
-    patch.apply(&mut props);
-    node.props = Value::Object(props);
-    if node.props != before {
-        tx.exec(
-            "UPDATE nodes SET props = $2, updated_at = now() WHERE id = $1",
-            &[&id, &node.props],
-        )
-        .await?;
-    }
-    tx.commit().await.map_err(pg)?;
-    Ok(Some(node))
 }
 
 /// Locks node `id` `FOR SHARE` in the transaction `c` and refuses a husk with
@@ -357,7 +441,7 @@ pub(crate) async fn lock_live(c: &impl GenericClient, id: Uuid) -> Result<bool> 
         .await?;
     match row {
         None => Ok(false),
-        Some(r) => match merged_into_column(&r) {
+        Some(r) => match merged_into_column(&r, 0) {
             Some(into) => Err(Error::MergedAway { company: id, into }),
             None => Ok(true),
         },
@@ -567,7 +651,7 @@ impl GraphStore for PgStore {
 
     async fn upsert_live_edge(&self, edge: &Edge) -> Result<LiveEdge> {
         edge.validate()?;
-        upsert_live_edge(&mut client(&self.pool).await?, edge).await
+        upsert_live_edge(&client(&self.pool).await?, edge).await
     }
 
     async fn neighbours(&self, node: Uuid, q: &NeighbourQuery) -> Result<Vec<Neighbour>> {
@@ -671,41 +755,47 @@ impl GraphStore for PgStore {
 
     async fn upsert_location(&self, blake3: &Blake3, at: &ObjectLocation) -> Result<Located> {
         let at = &at.checked()?;
-        let mut c = client(&self.pool).await?;
-        let tx = c.transaction().await.map_err(pg)?;
-        let document = ensure_node(&tx, NodeKind::Document, &blake3.to_hex()).await?;
         let props = serde_json::json!({
             "endpoint": at.endpoint, "bucket": at.bucket, "key": at.key,
         });
-        let location = upsert_node(&tx, NodeKind::Location, &at.node_key(), &props).await?;
-        tx.exec(
-            "INSERT INTO locations (node_id, document_id, blake3, endpoint, bucket, object_key) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
-             ON CONFLICT (node_id) DO UPDATE SET document_id = EXCLUDED.document_id, \
-             blake3 = EXCLUDED.blake3, updated_at = now()",
-            &[
-                &location,
-                &document,
-                &blake3.as_bytes().as_slice(),
-                &at.endpoint,
-                &at.bucket,
-                &at.key,
-            ],
-        )
-        .await?;
-        tx.exec(
-            "UPDATE edges SET state = 'superseded', updated_at = now() \
-             WHERE dst = $1 AND kind = 'located_at' AND src <> $2 AND state = 'active'",
-            &[&location, &document],
-        )
-        .await?;
-        upsert_edge(
-            &tx,
-            &Edge::new(document, location, EdgeKind::LocatedAt, EdgeSource::Storage),
-        )
-        .await?;
-        tx.commit().await.map_err(pg)?;
-        Ok(Located { document, location })
+        // The ends are filled in by the statement; the rest is the edge as written.
+        let edge = Edge::new(
+            Uuid::nil(),
+            Uuid::nil(),
+            EdgeKind::LocatedAt,
+            EdgeSource::Storage,
+        );
+        edge.validate()?;
+        let c = client(&self.pool).await?;
+        let row = c
+            .one(
+                &format!(
+                    "{UPSERT_LOCATION}{EDGE_ON_CONFLICT}) SELECT doc.id, loc.id FROM doc, loc"
+                ),
+                &[
+                    &Uuid::now_v7(),
+                    &blake3.to_hex(),
+                    &Uuid::now_v7(),
+                    &at.node_key(),
+                    &props,
+                    &blake3.as_bytes().as_slice(),
+                    &at.endpoint,
+                    &at.bucket,
+                    &at.key,
+                    &Uuid::now_v7(),
+                    &edge.props,
+                    &edge.evidence,
+                    &edge.confidence,
+                    &edge.state.as_str(),
+                    &edge.valid_from,
+                    &edge.valid_to,
+                ],
+            )
+            .await?;
+        Ok(Located {
+            document: row.try_get(0).map_err(pg)?,
+            location: row.try_get(1).map_err(pg)?,
+        })
     }
 
     async fn end_location(&self, at: &ObjectLocation, on: Date) -> Result<Option<LocationEnded>> {
@@ -758,19 +848,40 @@ impl GraphStore for PgStore {
     ) -> Result<NodeAlias> {
         validate_alias(alias, props)?;
         let c = client(&self.pool).await?;
-        // A no-op update on conflict, so the stored row always comes back.
-        let row = c
-            .one(
-                "INSERT INTO node_aliases (kind, alias, node_id, props) VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (kind, alias) DO UPDATE SET kind = node_aliases.kind \
-                 RETURNING node_id, props",
-                &[&kind.as_str(), &alias, &node, props],
-            )
-            .await?;
-        Ok(NodeAlias {
-            node: row.try_get(0).map_err(pg)?,
-            props: row.try_get(1).map_err(pg)?,
-        })
+        alias_at(
+            &c.one(CLAIM_ALIAS, &[&kind.as_str(), &alias, &node, props])
+                .await?,
+            0,
+        )
+    }
+
+    async fn claim_aliases(
+        &self,
+        kind: NodeKind,
+        node: Uuid,
+        claims: &[(String, Value)],
+    ) -> Result<Vec<NodeAlias>> {
+        validate_alias_count(claims.len())?;
+        for (alias, props) in claims {
+            validate_alias(alias, props)?;
+        }
+        if claims.is_empty() {
+            return Ok(Vec::new());
+        }
+        let c = client(&self.pool).await?;
+        let st = c.prepare_cached(CLAIM_ALIAS).await.map_err(pg)?;
+        let kind = kind.as_str();
+        // Pipelined (issue #103): the claims go out together, in order, on this connection,
+        // and the server runs each as its own statement and transaction, one after the other,
+        // so a claim sees the ones before it. One round trip for all of them.
+        let params: Vec<[&(dyn ToSql + Sync); 4]> = claims
+            .iter()
+            .map(|(alias, props)| [&kind as &(dyn ToSql + Sync), alias, &node, props])
+            .collect();
+        let rows = try_join_all(params.iter().map(|p| c.query_one(&st, p)))
+            .await
+            .map_err(pg)?;
+        rows.iter().map(|r| alias_at(r, 0)).collect()
     }
 
     async fn claim_live_alias(
@@ -785,18 +896,11 @@ impl GraphStore for PgStore {
         let tx = c.transaction().await.map_err(pg)?;
         // A missing node: the insert below fails as `claim_alias` does.
         lock_live(&tx, node).await?;
-        let row = tx
-            .one(
-                "INSERT INTO node_aliases (kind, alias, node_id, props) VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (kind, alias) DO UPDATE SET kind = node_aliases.kind \
-                 RETURNING node_id, props",
-                &[&kind.as_str(), &alias, &node, props],
-            )
-            .await?;
-        let got = NodeAlias {
-            node: row.try_get(0).map_err(pg)?,
-            props: row.try_get(1).map_err(pg)?,
-        };
+        let got = alias_at(
+            &tx.one(CLAIM_ALIAS, &[&kind.as_str(), &alias, &node, props])
+                .await?,
+            0,
+        )?;
         tx.commit().await.map_err(pg)?;
         Ok(got)
     }
@@ -808,13 +912,31 @@ impl GraphStore for PgStore {
             &[&kind.as_str(), &alias],
         )
         .await?
-        .map(|r| {
-            Ok(NodeAlias {
-                node: r.try_get(0).map_err(pg)?,
-                props: r.try_get(1).map_err(pg)?,
-            })
-        })
+        .map(|r| alias_at(&r, 0))
         .transpose()
+    }
+
+    async fn aliases(&self, kind: NodeKind, aliases: &[String]) -> Result<Vec<Option<NodeAlias>>> {
+        validate_alias_count(aliases.len())?;
+        let mut out = vec![None; aliases.len()];
+        if aliases.is_empty() {
+            return Ok(out);
+        }
+        let c = client(&self.pool).await?;
+        let rows = c
+            .rows(
+                "SELECT a.ord, n.node_id, n.props \
+                 FROM unnest($2::text[]) WITH ORDINALITY AS a(alias, ord) \
+                 JOIN node_aliases n ON n.kind = $1 AND n.alias = a.alias",
+                &[&kind.as_str(), &aliases],
+            )
+            .await?;
+        for r in &rows {
+            let ord: i64 = r.try_get(0).map_err(pg)?;
+            let at = usize::try_from(ord - 1).map_err(|e| bad("ordinal", e))?;
+            *out.get_mut(at).ok_or_else(|| bad("ordinal", ord))? = Some(alias_at(r, 1)?);
+        }
+        Ok(out)
     }
 
     async fn block_alias(&self, kind: NodeKind, alias: &str, props: &Value) -> Result<()> {
@@ -841,30 +963,9 @@ impl SketchStore for PgStore {
         validate_sketch(signature, bands)?;
         let key = blake3.as_bytes().as_slice();
         let bands: Vec<i64> = bands.iter().map(|b| band_to_i64(*b)).collect();
-        let mut c = client(&self.pool).await?;
-        let tx = c.transaction().await.map_err(pg)?;
-        // Issue #74: an unchanged sketch writes nothing. The signature row is updated only
-        // when it differs, and only the bands that changed are deleted or inserted.
-        tx.exec(
-            "INSERT INTO sketches (blake3, signature) VALUES ($1, $2) \
-             ON CONFLICT (blake3) DO UPDATE SET signature = EXCLUDED.signature, \
-             updated_at = now() WHERE sketches.signature IS DISTINCT FROM EXCLUDED.signature",
-            &[&key, &signature],
-        )
-        .await?;
-        tx.exec(
-            "DELETE FROM sketch_bands WHERE blake3 = $1 AND band <> ALL($2::bigint[])",
-            &[&key, &bands],
-        )
-        .await?;
-        tx.exec(
-            "INSERT INTO sketch_bands (band, blake3) \
-             SELECT DISTINCT b, $2::bytea FROM unnest($1::bigint[]) AS b \
-             ON CONFLICT DO NOTHING",
-            &[&bands, &key],
-        )
-        .await?;
-        tx.commit().await.map_err(pg)
+        let c = client(&self.pool).await?;
+        c.exec(PUT_SKETCH, &[&key, &signature, &bands]).await?;
+        Ok(())
     }
 
     async fn sketch_candidates(

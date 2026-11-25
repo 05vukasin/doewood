@@ -1280,6 +1280,7 @@ dependencies = [
  "deadpool-postgres",
  "doewood-core",
  "doewood-model",
+ "futures-util",
  "rustls",
  "rustls-native-certs",
  "serde_json",

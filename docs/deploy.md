@@ -427,6 +427,48 @@ Where the workers' time goes (4 workers, share of workers x wall time; the test 
 - The instance store's lock wait (a trivial call every millisecond) stayed under 0.4 ms mean
   in every run.
 
+### Fewer round trips per file on Postgres (issue #103)
+
+The same `throughput` run (2000 files, test profile, Postgres 17 in a container bound to
+127.0.0.1 on the same machine, `pg_stat_statements` loaded), one run each, `main` at
+`574b4cc` against this change, back to back:
+
+| workers | files/s before | files/s after | graph stage per file before / after | statements per file before / after |
+|---|---|---|---|---|
+| 1 | 44 | 61 | 13.4 / 6.9 ms | 24.1 / 11.3 |
+| 2 | 150 | 194 | 8.1 / 4.6 ms | 24.1 / 11.3 |
+| 4 | 206 | 277 | 12.2 / 6.6 ms | 24.1 / 11.3 |
+
+(Statements as `pg_stat_statements` counts them, `BEGIN` and `COMMIT` included. The machine was
+shared with other builds, so absolute files/s vary between sessions; the before and after
+runs are next to each other.)
+
+What changed, with the same rows written:
+
+- **One statement instead of a transaction** for `upsert_location` (5 statements plus
+  `BEGIN`/`COMMIT`), `put_sketch` (3 plus `BEGIN`/`COMMIT`) and `upsert_live_edge` (two
+  `merged_into` reads, then a locked check and the write in a transaction): data-modifying
+  CTEs, whose parts touch different rows and whose foreign keys are checked at the end of the
+  statement. The live edge locks its ends `FOR SHARE` and writes only when both are live, in
+  that one statement; a husk end costs one more round trip per `merged_into` hop.
+- **`update_props` is a compare-and-set** (read the node and its row version `xmin`, write
+  only if the row is still that version, else apply the patch again): two round trips
+  instead of four, and still no lost write and no write onto a node a merge marked as a husk.
+- **Batches**: `GraphStore::aliases` reads all the keys of a party's match ladder in one
+  statement, and `GraphStore::claim_aliases` sends a party's claims (and learned aliases,
+  and a document's numbers) pipelined on one connection: still one statement and one
+  transaction per claim, run in order, in one round trip. Both have sequential defaults, so
+  SQLite is unchanged.
+- **Independent steps overlap** in `GraphWriter::write`: the document's props, its search
+  row, its references (own numbers, then cites), its parties (under the company lock, as
+  before) and its similar documents run together, each in its own order. A document without
+  parties no longer takes the company lock.
+
+`crates/doewood-ingest/tests/round_trips.rs` counts statements and round trips through a
+proxy that reads the wire protocol, and fails above the targets (each store call above is
+one round trip; the `throughput` mix is at most 15 statements and 14.5 round trips per
+document, 32.25 of each before).
+
 ### API under many clients (issue #80)
 
 `api_load` in `crates/doewood-api/tests/api_load.rs` (ignored): an in-process API server on a
