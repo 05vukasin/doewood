@@ -191,6 +191,11 @@ async fn store() -> Option<(
     Some((Arc::new(pg), counts, admin, schema))
 }
 
+/// An empty record body, in the canonical form the store takes.
+fn empty_record() -> Box<serde_json::value::RawValue> {
+    doewood_model::canonical::to_canonical(&json!({})).unwrap()
+}
+
 fn at(key: &str) -> ObjectLocation {
     ObjectLocation {
         endpoint: "http://objects.test:9000".into(),
@@ -207,7 +212,7 @@ async fn store_calls_are_one_round_trip() {
         return;
     };
     for n in 1..=4u8 {
-        b.put_record(&Blake3([n; 32]), &json!({}), &StepVersions::new())
+        b.put_record(&Blake3([n; 32]), &empty_record(), &StepVersions::new())
             .await
             .unwrap();
     }
@@ -365,7 +370,7 @@ async fn graph_writes_stay_under_the_round_trip_target() {
         for (j, facts) in mix(i).iter().enumerate() {
             let h =
                 Blake3::from_slice(blake3::hash(format!("{i}/{j}").as_bytes()).as_bytes()).unwrap();
-            b.put_record(&h, &json!({}), &StepVersions::new())
+            b.put_record(&h, &empty_record(), &StepVersions::new())
                 .await
                 .unwrap();
             writer
