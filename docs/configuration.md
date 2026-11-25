@@ -92,8 +92,13 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
   and retries with backoff (1 s doubling to 60 s, with jitter). `/readyz` answers 503 with the
   reason, for example `not ready: shared Postgres unreachable: ... (retrying in 4s)`. A connected
   store is pinged every 15 s; while it does not answer, `/readyz` is 503 again.
-- **Migrations** run on connect, under an advisory lock, so instances starting together migrate
-  once. The version is in the `doewood_schema` table. A database migrated by a newer doewood is
+- **Migrations** run on connect, together with the pgvector setup, in one transaction under a
+  Postgres advisory lock (key `28269979257237348`, "doewood" in ASCII; a transaction-level
+  lock, so it works through a transaction-mode pooler and never outlives a failed start).
+  Instances starting together against an empty database are safe: one migrates, the others
+  log `another instance is setting up the shared schema; waiting for it`, wait for it (at most
+  5 minutes, then they retry with backoff) and find the schema migrated. The version is in
+  the `doewood_schema` table. A database migrated by a newer doewood is
   refused (not ready) until this one is upgraded.
 - **Schema 4** (the merge log and dismissals of ADR 0002 section 1.8: the new tables
   `company_merges` and `company_dismissals`; nothing else changes) is the current version.
