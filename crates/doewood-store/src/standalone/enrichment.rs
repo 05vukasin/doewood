@@ -22,6 +22,36 @@ const DOCUMENTS: &str = "(SELECT count(DISTINCT e.src) FROM edges e JOIN nodes d
      WHERE e.dst = n.id AND e.kind = 'party' AND d.kind = 'document' \
      AND e.state NOT IN ('retracted', 'superseded'))";
 
+/// The companies due (issue #71: the cheap tests decide first, as on Postgres).
+///
+/// A company never enriched, or with a registry due, needs one live document. Any other is
+/// due only when its document count doubled: first a bound from its `party` edges in
+/// `edges_by_dst` alone (a covering-index count; it counts every party edge, so it is never
+/// below the document count), and only past that bound the exact count. SQLite allows no
+/// outer column in a `LIMIT`, so neither count stops at the threshold as on Postgres. `CASE`
+/// runs the tests in this order. The exact count is taken for the returned rows only. `?1` is
+/// the caller, `?2` the page token, `?3` the page size, `?4` now.
+pub(crate) const COMPANIES_DUE: &str = "SELECT n.id, \
+     (SELECT count(DISTINCT e.src) FROM edges e JOIN nodes d ON d.id = e.src \
+     WHERE e.dst = n.id AND e.kind = 'party' AND d.kind = 'document' \
+     AND e.state NOT IN ('retracted', 'superseded')), \
+     f.documents \
+     FROM nodes n LEFT JOIN company_enrichment f ON f.company_id = n.id \
+     WHERE n.kind = 'company' AND n.id > coalesce(?2, '') \
+     AND NOT EXISTS (SELECT 1 FROM company_leases l \
+     WHERE l.company_id = n.id AND l.owner <> ?1 AND l.expires_at > ?4) \
+     AND CASE WHEN f.company_id IS NULL OR EXISTS (SELECT 1 FROM company_registry_due r \
+     WHERE r.company_id = n.id AND r.next_due_at <= ?4) \
+     THEN EXISTS (SELECT 1 FROM edges e JOIN nodes d ON d.id = e.src \
+     WHERE e.dst = n.id AND e.kind = 'party' AND d.kind = 'document' \
+     AND e.state NOT IN ('retracted', 'superseded')) \
+     WHEN (SELECT count(*) FROM edges e WHERE e.dst = n.id AND e.kind = 'party') \
+     < 2 * max(f.documents, 1) THEN 0 \
+     ELSE (SELECT count(DISTINCT e.src) FROM edges e JOIN nodes d ON d.id = e.src \
+     WHERE e.dst = n.id AND e.kind = 'party' AND d.kind = 'document' \
+     AND e.state NOT IN ('retracted', 'superseded')) >= 2 * max(f.documents, 1) END \
+     ORDER BY n.id LIMIT ?3";
+
 fn count(n: i64) -> Result<u64> {
     u64::try_from(n).map_err(|e| backend(format!("stored count: {e}")))
 }
@@ -306,21 +336,7 @@ impl FreshnessStore for Standalone {
         self.run(move |conn| {
             let at = now();
             let rows = {
-                let mut stmt = conn
-                    .prepare_cached(&format!(
-                        "SELECT id, docs, documents FROM ( \
-                         SELECT n.id AS id, {DOCUMENTS} AS docs, f.documents AS documents, \
-                         f.company_id AS enriched \
-                         FROM nodes n LEFT JOIN company_enrichment f ON f.company_id = n.id \
-                         WHERE n.kind = 'company' AND n.id > coalesce(?2, '') \
-                         AND NOT EXISTS (SELECT 1 FROM company_leases l \
-                         WHERE l.company_id = n.id AND l.owner <> ?1 AND l.expires_at > ?4)) \
-                         WHERE docs > 0 AND (enriched IS NULL OR docs >= 2 * max(documents, 1) \
-                         OR EXISTS (SELECT 1 FROM company_registry_due r \
-                         WHERE r.company_id = id AND r.next_due_at <= ?4)) \
-                         ORDER BY id LIMIT ?3"
-                    ))
-                    .map_err(sql)?;
+                let mut stmt = conn.prepare_cached(COMPANIES_DUE).map_err(sql)?;
                 stmt.query_map(
                     params![
                         owner.as_str(),
@@ -397,3 +413,6 @@ impl FreshnessStore for Standalone {
         .await
     }
 }
+
+#[cfg(test)]
+mod tests;

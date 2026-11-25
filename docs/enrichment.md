@@ -41,6 +41,39 @@ the company is run once more after that page's tasks are done, and the merge hap
 when another instance holds it, every registry of the company is due again after the retry
 interval (6 hours), and the merge happens on that run. A lease left behind by a crash expires.
 
+**`companies_due` cost (issue #71).** Every pass on every instance asks for the companies
+due, and in the steady state (nothing due) one call walks every company. The query tests the
+cheap things first: no enrichment row or a registry due (then one live document is enough),
+else a bound from the company's `party` edges in the `edges_by_dst` index alone (every party
+edge, so never below the document count); only a company past that bound gets the exact
+document count. The exact count is taken for the returned page only. On Postgres the
+candidates are listed in id order behind a fence (`OFFSET 0`), so the tests run in that order
+and stop at the page size. No schema change. Results are those of the query before: a test on
+each backend walks both queries on 1,000 generated companies covering every case, for three
+owners and four page sizes, and compares the pages.
+
+One page of 100, generated companies with ten party edges each, median of 7 runs (ignored
+tests `companies_due_timings` in `doewood-pg` and `doewood-store`; `DOEWOOD_BENCH_COMPANIES`
+sets the count; SQLite on disk, release build; Postgres 17 in Docker, after `VACUUM ANALYZE`):
+
+| backend | companies | state | before | after |
+|---|---|---|---|---|
+| Postgres | 10,000 | steady (nothing due) | 461 ms | 36 ms |
+| Postgres | 10,000 | mixed | 15 ms | 7.6 ms |
+| Postgres | 100,000 | steady (nothing due) | 9,795 ms | 391 ms |
+| Postgres | 100,000 | mixed | 26 ms | 12.7 ms |
+| SQLite | 10,000 | steady (nothing due) | 155 ms | 15 ms |
+| SQLite | 10,000 | mixed | 4.1 ms | 2.1 ms |
+| SQLite | 100,000 | steady (nothing due) | 1,763 ms | 160 ms |
+| SQLite | 100,000 | mixed | 4.3 ms | 2.5 ms |
+
+At 100,000 companies the Postgres steady-state plan touches 0.8 million buffers instead of
+10.7 million (`EXPLAIN (ANALYZE, BUFFERS)`): no heap fetch per edge any more. The partial
+covering index the issue held in reserve is not needed. On SQLite this is also how long the call holds the store's only connection. The steady state
+is still linear in the companies (a few index probes each, about 10 index entries of
+`edges_by_dst` per company); keeping a live document count per company at write time would
+make it a range scan on due times, at the cost of a schema change.
+
 **Shutdown.** The pass stops taking companies; those in flight get 10 seconds, then are
 dropped (their leases expire and they are enriched again later).
 
@@ -356,3 +389,7 @@ CIK's 10-K due (not a 10-Q, not unknown CIKs) and EDGAR's 30-day refresh with th
 APR's new set making only the changed MB due, read from the cache on the next pass; and the
 Companies House stream (with basic auth) making a company due, resuming each stream from its
 timepoint, and restarting a stream whose timepoint is too old (416).
+
+`companies_due` against the query before issue #71: `cargo test -p doewood-store companies_due`
+and, with `DOEWOOD_TEST_POSTGRES_URL`, `cargo test -p doewood-pg companies_due`; the timings
+with `-- --ignored --nocapture companies_due_timings`.
