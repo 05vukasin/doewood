@@ -710,7 +710,7 @@ impl Summaries {
     /// (read from the store now) is reached.
     async fn take_slot(&self) -> Result<Slot, SummarizeError> {
         let cap = self
-            .db(|s| s.ingest_settings())
+            .db(Store::ingest_settings)
             .await?
             .summarize_max_concurrent;
         let cap = usize::try_from(cap).unwrap_or(usize::MAX);

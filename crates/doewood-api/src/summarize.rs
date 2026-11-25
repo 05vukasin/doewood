@@ -72,7 +72,7 @@ pub enum OnDemandError {
     FailedPrecondition(String),
     /// UNAVAILABLE.
     Unavailable(String),
-    /// RESOURCE_EXHAUSTED: as many on-demand analyses as the instance allows are in flight.
+    /// `RESOURCE_EXHAUSTED`: as many on-demand analyses as the instance allows are in flight.
     ResourceExhausted(String),
     /// INTERNAL (logged, answered without details).
     Internal(String),
