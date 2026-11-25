@@ -62,7 +62,8 @@ chart in [docs/deploy.md](docs/deploy.md).
 ```
 crates/
   doewood-core    bootstrap config, errors, ids, the master key type
-  doewood-model   records, graph, claims, search: the store traits and their conformance suite
+  doewood-model   records, graph, claims, search, the enrichment caches and company freshness:
+                  the store traits and their conformance suite
   doewood-store   the instance-local SQLite store: settings, encrypted secrets, sources, jobs,
                   and the standalone backend of the store traits (FTS5 search)
   doewood-pg      the shared Postgres (+ pgvector) backend of the store traits
@@ -81,8 +82,10 @@ charts/doewood    the Helm chart (StatefulSet, one volume per instance)
 Dockerfile        the image, with OCR
 ```
 
-Planned: the enrichment job that uses the registry clients, with their shared Postgres cache and
-their runtime settings (on/off, keys, the EDGAR contact). See [docs/registries.md](docs/registries.md).
+The enrichment storage is in place: the registry and favicon caches in the store (shared
+Postgres, or the instance's SQLite file) and each company's freshness. Planned: the enrichment
+job that uses the registry clients, and their runtime settings (on/off, keys, the EDGAR
+contact). See [docs/registries.md](docs/registries.md).
 
 The `.proto` files compile with `protox` (pure Rust) in `doewood-api`'s build script, so
 `cargo build` needs no `protoc`.

@@ -66,11 +66,39 @@ Every client is built on the same request loop (`Fetcher`):
   such record" (404) for one day. Failures and malformed bodies are never cached. The cache
   keeps the raw (capped) body, so a better parser also applies to cached answers.
 
-The cache is a trait (`Cache`). This step ships `MemoryCache` (in-process, at most 10,000
-entries, the oldest fetch evicted first) and `NoCache`. The shared Postgres cache of ADR 0002
-section 6 is not here yet: it needs a new table, and a new shared-schema migration makes every
-older instance refuse the database (see [configuration.md](configuration.md#the-shared-postgres)),
-so it comes with the enrichment job.
+The cache is a trait (`Cache`), with three implementations:
+
+- `StoreCache`: the store's `registry_cache` table (shared schema 3, instance schema 6), through
+  `doewood-model`'s `CacheStore` trait. In shared mode that is the shared Postgres, so an answer
+  one instance fetched is reused by every other (ADR 0002 sections 2 and 6); standalone it is
+  the instance's SQLite file. A key `<registry>:<request>` is stored under that registry and
+  request, with the body as the client hands it over (for Companies House the minimised fields
+  only), the fetch date and an expiry: the fetch date plus the client's freshness for that
+  answer. Times are kept to the second. The store never returns an expired entry, and the
+  binary purges expired rows every hour. A store failure is a miss and is logged at debug
+  level; while the shared store is not connected, the cache works in memory.
+- `MemoryCache` (in-process, at most 10,000 entries, the oldest fetch evicted first).
+- `NoCache`.
+
+`doewood-registry` itself has no database dependency: the backends implement `CacheStore`.
+The enrichment job (issue #40) builds its clients with a `StoreCache`.
+
+### Company freshness
+
+ADR 0002 section 6 refreshes a company on each registry's schedule and as soon as its document
+count doubles. The store keeps, per company, the last enrichment time, its document count then
+(documents with a live `party` edge) and each registry's next due time (`FreshnessStore` in
+`doewood-model`; tables `company_enrichment` and `company_registry_due`):
+
+- `record_enrichment(company, [(registry, interval)])` sets the time and the count to now and
+  each listed registry's due time to now plus its interval; other registries keep theirs.
+- `companies_due(owner, after, limit)` is one page (by id, at most 1000) of the companies with
+  at least one document that were never enriched (`New`), whose count is at least twice the
+  count then, and at least 2 (`Doubled`), or with a registry due (`Scheduled`, naming the
+  registries). A company another instance holds an unexpired lease on is left out.
+- The lease is the existing one (`lease_company`, table `company_leases`), unchanged.
+
+Both backends pass the same conformance checks.
 
 ## GLEIF
 

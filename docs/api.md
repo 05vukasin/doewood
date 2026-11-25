@@ -369,15 +369,36 @@ profile, commit `fa9f72f` plus this change.
 | all pages of the 5 % prefix, 50 each | 9.8 | 9.6 | 628 | 203 |
 
 With 50,000 records, the page halfway through read 32,024 buffers before and 485 after: the
-`locations` index scan starts at the page token now. A prefix that matches few or no keys
-gets a sequential scan of `locations`, which grows with the table: about 10 ms at 62,597
-locations. The default collation does not let `starts_with` use the
-`(endpoint, bucket, object_key)` index. In a trial with a similar 60,000 locations, an index on
-`(endpoint, bucket, object_key COLLATE "C")` brought these cases from 7 to 11 ms to under
-1.2 ms. It needs a schema migration, though, and a
-database migrated by a newer doewood is refused by older instances
-([configuration.md](configuration.md#the-shared-postgres)). So it is left for a release that
-upgrades every instance together.
+`locations` index scan starts at the page token now.
+
+A prefix that matches few or no keys used to get a sequential scan of `locations`, which grows
+with the table (about 10 ms at 62,597 locations): the default collation does not let
+`starts_with` use the `(endpoint, bucket, object_key)` index. Shared schema 3 (issue #27) adds
+`locations_by_key_c` on `(endpoint, bucket, object_key COLLATE "C")`, and the query matches the
+prefix as `starts_with(l.object_key COLLATE "C", $3)`. Postgres (15 and newer) turns that into
+a range on the index (`object_key >= 'dept0/2026/file-40' AND object_key < 'dept0/2026/file-41'`)
+and keeps `starts_with` as the filter, so the results are the same; the comparison test above
+still passes. The same index also serves the old query and the source filter of search.
+
+The same test at 50,000 records, run on commit `fb0db75` (schema 2) and on this change
+(schema 3), same setup. "before #13" and "now" are the two queries the test times; the bold
+rows are the ones the index is for.
+
+| case | 50,000, schema 2, before #13 | 50,000, schema 2, now | 50,000, schema 3, before #13 | 50,000, schema 3, now |
+|---|---|---|---|---|
+| bucket, first page (50) | 1.08 | 1.14 | 1.19 | 1.14 |
+| bucket, page halfway (50) | 15.11 | 1.23 | 11.53 | 1.12 |
+| bucket, 1000 per page | 16.06 | 11.75 | 12.55 | 9.59 |
+| prefix with 5 %, first page | 1.52 | 1.54 | 1.58 | 1.83 |
+| **rare prefix (49 records)** | 13.20 | **13.35** | 1.48 | **0.96** |
+| **prefix matching nothing** | 8.29 | **8.88** | 0.54 | **0.52** |
+| all pages of the bucket, 50 each | 2,628 | 339 | 2,548 | 360 |
+| all pages of the bucket, 1000 each | 256 | 181 | 271 | 192 |
+| all pages of the 5 % prefix, 50 each | 527 | 164 | 351 | 157 |
+
+The rare prefix now reads 227 buffers instead of 1,393. At 5,000 records the prefix cases were
+already 1 to 2 ms and stay there. Every shared instance must run schema 3 together
+([configuration.md](configuration.md#the-shared-postgres)).
 
 Standalone SQLite probes `locations` once per record, but `?4 IS NULL OR r.blake3 > ?4` kept
 it from starting at the page token, so it too read every record before the page. It now

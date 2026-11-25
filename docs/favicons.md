@@ -31,8 +31,12 @@ The code is `crates/doewood-registry/src/favicon/`: the resolver (`mod.rs`), the
    fallback is not used. The fallback goes through the same guard and checks as the site.
 4. **Time budgets:** 6 s for the site, 5 s for the fallback, 12 s in all. Each request has a
    3 s connect and a 5 s total timeout.
-5. **Cache:** a hit is kept 30 days, a miss 6 hours, in memory (up to 10,000 domains; the
-   oldest go first). Anything that finds no usable icon is a miss, including a site that does
+5. **Cache:** a hit is kept 30 days, a miss 6 hours, in the backend's `favicons` table: the
+   icon's bytes and format (or the miss), the lookup date and the expiry. With a shared
+   Postgres every instance uses the same table, so an icon is fetched once; standalone it is
+   the instance's SQLite file. While the shared store is not connected yet, icons are cached
+   in memory (up to 10,000 domains; the oldest go first). Expired rows are never served and are
+   purged every hour. Anything that finds no usable icon is a miss, including a site that does
    not answer or that the guard refuses. At most 16 lookups fetch at the same time; more
    answer `503`.
 
