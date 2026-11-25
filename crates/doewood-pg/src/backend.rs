@@ -257,7 +257,8 @@ async fn upsert_live_edge(c: &mut Object, edge: &Edge) -> Result<LiveEdge> {
         ends.dedup();
         let rows = tx
             .query(
-                "SELECT props->>'merged_into' FROM nodes WHERE id = ANY($1)                  ORDER BY id FOR SHARE",
+                "SELECT props->>'merged_into' FROM nodes WHERE id = ANY($1) \
+                 ORDER BY id FOR SHARE",
                 &[&ends],
             )
             .await
