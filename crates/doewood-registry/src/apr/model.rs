@@ -197,7 +197,7 @@ pub(crate) const FIELDS: [&str; 7] = [
 ];
 
 /// One company as cached: the raw fields with its MB and the snapshot date.
-#[derive(Debug, Default, Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub(crate) struct RawRecord {
     #[serde(rename = "MaticniBroj")]

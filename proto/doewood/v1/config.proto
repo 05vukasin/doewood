@@ -338,6 +338,21 @@ message EnrichmentSettings {
   bool favicon_fallback = 12;
   // The proxy all favicon requests go through; empty: direct.
   string favicon_egress_proxy = 13;
+  // The registry delta feed switches (ADR 0002 section 6). A feed is read only while its
+  // registry is switched on too; one instance per cluster reads each. GLEIF's daily delta
+  // files, default on.
+  bool gleif_feed_enabled = 14;
+  // EDGAR's daily index (new 10-K, 20-F and 8-K filings), default on.
+  bool edgar_feed_enabled = 15;
+  // APR's monthly open-data set, swapped in when a new one is published, default on.
+  bool apr_feed_enabled = 16;
+  // Companies House's streaming API, default off: see `companies_house_feed_active`.
+  bool companies_house_feed_enabled = 17;
+  // Whether a Companies House streaming key is stored.
+  bool companies_house_stream_key_set = 18;
+  // Whether the Companies House stream is read: its switch on, a streaming key set, and
+  // Companies House asked (`companies_house_active`).
+  bool companies_house_feed_active = 19;
 }
 
 message GetEnrichmentSettingsRequest {}
@@ -373,4 +388,14 @@ message SetEnrichmentSettingsRequest {
   // The favicon egress proxy: an `http://` or `https://` URL without credentials. Unset
   // keeps it; empty removes it (direct).
   optional string favicon_egress_proxy = 15;
+  // The delta feed switches. Unset keeps the stored value.
+  optional bool gleif_feed_enabled = 16;
+  optional bool edgar_feed_enabled = 17;
+  optional bool apr_feed_enabled = 18;
+  optional bool companies_house_feed_enabled = 19;
+  // WRITE-ONLY. The Companies House streaming key (Companies House issues streaming keys
+  // apart from REST keys), same format as the API key. Empty keeps the stored key.
+  string companies_house_stream_key = 20;
+  // Deletes the stored streaming key.
+  bool clear_companies_house_stream_key = 21;
 }

@@ -61,6 +61,47 @@ pub struct EnrichmentCounts {
     pub last_pass_completed_at: i64,
     /// Whether a pass is running.
     pub running: bool,
+    /// The registry delta feeds (issue #49).
+    pub feeds: [FeedCounts; 4],
+}
+
+/// One registry delta feed on this instance (ADR 0002 section 6, issue #49).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FeedCounts {
+    /// `gleif`, `edgar`, `apr` or `companies_house`; empty for an unused slot.
+    pub feed: &'static str,
+    /// Switched on here (and its registry asked).
+    pub enabled: bool,
+    /// This instance holds the feed's lease.
+    pub leader: bool,
+    /// Runs completed.
+    pub runs: u64,
+    /// Records read.
+    pub records: u64,
+    /// Companies made due.
+    pub companies_due: u64,
+    /// Runs that failed.
+    pub failures: u64,
+    /// When a run last completed, Unix seconds; 0 before the first.
+    pub last_run_at: i64,
+    /// Where the feed stands (a time, or Companies House's timepoint); 0: none.
+    pub position: i64,
+}
+
+impl From<FeedCounts> for pb::FeedProgress {
+    fn from(c: FeedCounts) -> Self {
+        Self {
+            feed: c.feed.to_owned(),
+            enabled: c.enabled,
+            leader: c.leader,
+            runs: c.runs,
+            records: c.records,
+            companies_due: c.companies_due,
+            failures: c.failures,
+            last_run_at: c.last_run_at,
+            position: c.position,
+        }
+    }
 }
 
 impl From<EnrichmentCounts> for pb::EnrichmentProgress {
@@ -77,6 +118,12 @@ impl From<EnrichmentCounts> for pb::EnrichmentProgress {
             passes: c.passes,
             last_pass_completed_at: c.last_pass_completed_at,
             running: c.running,
+            feeds: c
+                .feeds
+                .into_iter()
+                .filter(|f| !f.feed.is_empty())
+                .map(Into::into)
+                .collect(),
         }
     }
 }
@@ -411,6 +458,34 @@ mod tests {
         assert_eq!(p.enrichment(), Some(c));
         let pb: pb::EnrichmentProgress = c.into();
         assert_eq!((pb.enriched, pb.merged), (2, 1));
+        assert!(pb.feeds.is_empty(), "unused slots are left out");
+        let mut c = c;
+        c.feeds[0] = FeedCounts {
+            feed: "gleif",
+            enabled: true,
+            leader: true,
+            runs: 3,
+            companies_due: 2,
+            ..FeedCounts::default()
+        };
+        p.set_enrichment(c);
+        assert!(
+            rx.has_changed().unwrap(),
+            "a feed's counts wake watchers too"
+        );
+        let pb: pb::EnrichmentProgress = c.into();
+        assert_eq!(pb.feeds.len(), 1);
+        let f = &pb.feeds[0];
+        assert_eq!(
+            (
+                f.feed.as_str(),
+                f.enabled,
+                f.leader,
+                f.runs,
+                f.companies_due
+            ),
+            ("gleif", true, true, 3, 2)
+        );
     }
 
     #[test]

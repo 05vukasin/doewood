@@ -5,6 +5,7 @@
 //! aliases that refer to them.
 
 use async_trait::async_trait;
+use deadpool_postgres::GenericClient;
 use doewood_core::InstanceId;
 use doewood_model::merge::{self, MergeTx};
 use doewood_model::{
@@ -13,11 +14,12 @@ use doewood_model::{
     StoredEdge, UndoOutcome, UndoRequest, Undone, merges_limit,
 };
 use serde_json::Value;
-use tokio_postgres::{GenericClient, Row};
+use tokio_postgres::Row;
 use uuid::Uuid;
 
 use crate::PgStore;
 use crate::backend::{EDGE_COLUMNS, NODE_COLUMNS, bad, client, edge_at, node_at, parse, pg};
+use crate::cached::Cached;
 
 /// Serializes merge-log writes between instances ("dwmerge").
 const LOCK: i64 = 0x0064_776d_6572_6765;
@@ -77,13 +79,12 @@ fn dismissal_at(r: &Row) -> Result<Dismissal> {
 
 pub(crate) async fn aliases_of(c: &impl GenericClient, node: Uuid) -> Result<Vec<OwnedAlias>> {
     let rows = c
-        .query(
+        .rows(
             "SELECT kind, alias, props FROM node_aliases WHERE node_id = $1 \
              ORDER BY kind COLLATE \"C\", alias COLLATE \"C\"",
             &[&node],
         )
-        .await
-        .map_err(pg)?;
+        .await?;
     rows.iter()
         .map(|r| {
             Ok(OwnedAlias {
@@ -104,23 +105,21 @@ impl MergeTx for Tx<'_> {
         let mut ids = ids.to_vec();
         ids.sort_unstable();
         self.0
-            .execute(
+            .exec(
                 "SELECT id FROM nodes WHERE id = ANY($1) ORDER BY id FOR UPDATE",
                 &[&ids],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         Ok(())
     }
 
     async fn node(&mut self, id: Uuid) -> Result<Option<Node>> {
         self.0
-            .query_opt(
+            .opt(
                 &format!("SELECT {NODE_COLUMNS} FROM nodes n WHERE n.id = $1"),
                 &[&id],
             )
-            .await
-            .map_err(pg)?
+            .await?
             .map(|r| node_at(&r, 0))
             .transpose()
     }
@@ -134,65 +133,60 @@ impl MergeTx for Tx<'_> {
     ) -> Result<bool> {
         let n = self
             .0
-            .execute(
+            .exec(
                 "INSERT INTO nodes (id, kind, key, props) VALUES ($1, $2, $3, $4) \
                  ON CONFLICT ON CONSTRAINT nodes_kind_key DO NOTHING",
                 &[&id, &kind.as_str(), &key, props],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         Ok(n == 1)
     }
 
     async fn set_props(&mut self, id: Uuid, props: &Value) -> Result<()> {
         self.0
-            .execute(
+            .exec(
                 "UPDATE nodes SET props = $2, updated_at = now() WHERE id = $1",
                 &[&id, props],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         Ok(())
     }
 
     async fn delete_node(&mut self, id: Uuid) -> Result<()> {
         self.0
-            .execute("DELETE FROM nodes WHERE id = $1", &[&id])
-            .await
-            .map_err(pg)?;
+            .exec("DELETE FROM nodes WHERE id = $1", &[&id])
+            .await?;
         Ok(())
     }
 
     async fn edges_at(&mut self, node: Uuid) -> Result<Vec<StoredEdge>> {
         let rows = self
             .0
-            .query(
+            .rows(
                 &format!(
                     "SELECT {EDGE_COLUMNS} FROM edges e WHERE e.src = $1 OR e.dst = $1 \
                      ORDER BY e.id"
                 ),
                 &[&node],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         rows.iter().map(edge_at).collect()
     }
 
     async fn edge(&mut self, id: Uuid) -> Result<Option<StoredEdge>> {
         self.0
-            .query_opt(
+            .opt(
                 &format!("SELECT {EDGE_COLUMNS} FROM edges e WHERE e.id = $1"),
                 &[&id],
             )
-            .await
-            .map_err(pg)?
+            .await?
             .map(|r| edge_at(&r))
             .transpose()
     }
 
     async fn edge_with_identity(&mut self, e: &Edge) -> Result<Option<Uuid>> {
         self.0
-            .query_opt(
+            .opt(
                 "SELECT id FROM edges WHERE src = $1 AND dst = $2 AND kind = $3 \
                  AND source = $4 AND valid_from IS NOT DISTINCT FROM $5",
                 &[
@@ -203,46 +197,42 @@ impl MergeTx for Tx<'_> {
                     &e.valid_from,
                 ],
             )
-            .await
-            .map_err(pg)?
+            .await?
             .map(|r| r.try_get(0).map_err(pg))
             .transpose()
     }
 
     async fn repoint_edge(&mut self, id: Uuid, src: Uuid, dst: Uuid) -> Result<()> {
         self.0
-            .execute(
+            .exec(
                 "UPDATE edges SET src = $2, dst = $3, updated_at = now() WHERE id = $1",
                 &[&id, &src, &dst],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         Ok(())
     }
 
     async fn set_edge_state(&mut self, id: Uuid, state: EdgeState) -> Result<()> {
         self.0
-            .execute(
+            .exec(
                 "UPDATE edges SET state = $2, updated_at = now() WHERE id = $1",
                 &[&id, &state.as_str()],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         Ok(())
     }
 
     async fn aliases_of(&mut self, node: Uuid) -> Result<Vec<OwnedAlias>> {
-        aliases_of(&*self.0, node).await
+        aliases_of(&self.0, node).await
     }
 
     async fn alias(&mut self, kind: NodeKind, alias: &str) -> Result<Option<NodeAlias>> {
         self.0
-            .query_opt(
+            .opt(
                 "SELECT node_id, props FROM node_aliases WHERE kind = $1 AND alias = $2",
                 &[&kind.as_str(), &alias],
             )
-            .await
-            .map_err(pg)?
+            .await?
             .map(|r| {
                 Ok(NodeAlias {
                     node: r.try_get(0).map_err(pg)?,
@@ -254,13 +244,12 @@ impl MergeTx for Tx<'_> {
 
     async fn set_alias_owner(&mut self, kind: NodeKind, alias: &str, node: Uuid) -> Result<()> {
         self.0
-            .execute(
+            .exec(
                 "UPDATE node_aliases SET node_id = $3, updated_at = now() \
                  WHERE kind = $1 AND alias = $2",
                 &[&kind.as_str(), &alias, &node],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         Ok(())
     }
 
@@ -268,7 +257,7 @@ impl MergeTx for Tx<'_> {
         #[allow(clippy::cast_precision_loss)]
         let at = e.at as f64;
         self.0
-            .query_one(
+            .one(
                 "INSERT INTO company_merges (id, op, at, actor, instance, survivor_id, \
                  absorbed_id, evidence, confidence, probability, undo) \
                  VALUES ($1, $2, to_timestamp($3), $4, $5, $6, $7, $8, $9, $10, $11) \
@@ -287,20 +276,18 @@ impl MergeTx for Tx<'_> {
                     &e.undo,
                 ],
             )
-            .await
-            .map_err(pg)?
+            .await?
             .try_get(0)
             .map_err(pg)
     }
 
     async fn entry(&mut self, id: Uuid) -> Result<Option<MergeEntry>> {
         self.0
-            .query_opt(
+            .opt(
                 &format!("SELECT {ENTRY_COLUMNS} FROM company_merges WHERE id = $1"),
                 &[&id],
             )
-            .await
-            .map_err(pg)?
+            .await?
             .map(|r| entry_at(&r))
             .transpose()
     }
@@ -308,7 +295,7 @@ impl MergeTx for Tx<'_> {
     async fn entries(&mut self, q: &MergeQuery) -> Result<Vec<MergeEntry>> {
         let rows = self
             .0
-            .query(
+            .rows_uncached(
                 &format!(
                     "SELECT {ENTRY_COLUMNS} FROM company_merges \
                      WHERE ($1::uuid IS NULL OR survivor_id = $1 OR absorbed_id = $1) \
@@ -316,15 +303,14 @@ impl MergeTx for Tx<'_> {
                 ),
                 &[&q.company, &q.before, &i64::from(merges_limit(q.limit))],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         rows.iter().map(entry_at).collect()
     }
 
     async fn live_entries_after(&mut self, seq: i64, nodes: &[Uuid]) -> Result<Vec<MergeEntry>> {
         let rows = self
             .0
-            .query(
+            .rows(
                 &format!(
                     "SELECT {ENTRY_COLUMNS} FROM company_merges \
                      WHERE seq > $1 AND undone_at IS NULL \
@@ -332,21 +318,19 @@ impl MergeTx for Tx<'_> {
                 ),
                 &[&seq, &nodes],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         rows.iter().map(entry_at).collect()
     }
 
     async fn absorbed_into(&mut self, survivors: &[Uuid]) -> Result<Vec<Uuid>> {
         let rows = self
             .0
-            .query(
+            .rows(
                 "SELECT absorbed_id FROM company_merges WHERE op = 'merge' \
                  AND undone_at IS NULL AND survivor_id = ANY($1)",
                 &[&survivors],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         rows.iter().map(|r| r.try_get(0).map_err(pg)).collect()
     }
 
@@ -354,19 +338,18 @@ impl MergeTx for Tx<'_> {
         #[allow(clippy::cast_precision_loss)]
         let at = u.at as f64;
         self.0
-            .execute(
+            .exec(
                 "UPDATE company_merges SET undone_at = to_timestamp($2), undone_actor = $3, \
                  undone_instance = $4 WHERE id = $1",
                 &[&id, &at, &u.actor.kind.as_str(), &u.actor.instance.as_str()],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         Ok(())
     }
 
     async fn dismissal_among(&mut self, a: &[Uuid], b: &[Uuid]) -> Result<Option<Dismissal>> {
         self.0
-            .query_opt(
+            .opt(
                 &format!(
                     "SELECT {DISMISSAL_COLUMNS} FROM company_dismissals \
                      WHERE (company_a = ANY($1) AND company_b = ANY($2)) \
@@ -374,8 +357,7 @@ impl MergeTx for Tx<'_> {
                 ),
                 &[&a, &b],
             )
-            .await
-            .map_err(pg)?
+            .await?
             .map(|r| dismissal_at(&r))
             .transpose()
     }
@@ -384,7 +366,7 @@ impl MergeTx for Tx<'_> {
         #[allow(clippy::cast_precision_loss)]
         let at = d.at as f64;
         self.0
-            .execute(
+            .exec(
                 "INSERT INTO company_dismissals (company_a, company_b, at, actor, instance, \
                  reason, merge_id) VALUES ($1, $2, to_timestamp($3), $4, $5, $6, $7) \
                  ON CONFLICT (company_a, company_b) DO NOTHING",
@@ -398,26 +380,24 @@ impl MergeTx for Tx<'_> {
                     &d.merge,
                 ],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         let row = self
             .0
-            .query_one(
+            .one(
                 &format!(
                     "SELECT {DISMISSAL_COLUMNS} FROM company_dismissals \
                      WHERE company_a = $1 AND company_b = $2"
                 ),
                 &[&d.a, &d.b],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         dismissal_at(&row)
     }
 
     async fn dismissals(&mut self, q: &DismissalQuery) -> Result<Vec<Dismissal>> {
         let rows = self
             .0
-            .query(
+            .rows_uncached(
                 &format!(
                     "SELECT {DISMISSAL_COLUMNS} FROM company_dismissals \
                      WHERE ($1::uuid IS NULL OR company_a = $1 OR company_b = $1) \
@@ -425,8 +405,7 @@ impl MergeTx for Tx<'_> {
                 ),
                 &[&q.company, &q.before, &i64::from(merges_limit(q.limit))],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         rows.iter().map(dismissal_at).collect()
     }
 }
@@ -439,9 +418,8 @@ macro_rules! in_tx {
         let mut $tx = Tx(t);
         if $write {
             $tx.0
-                .execute("SELECT pg_advisory_xact_lock($1)", &[&LOCK])
-                .await
-                .map_err(pg)?;
+                .exec("SELECT pg_advisory_xact_lock($1)", &[&LOCK])
+                .await?;
         }
         let out = $body;
         $tx.0.commit().await.map_err(pg)?;

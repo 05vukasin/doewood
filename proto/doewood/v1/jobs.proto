@@ -116,6 +116,35 @@ message EnrichmentProgress {
   // Dated edges that landed on the company an end was merged into while the company was
   // worked on (a merge committed between the lookup and the write).
   uint64 redirected = 11;
+  // The registry delta feeds, one entry per feed (`gleif`, `edgar`, `apr`,
+  // `companies_house`), counted on this instance since it started.
+  repeated FeedProgress feeds = 12;
+}
+
+// One registry delta feed (ADR 0002 section 6) on this instance. One instance per cluster
+// reads each feed at a time (a lease in the shared store); the others count nothing.
+message FeedProgress {
+  // `gleif`, `edgar`, `apr` or `companies_house`.
+  string feed = 1;
+  // Whether it is switched on here (and its registry is asked).
+  bool enabled = 2;
+  // Whether this instance holds the feed's lease now.
+  bool leader = 3;
+  // Runs completed here: a delta file set, a day of the index, a set download, a stream
+  // connection.
+  uint64 runs = 4;
+  // Records read (LEI and relationship records, index rows, set entries compared, stream
+  // events).
+  uint64 records = 5;
+  // Companies the graph has that a record named, made due for their registry.
+  uint64 companies_due = 6;
+  // Runs that failed (each logged at WARN); the feed is tried again later.
+  uint64 failures = 7;
+  // When a run last completed, Unix seconds; 0 before the first.
+  int64 last_run_at = 8;
+  // Where the feed stands, as a time (GLEIF: the publication; EDGAR: the last index day;
+  // APR: the set's date), Unix seconds; for Companies House the stream's timepoint. 0: none.
+  int64 position = 9;
 }
 
 message ReprocessJobRequest {

@@ -13,6 +13,7 @@
 pub mod conformance;
 mod enrichment;
 mod error;
+mod feed;
 pub mod merge;
 pub mod proposal;
 mod props;
@@ -26,6 +27,10 @@ pub use enrichment::{
     validate_schedule,
 };
 pub use error::{Error, Result};
+pub use feed::{
+    FEED_BATCH_MAX, FEED_CURSOR_MAX_LEN, FEED_NAME_MAX_LEN, FeedState, validate_batch,
+    validate_cursor, validate_feed,
+};
 pub use merge::{
     DismissRequest, Dismissal, DismissalQuery, EVIDENCE_MAX_BYTES, MERGE_CHAIN_MAX,
     MERGES_MAX_LIMIT, MergeActor, MergeEntry, MergeQuery, MergeRequest, MergeTx, OwnedAlias,
@@ -38,8 +43,8 @@ pub use proposal::{
 };
 pub use props::{PATCH_MAX_DEPTH, PATCH_MAX_OPS, PropOp, PropsPatch};
 pub use traits::{
-    Backend, CacheStore, ClaimStore, FreshnessStore, GraphStore, MergeStore, ProposalStore,
-    RecordStore, SearchStore, SketchStore, sketch_limit,
+    Backend, CacheStore, ClaimStore, FeedStore, FreshnessStore, GraphStore, MergeStore,
+    ProposalStore, RecordStore, SearchStore, SketchStore, sketch_limit,
 };
 pub use types::{
     Blake3, Direction, Edge, EdgeKind, EdgeSource, EdgeState, LiveEdge, Located, LocationEnded,

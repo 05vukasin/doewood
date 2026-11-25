@@ -28,10 +28,12 @@ pub use store::ai::{
     valid_provider_name,
 };
 pub use store::enrichment::{
-    APR_ENABLED, APR_EXTRA_ROOTS_SECRET, COMPANIES_HOUSE_ENABLED, COMPANIES_HOUSE_KEY_SECRET,
-    EDGAR_CONTACT, EDGAR_CONTACT_MAX_CHARS, EDGAR_ENABLED, EnrichmentConfig, EnrichmentSettings,
-    EnrichmentSettingsPatch, GLEIF_ENABLED, OPENCORPORATES_KEY_SECRET, PEM_MAX_LEN,
-    RegistrySwitches, RegistrySwitchesPatch, RootsChange, RootsPem, VIES_ENABLED, WIKIDATA_ENABLED,
+    APR_ENABLED, APR_EXTRA_ROOTS_SECRET, APR_FEED_ENABLED, COMPANIES_HOUSE_ENABLED,
+    COMPANIES_HOUSE_FEED_ENABLED, COMPANIES_HOUSE_KEY_SECRET, COMPANIES_HOUSE_STREAM_KEY_SECRET,
+    EDGAR_CONTACT, EDGAR_CONTACT_MAX_CHARS, EDGAR_ENABLED, EDGAR_FEED_ENABLED, EnrichmentConfig,
+    EnrichmentSettings, EnrichmentSettingsPatch, FeedSwitches, FeedSwitchesPatch, GLEIF_ENABLED,
+    GLEIF_FEED_ENABLED, OPENCORPORATES_KEY_SECRET, PEM_MAX_LEN, RegistrySwitches,
+    RegistrySwitchesPatch, RootsChange, RootsPem, VIES_ENABLED, WIKIDATA_ENABLED,
     valid_edgar_contact,
 };
 pub use store::favicon::{

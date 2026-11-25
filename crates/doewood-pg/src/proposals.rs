@@ -1,15 +1,17 @@
 //! Enrichment proposals over Postgres (schema 5). The rules are `doewood_model::proposal`.
 
 use async_trait::async_trait;
+use deadpool_postgres::GenericClient;
 use doewood_model::{
     Error, MergeStore, NodeKind, Proposal, ProposalKind, ProposalQuery, ProposalRequest,
     ProposalState, ProposalStore, Resolution, ResolveRequest, Result, proposals_limit,
 };
-use tokio_postgres::{GenericClient, Row};
+use tokio_postgres::Row;
 use uuid::Uuid;
 
 use crate::PgStore;
 use crate::backend::{client, parse, pg};
+use crate::cached::Cached;
 use crate::merges::actor;
 
 const COLUMNS: &str = "id, seq, kind, company_id, candidate, detail, evidence, probability, \
@@ -53,12 +55,11 @@ fn proposal_at(r: &Row) -> Result<Proposal> {
 }
 
 async fn by_id(c: &impl GenericClient, id: Uuid) -> Result<Option<Proposal>> {
-    c.query_opt(
+    c.opt(
         &format!("SELECT {COLUMNS} FROM company_proposals WHERE id = $1"),
         &[&id],
     )
-    .await
-    .map_err(pg)?
+    .await?
     .map(|r| proposal_at(&r))
     .transpose()
 }
@@ -66,9 +67,8 @@ async fn by_id(c: &impl GenericClient, id: Uuid) -> Result<Option<Proposal>> {
 /// Fails unless `id` is a company node.
 async fn company(c: &impl GenericClient, id: Uuid) -> Result<()> {
     let kind: Option<String> = c
-        .query_opt("SELECT kind FROM nodes WHERE id = $1", &[&id])
-        .await
-        .map_err(pg)?
+        .opt("SELECT kind FROM nodes WHERE id = $1", &[&id])
+        .await?
         .map(|r| r.try_get(0))
         .transpose()
         .map_err(pg)?;
@@ -84,28 +84,27 @@ impl ProposalStore for PgStore {
     async fn propose(&self, req: &ProposalRequest) -> Result<Option<Proposal>> {
         req.validate()?;
         let c = client(&self.pool).await?;
-        company(&**c, req.company).await?;
+        company(&c, req.company).await?;
         if req.kind == ProposalKind::Merge {
             let other = Uuid::parse_str(&req.candidate)
                 .map_err(|e| Error::Invalid(format!("candidate: {e}")))?;
-            company(&**c, other).await?;
+            company(&c, other).await?;
             if self.dismissal(req.company, other).await?.is_some() {
                 return Ok(None);
             }
         }
         let blocked = c
-            .query_opt(
+            .opt(
                 "SELECT 1 FROM company_proposals WHERE kind = $1 AND company_id = $2 \
                  AND candidate = $3 AND state = 'rejected' AND dismissed LIMIT 1",
                 &[&req.kind.as_str(), &req.company, &req.candidate],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         if blocked.is_some() {
             return Ok(None);
         }
         let row = c
-            .query_one(
+            .one(
                 &format!(
                     "INSERT INTO company_proposals (id, kind, company_id, candidate, detail, \
                      evidence, probability, reason, state, created_at, updated_at) \
@@ -126,20 +125,19 @@ impl ProposalStore for PgStore {
                     &req.reason.as_str(),
                 ],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         proposal_at(&row).map(Some)
     }
 
     async fn proposal(&self, id: Uuid) -> Result<Option<Proposal>> {
         let c = client(&self.pool).await?;
-        by_id(&**c, id).await
+        by_id(&c, id).await
     }
 
     async fn list_proposals(&self, q: &ProposalQuery) -> Result<Vec<Proposal>> {
         let c = client(&self.pool).await?;
         let rows = c
-            .query(
+            .rows_uncached(
                 &format!(
                     "SELECT {COLUMNS} FROM company_proposals \
                      WHERE ($1::text IS NULL OR state = $1) \
@@ -156,8 +154,7 @@ impl ProposalStore for PgStore {
                     &i64::from(proposals_limit(q.limit)),
                 ],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         rows.iter().map(proposal_at).collect()
     }
 
@@ -165,7 +162,7 @@ impl ProposalStore for PgStore {
         req.validate()?;
         let c = client(&self.pool).await?;
         let row = c
-            .query_opt(
+            .opt(
                 &format!(
                     "UPDATE company_proposals SET state = $2, resolved_at = now(), \
                      resolved_actor = $3, resolved_instance = $4, dismissed = $5, \
@@ -182,12 +179,11 @@ impl ProposalStore for PgStore {
                     &req.note,
                 ],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         if let Some(r) = row {
             return proposal_at(&r);
         }
-        match by_id(&**c, req.id).await? {
+        match by_id(&c, req.id).await? {
             Some(p) => Err(Error::Precondition(format!(
                 "proposal {} is {} already",
                 p.id, p.state

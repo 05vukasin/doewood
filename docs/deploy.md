@@ -54,7 +54,9 @@ Service for the gRPC (7443) and ops (7444) ports. The liveness probe is `/health
 probe `/readyz`. `DOEWOOD_INSTANCE_ID` is the pod name. Parallel starts against a new, empty
 database are safe: one pod migrates the shared schema (and creates pgvector), the others
 wait for it and stay not ready until then (see the Migrations bullet in
-[configuration.md](configuration.md#the-shared-postgres)).
+[configuration.md](configuration.md#the-shared-postgres)). Behind PgBouncer in transaction
+mode, use PgBouncer 1.21 or newer with `max_prepared_statements` set: doewood keeps prepared
+statements per connection (see the Prepared statements bullet there).
 
 Secrets come only from existing `Secret`s, never from values:
 
