@@ -511,7 +511,7 @@ page took 471 ms before and 69 ms after, with the same results.
 
 `cargo test -p doewood-api` starts in-process servers and calls every RPC with a tonic client:
 the happy paths, validation errors, two instances sharing one backend (the claim conflict),
-secrets never coming back (SQS inlet credentials included), the progress stream, a gRPC-Web request over HTTP/1.1, health,
-reflection and the message limit. `tests/icons.rs` checks the icon route's answers and
+secrets never coming back (SQS inlet credentials included), the progress stream, a gRPC-Web
+request over HTTP/1.1, health, reflection and the message limit. `tests/icons.rs` checks the icon route's answers and
 headers with a fake resolver. With `DOEWOOD_TEST_POSTGRES_URL` set, the claim, records,
 graph, merge-log and search tests also run against Postgres.
