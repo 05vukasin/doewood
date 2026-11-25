@@ -13,13 +13,16 @@
 //!   a stream only while it is set up, so an open `WatchProgress` is neither counted nor cut.
 //!   Health checks are exempt from both; `Summarize` is counted but has no server deadline
 //!   (its analysis and provider calls are bounded on their own and can take minutes).
+//!   A shed call carries `grpc-retry-pushback-ms` (issue #104, gRFC A6): a delay drawn
+//!   uniformly from [[`RETRY_PUSHBACK_BASE`], 2 × [`RETRY_PUSHBACK_BASE`]), so clients with a
+//!   retry policy wait at least that long and clients shed together do not retry together.
 
 use std::convert::Infallible;
 use std::future::Future as _;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -30,7 +33,7 @@ use tokio::time::Sleep;
 use tokio_stream::Stream;
 use tonic::Status;
 use tonic::body::Body;
-use tonic::codegen::http::{Request, Response};
+use tonic::codegen::http::{HeaderValue, Request, Response};
 use tonic::codegen::{BoxFuture, Service};
 use tonic::transport::server::Connected;
 
@@ -56,6 +59,13 @@ pub const MAX_CONNECTION_AGE_JITTER_PERCENT: u32 = 10;
 /// the connection is closed.
 pub const MAX_CONNECTION_AGE_GRACE: Duration = Duration::from_mins(5);
 
+/// The shortest retry pushback a shed call gets; each draws its own from
+/// [base, 2 × base), in whole milliseconds.
+pub const RETRY_PUSHBACK_BASE: Duration = Duration::from_millis(100);
+
+/// The gRPC trailer (gRFC A6) that tells a client how long to wait before it retries.
+pub const RETRY_PUSHBACK_HEADER: &str = "grpc-retry-pushback-ms";
+
 /// Paths exempt from the call limits: health checks must answer under load.
 const HEALTH_PREFIX: &str = "/grpc.health.v1.Health/";
 /// Paths counted but without a server deadline.
@@ -67,6 +77,8 @@ pub(crate) struct CallLimits {
     max_in_flight: AtomicU32,
     deadline_seconds: AtomicU32,
     in_flight: AtomicU32,
+    /// The state of the shed calls' pushback jitter (splitmix64, advanced atomically).
+    pushback: AtomicU64,
 }
 
 impl CallLimits {
@@ -75,6 +87,7 @@ impl CallLimits {
             max_in_flight: AtomicU32::new(0),
             deadline_seconds: AtomicU32::new(0),
             in_flight: AtomicU32::new(0),
+            pushback: AtomicU64::new(Jitter::random().0),
         };
         limits.set(settings);
         limits
@@ -101,6 +114,17 @@ impl CallLimits {
             })
             .ok()
             .map(|_| InFlight(Arc::clone(self)))
+    }
+
+    /// The retry pushback for one shed call, in milliseconds: uniform in
+    /// [[`RETRY_PUSHBACK_BASE`], 2 × [`RETRY_PUSHBACK_BASE`]).
+    fn pushback_ms(&self) -> u64 {
+        let state = self
+            .pushback
+            .fetch_add(SPLITMIX_GAMMA, Ordering::Relaxed)
+            .wrapping_add(SPLITMIX_GAMMA);
+        let base = u64::try_from(RETRY_PUSHBACK_BASE.as_millis()).unwrap_or(u64::MAX);
+        base + splitmix(state) % base
     }
 
     /// Calls in flight now.
@@ -166,10 +190,16 @@ where
             tracing::debug!(path, "call shed: too many calls in flight");
             self.metrics.shed();
             let max = self.limits.max_in_flight.load(Ordering::Relaxed);
-            return Box::pin(std::future::ready(Ok(reply(Status::unavailable(format!(
+            let mut shed = reply(Status::unavailable(format!(
                 "the server is overloaded ({max} calls in flight); retry with backoff, \
                  another replica may answer"
-            ))))));
+            )));
+            // Trailers-only: the headers are the trailers, for gRPC and gRPC-Web alike.
+            shed.headers_mut().insert(
+                RETRY_PUSHBACK_HEADER,
+                HeaderValue::from(self.limits.pushback_ms()),
+            );
+            return Box::pin(std::future::ready(Ok(shed)));
         };
         // The service that was made ready answers this call; a fresh clone waits for the next.
         let clone = self.inner.clone();
@@ -209,11 +239,8 @@ impl Jitter {
     }
 
     fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
+        self.0 = self.0.wrapping_add(SPLITMIX_GAMMA);
+        splitmix(self.0)
     }
 
     /// `age` times a factor drawn uniformly from [1 − p, 1 + p], p =
@@ -225,6 +252,17 @@ impl Jitter {
         let nanos = age.as_nanos() * u128::from(factor) / u128::from(MILLION);
         Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
     }
+}
+
+/// splitmix64's state increment.
+const SPLITMIX_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// splitmix64's output for one state.
+fn splitmix(state: u64) -> u64 {
+    let mut z = state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
 /// An accepted connection that is closed its own age + [`MAX_CONNECTION_AGE_GRACE`] after it
@@ -399,6 +437,13 @@ mod tests {
         Status::from_header_map(r.headers()).map_or(tonic::Code::Ok, |s| s.code())
     }
 
+    /// The response's retry pushback in milliseconds, if it has one.
+    fn pushback(r: &Response<Body>) -> Option<u64> {
+        r.headers()
+            .get(RETRY_PUSHBACK_HEADER)
+            .map(|v| v.to_str().unwrap().parse().unwrap())
+    }
+
     #[tokio::test(start_paused = true)]
     async fn sheds_beyond_the_cap_and_frees_slots() {
         let release = Arc::new(Notify::new());
@@ -423,14 +468,18 @@ mod tests {
         assert_eq!(code(&shed), tonic::Code::Unavailable);
         let status = Status::from_header_map(shed.headers()).unwrap();
         assert!(status.message().contains("overloaded"), "{status:?}");
+        let ms = pushback(&shed).expect("a shed call carries a retry pushback");
+        assert!((100..200).contains(&ms), "{ms}");
         // Health checks are never shed.
         let health = tokio::spawn(svc.call(request("/grpc.health.v1.Health/Check")));
         tokio::task::yield_now().await;
         assert_eq!(l.in_flight(), 2);
         release.notify_waiters();
-        assert_eq!(code(&a.await.unwrap().unwrap()), tonic::Code::Ok);
-        assert_eq!(code(&b.await.unwrap().unwrap()), tonic::Code::Ok);
-        assert_eq!(code(&health.await.unwrap().unwrap()), tonic::Code::Ok);
+        for answered in [a, b, health] {
+            let r = answered.await.unwrap().unwrap();
+            assert_eq!(code(&r), tonic::Code::Ok);
+            assert_eq!(pushback(&r), None, "only shed calls are pushed back");
+        }
         assert_eq!(l.in_flight(), 0);
         // The cap changes live.
         l.set(ApiSettings {
@@ -465,6 +514,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(code(&slow), tonic::Code::DeadlineExceeded);
+        assert_eq!(pushback(&slow), None, "a call that ran is not pushed back");
         let status = Status::from_header_map(slow.headers()).unwrap();
         assert!(status.message().contains("60s"), "{status:?}");
         assert_eq!(l.in_flight(), 0, "a timed-out call frees its slot");
@@ -550,6 +600,24 @@ mod tests {
         // The random seed differs between generators.
         let draws = |mut j: Jitter| (0..4).map(|_| j.age(age)).collect::<Vec<_>>();
         assert_ne!(draws(Jitter::random()), draws(Jitter::random()));
+    }
+
+    #[test]
+    fn retry_pushback_spreads_over_its_range() {
+        let l = limits(1, 60);
+        let draws: Vec<u64> = (0..1000).map(|_| l.pushback_ms()).collect();
+        assert!(draws.iter().all(|ms| (100..200).contains(ms)), "{draws:?}");
+        // Each tenth of the range gets a share.
+        for tenth in 0..10 {
+            let n = draws.iter().filter(|ms| (*ms - 100) / 10 == tenth).count();
+            assert!((50..=150).contains(&n), "tenth {tenth}: {n} of 1000");
+        }
+        // Two servers do not draw the same sequence.
+        let other = limits(1, 60);
+        assert_ne!(
+            draws[..10],
+            (0..10).map(|_| other.pushback_ms()).collect::<Vec<_>>()[..]
+        );
     }
 
     #[test]

@@ -12,9 +12,10 @@
 //! 25%. A share of the clients hold `WatchProgress` streams instead, woken every 10 ms as
 //! ingest does after each file. A call shed with `UNAVAILABLE` is retried as docs/api.md
 //! advises (100 ms doubling to 10 s, with jitter), or after a fixed
-//! `DOEWOOD_BENCH_BACKOFF_MS`. Seeding is followed by `ANALYZE` (Postgres) and a 2 s warm-up
-//! that is not reported. At the end a burst of idle connections measures memory per
-//! connection.
+//! `DOEWOOD_BENCH_BACKOFF_MS`; with `DOEWOOD_BENCH_PUSHBACK=1` a client waits the server's
+//! `grpc-retry-pushback-ms` instead when the refusal carries one (issue #104). Seeding is
+//! followed by `ANALYZE` (Postgres) and a 2 s warm-up that is not reported. At the end a
+//! burst of idle connections measures memory per connection.
 //!
 //! Settings: `DOEWOOD_BENCH_CLIENTS` (comma-separated, default `10,100,500,1000`),
 //! `DOEWOOD_BENCH_PER_CONN` (clients per connection, default 1), `DOEWOOD_BENCH_WATCH_PCT`
@@ -172,6 +173,8 @@ struct Seeded {
     /// `DOEWOOD_BENCH_ONLY`: one method of [`METHODS`] (by name) instead of the mix.
     only: Option<usize>,
     retry: Retry,
+    /// `DOEWOOD_BENCH_PUSHBACK`: wait the server's retry pushback when it sends one.
+    pushback: bool,
     source: String,
     docs: Vec<Uuid>,
     companies: Vec<Uuid>,
@@ -303,6 +306,7 @@ async fn seed(a: &Instance, backend: &Arc<dyn Backend>, docs: usize) -> Seeded {
     Seeded {
         only,
         retry: Retry::from_env(),
+        pushback: std::env::var("DOEWOOD_BENCH_PUSHBACK").is_ok_and(|v| v == "1"),
         source: source.to_string(),
         docs,
         companies: Arc::try_unwrap(companies).unwrap(),
@@ -444,6 +448,13 @@ async fn client(ch: Channel, seeded: Arc<Seeded>, seed: usize, stop: Arc<AtomicB
                     // Jitter: 50% to 100% of the backoff, scattered by the call number.
                     let wait = backoff
                         .mul_f64(0.5 + (n.wrapping_mul(2_654_435_761) % 1000) as f64 / 2000.0);
+                    // As a gRPC retry policy does (gRFC A6): the server's pushback wins.
+                    let pushback = e
+                        .metadata()
+                        .get("grpc-retry-pushback-ms")
+                        .and_then(|v| v.to_str().ok()?.parse().ok())
+                        .filter(|_| seeded.pushback);
+                    let wait = pushback.map_or(wait, Duration::from_millis);
                     let until = Instant::now() + wait;
                     while !stop.load(Ordering::Relaxed) && Instant::now() < until {
                         tokio::time::sleep(
