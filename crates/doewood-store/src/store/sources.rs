@@ -621,11 +621,13 @@ impl Store {
             .transpose()?;
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO sources (id, endpoint, bucket, prefix, region, url_style, \
              credentials_secret, max_object_bytes, state, scan_interval_s, created_at, updated_at, \
              policy_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?12)",
-            params![
+        )
+        .and_then(|mut cached| {
+            cached.execute(params![
                 id.to_string(),
                 source.endpoint,
                 source.bucket,
@@ -638,16 +640,16 @@ impl Store {
                 interval,
                 now,
                 source.llm_policy.to_json().to_string(),
-            ],
-        )?;
+            ])
+        })?;
         if let Some((name, nonce, ct)) = &sealed {
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO secrets (name, nonce, ciphertext, created_at, updated_at) \
                  VALUES (?1, ?2, ?3, ?4, ?4) \
                  ON CONFLICT (name) DO UPDATE SET nonce = excluded.nonce, \
                  ciphertext = excluded.ciphertext, updated_at = excluded.updated_at",
-                params![name, nonce.as_slice(), ct, now],
-            )?;
+            )
+            .and_then(|mut cached| cached.execute(params![name, nonce.as_slice(), ct, now]))?;
         }
         tx.commit()?;
         Ok(id)
@@ -656,7 +658,7 @@ impl Store {
     /// All sources, oldest first.
     pub fn sources(&self) -> Result<Vec<Source>, StoreError> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(&format!(
+        let mut stmt = conn.prepare_cached(&format!(
             "SELECT {SOURCE_COLUMNS} FROM sources ORDER BY created_at, id"
         ))?;
         let rows = stmt
@@ -668,11 +670,10 @@ impl Store {
     /// One source.
     pub fn source(&self, id: SourceId) -> Result<Option<Source>, StoreError> {
         self.conn()
-            .query_row(
-                &format!("SELECT {SOURCE_COLUMNS} FROM sources WHERE id = ?1"),
-                [id.to_string()],
-                Source::from_row,
-            )
+            .prepare_cached(&format!(
+                "SELECT {SOURCE_COLUMNS} FROM sources WHERE id = ?1"
+            ))
+            .and_then(|mut cached| cached.query_row([id.to_string()], Source::from_row))
             .optional()?
             .transpose()
     }
@@ -689,10 +690,14 @@ impl Store {
         } else {
             None
         };
-        let n = self.conn().execute(
-            "UPDATE sources SET state = ?2, state_reason = ?3, updated_at = ?4 WHERE id = ?1",
-            params![id.to_string(), state.as_str(), reason, now()],
-        )?;
+        let n = self
+            .conn()
+            .prepare_cached(
+                "UPDATE sources SET state = ?2, state_reason = ?3, updated_at = ?4 WHERE id = ?1",
+            )
+            .and_then(|mut cached| {
+                cached.execute(params![id.to_string(), state.as_str(), reason, now()])
+            })?;
         if n == 0 {
             return Err(StoreError::NoSuchSource(id.to_string()));
         }
@@ -714,11 +719,15 @@ impl Store {
         } else {
             None
         };
-        let n = self.conn().execute(
-            "UPDATE sources SET state = ?2, state_reason = ?3, updated_at = ?4 \
+        let n = self
+            .conn()
+            .prepare_cached(
+                "UPDATE sources SET state = ?2, state_reason = ?3, updated_at = ?4 \
              WHERE id = ?1 AND state IN ('active', 'error')",
-            params![id.to_string(), state.as_str(), reason, now()],
-        )?;
+            )
+            .and_then(|mut cached| {
+                cached.execute(params![id.to_string(), state.as_str(), reason, now()])
+            })?;
         if n == 0 && self.source(id)?.is_none() {
             return Err(StoreError::NoSuchSource(id.to_string()));
         }
@@ -736,20 +745,21 @@ impl Store {
         let now = now();
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let n = tx.execute(
-            "UPDATE sources SET credentials_secret = ?2, updated_at = ?3 WHERE id = ?1",
-            params![id.to_string(), name, now],
-        )?;
+        let n = tx
+            .prepare_cached(
+                "UPDATE sources SET credentials_secret = ?2, updated_at = ?3 WHERE id = ?1",
+            )
+            .and_then(|mut cached| cached.execute(params![id.to_string(), name, now]))?;
         if n == 0 {
             return Err(StoreError::NoSuchSource(id.to_string()));
         }
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO secrets (name, nonce, ciphertext, created_at, updated_at) \
              VALUES (?1, ?2, ?3, ?4, ?4) \
              ON CONFLICT (name) DO UPDATE SET nonce = excluded.nonce, \
              ciphertext = excluded.ciphertext, updated_at = excluded.updated_at",
-            params![name, nonce.as_slice(), ct, now],
-        )?;
+        )
+        .and_then(|mut cached| cached.execute(params![name, nonce.as_slice(), ct, now]))?;
         tx.commit()?;
         Ok(())
     }
@@ -762,14 +772,13 @@ impl Store {
         prefix: &str,
     ) -> Result<Option<Source>, StoreError> {
         self.conn()
-            .query_row(
-                &format!(
-                    "SELECT {SOURCE_COLUMNS} FROM sources \
+            .prepare_cached(&format!(
+                "SELECT {SOURCE_COLUMNS} FROM sources \
                      WHERE endpoint = ?1 AND bucket = ?2 AND prefix = ?3"
-                ),
-                params![endpoint, bucket, prefix],
-                Source::from_row,
-            )
+            ))
+            .and_then(|mut cached| {
+                cached.query_row(params![endpoint, bucket, prefix], Source::from_row)
+            })
             .optional()?
             .transpose()
     }
@@ -797,10 +806,12 @@ impl Store {
             .map_err(|_| StoreError::InvalidSource("object size cap too large".to_owned()))?;
         let interval = i64::try_from(interval.as_secs())
             .map_err(|_| StoreError::InvalidSource("scan interval too large".to_owned()))?;
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE sources SET region = ?2, url_style = ?3, scan_interval_s = ?4, \
              max_object_bytes = ?5, policy_json = ?6, updated_at = ?7 WHERE id = ?1",
-            params![
+        )
+        .and_then(|mut cached| {
+            cached.execute(params![
                 id.to_string(),
                 region,
                 url_style.as_str(),
@@ -808,8 +819,8 @@ impl Store {
                 max,
                 policy.to_json().to_string(),
                 now()
-            ],
-        )?;
+            ])
+        })?;
         let updated = tx.query_row(&select, [id.to_string()], Source::from_row)??;
         tx.commit()?;
         Ok(updated)
@@ -819,17 +830,16 @@ impl Store {
     pub fn clear_source_credentials(&self, id: SourceId) -> Result<(), StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let n = tx.execute(
-            "UPDATE sources SET credentials_secret = NULL, updated_at = ?2 WHERE id = ?1",
-            params![id.to_string(), now()],
-        )?;
+        let n = tx
+            .prepare_cached(
+                "UPDATE sources SET credentials_secret = NULL, updated_at = ?2 WHERE id = ?1",
+            )
+            .and_then(|mut cached| cached.execute(params![id.to_string(), now()]))?;
         if n == 0 {
             return Err(StoreError::NoSuchSource(id.to_string()));
         }
-        tx.execute(
-            "DELETE FROM secrets WHERE name = ?1",
-            [credentials_secret_name(id)],
-        )?;
+        tx.prepare_cached("DELETE FROM secrets WHERE name = ?1")
+            .and_then(|mut cached| cached.execute([credentials_secret_name(id)]))?;
         tx.commit()?;
         Ok(())
     }
@@ -840,20 +850,16 @@ impl Store {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         // `objects_seen`, `scan_checkpoints` and `jobs` go with it (ON DELETE CASCADE).
-        let n = tx.execute("DELETE FROM sources WHERE id = ?1", [id.to_string()])?;
-        tx.execute(
-            "DELETE FROM secrets WHERE name = ?1",
-            [credentials_secret_name(id)],
-        )?;
+        let n = tx
+            .prepare_cached("DELETE FROM sources WHERE id = ?1")
+            .and_then(|mut cached| cached.execute([id.to_string()]))?;
+        tx.prepare_cached("DELETE FROM secrets WHERE name = ?1")
+            .and_then(|mut cached| cached.execute([credentials_secret_name(id)]))?;
         // The SQS inlet and its credentials go with it.
-        tx.execute(
-            "DELETE FROM settings WHERE key = ?1",
-            [sqs::settings_key(id)],
-        )?;
-        tx.execute(
-            "DELETE FROM secrets WHERE name = ?1",
-            [sqs::secret_name(id)],
-        )?;
+        tx.prepare_cached("DELETE FROM settings WHERE key = ?1")
+            .and_then(|mut cached| cached.execute([sqs::settings_key(id)]))?;
+        tx.prepare_cached("DELETE FROM secrets WHERE name = ?1")
+            .and_then(|mut cached| cached.execute([sqs::secret_name(id)]))?;
         tx.commit()?;
         Ok(n > 0)
     }
@@ -861,9 +867,8 @@ impl Store {
     /// How many of a source's objects are in each ingest status.
     pub fn object_counts(&self, id: SourceId) -> Result<ObjectCounts, StoreError> {
         let conn = self.conn();
-        let mut stmt = conn.prepare_cached(
-            "SELECT status, count(*) FROM objects_seen WHERE source_id = ?1 GROUP BY status",
-        )?;
+        let mut stmt =
+            conn.prepare_cached("SELECT status, n FROM object_counts WHERE source_id = ?1")?;
         let mut counts = ObjectCounts::default();
         let rows = stmt.query_map([id.to_string()], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
@@ -1182,6 +1187,195 @@ mod tests {
             .unwrap();
         let counts = store.object_counts(id).unwrap();
         assert_eq!((counts.pending, counts.deleted, counts.live()), (2, 1, 2));
+    }
+
+    /// `(status, n)` of a source's rows of `table`, counted the slow way, without zeros.
+    fn counted(store: &Store, table: &str, id: SourceId) -> Vec<(String, i64)> {
+        let conn = store.raw();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT status, count(*) FROM {table} WHERE source_id = ?1 \
+                 GROUP BY status ORDER BY status"
+            ))
+            .unwrap();
+        stmt.query_map([id.to_string()], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    /// `(status, n)` of a source's rows of a counter table, without zeros.
+    fn kept(store: &Store, table: &str, id: SourceId) -> Vec<(String, i64)> {
+        let conn = store.raw();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT status, n FROM {table} WHERE source_id = ?1 AND n <> 0 ORDER BY status"
+            ))
+            .unwrap();
+        stmt.query_map([id.to_string()], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn status_counters_follow_every_change() {
+        use crate::{IngestOutcome, LlmJobStatus, ObjectChange, SeenObject};
+        let store = store();
+        let add = |b: &str| {
+            store
+                .add_source(&NewSource::new("http://x", b), None)
+                .unwrap()
+        };
+        let (a, b) = (add("a"), add("b"));
+        let obj = |k: &str, etag: &str| {
+            ObjectChange::Upsert(SeenObject {
+                key: k.into(),
+                etag: Some(etag.into()),
+                size: 1,
+                last_modified: None,
+            })
+        };
+        let keys = ["k1", "k2", "k3", "k4", "k5"];
+        let all: Vec<_> = keys.iter().map(|k| obj(k, "e1")).collect();
+        store.record_objects(a, &all, None).unwrap();
+        store.record_objects(b, &all[..2], None).unwrap();
+        let done = IngestOutcome::Done { blake3: [1; 32] };
+        assert!(store.finish_object(a, "k1", Some("e1"), &done).unwrap());
+        let failed = IngestOutcome::Failed {
+            error: "boom".into(),
+            attempts: 3,
+        };
+        assert!(store.finish_object(a, "k2", Some("e1"), &failed).unwrap());
+        let skipped = IngestOutcome::Skipped { blake3: [2; 32] };
+        assert!(store.finish_object(a, "k3", Some("e1"), &skipped).unwrap());
+        // A retry that stays pending, and an outcome for an older version: no change.
+        store.note_attempt(a, "k5", Some("e1"), 1, "again").unwrap();
+        assert!(!store.finish_object(a, "k5", Some("old"), &done).unwrap());
+        store
+            .record_objects(a, &[ObjectChange::Delete { key: "k4".into() }], None)
+            .unwrap();
+        store.record_objects(a, &[obj("k1", "e2")], None).unwrap();
+        assert!(store.finish_object(a, "k1", Some("e2"), &done).unwrap());
+        assert!(store.finish_object(b, "k1", Some("e1"), &done).unwrap());
+        let check = |id| {
+            assert_eq!(
+                kept(&store, "object_counts", id),
+                counted(&store, "objects_seen", id)
+            );
+            assert_eq!(
+                kept(&store, "llm_job_counts", id),
+                counted(&store, "llm_jobs", id)
+            );
+        };
+        check(a);
+        check(b);
+        let c = store.object_counts(a).unwrap();
+        assert_eq!(
+            (c.pending, c.done, c.failed, c.skipped, c.deleted),
+            (1, 1, 1, 1, 1)
+        );
+        assert_eq!(store.live_object_count(a).unwrap(), 4);
+        store.requeue_objects(a, Some(&["k1".to_owned()])).unwrap();
+        check(a);
+        store.requeue_objects(a, None).unwrap();
+        check(a);
+        assert_eq!(store.object_counts(a).unwrap().pending, 4);
+
+        // The LLM queue.
+        for h in 1..=4u8 {
+            store.queue_llm_job(a, &[h; 32], None).unwrap();
+        }
+        store
+            .finish_llm_job(a, &[1; 32], LlmJobStatus::Done, None, true)
+            .unwrap();
+        store
+            .finish_llm_job(a, &[2; 32], LlmJobStatus::Failed, Some("first"), true)
+            .unwrap();
+        store
+            .finish_llm_job(a, &[3; 32], LlmJobStatus::Skipped, Some("empty"), false)
+            .unwrap();
+        // Queued again after it ended; queued again while pending (no change).
+        store.queue_llm_job(a, &[1; 32], None).unwrap();
+        store.queue_llm_job(a, &[4; 32], None).unwrap();
+        check(a);
+        let l = store.llm_counts(a).unwrap();
+        assert_eq!(
+            (
+                l.pending,
+                l.done,
+                l.failed,
+                l.skipped,
+                l.last_error.as_deref()
+            ),
+            (2, 0, 1, 1, Some("first"))
+        );
+
+        // A removed source's counters go with it.
+        store.queue_llm_job(b, &[9; 32], None).unwrap();
+        assert!(store.delete_source(b).unwrap());
+        let left: i64 = store
+            .raw()
+            .query_row(
+                "SELECT (SELECT count(*) FROM object_counts WHERE source_id = ?1) \
+                 + (SELECT count(*) FROM llm_job_counts WHERE source_id = ?1)",
+                [b.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0);
+        check(a);
+    }
+
+    /// The plan of a query, one detail per line.
+    fn plan(store: &Store, sql: &str) -> String {
+        let conn = store.raw();
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        stmt.query_map(["s", "k"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n")
+    }
+
+    #[test]
+    fn hot_queries_use_their_indexes() {
+        let store = store();
+        // `pending_objects` (as it is written there): the queue index, no sort. Without
+        // `INDEXED BY`, SQLite 3.54 reads the primary key here, even after `ANALYZE` of a
+        // source whose rows are spread over the five statuses.
+        let p = plan(
+            &store,
+            "SELECT key, etag, size, last_modified FROM objects_seen \
+             INDEXED BY objects_seen_pending \
+             WHERE source_id = ?1 AND status = 'pending' AND (?2 IS NULL OR key > ?2) \
+             ORDER BY key LIMIT 10",
+        );
+        assert!(p.contains("USING INDEX objects_seen_pending"), "{p}");
+        assert!(!p.contains("TEMP B-TREE"), "{p}");
+        let indexes: i64 = store
+            .raw()
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'objects_seen_by_status'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 0, "the duplicate index is gone");
+        // `llm_counts`: the newest failure without a sort.
+        let p = plan(
+            &store,
+            "SELECT last_error FROM llm_jobs WHERE source_id = ?1 AND status = 'failed' \
+             AND last_error IS NOT NULL AND ?2 = ?2 ORDER BY updated_at DESC LIMIT 1",
+        );
+        assert!(p.contains("USING INDEX llm_jobs_by_source"), "{p}");
+        assert!(!p.contains("TEMP B-TREE"), "{p}");
+        // The counters are one primary key range.
+        let p = plan(
+            &store,
+            "SELECT status, n FROM object_counts WHERE source_id = ?1 AND ?2 = ?2",
+        );
+        assert!(p.contains("USING PRIMARY KEY"), "{p}");
     }
 
     #[test]

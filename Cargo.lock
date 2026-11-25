@@ -1226,6 +1226,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "blake3",
+ "doewood-api",
  "doewood-core",
  "doewood-enrich",
  "doewood-model",
@@ -1251,6 +1252,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-postgres",
+ "tonic",
  "tracing",
  "url",
  "uuid",

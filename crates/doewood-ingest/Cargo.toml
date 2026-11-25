@@ -55,6 +55,9 @@ url = "2.5"
 uuid.workspace = true
 
 [dev-dependencies]
+# `throughput` measures ingest with `WatchProgress` streams open on a real API server.
+doewood-api.workspace = true
+tonic = { version = "0.14", default-features = false, features = ["transport"] }
 # The favicon of the enrichment tests, built in code.
 image = { version = "0.25", default-features = false, features = ["png"] }
 doewood-pg.workspace = true
@@ -62,7 +65,7 @@ doewood-pg.workspace = true
 zip = { version = "9.0.5", default-features = false }
 # Writes the generated PDF fixtures, like quail's tests.
 lopdf = { version = "0.47.0", default-features = false }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
 tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
 # The end-to-end test writes to MinIO with raw presigned requests, as doewood-s3's tests do.
 reqwest = { version = "0.13", default-features = false }
