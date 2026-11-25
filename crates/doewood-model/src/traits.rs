@@ -156,8 +156,38 @@ pub trait GraphStore: Send + Sync {
         props: &Value,
     ) -> Result<NodeAlias>;
 
+    /// [`GraphStore::claim_alias`] of each `(alias, props)` for `node`, in order, as if one
+    /// call followed the other: the results are in the same order, and an alias given twice
+    /// is claimed by its first entry. Each claim is its own write, not one transaction. A
+    /// backend may send them together (issue #103: Postgres pipelines them on one
+    /// connection, one round trip).
+    async fn claim_aliases(
+        &self,
+        kind: NodeKind,
+        node: Uuid,
+        claims: &[(String, Value)],
+    ) -> Result<Vec<NodeAlias>> {
+        crate::validate_alias_count(claims.len())?;
+        let mut out = Vec::with_capacity(claims.len());
+        for (alias, props) in claims {
+            out.push(self.claim_alias(kind, alias, node, props).await?);
+        }
+        Ok(out)
+    }
+
     /// The alias, if claimed or blocked.
     async fn alias(&self, kind: NodeKind, alias: &str) -> Result<Option<NodeAlias>>;
+
+    /// [`GraphStore::alias`] of each of `aliases`, in the same order. A backend may read them
+    /// in one statement (issue #103). At most [`crate::ALIASES_MAX`] per call.
+    async fn aliases(&self, kind: NodeKind, aliases: &[String]) -> Result<Vec<Option<NodeAlias>>> {
+        crate::validate_alias_count(aliases.len())?;
+        let mut out = Vec::with_capacity(aliases.len());
+        for alias in aliases {
+            out.push(self.alias(kind, alias).await?);
+        }
+        Ok(out)
+    }
 
     /// Blocks an alias: it resolves to no node from now on (a key that turned out to belong
     /// to more than one), with `props` saying why.

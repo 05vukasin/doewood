@@ -38,6 +38,7 @@ pub async fn run<B: Backend + ?Sized>(a: &B, b: &B) {
     records_by_source(a).await;
     sketches(a).await;
     aliases(a).await;
+    alias_batches(a).await;
     claims(a, b).await;
     leases(a, b).await;
     search(a).await;
@@ -817,6 +818,88 @@ pub async fn aliases<B: Backend + ?Sized>(s: &B) {
     );
     assert!(matches!(
         s.claim_alias(kind, "", one, &json!({})).await,
+        Err(Error::Invalid(_))
+    ));
+}
+
+/// [`crate::GraphStore::claim_aliases`] and [`crate::GraphStore::aliases`] (issue #103): in
+/// order, as one call after the other; an alias given twice is claimed by its first entry.
+///
+/// # Panics
+///
+/// When the backend misbehaves.
+pub async fn alias_batches<B: Backend + ?Sized>(s: &B) {
+    let kind = NodeKind::Company;
+    let one = s.upsert_node(kind, "batch-one", &json!({})).await.unwrap();
+    let two = s.upsert_node(kind, "batch-two", &json!({})).await.unwrap();
+    s.block_alias(kind, "name:batch-blocked", &json!({"why": "two companies"}))
+        .await
+        .unwrap();
+    let claims = [
+        ("name:batch-b".to_owned(), json!({"n": 1})),
+        ("name:batch-a".to_owned(), json!({"n": 2})),
+        ("name:batch-blocked".to_owned(), json!({"n": 3})),
+        ("name:batch-b".to_owned(), json!({"n": 4})),
+    ];
+    let got = s.claim_aliases(kind, two, &claims).await.unwrap();
+    let got: Vec<_> = got.into_iter().map(|a| (a.node, a.props)).collect();
+    assert_eq!(
+        got,
+        [
+            (Some(two), json!({"n": 1})),
+            (Some(two), json!({"n": 2})),
+            (None, json!({"why": "two companies"})),
+            (Some(two), json!({"n": 1})),
+        ]
+    );
+    let got = s
+        .claim_aliases(kind, one, &[("name:batch-a".to_owned(), json!({}))])
+        .await
+        .unwrap();
+    assert_eq!(
+        got[0].node,
+        Some(two),
+        "the first claim wins in a batch too"
+    );
+    assert!(s.claim_aliases(kind, one, &[]).await.unwrap().is_empty());
+    let keys: Vec<String> = [
+        "name:batch-a",
+        "name:none",
+        "name:batch-blocked",
+        "name:batch-a",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let found = s.aliases(kind, &keys).await.unwrap();
+    assert_eq!(
+        found
+            .iter()
+            .map(|a| a.as_ref().map(|a| a.node))
+            .collect::<Vec<_>>(),
+        [Some(Some(two)), None, Some(None), Some(Some(two))]
+    );
+    assert_eq!(found[0].as_ref().unwrap().props, json!({"n": 2}));
+    assert!(
+        s.aliases(NodeKind::Document, &keys)
+            .await
+            .unwrap()
+            .iter()
+            .all(Option::is_none)
+    );
+    assert!(s.aliases(kind, &[]).await.unwrap().is_empty());
+    let many = vec!["name:x".to_owned(); crate::ALIASES_MAX + 1];
+    assert!(matches!(
+        s.aliases(kind, &many).await,
+        Err(Error::Invalid(_))
+    ));
+    assert!(
+        s.claim_aliases(kind, Uuid::now_v7(), &[("name:y".to_owned(), json!({}))])
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        s.claim_aliases(kind, one, &[(String::new(), json!({}))])
+            .await,
         Err(Error::Invalid(_))
     ));
 }

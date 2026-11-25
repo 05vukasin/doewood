@@ -152,22 +152,43 @@ impl GraphWriter {
             .set(&["title"], json!(title))
             .set(&["kind"], json!(facts.kind))
             .set(&["numbers"], json!(facts.numbers));
-        b.update_props(doc, &patch).await?;
-        let mut stats = WriteStats::default();
-        self.numbers(doc, &hex, facts, &mut stats).await?;
-        self.parties(doc, &hex, facts, &mut stats).await?;
-        self.cites(doc, &hex, facts, &mut stats).await?;
-        self.similar(blake3, doc, facts, min_jaccard, &mut stats)
-            .await?;
-        b.index_document(&SearchDoc {
+        let search = SearchDoc {
             blake3: *blake3,
             title,
             body: facts.body.clone(),
             kind: facts.kind.clone(),
             date: facts.date,
             amount: facts.amount,
-        })
-        .await?;
+        };
+        // Independent steps run together (issue #103), so their round trips overlap: the
+        // document's props and search row, which nothing else here reads; its references
+        // (its own numbers first, then what it cites, as before); its parties; and its
+        // similar documents. Each step keeps its own order. All of them finish before the
+        // first error, in this order, is returned.
+        let (mut stats, mut refs, mut similar) = Default::default();
+        let (props, indexed, refs_done, parties, similar_done) = tokio::join!(
+            b.update_props(doc, &patch),
+            b.index_document(&search),
+            async {
+                self.numbers(doc, &hex, facts, &mut refs).await?;
+                self.cites(doc, &hex, facts, &mut refs).await
+            },
+            self.parties(doc, &hex, facts, &mut stats),
+            self.similar(blake3, doc, facts, min_jaccard, &mut similar),
+        );
+        props?;
+        indexed?;
+        refs_done?;
+        parties?;
+        similar_done?;
+        let WriteStats {
+            refs: cited,
+            pending_refs,
+            ..
+        } = refs;
+        stats.refs += cited;
+        stats.pending_refs += pending_refs;
+        stats.similar += similar.similar;
         Ok(stats)
     }
 
@@ -180,14 +201,13 @@ impl GraphWriter {
         stats: &mut WriteStats,
     ) -> Result<()> {
         let b = &self.backend;
+        let claims: Vec<(String, Value)> = facts
+            .numbers
+            .iter()
+            .map(|n| (format!("number:{n}"), json!({"document": hex})))
+            .collect();
+        b.claim_aliases(NodeKind::Document, doc, &claims).await?;
         for n in &facts.numbers {
-            b.claim_alias(
-                NodeKind::Document,
-                &format!("number:{n}"),
-                doc,
-                &json!({"document": hex}),
-            )
-            .await?;
             let Some(pending) = b
                 .node_by_key(NodeKind::Document, &format!("{PENDING_REF_PREFIX}{n}"))
                 .await?
@@ -230,10 +250,15 @@ impl GraphWriter {
         stats: &mut WriteStats,
     ) -> Result<()> {
         let b = &self.backend;
-        for c in &facts.cites {
-            if facts.numbers.contains(&c.key) {
-                continue; // its own number, cited in its own header
-            }
+        // Its own numbers, cited in its own header, are left out.
+        let cites: Vec<_> = facts
+            .cites
+            .iter()
+            .filter(|c| !facts.numbers.contains(&c.key))
+            .collect();
+        let keys: Vec<String> = cites.iter().map(|c| format!("number:{}", c.key)).collect();
+        let targets = b.aliases(NodeKind::Document, &keys).await?;
+        for (c, target) in cites.into_iter().zip(targets) {
             let kind = if c.relation == "amends" {
                 EdgeKind::Amends
             } else {
@@ -241,11 +266,7 @@ impl GraphWriter {
             };
             let mut props =
                 json!({"relation": c.relation, "raw": c.raw, "key": c.key, "kind": c.kind});
-            let target = match b
-                .alias(NodeKind::Document, &format!("number:{}", c.key))
-                .await?
-                .and_then(|a| a.node)
-            {
+            let target = match target.and_then(|a| a.node) {
                 Some(t) if t != doc => t,
                 Some(_) => continue,
                 None => {
@@ -448,15 +469,27 @@ impl GraphWriter {
         attached: &BTreeSet<Uuid>,
     ) -> Result<(Match, bool)> {
         let b = &self.backend;
+        // Every key of the ladder in one read (issue #103): the identifiers, then the names.
+        let ids: Vec<String> = p
+            .ids
+            .iter()
+            .map(crate::company::Identifier::alias)
+            .collect();
+        let names = name.ladder_keys();
+        let keys: Vec<String> = ids
+            .iter()
+            .cloned()
+            .chain(names.iter().map(|(_, k)| k.clone()))
+            .collect();
+        let mut owners = b
+            .aliases(NodeKind::Company, &keys)
+            .await?
+            .into_iter()
+            .map(|a| a.and_then(|a| a.node));
         // 1. Identifiers, strongest first. Ones that point elsewhere are conflicts.
         let mut found: Option<Match> = None;
-        for id in &p.ids {
-            let alias = id.alias();
-            let Some(owner) = b
-                .alias(NodeKind::Company, &alias)
-                .await?
-                .and_then(|a| a.node)
-            else {
+        for (alias, owner) in ids.into_iter().zip(owners.by_ref()) {
+            let Some(owner) = owner else {
                 continue;
             };
             match &mut found {
@@ -476,9 +509,8 @@ impl GraphWriter {
         }
         // 2. Names: normalized with the form, squashed, legal-form-blind.
         if found.is_none() {
-            for (step, key) in name.ladder_keys() {
-                let Some(owner) = b.alias(NodeKind::Company, &key).await?.and_then(|a| a.node)
-                else {
+            for ((step, key), owner) in names.into_iter().zip(owners) {
+                let Some(owner) = owner else {
                     continue;
                 };
                 if step == LadderStep::FormBlind
@@ -557,28 +589,30 @@ impl GraphWriter {
         let b = &self.backend;
         let me = m.company;
         let evidence = |step: LadderStep| json!({"step": step.as_str(), "confidence": step.confidence(), "document": hex, "surface": name.original});
-        for id in &p.ids {
-            let alias = id.alias();
-            let got = b
-                .claim_alias(
-                    NodeKind::Company,
-                    &alias,
-                    me,
-                    &evidence(LadderStep::Identifier),
-                )
-                .await?;
-            if got.node.is_some_and(|o| o != me) && !m.conflicts.contains(&alias) {
-                m.conflicts.push(alias);
+        let names = name.ladder_keys();
+        // Identifiers first, then the name keys, as one batch (issue #103).
+        let claims: Vec<(String, Value)> = p
+            .ids
+            .iter()
+            .map(|id| (id.alias(), evidence(LadderStep::Identifier)))
+            .chain(
+                names
+                    .iter()
+                    .map(|(step, key)| (key.clone(), evidence(*step))),
+            )
+            .collect();
+        let got = b.claim_aliases(NodeKind::Company, me, &claims).await?;
+        let (ids, keys) = got.split_at(p.ids.len());
+        for ((alias, _), got) in claims.iter().zip(ids) {
+            if got.node.is_some_and(|o| o != me) && !m.conflicts.contains(alias) {
+                m.conflicts.push(alias.clone());
             }
         }
-        for (step, key) in name.ladder_keys() {
-            let got = b
-                .claim_alias(NodeKind::Company, &key, me, &evidence(step))
-                .await?;
-            if step == LadderStep::FormBlind && got.node.is_some_and(|o| o != me) {
+        for ((step, key), got) in names.iter().zip(keys) {
+            if *step == LadderStep::FormBlind && got.node.is_some_and(|o| o != me) {
                 b.block_alias(
                     NodeKind::Company,
-                    &key,
+                    key,
                     &json!({"blocked": "more than one company owns this name", "document": hex}),
                 )
                 .await?;
@@ -608,22 +642,20 @@ impl GraphWriter {
                 others.push(s.other.clone());
             }
         }
-        for other in others {
-            let Some(alias) = CompanyName::parse(&other) else {
-                continue;
-            };
-            let form = alias.legal_form.or(name.legal_form).unwrap_or("");
-            let key = format!("name:{}|{form}", alias.key);
-            let step = LadderStep::LearnedAlias;
-            self.backend
-                .claim_alias(
-                    NodeKind::Company,
-                    &key,
-                    company,
-                    &json!({"step": step.as_str(), "confidence": step.confidence(), "document": hex, "surface": other}),
-                )
-                .await?;
-        }
+        let step = LadderStep::LearnedAlias;
+        let claims: Vec<(String, Value)> = others
+            .into_iter()
+            .filter_map(|other| {
+                let alias = CompanyName::parse(&other)?;
+                let form = alias.legal_form.or(name.legal_form).unwrap_or("");
+                let key = format!("name:{}|{form}", alias.key);
+                let props = json!({"step": step.as_str(), "confidence": step.confidence(), "document": hex, "surface": other});
+                Some((key, props))
+            })
+            .collect();
+        self.backend
+            .claim_aliases(NodeKind::Company, company, &claims)
+            .await?;
         Ok(())
     }
 
