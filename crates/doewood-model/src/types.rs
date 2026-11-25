@@ -712,6 +712,19 @@ pub struct NodeAlias {
     pub props: Value,
 }
 
+/// Most aliases per [`crate::GraphStore::aliases`] or [`crate::GraphStore::claim_aliases`] call.
+pub const ALIASES_MAX: usize = 1000;
+
+/// Refuses more than [`ALIASES_MAX`] aliases in one call.
+pub fn validate_alias_count(n: usize) -> Result<(), Error> {
+    if n > ALIASES_MAX {
+        return Err(Error::Invalid(format!(
+            "at most {ALIASES_MAX} aliases per call"
+        )));
+    }
+    Ok(())
+}
+
 /// Checks an alias before it reaches a backend: the same rules as a node key.
 pub fn validate_alias(alias: &str, props: &Value) -> Result<(), Error> {
     if alias.is_empty() || alias.len() > NODE_KEY_MAX_LEN || alias.contains('\0') {

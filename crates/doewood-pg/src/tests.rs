@@ -93,6 +93,38 @@ impl Scratch {
     }
 }
 
+/// Issue #108: the pool follows the CPUs, within its bounds.
+#[test]
+fn pool_follows_the_cpus() {
+    use crate::{MAX_POOL_SIZE, MIN_POOL_SIZE, default_pool_size, plan_pool_size};
+    for (cpus, pool) in [
+        (0, 16),
+        (1, 16),
+        (2, 16),
+        (4, 16),
+        (8, 32),
+        (16, 64),
+        (64, 64),
+    ] {
+        assert_eq!(plan_pool_size(cpus), pool, "{cpus} CPUs");
+    }
+    assert_eq!(plan_pool_size(usize::MAX), MAX_POOL_SIZE);
+    let pool = default_pool_size();
+    assert!((MIN_POOL_SIZE..=MAX_POOL_SIZE).contains(&pool));
+}
+
+#[tokio::test]
+async fn pool_size_is_kept() {
+    let Some(url) = test_url() else { return };
+    let db = Scratch::new(&url).await;
+    assert_eq!(db.store().await.pool_size(), crate::default_pool_size());
+    let sized = PgStore::connect_sized(db.config.clone(), 3).await.unwrap();
+    assert_eq!(sized.pool_size(), 3);
+    let one = PgStore::connect_sized(db.config.clone(), 0).await.unwrap();
+    assert_eq!(one.pool_size(), 1);
+    db.drop_schema().await;
+}
+
 #[tokio::test]
 async fn conformance() {
     let Some(url) = test_url() else { return };

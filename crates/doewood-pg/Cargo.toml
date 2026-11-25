@@ -12,6 +12,7 @@ async-trait.workspace = true
 deadpool-postgres = { version = "0.14", default-features = false, features = ["rt_tokio_1"] }
 doewood-core.workspace = true
 doewood-model.workspace = true
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 # ring, not aws-lc-rs: no C toolchain beyond what `cc` needs, on every CI platform.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-native-certs = "0.8"

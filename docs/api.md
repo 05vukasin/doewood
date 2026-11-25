@@ -396,10 +396,12 @@ The API's metrics are on the ops port's `/metrics` (Prometheus text format), nex
 
 Measured with `tests/api_load.rs` (issue #80) on 4 vCPU, a realistic mix of reads, streams
 included: one instance serves about 4,500 calls/s on SQLite, reached at 10 clients (the
-store's 2 read-only connections), and about 6,000 calls/s on Postgres, reached at about 100
-clients (the pool of 16 connections). Beyond `max_calls_in_flight` the server sheds and the
+store's 2 read-only connections; about 5,200 since #108 opens one per CPU), and about 6,000
+calls/s on Postgres, reached at about 100 clients (the pool of 16 connections, 4 per CPU since
+#108; on 4 vCPU the process and the database then use all the cores). Beyond `max_calls_in_flight` the server sheds and the
 calls it takes keep their latency. An idle connection costs about 13.5 KiB. Numbers, method and
-caveats: [deploy.md](deploy.md#api-under-many-clients-issue-80).
+caveats: [deploy.md](deploy.md#api-under-many-clients-issue-80) and
+[deploy.md](deploy.md#api-read-capacity-issue-108).
 
 ## Examples with grpcurl
 
