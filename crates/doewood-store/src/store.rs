@@ -10,6 +10,7 @@ use crate::crypto::Cipher;
 use crate::{StoreError, migrate};
 
 pub(crate) mod ai;
+pub(crate) mod api;
 pub(crate) mod enrichment;
 pub(crate) mod favicon;
 pub(crate) mod ingest;

@@ -25,6 +25,8 @@ Set through the API, kept in `doewood.sqlite`, applied without a restart:
 | The default AI provider (the LLM queue's) | `SetAiProvider` (`make_default`; the first one set) | setting `ai.default_provider` |
 | Ingest: least MinHash Jaccard estimate for a `similar_to` edge (above 0, at most 1, default `0.8`). Read for every file, so a change applies to the next file ingested. Edges already written are kept; `ReprocessJob` with `force` compares a source's documents again (a lower value adds edges, a higher one removes none). | `SetIngestSettings`, read with `GetIngestSettings` | setting `ingest.similar_min_jaccard` |
 | Ingest: `Summarize` calls that read and analyze a file at once (1 to 16, default `2`; OCR of a scanned page can take 0.6 to 1 GB). Read for every call, so a change applies to the next one. A call beyond it gets `RESOURCE_EXHAUSTED` at once. | `SetIngestSettings`, read with `GetIngestSettings` | setting `ingest.summarize_max_concurrent` |
+| API: calls in flight before new ones are shed with `UNAVAILABLE` (1 to 65536, default `256`). Applies to the next call. See [api.md](api.md#limits). | `SetApiSettings`, read with `GetApiSettings` | setting `api.max_calls_in_flight` |
+| API: the server's deadline for a call, in seconds (1 to 3600, default `60`; `Summarize` and open streams are not cut by it). Applies to the next call. | `SetApiSettings` | setting `api.deadline_seconds` |
 | Enrichment: the registry switches for GLEIF, VIES, Wikidata, EDGAR, APR and Companies House (all default on; Companies House is asked only once its key is set) | `SetEnrichmentSettings`, read with `GetEnrichmentSettings` | settings `registry.<gleif\|vies\|wikidata\|edgar\|apr\|companies_house>.enabled` |
 | Enrichment: the EDGAR contact for the SEC's `User-Agent` (printable ASCII, at most 200 characters; default none: the generic `User-Agent`) | `SetEnrichmentSettings` | setting `registry.edgar.contact` |
 | Enrichment: the Companies House API key | `SetEnrichmentSettings` | secret `registry/companies_house/api_key` (sealed, write-only) |
@@ -74,6 +76,24 @@ not, because the API cannot set them:
 `DOEWOOD_SIMILAR_MIN_JACCARD`, read by earlier versions, is the runtime setting
 `similar_min_jaccard` now. If it is still set, doewood ignores it and logs a `WARN` at start
 (also shown by `doewood config check`) saying to use `ConfigService.SetIngestSettings`.
+
+### API limits
+
+The two per-call limits of the API (calls in flight, the server deadline) are runtime
+settings, above. The connection limits are neither settings nor variables but fixed values,
+because hyper and the listener take them once, when the server starts, before the API could
+set anything, and a new bootstrap variable would extend ADR 0001's table (issue #21):
+
+| limit | value |
+|---|---|
+| HTTP/2 streams per connection | 256 |
+| HTTP/2 keepalive | PING after 30 s without traffic, closed after 20 s without an answer |
+| TCP keepalive | probes after 60 s idle (the kernel's interval and count) |
+| Connection age | GOAWAY at 30 min, closed 5 min later |
+
+They are `doewood_api::MAX_CONCURRENT_STREAMS` and the constants next to it. See
+[api.md](api.md#limits) for what clients see, and [deploy.md](deploy.md#load-balancing) for
+why connections are aged.
 
 ### Rules
 

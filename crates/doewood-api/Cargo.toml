@@ -42,7 +42,7 @@ tonic-prost-build = { version = "0.14", default-features = false, features = ["t
 
 [dev-dependencies]
 doewood-pg.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "test-util"] }
 tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
 
 [lints]

@@ -121,6 +121,13 @@ pub(crate) fn ingest_settings(s: doewood_store::IngestSettings) -> pb::IngestSet
     }
 }
 
+pub(crate) fn api_settings(s: doewood_store::ApiSettings) -> pb::ApiSettings {
+    pb::ApiSettings {
+        max_calls_in_flight: s.max_calls_in_flight,
+        deadline_seconds: s.deadline_seconds,
+    }
+}
+
 pub(crate) fn record(r: &Record) -> pb::Record {
     pb::Record {
         blake3: r.blake3.to_hex(),

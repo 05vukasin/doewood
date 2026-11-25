@@ -13,6 +13,7 @@ use tokio::sync::watch;
 use tonic::Status;
 
 use crate::icons::Icons;
+use crate::limits::CallLimits;
 use crate::progress::{Progress, Snapshots};
 use crate::reprocess::Reprocessor;
 use crate::summarize::OnDemand;
@@ -81,6 +82,9 @@ struct Inner {
     sources: tokio::sync::Mutex<()>,
     /// Whether the start-up claim pass has finished (always, without shared claims).
     claims_checked: AtomicBool,
+    /// The per-call limits in effect (`SetApiSettings`); the stored ones once `serve` read
+    /// them, the defaults before.
+    call_limits: Arc<CallLimits>,
 }
 
 impl ApiState {
@@ -101,6 +105,7 @@ impl ApiState {
                 snapshots,
                 sources: tokio::sync::Mutex::new(()),
                 claims_checked,
+                call_limits: Arc::new(CallLimits::new(doewood_store::ApiSettings::default())),
             }),
         }
     }
@@ -130,6 +135,10 @@ impl ApiState {
 
     pub(crate) fn claims_done(&self) {
         self.inner.claims_checked.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn call_limits(&self) -> &Arc<CallLimits> {
+        &self.inner.call_limits
     }
 
     pub(crate) fn instance(&self) -> &InstanceId {
