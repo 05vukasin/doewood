@@ -211,8 +211,8 @@ is busy a read waits for one, never for the writer. An in-memory store (tests) h
 readers; its reads use the writer, as before.
 
 **The instance's reads go first (issue #109).** When reads wait for a reader, the instance's
-own (ingest, enrichment, the `WatchProgress` snapshot) get the next free one before the API
-calls' reads, so a flood of API reads cannot slow ingest down by holding every reader. The API
+own (ingest, enrichment, the scanners) get the next free one before the API's (its calls and
+the `WatchProgress` snapshot), so a flood of API reads cannot slow ingest down by holding every reader. The API
 is not starved: while none of its reads holds a reader, the instance's reads leave it the last
 free one, so at least one API read is always going. Neither side waits for more than the reads
 already running.

@@ -359,19 +359,22 @@ impl Snapshots {
     async fn compute(&self) -> Result<BTreeMap<SourceId, SourceProgress>, Status> {
         let store = Arc::clone(&self.store);
         // One read transaction on a reader: every source's counters come from the same
-        // committed state, and the snapshot does not wait for ingest's writes.
+        // committed state, and the snapshot does not wait for ingest's writes. It is the
+        // API's read (for its watchers), so it gives way to ingest's (issue #109).
         let rows = tokio::task::spawn_blocking(move || -> Result<_, StoreError> {
-            store.snapshot(|snap| {
-                snap.sources()?
-                    .into_iter()
-                    .map(|s| {
-                        let counts = snap.object_counts(s.id)?;
-                        let checkpoint = snap.scan_checkpoint(s.id)?.unwrap_or_default();
-                        let llm = snap.llm_counts(s.id)?;
-                        let spent = snap.llm_usage(s.id, doewood_store::utc_day(unix_now()))?;
-                        Ok((s, counts, checkpoint, (llm, spent)))
-                    })
-                    .collect::<Result<Vec<(Source, _, _, _)>, _>>()
+            doewood_store::api_call_blocking(|| {
+                store.snapshot(|snap| {
+                    snap.sources()?
+                        .into_iter()
+                        .map(|s| {
+                            let counts = snap.object_counts(s.id)?;
+                            let checkpoint = snap.scan_checkpoint(s.id)?.unwrap_or_default();
+                            let llm = snap.llm_counts(s.id)?;
+                            let spent = snap.llm_usage(s.id, doewood_store::utc_day(unix_now()))?;
+                            Ok((s, counts, checkpoint, (llm, spent)))
+                        })
+                        .collect::<Result<Vec<(Source, _, _, _)>, _>>()
+                })
             })
         })
         .await

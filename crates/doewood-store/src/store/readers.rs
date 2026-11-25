@@ -1,7 +1,8 @@
 //! The read-only connections, and which read gets the next free one (issue #109).
 //!
-//! Reads come from two kinds of caller: the instance itself (ingest, enrichment, the progress
-//! snapshot) and the API's calls ([`api_call`], [`api_call_blocking`]). A flood of API reads
+//! Reads come from two kinds of caller: the instance itself (ingest, enrichment, the
+//! scanners) and the API ([`api_call`], [`api_call_blocking`]: its calls and the
+//! `WatchProgress` snapshot). A flood of API reads
 //! must not leave ingest's reads waiting behind it, so when both wait, the instance's read
 //! gets the reader. The API is not starved either: while it holds no reader, it may take one
 //! even if instance reads wait (one at a time), and instance reads leave it the last free one.
@@ -43,7 +44,7 @@ pub fn api_call_blocking<T>(f: impl FnOnce() -> T) -> T {
 /// Who a read is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Caller {
-    /// The instance's own work: ingest, enrichment, the progress snapshot.
+    /// The instance's own work: ingest, enrichment, the scanners.
     Instance,
     /// An API call.
     Api,
