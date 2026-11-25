@@ -742,9 +742,13 @@ async fn a_dismissal_keeps_a_split_off_document_apart() {
         let writer = GraphWriter::new(Arc::clone(b), SimilarityConfig::default());
         for (n, dismiss) in [(71u8, true), (72, false)] {
             let h = Blake3([n; 32]);
-            b.put_record(&h, &serde_json::json!({}), &Default::default())
-                .await
-                .unwrap();
+            b.put_record(
+                &h,
+                &serde_json::json!({}),
+                &doewood_model::StepVersions::new(),
+            )
+            .await
+            .unwrap();
             let at = ObjectLocation {
                 endpoint: ENDPOINT.into(),
                 bucket: BUCKET.into(),
