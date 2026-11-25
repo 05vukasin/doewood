@@ -37,11 +37,21 @@ fn a_read_within_the_deadline_reads() {
     assert!(out.steps.contains(&sheet::TABLES_ID));
 }
 
-/// The cell cap is what one worker's plan holds at the measured bytes a cell.
+/// The smallest cell cap is what one worker's plan holds at the measured bytes a cell; the cap
+/// grows with the memory per worker, up to hedgehog's default.
 #[test]
 fn the_cell_cap_fits_a_worker() {
-    assert_eq!(sheet::MAX_CELLS, 1_600_000);
-    const { assert!(sheet::MAX_CELLS * sheet::CELL_BYTES <= doewood_ingest::pipeline::WORKER_BYTES) };
+    assert_eq!(sheet::MIN_AUTO_CELLS, 1_600_000);
+    const {
+        assert!(
+            sheet::MIN_AUTO_CELLS * sheet::CELL_BYTES <= doewood_ingest::pipeline::WORKER_BYTES
+        );
+    };
+    assert_eq!(sheet::cells_for(512 << 20), 1_600_000);
+    assert_eq!(sheet::cells_for(2 << 30), 6_700_000);
+    assert_eq!(sheet::cells_for(0), 1_600_000);
+    assert_eq!(sheet::cells_for(64 << 30), 10_000_000);
+    assert_eq!(sheet::MAX_AUTO_CELLS, 10_000_000);
 }
 
 /// A workbook over the cap fails with hedgehog's limit error, without a panic; one at the cap
@@ -55,7 +65,8 @@ fn a_workbook_over_the_cell_cap_fails() {
     assert_eq!(
         failed,
         format!(
-            "{}: file refused: the workbook has more than 5 cells (limit 5)",
+            "{}: file refused: the workbook has more than 5 cells (limit 5); \
+             DOEWOOD_INGEST_MAX_CELLS raises the cap (it follows the memory per ingest worker)",
             sheet::READ_ID
         )
     );
@@ -71,7 +82,7 @@ fn the_analyzer_refuses_a_workbook_over_the_default_cap() {
     use doewood_ingest::{Analyzer, AnalyzerConfig, Outcome};
 
     let cols = 26;
-    let rows = usize::try_from(sheet::MAX_CELLS).unwrap() / cols + 1;
+    let rows = usize::try_from(sheet::MIN_AUTO_CELLS).unwrap() / cols + 1;
     let analyzer = Analyzer::new(&AnalyzerConfig {
         ocr_models: "/nonexistent/doewood-ocr-models".into(),
         ..AnalyzerConfig::default()
@@ -84,7 +95,8 @@ fn the_analyzer_refuses_a_workbook_over_the_default_cap() {
     assert_eq!(
         error,
         "sheet.read@1: file refused: the workbook has more than 1,600,000 cells (limit \
-         1,600,000)"
+         1,600,000); DOEWOOD_INGEST_MAX_CELLS raises the cap (it follows the memory per ingest \
+         worker)"
     );
     assert_eq!(a.body["status"]["state"], "failed");
     assert_eq!(a.body["format"], "xlsx");

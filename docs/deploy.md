@@ -233,8 +233,12 @@ the test's own copies of the files).
 | 3 x 1.56 M cells, half text (214 MiB), budget 4 GiB / 64 MiB | +1294 / +729 MiB, all `done` (4.2 s / 7.8 s) | |
 
 - The peak per cell was 200 to 300 bytes (file included) before the cap; that is
-  `CELL_BYTES` (320, rounded up), and the cap is what 512 MiB holds at that rate (1.6 M).
-  A refused workbook still costs its file and the cells read up to the cap.
+  `CELL_BYTES` (320, rounded up), and the cap was what 512 MiB holds at that rate (1.6 M).
+  Since #94 the cap follows the memory per worker (at least 1.6 M, at most 10 M; see
+  [ingest.md](ingest.md#memory)), so on the server these runs had (7 GB, 3 workers, up to
+  about 1 GiB per worker) it would be around 3 M, depending on the memory free at start, and
+  the 2.6 M-cell files would be read. A refused
+  workbook still costs its file and the cells read up to the cap.
 - Under the cap the default budget does not serialize these files (71 MiB each, 3 fit in
   768 MiB): the budget bounds the bytes of files in flight, the cell cap the workbook's
   working set. A small budget runs big files one at a time (64 MiB: 40 % lower peak, twice
@@ -254,9 +258,13 @@ Per doewood instance (one pod):
   covers the OCR engine with one worker, the limit covers 4 workers with OCR plus a large
   spreadsheet in flight. With a lower limit the default worker count drops (half the room under
   the limit, 512 MiB a worker), and so does the memory budget (half the workers' plan: 768 MiB
-  with 3 workers under 4 GiB). Files over 16 MiB beyond the budget wait; a workbook over
-  1,600,000 cells fails (see [ingest.md](ingest.md#memory)). Set `DOEWOOD_INGEST_BUDGET_MIB`
-  lower if big PDFs or DOCX files come several at a time on a small limit.
+  with 3 workers under 4 GiB). Files over 16 MiB beyond the budget wait. A workbook over the
+  cell cap fails: each worker's share of half the room under the limit at 320 bytes a cell,
+  from 1,600,000 to 10,000,000 (2,100,000 with 3 workers under 4 GiB, 6,700,000 for a 2 GiB
+  worker; see [ingest.md](ingest.md#memory)). Set `DOEWOOD_INGEST_BUDGET_MIB` lower if big
+  PDFs or DOCX files come several at a time on a small limit. For bigger workbooks, raise the
+  memory limit or lower `DOEWOOD_INGEST_JOBS` (the cap grows with the memory per worker), or
+  set `DOEWOOD_INGEST_MAX_CELLS` with about 320 bytes a cell of room for each worker.
 - OCR throughput follows the CPU: with a 500m request an OCR-heavy pod gets only what the node
   has spare. Plan about 1500 scanned pages an hour per instance on 4 cores, and more instances
   (each with its own sources) rather than more workers to go faster. A second OCR engine needs a
