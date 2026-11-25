@@ -44,11 +44,20 @@ impl Scratch {
             .batch_execute(&format!("CREATE SCHEMA {schema}"))
             .await
             .unwrap();
-        // pgvector in `public`, shared by every test schema. Concurrent tests may race to
-        // create it; whoever loses sees it created.
-        let _ = admin
-            .batch_execute("CREATE EXTENSION IF NOT EXISTS vector SCHEMA public")
-            .await;
+        // pgvector in `public`, shared by every test schema, created under the store's own
+        // lock. Left to the store, it would land in the first test schema to connect and go
+        // when that schema is dropped, under the feet of the other tests.
+        admin
+            .batch_execute(&format!(
+                "BEGIN; SELECT pg_advisory_xact_lock({}); \
+                 DO $$ BEGIN \
+                     IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'vector') \
+                     THEN CREATE EXTENSION IF NOT EXISTS vector SCHEMA public; END IF; \
+                 END $$; COMMIT",
+                crate::MIGRATION_LOCK
+            ))
+            .await
+            .unwrap();
         let mut config = base;
         config.options(format!("-c search_path={schema}"));
         Self {
@@ -337,4 +346,142 @@ async fn a_bad_url_is_invalid() {
         PgStore::connect(&url).await,
         Err(Error::Invalid(_))
     ));
+}
+
+/// A database of its own, dropped (with its connections) at the end of a passing test.
+struct FreshDb {
+    admin: tokio_postgres::Client,
+    config: tokio_postgres::Config,
+    name: String,
+}
+
+impl FreshDb {
+    async fn new(url: &str) -> Self {
+        let base: tokio_postgres::Config = url.parse().expect("test URL");
+        let (admin, conn) = base
+            .connect(crate::tls::connector().unwrap())
+            .await
+            .expect("connect to the test database");
+        tokio::spawn(conn);
+        let name = format!("dw_fresh_{}", Uuid::now_v7().simple());
+        admin
+            .batch_execute(&format!("CREATE DATABASE {name}"))
+            .await
+            .unwrap();
+        let mut config = base;
+        config.dbname(&name);
+        Self {
+            admin,
+            config,
+            name,
+        }
+    }
+
+    async fn client(&self) -> tokio_postgres::Client {
+        let (client, conn) = self
+            .config
+            .connect(crate::tls::connector().unwrap())
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        client
+    }
+
+    async fn drop_db(self) {
+        self.admin
+            .batch_execute(&format!("DROP DATABASE {} WITH (FORCE)", self.name))
+            .await
+            .unwrap();
+    }
+}
+
+/// Instances starting at the same moment against an empty database (a `StatefulSet` with
+/// `podManagementPolicy: Parallel`): all connect, pgvector is created once and every
+/// migration runs exactly once.
+#[tokio::test]
+async fn concurrent_first_starts_on_a_fresh_database_migrate_once() {
+    const N: usize = 8;
+    let Some(url) = test_url() else { return };
+    let db = FreshDb::new(&url).await;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(N));
+    let mut tasks = Vec::new();
+    for _ in 0..N {
+        let config = db.config.clone();
+        let barrier = std::sync::Arc::clone(&barrier);
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            PgStore::connect_config(config).await
+        }));
+    }
+    let mut stores = Vec::new();
+    for t in tasks {
+        stores.push(t.await.unwrap().expect("every concurrent start connects"));
+    }
+    let client = db.client().await;
+    let available: bool = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'vector')",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(stores.iter().all(|s| s.has_vector() == available));
+    let rows = client
+        .query(
+            "SELECT version, count(*) OVER (PARTITION BY version) FROM doewood_schema \
+             ORDER BY 1",
+            &[],
+        )
+        .await
+        .unwrap();
+    let versions: Vec<i32> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(
+        versions,
+        (1..=i32::try_from(crate::SCHEMA_VERSION).unwrap()).collect::<Vec<_>>(),
+        "each migration ran exactly once"
+    );
+    assert!(rows.iter().all(|r| r.get::<_, i64>(1) == 1));
+    let extensions: i64 = client
+        .query_one(
+            "SELECT count(*) FROM pg_extension WHERE extname = 'vector'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(extensions, i64::from(available));
+    drop(stores);
+    drop(client);
+    db.drop_db().await;
+}
+
+/// A start that finds the schema lock held waits for it, then proceeds.
+#[tokio::test]
+async fn a_start_waits_for_the_schema_lock() {
+    let Some(url) = test_url() else { return };
+    let db = FreshDb::new(&url).await;
+    let mut holder = db.client().await;
+    let tx = holder.transaction().await.unwrap();
+    tx.execute(
+        "SELECT pg_advisory_xact_lock($1)",
+        &[&crate::MIGRATION_LOCK],
+    )
+    .await
+    .unwrap();
+    let start = tokio::spawn(PgStore::connect_config(db.config.clone()));
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        !start.is_finished(),
+        "the start waits while the lock is held"
+    );
+    tx.commit().await.unwrap();
+    let store = tokio::time::timeout(Duration::from_secs(30), start)
+        .await
+        .expect("the start proceeds once the lock is free")
+        .unwrap()
+        .unwrap();
+    drop(store);
+    drop(holder);
+    db.drop_db().await;
 }

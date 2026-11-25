@@ -58,9 +58,15 @@ pub(crate) fn pg(e: tokio_postgres::Error) -> Error {
     if e.is_closed() || io || transient {
         return Error::Unavailable(e.to_string());
     }
+    // The server's message, not tokio-postgres' bare "db error". Not the DETAIL, which can
+    // quote row values.
+    let message = e.as_db_error().map_or_else(
+        || e.to_string(),
+        |db| format!("{}: {}", db.code().code(), db.message()),
+    );
     Error::Backend {
         backend: "postgres",
-        message: e.to_string(),
+        message,
     }
 }
 
