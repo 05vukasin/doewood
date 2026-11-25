@@ -179,15 +179,16 @@ impl Store {
     /// Every configured provider, by name.
     pub fn ai_providers(&self) -> Result<Vec<AiProvider>, StoreError> {
         let default = self.default_ai_provider()?;
-        let rows: Vec<(String, String, i64)> = {
-            let conn = self.conn();
-            let mut stmt = conn.prepare(
+        let rows: Vec<(String, String, i64)> = self.read(StoreError::from, |conn| {
+            let mut stmt = conn.prepare_cached(
                 "SELECT key, value_json, updated_at FROM settings \
                  WHERE substr(key, 1, length(?1)) = ?1 ORDER BY key",
             )?;
-            stmt.query_map([PROVIDER_PREFIX], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-                .collect::<Result<_, _>>()?
-        };
+            let rows = stmt
+                .query_map([PROVIDER_PREFIX], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<Result<_, _>>()?;
+            Ok(rows)
+        })?;
         rows.into_iter()
             .map(|(key, value, updated_at)| {
                 let name = key[PROVIDER_PREFIX.len()..].to_owned();
@@ -202,14 +203,14 @@ impl Store {
         if !valid_provider_name(name) {
             return Ok(None);
         }
-        let row: Option<(String, i64)> = self
-            .conn()
-            .query_row(
-                "SELECT value_json, updated_at FROM settings WHERE key = ?1",
-                [format!("{PROVIDER_PREFIX}{name}")],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
+        let row: Option<(String, i64)> = self.read(StoreError::from, |conn| {
+            Ok(conn
+                .prepare_cached("SELECT value_json, updated_at FROM settings WHERE key = ?1")?
+                .query_row([format!("{PROVIDER_PREFIX}{name}")], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .optional()?)
+        })?;
         let Some((value, updated_at)) = row else {
             return Ok(None);
         };

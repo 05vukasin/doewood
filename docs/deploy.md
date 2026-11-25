@@ -33,6 +33,11 @@ The image sets these [bootstrap variables](configuration.md#bootstrap-variables)
 | `DOEWOOD_OPS_LISTEN` | `0.0.0.0:7444` |
 | `DOEWOOD_OCR_MODELS` | `/opt/doewood/ocr-models` |
 
+It also sets `GLIBC_TUNABLES=glibc.malloc.arena_max=2:glibc.malloc.mmap_threshold=131072`:
+glibc then returns the memory of big files and OCR to the system when it is freed, instead of
+keeping it in per-thread arenas (a third less memory after OCR, see [Allocator](#allocator)). A
+binary run outside the image does not get it; set the variable yourself there.
+
 ```sh
 docker run --rm -p 7443:7443 -p 7444:7444 -v doewood-data:/data \
   -e DOEWOOD_MASTER_KEY="$(openssl rand -base64 32)" doewood:dev
@@ -243,7 +248,118 @@ the test's own copies of the files).
   768 MiB): the budget bounds the bytes of files in flight, the cell cap the workbook's
   working set. A small budget runs big files one at a time (64 MiB: 40 % lower peak, twice
   the wall time).
-- glibc keeps some of the freed memory (RSS after the runs: 0.5 to 1.2 GiB above the start).
+- glibc kept some of the freed memory (RSS after the runs: 0.5 to 1.2 GiB above the start). This was before the image set
+  `GLIBC_TUNABLES` (see [Allocator](#allocator)).
+
+### Allocator
+
+Issues #68 and #77, generated data, the same machine and setup as above (one private Docker
+network created with `--internal`, every registry, feed and the favicon fallback switched off in
+the instance settings before `serve`). Single runs. "After" is the container's `anon` when the
+last object had its location, then again after the idle time; it did not change between 60 s
+and the end of the idle time with glibc (glibc does not give memory back on its own), so one
+number is shown. jemalloc and mimalloc were loaded with `LD_PRELOAD` from Debian's
+`libjemalloc2` and `libmimalloc3`, not linked in.
+
+OCR burst: 20 scanned PDFs of one page, default workers (4), image from `f8c6e3a`, 2 min idle:
+
+| allocator | time | CPU | `memory.peak` | `anon` peak | `anon` after (RSS) |
+|---|---|---|---|---|---|
+| glibc, defaults | 48.9 s | 129 s | 958 MiB | 858 MiB | 810 MiB (896) |
+| `MALLOC_ARENA_MAX=2` | 48.4 s | 129 s | 805 MiB | 653 MiB | 597 MiB |
+| `mmap_threshold=131072` | 47.1 s | 124 s | 621 MiB | 587 MiB | 530 MiB |
+| both (the image now) | 49.7 s | 129 s | 663 MiB | 584 MiB | 527 MiB (613) |
+| jemalloc | 49.7 s | 130 s | 784 MiB | 643 MiB | 573, 547 after 60 s |
+| mimalloc | 44.3 s | 118 s | 783 MiB | 730 MiB | 730, 602 after 60 s |
+
+Big files: 200 small documents (PDF, DOCX, TXT, XLSX) plus a 120k-row XLSX, a 190k-row XLSX
+(1.52 M cells), a 150-page text PDF and a 22 MiB DOCX, default workers (4), 3 min idle:
+
+| image | allocator | time | `memory.peak` | `anon` peak | `anon` after (RSS) | threads at most |
+|---|---|---|---|---|---|---|
+| `f8c6e3a` (hedgehog `c418c2b`) | glibc, defaults | 17.0 s | 791 MiB | 695 MiB | 266 MiB (341) | 19 |
+| same | `MALLOC_ARENA_MAX=2` | 17.7 s | 774 MiB | 567 MiB | 154 MiB | 20 |
+| same | both tunables | 17.7 s | 613 MiB | 579 MiB | 122 MiB (198) | 19 |
+| same | jemalloc | 16.9 s | 850 MiB | 664 MiB | 214, 138 after 60 s | 19 |
+| same | mimalloc | 16.4 s | 685 MiB | 644 MiB | 331, 106 after 60 s | 17 |
+| `84ad79f` (hedgehog `fac6eba`) | glibc, defaults | 15.7 s | 586 MiB | 515 MiB | 145 MiB (224) | 13 |
+| same | both tunables (the image) | 16.2 s | 586 MiB | 504 MiB | 122 MiB (202) | 13 |
+
+- **The OCR engine is kept** after the queue is empty (quail's pool keeps one idle engine per
+  OCR job, for the life of the process), so memory after OCR never falls to the start (about
+  20 MiB). What the allocator changes is how much of the freed page buffers it keeps: with
+  glibc's defaults about 280 MiB more than with the tunables.
+- **The image now sets** `GLIBC_TUNABLES=glibc.malloc.arena_max=2:glibc.malloc.mmap_threshold=131072`:
+  a third less memory after OCR (810 to 527 MiB) and a 30 % lower peak, at the same speed. The
+  fixed mmap threshold does most of it (buffers of 128 KiB and more are mapped and unmapped
+  instead of staying in the heap); two arenas add a little for mixed files. Clear the variable
+  to get glibc's defaults back.
+- jemalloc and mimalloc give back memory a few seconds to a minute later and end close to the
+  tunables; neither beat them on memory, so no allocator is linked in. mimalloc was 10 % faster
+  in the OCR run (one run). doewood cannot call `malloc_trim` itself (`unsafe` is denied); the
+  tunables do that job, and hedgehog trims after each big sheet.
+- **Big-sheet threads:** with hedgehog `fac6eba` (which honours `threads: 1` in every inner
+  fan-out) the process peaked at 13 threads with 4 workers on these files, against 19 to 20
+  before, and its memory after the run fell from 266 to 145 MiB with glibc's defaults.
+- Not measured: a 30 to 60 minute soak, quail's pool with no idle engine (`max_idle = 0`),
+  3 M-cell workbooks under load and a bytes-per-cell sweep (see the #67 table above for that).
+
+### Records
+
+The same big-file run (204 records, `f8c6e3a`, Postgres 17). Sizes are the compact JSON a
+record is stored as (SQLite stores this text as it is, in `records.body_json`; a separate SQLite
+run was not made) and what Postgres stores in `records.record` (`pg_column_size`, TOASTed).
+
+| record | JSON, median | JSON, largest | Postgres stored, median |
+|---|---|---|---|
+| one-page text PDF | 30 KB | 390 KB (150-page PDF) | 12 KB |
+| small DOCX | 28.6 KB | 110 KB (22 MiB DOCX) | 12 KB |
+| small TXT | 27 KB | 27 KB | 12 KB |
+| XLSX of 20 rows | 4.7 KB | 65 KB (190k rows) | 2.4 KB |
+| scanned page with OCR (other run, 20 records) | 33 KB | 34 KB | 14 KB |
+
+- **Where the bytes go:** the fact envelope (`key`, `src`, `conf` and the value's type tag) is
+  a third of every record. The largest facts: `signal.amount` 12 %, `summary.keywords` 9 %,
+  `summary.digest` 7 %, `sketch.compat_minhash` 6 %, `party.company` 6 %, `summary.card` 5 %,
+  `timings` 4 %, the two `*_minhash_bands` 4 % each, `hash.cdc` 4 %.
+- **`hash.cdc`** (one entry per 8 KiB chunk, never read by doewood) is small on small files but
+  76 % of the 22 MiB DOCX's record (110 KB, 26 KB without it; 2291 entries) and 71 % of the
+  190k-row XLSX's.
+- **In memory** a record is a `serde_json::Value` tree on its way to the store and back. That
+  tree is about 16 times the JSON text (counted with a counting allocator): 450 KB for a 28 KB
+  record, 6.8 MB for the 150-page PDF, 1.9 MB for the big DOCX (0.3 MB without `hash.cdc`).
+  serde_json's maps are B-trees, and every small object (each fact, its `src`, its value)
+  allocates a whole node. Per file in flight this is small next to the file and OCR.
+- **TOAST:** jsonb is 1.28 times the JSON text before compression; `pglz` (the default) stores
+  37 % of the text (2.08 MB for these 204 records, 12.7 KB a record with the index). `lz4`
+  stored 9 % more (2.27 MB) but wrote the records 45 % faster (98 against 179 ms) and read them
+  13 % faster. Not worth a change for space; the default stays.
+
+### The instance store's read-only connections (issue #83)
+
+An on-disk instance store opens 2 read-only SQLite connections next to its writer (see
+[configuration.md](configuration.md#the-instance-store)). Each keeps SQLite's default page
+cache (up to 2000 KiB) and up to 128 prepared statements, and there is no `mmap`. Measured with
+`reader_memory` (`cargo test -p doewood-store --lib -- --ignored --nocapture reader_memory`,
+a 40 MiB store read in full on every connection): **2.1 MiB of RSS per reader** once its cache
+is full, so about 4 MiB for the default 2 (2, 4 readers: 2.08 MiB each). They also hold
+two more file handles to the store file and share its `-wal` and `-shm` files.
+
+Effect, measured with `throughput` on an on-disk store (`DOEWOOD_BENCH_FILES=2000
+DOEWOOD_BENCH_READERS=0|2`, 4 ingest workers, a `ListRecords` page of 100 every millisecond
+through the API, test profile, 4 cores, 3 runs each, medians):
+
+| watchers | readers | files/s | writer lock wait mean / p99 | `ListRecords` mean / p99 |
+|---|---|---|---|---|
+| 0 | 0 (before) | 105 | 2.03 ms / 59.2 ms | 85 ms / 160 ms |
+| 0 | 2 | 239 | 0.51 ms / 3.7 ms | 57 ms / 162 ms |
+| 10 | 0 (before) | 101 | 2.08 ms / 59.9 ms | 86 ms / 168 ms |
+| 10 | 2 | 236 | 0.50 ms / 3.7 ms | 58 ms / 173 ms |
+
+The reads no longer take the writer's lock, so ingest runs more than twice as fast while the
+API reads, and the writer's lock wait falls by an order of magnitude. A `ListRecords` page
+waits less on average, but its tail is the query itself (the test profile builds SQLite
+without optimisation), not the lock.
 
 ### Requests and limits
 

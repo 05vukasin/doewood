@@ -71,10 +71,14 @@ COPY --from=build /out/doewood /usr/local/bin/doewood
 COPY --from=models /models /opt/doewood/ocr-models
 # Bootstrap variables (docs/configuration.md): listen on every interface inside the container,
 # keep the store on the volume, use the models of the image.
+# glibc malloc: 2 arenas and a fixed 128 KiB mmap threshold, so the memory of big files and OCR
+# goes back to the system when it is freed (measured: a third less memory after OCR, a sixth
+# less after big files, no slower; docs/deploy.md, Sizing). Clear GLIBC_TUNABLES to undo it.
 ENV DOEWOOD_DATA_DIR=/data \
     DOEWOOD_LISTEN=0.0.0.0:7443 \
     DOEWOOD_OPS_LISTEN=0.0.0.0:7444 \
-    DOEWOOD_OCR_MODELS=/opt/doewood/ocr-models
+    DOEWOOD_OCR_MODELS=/opt/doewood/ocr-models \
+    GLIBC_TUNABLES=glibc.malloc.arena_max=2:glibc.malloc.mmap_threshold=131072
 VOLUME /data
 EXPOSE 7443 7444
 USER 10001:10001

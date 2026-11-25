@@ -5,7 +5,9 @@
 //! source claims and search: [`Standalone`] implements the `doewood-model` store traits over it.
 //!
 //! - One SQLite file per instance, opened in WAL mode with a busy timeout.
-//! - A single writer: every statement goes through one connection behind a mutex.
+//! - A single writer: every write goes through one connection behind a mutex. An on-disk store
+//!   also has a few read-only connections for pure reads (WAL lets them run next to the
+//!   writer); an in-memory one reads on the writer.
 //! - The schema is migrated on open from SQL embedded in the binary.
 //! - Secrets are sealed with XChaCha20-Poly1305 under the master key and are **write-only**
 //!   through the public API: they can be set, deleted and tested for, never read back. The
@@ -61,4 +63,4 @@ pub use store::sqs::{
     CredentialsChange, QUEUE_URL_MAX_LEN, SQS_DEFAULT_REGION, SqsInlet, SqsInletInput,
     queue_url_region, valid_queue_url,
 };
-pub use store::{SECRET_MAX_LEN, STORE_FILE, Store};
+pub use store::{DEFAULT_READERS, MAX_READERS, SECRET_MAX_LEN, STORE_FILE, Snapshot, Store};
