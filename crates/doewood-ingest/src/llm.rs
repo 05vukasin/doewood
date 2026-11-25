@@ -38,6 +38,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use doewood_core::SourceId;
+use doewood_model::canonical::to_canonical;
 use doewood_model::{Backend, Blake3};
 use doewood_store::{LlmJob, LlmJobStatus, LlmPolicy, Source, Store, StoreError, utc_day};
 use quail_core::{AnalyzerId, Evidence, Fact, FactKey, Value};
@@ -50,12 +51,13 @@ use quail_summary::{
 };
 use serde::Deserialize;
 use serde_json::Value as Json;
+use serde_json::value::RawValue;
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::analyze::Analyzer;
-use crate::facts::DocFacts;
+use crate::facts::{DocFacts, elements, member, text};
 use crate::pipeline::Fetch;
 
 /// The record key of a summary: quail's `summary.llm`.
@@ -663,7 +665,7 @@ impl Summaries {
         name: String,
         from_store: bool,
         slot: Slot,
-    ) -> Result<(Blake3, Json), SummarizeError> {
+    ) -> Result<(Blake3, Box<RawValue>), SummarizeError> {
         let (bytes, blake3) = crate::pipeline::hash(bytes)
             .await
             .map_err(|e| SummarizeError::Internal(e.message))?;
@@ -938,37 +940,36 @@ struct RecordView {
 /// and an [`AnalyzerId`] read from JSON would be leaked).
 const READ_BACK: AnalyzerId = AnalyzerId::new("doewood.record", 1);
 
-fn fact_text(body: &Json, key: &str) -> Option<String> {
-    body.get("facts")?.as_array()?.iter().find_map(|f| {
-        if f.get("key")?.as_str()? != key {
-            return None;
-        }
-        let v: Value = serde_json::from_value(f.get("value")?.clone()).ok()?;
+/// The facts of the record named `key` (read as `Value` indexing read them: elements that are
+/// not objects with a string `key` are skipped), as their JSON text.
+fn facts_named<'a>(body: &'a RawValue, key: &str) -> impl Iterator<Item = &'a RawValue> {
+    let key = key.to_owned();
+    elements(member(body, "facts"))
+        .into_iter()
+        .filter(move |f| text(member(f, "key")).as_deref() == Some(key.as_str()))
+}
+
+fn fact_text(body: &RawValue, key: &str) -> Option<String> {
+    facts_named(body, key).find_map(|f| {
+        let v: Value = serde_json::from_str(member(f, "value")?.get()).ok()?;
         v.as_text().map(str::to_owned)
     })
 }
 
 /// Whether the record already has a model's summary.
-fn has_summary(body: &Json) -> bool {
-    body.get("facts")
-        .and_then(Json::as_array)
-        .is_some_and(|facts| {
-            facts.iter().any(|f| {
-                f.get("key").and_then(Json::as_str) == Some(SUMMARY_KEY)
-                    && f.pointer("/value/v/method/v").and_then(Json::as_str) == Some("llm")
-            })
-        })
+fn has_summary(body: &RawValue) -> bool {
+    facts_named(body, SUMMARY_KEY).any(|f| {
+        let method = member(f, "value")
+            .and_then(|v| member(v, "v"))
+            .and_then(|v| member(v, "method"))
+            .and_then(|m| member(m, "v"));
+        text(method).as_deref() == Some("llm")
+    })
 }
 
 /// Whether ingest should queue this record: a document with a digest.
-pub fn has_digest(body: &Json) -> bool {
-    body.get("facts")
-        .and_then(Json::as_array)
-        .is_some_and(|facts| {
-            facts
-                .iter()
-                .any(|f| f.get("key").and_then(Json::as_str) == Some(keys::DIGEST.as_str()))
-        })
+pub fn has_digest(body: &RawValue) -> bool {
+    facts_named(body, keys::DIGEST.as_str()).next().is_some()
 }
 
 /// What a model reads, from a stored record.
@@ -982,8 +983,8 @@ struct Prepared {
 impl Prepared {
     /// `None` when the record has no digest with text enough for a model (as `summary.llm`:
     /// at least 20 words).
-    fn from_record(body: &Json) -> Option<Self> {
-        let r = RecordView::deserialize(body).ok()?;
+    fn from_record(body: &RawValue) -> Option<Self> {
+        let r: RecordView = serde_json::from_str(body.get()).ok()?;
         let mut digest = None;
         let mut subject = None;
         let mut facts = Vec::with_capacity(r.facts.len());
@@ -1126,7 +1127,9 @@ async fn write_summary(
         evidence: None,
     };
     let fact = serde_json::to_value(&fact).map_err(|e| e.to_string())?;
-    let mut body = record.body;
+    // The one writer that edits a record: it reads it as a tree, and writes it back as the
+    // canonical text.
+    let mut body = record.body_value().map_err(|e| e.to_string())?;
     let Some(facts) = body.get_mut("facts").and_then(Json::as_array_mut) else {
         return Err("the record has no facts".to_owned());
     };
@@ -1138,6 +1141,7 @@ async fn write_summary(
     {
         steps.push(step);
     }
+    let body = to_canonical(&body).map_err(|e| e.to_string())?;
     backend
         .put_record(blake3, &body, &record.versions)
         .await
@@ -1151,7 +1155,7 @@ pub(crate) fn queue_if_wanted(
     store: &Store,
     source: &Source,
     blake3: &Blake3,
-    body: &Json,
+    body: &RawValue,
     kind: Option<&str>,
 ) -> bool {
     if !wants(&source.llm_policy, body, kind) {
@@ -1166,13 +1170,39 @@ pub(crate) fn queue_if_wanted(
     }
 }
 
-fn wants(policy: &LlmPolicy, body: &Json, kind: Option<&str>) -> bool {
+fn wants(policy: &LlmPolicy, body: &RawValue, kind: Option<&str>) -> bool {
     policy.queues(kind) && has_digest(body)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn raw(v: Json) -> Box<RawValue> {
+        to_canonical(&v).unwrap()
+    }
+
+    #[test]
+    fn facts_are_read_as_value_indexing_read_them() {
+        let body = raw(serde_json::json!({"facts": [
+            "not an object",
+            ["summary.digest"],
+            {"key": 7},
+            {"key": "summary.digest", "value": {"t": "text", "v": "first"}},
+            {"key": "summary.digest", "value": {"t": "text", "v": "second"}},
+            {"key": "summary.llm", "value": {"v": {"method": {"v": "llm"}}}}
+        ]}));
+        assert!(has_digest(&body));
+        assert!(has_summary(&body));
+        assert_eq!(
+            fact_text(&body, keys::DIGEST.as_str()).as_deref(),
+            Some("first")
+        );
+        assert!(!has_digest(&raw(
+            serde_json::json!({"facts": {"key": "summary.digest"}})
+        )));
+        assert!(!has_digest(&raw(serde_json::json!([]))));
+    }
 
     #[test]
     fn bedrock_regions_come_from_the_url() {
@@ -1190,13 +1220,13 @@ mod tests {
 
     #[test]
     fn records_without_a_digest_are_not_prepared() {
-        let body = serde_json::json!({"facts": []});
+        let body = raw(serde_json::json!({"facts": []}));
         assert!(Prepared::from_record(&body).is_none());
         assert!(!has_digest(&body));
         assert!(!has_summary(&body));
-        let short = serde_json::json!({"facts": [
+        let short = raw(serde_json::json!({"facts": [
             {"key": "summary.digest", "value": {"t": "text", "v": "FACTS:\ndoc: letter\n\nTEXT:\nToo short."}, "conf": 1.0, "src": {"name": "summary.digest", "version": 3}}
-        ]});
+        ]}));
         assert!(has_digest(&short));
         assert!(Prepared::from_record(&short).is_none());
     }
@@ -1204,20 +1234,20 @@ mod tests {
     #[test]
     fn the_digest_splits_into_card_and_text() {
         let text = "word ".repeat(30);
-        let body = serde_json::json!({"pages": 1, "facts": [
+        let body = raw(serde_json::json!({"pages": 1, "facts": [
             {"key": "summary.digest", "value": {"t": "text", "v": format!("FACTS:\ndoc: letter\nlang: en\n\nTEXT:\n{text}")}, "conf": 1.0, "src": {"name": "summary.digest", "version": 3}},
             {"key": "summary.subject", "value": {"t": "record", "v": {"text": {"t": "text", "v": "The subject."}, "method": {"t": "text", "v": "clause"}}}, "conf": 0.7, "src": {"name": "summary.extractive", "version": 2}},
             {"key": "summary.llm", "value": {"t": "record", "v": {"text": {"t": "text", "v": "x"}, "method": {"t": "text", "v": "extractive_fallback"}}}, "conf": 0.6, "src": {"name": "summary.llm", "version": 5}}
-        ]});
+        ]}));
         let p = Prepared::from_record(&body).unwrap();
         assert_eq!(p.card_text, "doc: letter\nlang: en");
         assert!(p.body.starts_with("TEXT:\nword word"));
         assert_eq!(p.subject.as_ref().unwrap().text, "The subject.");
         // A fallback is not a model's summary: the queue tries again.
         assert!(!has_summary(&body));
-        let done = serde_json::json!({"facts": [
+        let done = raw(serde_json::json!({"facts": [
             {"key": "summary.llm", "value": {"t": "record", "v": {"method": {"t": "text", "v": "llm"}}}, "conf": 0.8, "src": {"name": "summary.llm", "version": 5}}
-        ]});
+        ]}));
         assert!(has_summary(&done));
     }
 }
