@@ -169,6 +169,7 @@ impl CacheStore for PgStore {
         validate_registry(registry)?;
         validate_cache_key(key_prefix)?;
         let c = client(&self.pool).await?;
+        // Not cached: a generic plan could not turn the prefix into a range.
         let n = c
             .execute(
                 "DELETE FROM registry_cache WHERE registry = $1 AND starts_with(key, $2)",
@@ -321,7 +322,7 @@ impl FreshnessStore for PgStore {
         }
         let c = client(&self.pool).await?;
         let n = c
-            .execute(
+            .exec(
                 "INSERT INTO company_registry_due (company_id, registry, next_due_at) \
                  SELECT f.company_id, $2, now() FROM company_enrichment f \
                  WHERE f.company_id = ANY($1) \
@@ -329,8 +330,7 @@ impl FreshnessStore for PgStore {
                  next_due_at = least(company_registry_due.next_due_at, EXCLUDED.next_due_at)",
                 &[&companies, &registry],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         Ok(n)
     }
 }
