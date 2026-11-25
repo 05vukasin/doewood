@@ -174,7 +174,8 @@ where
         // The service that was made ready answers this call; a fresh clone waits for the next.
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
-        let call = inner.call(req);
+        // The call's store reads give way to the instance's own (issue #109).
+        let call = doewood_store::api_call(inner.call(req));
         Box::pin(async move {
             let _slot = slot;
             match deadline {

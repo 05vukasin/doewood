@@ -353,9 +353,11 @@ to do:
   store's read-only connections, so they do not queue behind ingest's writes. A read sees
   what was committed when it started: a write call's effect is visible to every call made
   after it returned, and a read running at the same time as a write sees the state before
-  it. Store calls are bounded by the in-flight cap above (`max_calls_in_flight`, default
-  256, fewer than tokio's 512 blocking threads), so a flood of reads is shed with
-  `UNAVAILABLE` before it can take every blocking thread from ingest. See
+  it. When the API's reads and ingest's both wait for a read-only connection, ingest's go
+  first; at least one API read always runs (issue #109). Store calls are bounded by the
+  in-flight cap above (`max_calls_in_flight`, default 256, fewer than tokio's 512 blocking
+  threads), so a flood of reads is shed with `UNAVAILABLE` before it can take every blocking
+  thread from ingest. See
   [configuration.md](configuration.md#the-instance-store).
 - **Retries:** `UNAVAILABLE` is safe to retry for every call (a shed call did not run). Use
   exponential backoff with jitter (for example 100 ms doubling to 10 s), and a client

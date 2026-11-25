@@ -1,7 +1,7 @@
 use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
-use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use doewood_core::MasterKey;
@@ -10,6 +10,7 @@ use zeroize::Zeroizing;
 
 use crate::crypto::Cipher;
 use crate::{StoreError, migrate};
+use readers::{Caller, Readers};
 
 pub(crate) mod ai;
 pub(crate) mod api;
@@ -18,6 +19,7 @@ pub(crate) mod favicon;
 pub(crate) mod ingest;
 pub(crate) mod llm;
 pub(crate) mod objects;
+pub(crate) mod readers;
 pub(crate) mod sources;
 pub(crate) mod sqs;
 
@@ -73,20 +75,13 @@ pub struct Store {
     cipher: Cipher,
 }
 
-/// The read-only connections: idle ones wait in `idle`, a read takes one and gives it back.
-#[derive(Default)]
-pub(crate) struct Readers {
-    idle: Mutex<Vec<Connection>>,
-    returned: Condvar,
-    count: usize,
-}
-
 /// The connection a read runs on: a read-only one, or the writer when the store has none.
 pub(crate) enum ReadConn<'a> {
     Writer(MutexGuard<'a, Connection>),
     Reader {
         readers: &'a Readers,
         conn: Option<Connection>,
+        caller: Caller,
     },
 }
 
@@ -117,11 +112,14 @@ impl Drop for ReadConn<'_> {
         if !self.is_autocommit() {
             let _ = self.execute_batch("ROLLBACK");
         }
-        if let Self::Reader { readers, conn } = self
+        if let Self::Reader {
+            readers,
+            conn,
+            caller,
+        } = self
             && let Some(conn) = conn.take()
         {
-            lock(&readers.idle).push(conn);
-            readers.returned.notify_one();
+            readers.give_back(conn, *caller);
         }
     }
 }
@@ -187,15 +185,10 @@ impl Store {
         )?;
         // The writer migrates and checks the key first: the readers open the finished schema.
         let mut store = Self::init(conn, key)?;
-        let count = readers.min(MAX_READERS);
-        let idle = (0..count)
+        let idle = (0..readers.min(MAX_READERS))
             .map(|_| open_reader(path))
             .collect::<Result<Vec<_>, _>>()?;
-        store.readers = Readers {
-            idle: Mutex::new(idle),
-            returned: Condvar::new(),
-            count,
-        };
+        store.readers = Readers::new(idle);
         Ok(store)
     }
 
@@ -237,29 +230,22 @@ impl Store {
 
     /// How many read-only connections the store has (0: reads use the writer).
     pub fn readers(&self) -> usize {
-        self.readers.count
+        self.readers.count()
     }
 
     /// A connection for a read: an idle reader (waiting for one when all are busy), or the
     /// writer when the store has none. Never the writer while it has readers, so reads do not
-    /// wait for writes, and a flood of reads cannot hold up a write.
+    /// wait for writes, and a flood of reads cannot hold up a write. When the instance's own
+    /// reads and the API's both wait, the instance's go first ([`readers`]).
     pub(crate) fn reader(&self) -> ReadConn<'_> {
-        if self.readers.count == 0 {
+        if self.readers.count() == 0 {
             return ReadConn::Writer(self.conn());
         }
-        let mut idle = lock(&self.readers.idle);
-        loop {
-            if let Some(conn) = idle.pop() {
-                return ReadConn::Reader {
-                    readers: &self.readers,
-                    conn: Some(conn),
-                };
-            }
-            idle = self
-                .readers
-                .returned
-                .wait(idle)
-                .unwrap_or_else(PoisonError::into_inner);
+        let caller = Caller::current();
+        ReadConn::Reader {
+            readers: &self.readers,
+            conn: Some(self.readers.take(caller)),
+            caller,
         }
     }
 
@@ -421,12 +407,7 @@ impl Store {
 
     /// Closes the readers, then checkpoints the WAL into the main file and closes the writer.
     pub fn close(self) -> Result<(), StoreError> {
-        let readers = self
-            .readers
-            .idle
-            .into_inner()
-            .unwrap_or_else(PoisonError::into_inner);
-        for reader in readers {
+        for reader in self.readers.into_idle() {
             reader.close().map_err(|(_, e)| StoreError::Sqlite(e))?;
         }
         let conn = self
@@ -508,6 +489,7 @@ pub(crate) fn now() -> i64 {
 mod tests {
     use super::*;
     use crate::SCHEMA_VERSION;
+    use crate::api_call_blocking;
 
     fn key(b: u8) -> MasterKey {
         MasterKey::from_bytes([b; 32])
@@ -896,10 +878,8 @@ mod tests {
             assert!(panicked.is_err());
         }
         // Every reader is idle, outside a transaction, and serves reads.
-        let idle = lock(&store.readers.idle);
-        assert_eq!(idle.len(), 2);
-        assert!(idle.iter().all(Connection::is_autocommit));
-        drop(idle);
+        assert_eq!(store.readers.state().0, 2);
+        assert!(store.readers.each_idle(Connection::is_autocommit));
         store.set_setting("k", &serde_json::json!(true)).unwrap();
         for _ in 0..4 {
             assert_eq!(store.setting("k").unwrap(), Some(serde_json::json!(true)));
@@ -916,6 +896,140 @@ mod tests {
             assert!(!read.is_finished(), "the only reader is taken");
             drop(held);
             assert_eq!(read.join().unwrap(), None);
+        });
+    }
+
+    /// Waits until the readers' state is `want`: (idle, instance reads waiting, API reads
+    /// waiting).
+    fn until(store: &Store, want: (usize, usize, usize)) {
+        let start = std::time::Instant::now();
+        while store.readers.state() != want {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "readers {:?}, want {want:?}",
+                store.readers.state()
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A read that notes `name` in `order` while it holds its connection.
+    fn noted(store: &Store, order: &Mutex<Vec<&'static str>>, name: &'static str) {
+        store
+            .read(StoreError::from, |_| {
+                lock(order).push(name);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn an_instance_read_goes_before_waiting_api_reads() {
+        let (_tmp, store) = on_disk(2);
+        let order = Mutex::new(Vec::new());
+        // The API holds both readers, and more of its reads wait.
+        let mut held: Vec<_> = (0..2).map(|_| api_call_blocking(|| store.reader())).collect();
+        std::thread::scope(|s| {
+            for _ in 0..3 {
+                s.spawn(|| api_call_blocking(|| noted(&store, &order, "api")));
+            }
+            until(&store, (0, 0, 3));
+            let instance = s.spawn(|| noted(&store, &order, "instance"));
+            until(&store, (0, 1, 3));
+            // The reader given back goes to the instance's read, not to the API's.
+            held.pop();
+            instance.join().unwrap();
+            held.pop();
+        });
+        assert_eq!(lock(&order).as_slice(), ["instance", "api", "api", "api"]);
+    }
+
+    #[test]
+    fn an_api_read_holding_no_reader_gets_the_last_free_one() {
+        let (_tmp, store) = on_disk(2);
+        let order = Mutex::new(Vec::new());
+        // Instance reads hold both readers, and more of them wait.
+        let mut held: Vec<_> = (0..2).map(|_| store.reader()).collect();
+        std::thread::scope(|s| {
+            s.spawn(|| api_call_blocking(|| noted(&store, &order, "api")));
+            until(&store, (0, 0, 1));
+            for _ in 0..2 {
+                s.spawn(|| noted(&store, &order, "instance"));
+            }
+            until(&store, (0, 2, 1));
+            // The API holds none: the one reader given back goes to it first.
+            held.pop();
+        });
+        drop(held);
+        assert_eq!(lock(&order).as_slice(), ["api", "instance", "instance"]);
+    }
+
+    #[test]
+    fn under_a_flood_of_reads_of_both_kinds_both_progress() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let (_tmp, store) = on_disk(2);
+        store.set_setting("k", &serde_json::json!(1)).unwrap();
+        let stop = AtomicBool::new(false);
+        let (instance, api) = (AtomicU64::new(0), AtomicU64::new(0));
+        let slow_read = |done: &AtomicU64| {
+            store
+                .read(StoreError::from, |conn| {
+                    let _: i64 = conn.query_row("SELECT 1", [], |r| r.get(0))?;
+                    std::thread::sleep(Duration::from_millis(1));
+                    Ok(())
+                })
+                .unwrap();
+            done.fetch_add(1, Ordering::Relaxed);
+        };
+        std::thread::scope(|s| {
+            for _ in 0..3 {
+                s.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        slow_read(&instance);
+                    }
+                });
+            }
+            for _ in 0..8 {
+                s.spawn(|| {
+                    api_call_blocking(|| {
+                        while !stop.load(Ordering::Relaxed) {
+                            slow_read(&api);
+                        }
+                    });
+                });
+            }
+            // Each kind gets on: 50 reads of each, though the other floods the readers.
+            let start = std::time::Instant::now();
+            while instance.load(Ordering::Relaxed) < 50 || api.load(Ordering::Relaxed) < 50 {
+                assert!(
+                    start.elapsed() < Duration::from_secs(30),
+                    "instance reads {instance:?}, API reads {api:?}"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        // Every reader is back.
+        assert_eq!(store.readers.state(), (2, 0, 0));
+    }
+
+    #[test]
+    fn api_calls_mark_their_reads() {
+        assert_eq!(Caller::current(), Caller::Instance);
+        api_call_blocking(|| {
+            assert_eq!(Caller::current(), Caller::Api);
+            // Nested, and restored on the way out.
+            api_call_blocking(|| assert_eq!(Caller::current(), Caller::Api));
+            assert_eq!(Caller::current(), Caller::Api);
+        });
+        assert_eq!(Caller::current(), Caller::Instance);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            assert_eq!(Caller::current(), Caller::Instance);
+            crate::api_call(async { assert_eq!(Caller::current(), Caller::Api) }).await;
+            assert_eq!(Caller::current(), Caller::Instance);
         });
     }
 

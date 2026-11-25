@@ -32,6 +32,7 @@ use uuid::Uuid;
 
 use crate::Store;
 use crate::store::now;
+use crate::store::readers::Caller;
 use enrichment::DOCUMENTS;
 
 mod enrichment;
@@ -97,14 +98,16 @@ impl Standalone {
 
     /// Runs a pure read on one of the store's read-only connections (the writer when it has
     /// none), in one transaction: it sees what was committed when it started, and does not
-    /// wait for a write in progress.
+    /// wait for a write in progress. An API call's read gives way to the instance's own
+    /// ([`crate::api_call`]).
     async fn read<T, F>(&self, f: F) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
     {
         let store = Arc::clone(&self.store);
-        tokio::task::spawn_blocking(move || store.read(sql, f))
+        let caller = Caller::current();
+        tokio::task::spawn_blocking(move || caller.run(|| store.read(sql, f)))
             .await
             .map_err(|e| backend(format!("blocking task failed: {e}")))?
     }
@@ -578,7 +581,7 @@ impl RecordStore for Standalone {
     ) -> Result<Vec<Record>> {
         let (source, after) = (source.clone(), after.copied());
         let limit = i64::from(records_limit(limit));
-        self.read(move |conn| {
+        let rows = self.read(move |conn| {
             // `> coalesce(?4, x'')` rather than `?4 IS NULL OR ...`: the OR kept SQLite from
             // starting the scan at the page token, so every page read the records before it
             // (issue #13). Every hash is 32 bytes, so all are greater than the empty blob.
@@ -611,8 +614,13 @@ impl RecordStore for Standalone {
                     },
                 )
                 .map_err(sql)?;
-            rows.map(|row| {
-                let (h, body, versions, updated_at) = row.map_err(sql)?;
+            rows.map(|row| row.map_err(sql)).collect::<Result<Vec<_>>>()
+        })
+        .await?;
+        // The bodies are checked as JSON after the reader is given back: a page can hold
+        // megabytes of them (issue #109).
+        rows.into_iter()
+            .map(|(h, body, versions, updated_at)| {
                 Ok(Record {
                     blake3: Blake3::from_slice(&h)?,
                     body: raw_json(body)?,
@@ -621,8 +629,6 @@ impl RecordStore for Standalone {
                 })
             })
             .collect()
-        })
-        .await
     }
 }
 
