@@ -4,6 +4,7 @@
 
 use std::fmt;
 
+use doewood_enrich::{IdKind, Identifier};
 use serde::Deserialize;
 use serde_json::Value;
 use time::Date;
@@ -145,6 +146,12 @@ pub struct Company {
     pub state_of_incorporation_description: Option<String>,
     /// The fiscal year end, `MMDD`.
     pub fiscal_year_end: Option<String>,
+    /// The filer's LEI (`lei`), when the SEC lists one and it passes ISO 17442: the link
+    /// from EDGAR to GLEIF.
+    pub lei: Option<Identifier>,
+    /// The IRS employer identification number (`ein`), when it is nine digits and not all
+    /// zeros.
+    pub ein: Option<String>,
     /// Former names, with the dates they were used.
     pub former_names: Vec<FormerName>,
     /// The recent filings (at least a year, or the last 1,000), newest first as sent.
@@ -162,7 +169,8 @@ impl Company {
         self.filings.iter().filter(|f| f.is_completed_acquisition())
     }
 
-    /// The newest annual report (10-K, 10-K405, 10-KT and their amendments) by filing date.
+    /// The newest annual report (10-K, 10-K405, 10-KT, a foreign private issuer's 20-F, and
+    /// their amendments) by filing date.
     pub fn latest_annual_report(&self) -> Option<&Filing> {
         self.filings
             .iter()
@@ -212,12 +220,18 @@ impl Filing {
         matches!(self.form.as_str(), "8-K" | "8-K/A") && self.has_item("2.01")
     }
 
-    /// A 10-K, 10-K405, 10-KT or an amendment of one.
+    /// A 10-K, 10-K405, 10-KT, 20-F or an amendment of one.
     pub fn is_annual_report(&self) -> bool {
         matches!(
             self.form.as_str(),
-            "10-K" | "10-K/A" | "10-K405" | "10-K405/A" | "10-KT" | "10-KT/A"
+            "10-K" | "10-K/A" | "10-K405" | "10-K405/A" | "10-KT" | "10-KT/A" | "20-F" | "20-F/A"
         )
+    }
+
+    /// A foreign private issuer's annual report (20-F or 20-F/A): its subsidiaries are in
+    /// Exhibit 8, not Exhibit 21.
+    pub fn is_foreign_annual_report(&self) -> bool {
+        matches!(self.form.as_str(), "20-F" | "20-F/A")
     }
 }
 
@@ -245,6 +259,8 @@ struct RawSubmissions {
     state_of_incorporation: Option<String>,
     state_of_incorporation_description: Option<String>,
     fiscal_year_end: Option<String>,
+    lei: Option<String>,
+    ein: Option<Value>,
     former_names: Option<Vec<RawFormer>>,
     filings: Option<RawFilings>,
 }
@@ -375,6 +391,13 @@ pub(crate) fn company(body: &[u8]) -> Result<Company, String> {
         state_of_incorporation: text(raw.state_of_incorporation),
         state_of_incorporation_description: text(raw.state_of_incorporation_description),
         fiscal_year_end: text(raw.fiscal_year_end),
+        lei: raw
+            .lei
+            .as_deref()
+            .and_then(|l| Identifier::parse(IdKind::Lei, l)),
+        ein: scalar(raw.ein.as_ref()).filter(|e| {
+            e.len() == 9 && e.bytes().all(|b| b.is_ascii_digit()) && e.bytes().any(|b| b != b'0')
+        }),
         former_names,
         filings,
         older_filing_files,

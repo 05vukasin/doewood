@@ -345,7 +345,17 @@ pub(crate) fn index_documents(body: &[u8]) -> Vec<(String, String)> {
 
 /// Whether a document type is Exhibit 21 (`EX-21`, `EX-21.1`, `EX-21.01`).
 pub(crate) fn is_ex21(kind: &str) -> bool {
-    kind == "EX-21" || kind.strip_prefix("EX-21.").is_some_and(|r| !r.is_empty())
+    is_exhibit(kind, "EX-21")
+}
+
+/// Whether a document type is Exhibit 8 (`EX-8`, `EX-8.1`): a 20-F's list of subsidiaries.
+pub(crate) fn is_ex8(kind: &str) -> bool {
+    is_exhibit(kind, "EX-8")
+}
+
+fn is_exhibit(kind: &str, base: &str) -> bool {
+    kind.strip_prefix(base)
+        .is_some_and(|r| r.is_empty() || r.strip_prefix('.').is_some_and(|n| !n.is_empty()))
 }
 
 /// The text from "Item 2.01" on, at most `max_chars` characters, cut before the next
@@ -454,5 +464,7 @@ mod tests {
     fn items() {
         assert!(is_ex21("EX-21") && is_ex21("EX-21.1") && is_ex21("EX-21.01"));
         assert!(!is_ex21("EX-21.") && !is_ex21("EX-211") && !is_ex21("EX-2.1"));
+        assert!(is_ex8("EX-8") && is_ex8("EX-8.1"));
+        assert!(!is_ex8("EX-8.") && !is_ex8("EX-80") && !is_ex8("EX-21"));
     }
 }

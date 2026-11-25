@@ -111,12 +111,34 @@ Both backends pass the same conformance checks.
 | `parent(lei, Direct \| Ultimate)` | `GET lei-records/{lei}/{direct,ultimate}-parent-relationship`, then on 404 `…-parent-reporting-exception` | `Reported`, `Exception` or `NotReported` |
 
 An LEI record (`LeiRecord`) has the LEI, the legal name and its language, other names (previous
-legal names, trading names), the legal address country and city, the jurisdiction, the
-registration authority (`registeredAt`) and the entity's id there (`registeredAs`), the ELF
-legal form code, the category, the entity status (active or inactive), the LEI registration
-status (`ISSUED`, `LAPSED`, `MERGED`, `RETIRED`, ...) and its last update, the expiration (date
-and reason), the successor entities, and the legal-entity events with their effective and
-recorded dates.
+legal names, trading names, other-language legal names, then the `transliteratedOtherNames`:
+`PREFERRED_ASCII_TRANSLITERATED_LEGAL_NAME`, `AUTO_ASCII_TRANSLITERATED_LEGAL_NAME`), the legal
+address country and city, the jurisdiction, the registration authority (`registeredAt`: the RA
+code, and its `other` text in `registered_at_other` when sent) and the entity's id there
+(`registeredAs`), the ELF legal form code, the category (`GENERAL`, `BRANCH`, `FUND`,
+`SOLE_PROPRIETOR`, `RESIDENT_GOVERNMENT_ENTITY`, `INTERNATIONAL_ORGANIZATION`), the entity
+status (active or inactive), the LEI registration status (`ISSUED`, `LAPSED`, `RETIRED`,
+`ANNULLED`, ...) and its last update, the expiration (date and reason: `DISSOLVED`,
+`CORPORATE_ACTION`, `OTHER`), the successor entities, and the legal-entity events with their
+status, event group type, effective and recorded dates.
+
+- **Legal form placeholders.** LEI-CDF 3.1 allows `8888` and `9999` as `legalForm.id`; the real
+  form is then in `legalForm.other` (GLEIF's own example: `{"id": "9999", "other": "LIMITED
+  LIABILITY COMPANY"}`), so `legal_form` is the `other` text for those two codes.
+- **Merged.** LEI-CDF 3.1 deprecates the registration status `MERGED`: a merged entity is
+  `RETIRED` with expiration reason `CORPORATE_ACTION` and successor entities.
+  `LeiRecord::is_merged()` is true for that (and for a legacy `MERGED`).
+- **Event types** (`EventKind`, LEI-CDF 3.1 `LegalEntityEventTypeEnum`): `CHANGE_LEGAL_NAME`
+  (`LegalNameChange`), `CHANGE_LEGAL_FORM`, `MERGERS_AND_ACQUISITIONS`, `ABSORPTION`,
+  `DEMERGER`, `SPINOFF` (`SPIN_OFF` is accepted too), `BREAKUP`, `ACQUISITION_BRANCH`
+  (`BranchAcquisition`), `TRANSFORMATION_*`, `BANKRUPTCY` / `LIQUIDATION` / `INSOLVENCY` /
+  `DISSOLUTION` (`Closure`), `VOLUNTARY_ARRANGEMENT` (its own kind: the entity usually
+  continues); the address and other-name changes are `Other`. Event statuses are
+  `IN_PROGRESS`, `WITHDRAWN_CANCELLED` and `COMPLETED`: only completed events (or events with
+  no status) count. The group type (`STANDALONE`, `CHANGE_LEGAL_FORM_AND_NAME`,
+  `COMPLEX_CHANGE_LEGAL_FORM`, `REVERSE_TAKEOVER`) is kept on each event;
+  `EntityEvent::is_reverse_takeover()` flags the group where the succession direction may be
+  the opposite of the event type's.
 
 Level 2:
 
@@ -124,15 +146,21 @@ Level 2:
   status, and `valid_from` / `valid_to` from the relationship period (not the accounting
   period). The relationship type must match the kind asked (`IS_DIRECTLY_CONSOLIDATED_BY` or
   `IS_ULTIMATELY_CONSOLIDATED_BY`), and an entity is never its own parent.
-- **A reporting exception** (`ReportingException`): why no parent is reported.
-  `NATURAL_PERSONS`, `NON_CONSOLIDATING`, `NO_KNOWN_PERSON`, `NON_PUBLIC` (and its older
-  detailed codes: legal obstacles, consent not obtained, binding legal commitments, disclosure
-  detrimental); any other code is kept as `Other` with the code.
+- **A reporting exception** (`ReportingException`): why no parent is reported (Reporting
+  Exceptions 2.1). `NO_LEI` (the parent does not consent to have an LEI), `NATURAL_PERSONS`,
+  `NON_CONSOLIDATING`, `NO_KNOWN_PERSON`, `NON_PUBLIC` (and its codes deprecated since March
+  2022: legal obstacles, consent not obtained, binding legal commitments, detriment not
+  excluded, disclosure detrimental); any other code is kept as `Other` with the code.
+  **`NO_LEI` and `NON_PUBLIC` mean a parent exists** but is not identified or not disclosed;
+  only `NATURAL_PERSONS`, `NO_KNOWN_PERSON` and `NON_CONSOLIDATING` mean no parent entity
+  (`ExceptionReason::parent_exists()`: `Some(true)`, `Some(false)`, or `None` for an unknown
+  code). The exception's `category` (`DIRECT_ACCOUNTING_CONSOLIDATION_PARENT` /
+  `ULTIMATE_ACCOUNTING_CONSOLIDATION_PARENT`) must match the kind asked, else `Malformed`.
 - **Successors with dates:** `LeiRecord::successions()` gives each successor entity (an LEI,
   or only a name) with the effective date of the latest completed merger-type event
-  (`MERGERS_AND_ACQUISITIONS`, `ABSORPTION`, `BREAKUP`, `TRANSFORMATION_*`), else the
-  expiration date. `LeiRecord::renames()` gives the `CHANGE_LEGAL_NAME` events: a rename keeps
-  the LEI.
+  (`MERGERS_AND_ACQUISITIONS`, `ABSORPTION`, `BREAKUP`, `ACQUISITION_BRANCH`,
+  `TRANSFORMATION_*`), else the expiration date. `LeiRecord::renames()` gives the completed
+  `CHANGE_LEGAL_NAME` events (not the in-progress or withdrawn ones): a rename keeps the LEI.
 
 Search returns candidates only. Matching a candidate to a company is doewood-enrich's job (the
 fuzzy score and the jurisdiction veto); a registry identifier is then the strongest evidence.
@@ -156,6 +184,12 @@ Search results with an invalid LEI or no legal name are skipped.
 The on/off switch is not yet a runtime setting: it becomes one (store and API, ADR 0001
 section 3) together with the other registries' switches and keys, when the enrichment job uses
 the clients.
+
+Checked against GLEIF's API documentation (its example responses and field enums), the LEI-CDF
+3.1 schema and the Reporting Exceptions 2.1 schema: the endpoints, the JSON:API media type, the
+60 requests a minute, every field path read, and the enumerations above. Not documented, and
+handled defensively: what the RA list's `RA888888` / `RA999999` codes stand for (the schema
+only fixes the pattern `RA` and six digits), so the code and the `other` text are both kept.
 
 ## VIES
 
@@ -231,7 +265,7 @@ job.
 
 | call | requests | gives |
 |---|---|---|
-| `by_lei(lei)` | `GET https://query.wikidata.org/sparql?query=…` (items with `wdt:P1278 "<LEI>"`) | the items with that LEI, sorted by id (normally one or none) |
+| `by_lei(lei)` | `GET https://query.wikidata.org/sparql?query=…` (items with a non-deprecated `p:P1278/ps:P1278 "<LEI>"` statement) | the items with that LEI, sorted by id (normally one or none) |
 | `item(qid)` | the same query with `VALUES ?item { wd:<Q-id> }` | the item, or `None` |
 | `search(name)` | `GET https://www.wikidata.org/w/api.php?action=wbsearchentities&search=…&type=item&language=…&limit=…&format=json&maxlag=5` | candidates: Q-id, label, description, the text matched |
 
@@ -262,6 +296,9 @@ one statement give the earliest start and the latest end.
   percent-encoded into the URL. A name only goes to `wbsearchentities`, as one
   percent-encoded URL parameter (whitespace collapsed; empty, longer than 256 characters or
   with control characters is `InvalidInput`), never into SPARQL.
+- **LEI lookup.** `by_lei` matches every LEI statement that is not deprecated, not only the
+  best-rank ("truthy") one that `wdt:P1278` matches: a normal-rank LEI next to a preferred one
+  is found too.
 - **Checks.** Every `by_lei` item must list the asked LEI, and `item` must answer about the
   asked Q-id, else `Malformed`. A SPARQL answer that is not SPARQL 1.1 JSON, or names an item
   that is not a Wikidata entity IRI, is `Malformed`. An item without rows (no such item, or a
@@ -299,10 +336,15 @@ with the backoff.
 | `ttl` | 30 days |
 | `search_size` | 10 (at most 50) |
 
-Assumed rather than confirmed from the documentation, and handled defensively: that every
-item has a `wikibase:statements` count in the query service's RDF (the `item` query uses it to
-tell an existing item from an unknown id), how unknown values appear (blank nodes or
-`.well-known/genid` IRIs: both are skipped), and that the WDQS v1 endpoint stays where it is
+Confirmed from the Wikibase RDF dump format and the W3C SPARQL 1.1 JSON results format: the
+`wikibase:statements` count on every item (the `item` query uses it to tell an existing item
+from an unknown id), the statement ranks, the `pqv:` time values with their precision, unknown
+values as blank nodes in dumps and `.well-known/genid` IRIs in the query service (both are
+skipped), and the Commons `Special:FilePath` form; the `wbsearchentities` parameters and its
+limit of 50. Assumed, and handled defensively: the time precision numbers (9 year, 10 month,
+11 day, from the Wikibase data model, not that page), the `wbsearchentities` answer's field
+names (`search[].id`, `label`, `description`, `match.text`: not described in the module help;
+the top-level `label` may be the `mul` one), and that the WDQS v1 endpoint stays where it is
 (the manual mentions a v2 service; `sparql_url` is a setting).
 
 ## SEC EDGAR
@@ -315,13 +357,15 @@ submissions API, `www.sec.gov` for the company tickers file and the filing archi
 | `company(cik)` | `GET data.sec.gov/submissions/CIK##########.json` | `Company`, or `None` (404) |
 | `ticker(symbol)` | `GET www.sec.gov/files/company_tickers.json` | the entry (CIK, ticker, name), or `None` |
 | `search(name)` | the same file | entries whose name has every word of `name` |
-| `exhibit21(cik, accession)` | `GET www.sec.gov/Archives/edgar/data/<cik>/<accession digits>/<accession>-index.htm`, then the exhibit | `Exhibit21`, or `None` when the filing has none |
-| `subsidiaries(cik)` | `company`, then `exhibit21` of the newest 10-K | `Exhibit21` with the 10-K's filing date |
+| `exhibit21(cik, accession)` | `GET www.sec.gov/Archives/edgar/data/<cik>/<accession digits>/<accession>-index.htm` (on a 404, `-index.html`), then the exhibit | `Exhibit21`, or `None` when the filing has none |
+| `exhibit8(cik, accession)` | the same, for a 20-F's Exhibit 8 (`EX-8`, `EX-8.<n>`) | `Exhibit21` (with `exhibit_type` `EX-8...`), or `None` |
+| `subsidiaries(cik)` | `company`, then `exhibit21` of the newest 10-K, or `exhibit8` when the newest annual report is a 20-F | `Exhibit21` with the report's filing date |
 | `acquisition_text(cik, filing)` | `GET` the filing's primary document | the text from "Item 2.01" on, or `None` |
 
 - **A company** (`Company`): the CIK, name, entity type, SIC code and description, tickers and
-  exchanges, state of incorporation, fiscal year end, **former names** with their `from` / `to`
-  days, and the recent filings (the SEC lists at least a year, or the last 1,000): form, filing
+  exchanges, state of incorporation, fiscal year end, the filer's **LEI** (`lei`, validated
+  with ISO 17442: the link from EDGAR to GLEIF) and EIN (`ein`, nine digits, not all zeros),
+  **former names** with their `from` / `to` days, and the recent filings (the SEC lists at least a year, or the last 1,000): form, filing
   and report dates, accession number, 8-K items, primary document. The older filings' file
   names are kept (`older_filing_files`) but not fetched. The answer must be about the CIK asked,
   else `Malformed`. Filings with an invalid accession number are skipped, and a primary document
@@ -334,7 +378,10 @@ submissions API, `www.sec.gov` for the company tickers file and the filing archi
   `item_chars` characters.
 - **Exhibit 21** (subsidiaries of the registrant). The filing index page's document table is
   read (columns found by their `Document` and `Type` headers, else EDGAR's order), and the first
-  document of type `EX-21` or `EX-21.<n>` is fetched. Its rows are **best-effort**
+  document of type `EX-21` or `EX-21.<n>` is fetched. A foreign private issuer's 20-F (and
+  20-F/A) lists its subsidiaries in **Exhibit 8** instead (`EX-8`, `EX-8.<n>`), read the same
+  way. The index is `<accession>-index.htm` (EDGAR's own filing-detail links); on a 404,
+  `<accession>-index.html`, the form the SEC's documentation shows. Its rows are **best-effort**
   (`Exhibit21::extraction`): HTML table rows give the name in the first cell and the
   jurisdiction in the last one that is not an ownership share; without tables, lines are read
   (`Name (Delaware)`, `Name, a Delaware corporation`, `Name - Delaware`, tab, dot-leader or
@@ -397,13 +444,17 @@ submissions API, `www.sec.gov` for the company tickers file and the filing archi
 
 Confirmed from the SEC's developer pages: the submissions URL (`CIK` and 10 digits), that it
 holds the current and former names, tickers and exchanges, at least a year or 1,000 filings in
-columnar arrays plus files for older ones; the 10 requests a second; the declared User-Agent
-and its sample form. Assumed, and handled defensively: the JSON field names (`formerNames`
-with `name` / `from` / `to`, `filings.recent.accessionNumber`, `items`, `primaryDocument`, ...;
-every field optional), the tickers file's shape (`cik_str`, `ticker`, `title`), the filing index
-page's table and its `Document` / `Type` columns, the 403 page texts ("Undeclared Automated
-Tool", "Request Rate Threshold Exceeded"; any other 403 is `Forbidden`), and the length of the
-SEC's block (the default pause is 10 minutes).
+columnar arrays plus files for older ones; the filing index under each accession folder; the
+10 requests a second; the declared User-Agent and its sample form. The SEC pages do not list
+the JSON field names: they were checked against one public submissions file (`cik` as a
+zero-padded string, `formerNames` with `name` / `from` / `to` timestamps,
+`filings.recent.accessionNumber`, `filingDate`, `reportDate`, `form`, `items` comma-joined,
+`primaryDocument`, `primaryDocDescription`, `filings.files[].name`, `lei`, `ein`), and every
+field stays optional. Assumed, and handled defensively: the tickers file's shape (`cik_str`,
+`ticker`, `title`; the docs give no field list), the filing index page's table and its
+`Document` / `Type` columns, the 403 page texts ("Undeclared Automated Tool", "Request Rate
+Threshold Exceeded"; any other 403 is `Forbidden`), and the length of the SEC's block (the
+default pause is 10 minutes).
 
 ## APR
 
@@ -521,7 +572,8 @@ doewood ships no key.
 | `company(number)` | `GET company/{number}` | `Company`, or `None` (404) |
 | `officers(number)` | `GET company/{number}/officers?items_per_page=…&start_index=…`, every page | `Listing<Officer>` |
 | `significant_control(number)` | `GET company/{number}/persons-with-significant-control?…`, every page | `Listing<Psc>` |
-| `filing_events(number)` | `GET company/{number}/filing-history?…`, every page | `Listing<Filing>`: name changes and mergers only |
+| `psc_statements(number)` | `GET company/{number}/persons-with-significant-control-statements?…`, every page | `Listing<PscStatement>` |
+| `filing_events(number)` | `GET company/{number}/filing-history?category=…&…`, every page | `Listing<Filing>`: name changes, mergers and conversions only |
 | `search(name)` | `GET search/companies?q=…&items_per_page=…&start_index=0` | candidates (`SearchHit`) |
 
 - **A company** (`Company`): the number, the name, the status (`Active`, `Dissolved`,
@@ -530,11 +582,15 @@ doewood ships no key.
   its detail (`active-proposal-to-strike-off`, `converted-to-plc`, ...), the type, the
   jurisdiction, the creation and cessation dates, the **previous names** with `from` / `to`
   (the dated `renamed_to` events of ADR 0002 section 3), the SIC codes, the registered office
-  and whether it has an insolvency history. It must be about the number asked and have a name,
+  (`premises`, `address_line_1`, `address_line_2` as lines, then locality, region, postal code
+  and country) and whether it has an insolvency history. `Company::is_conversion()` flags a
+  status detail of `transformed-to-se`, `converted-to-*` or `transferred-from-uk`: a
+  succession signal. It must be about the number asked and have a name,
   else `Malformed`.
 - **Officers** (`Officer`): name, role (`director`, `secretary`, `llp-member`,
   `corporate-director`, ...), whether it is a company or firm (a `corporate-*` role), appointed
-  and resigned dates, nationality and country of residence; for a corporate officer its
+  and resigned dates (a pre-1992 appointment has no `appointed_on`: its `appointed_before`
+  date is used, with `Officer::appointed_before` set), nationality and country of residence; for a corporate officer its
   registration (`Registration`: identification type, registration number, register, country,
   legal authority, legal form).
 - **People with significant control** (`Psc`): the kind (`Individual`, `CorporateEntity`,
@@ -545,16 +601,34 @@ doewood ships no key.
   individual, and for a corporate entity or legal person its `Registration`: a corporate PSC's
   registration number and country are how ownership chains are followed (a UK company's number
   leads to its own profile and PSCs).
-- **Filing history.** The whole history is read page by page (newest first, at most
-  `max_filings` filings) and only the corporate events are kept, with their filing date and
-  action date: **name changes** (category `change-of-name`, or a description with
-  `change-of-name`; not the `change-of-name-exemption`) and **mergers** (a description with
-  `merger`, such as `formation-by-merger-of-societas-europaea`, a cross-border merger form
-  `CB<digits>`, or a legacy filing whose text mentions a merger, kept as `text`). The merger
-  detection is best-effort.
-- **Paging.** Lists are read with `items_per_page` = `page_size` (100) until `total_results`
-  is reached, a page is empty, or the cap (`max_items`, 1,000; `max_filings` for the filing
-  history) is passed; `Listing::truncated` says the cap stopped it. Each page is cached on its
+- **PSC statements** (`PscStatement`): the `statement` as sent, its kind, and the notified and
+  ceased dates. They tell "no PSC" (`StatementKind::NoPsc`:
+  `no-individual-or-entity-with-signficant-control`, spelled so in the enumerations, and its
+  `-partnership` form) from "a PSC exists but is unidentified" (`StatementKind::Unidentified`:
+  `psc-exists-but-not-identified`, `psc-details-not-confirmed`,
+  `steps-to-find-psc-not-yet-completed`, `psc-contacted-but-no-response`,
+  `psc-has-failed-to-confirm-changed-details`, `restrictions-notice-issued-to-psc`, their
+  `-partnership` forms, `awaiting-confirmation-from-psc`, and the overseas-entity
+  `no-beneficial-owner-identified` and `at-least-one-beneficial-owner-unidentified*`); any
+  other statement is `Other`. The `linked_psc_name` (which may name a person) is not kept.
+- **Filing history.** The history is read page by page (newest first, at most `max_filings`
+  filings), filtered by `category` (`filing_categories`, comma-separated as the API documents:
+  by default `change-of-name`, `incorporation`, `resolution`, `miscellaneous`; empty reads the
+  whole history), and only the corporate events are kept, with their filing date and action
+  date: **name changes** (category `change-of-name`, or a description with `change-of-name`;
+  not `change-of-name-exemption`, `change-of-name-request-comments` or
+  `change-of-name-conditional-resolution-satisfaction`), **mergers** (a description with
+  `merger`, such as `formation-by-merger-of-societas-europaea`; `scheme-of-arrangement`;
+  `formation-of-holding-societas-europaea` and `formation-terms-holding-societas-europaea`; a
+  cross-border merger form `CB<digits>`; or a legacy filing whose text mentions a merger, kept
+  as `text`) and **conversions** between a plc and an SE
+  (`conversion-societas-europaea-to-public-limited-company`, `formation-terms-conversion-*`,
+  `transformation-public-limited-company-to-societas-europaea`). The merger detection is
+  best-effort, and a merger filed under another category is missed while the filter is on.
+- **Paging.** Lists are read with `items_per_page` = `page_size` (100) until the list's total
+  (`total_results`; the filing history sends `total_count`) is reached, a page is empty, or
+  the cap (`max_items`, 1,000; `max_filings` for the filing history) is passed;
+  `Listing::truncated` says the cap stopped it. Each page is cached on its
   own; the listing's fetch date is its oldest page's. A 404 on a list is an empty list (an
   unknown company; assumed also for a company with no PSC).
 - **Name search.** The name is whitespace-collapsed and sent as one percent-encoded `q`
@@ -577,7 +651,9 @@ doewood ships no key.
   5 minutes. A 429 and 5xx get the shared backoff (5 s, doubling) and `Retry-After` handling.
 - **Cached** under `companies_house:company/<number>`, `companies_house:company/<number>/
   {officers,persons-with-significant-control,filing-history}?items_per_page=…&start_index=…`
-  and `companies_house:search/companies?<query>` for 30 days (the ADR's refresh); a 404 for a
+  (`persons-with-significant-control-statements` likewise, the filing history with its
+  `category` filter first in the query) and `companies_house:search/companies?<query>` for 30
+  days (the ADR's refresh); a 404 for a
   day. Failures and malformed bodies are never cached.
 - **Streaming API.** ADR 0002 lists the Companies House streaming API as optional. It is not
   implemented: it is an open item for the enrichment job's refresh (ADR 0002 section 6).
@@ -602,7 +678,10 @@ Officers and PSCs are mostly natural persons. Their entries are public registry 
 - **Companies keep their registration.** A corporate officer or a corporate-entity or
   legal-person PSC keeps its identification (registration number, register, country, legal
   authority and form): that is how ownership chains are built. A company's registered office
-  is kept; it is not a person's address.
+  is kept, with its premises and region; it is not a person's address. A natural person's
+  address is never read, premises and region included.
+- **PSC statements** keep only the statement and its dates; the `linked_psc_name`,
+  `etag` and links are dropped and never cached.
 
 ### Settings
 
@@ -621,6 +700,7 @@ Officers and PSCs are mostly natural persons. Their entries are public registry 
 | `ttl` / `ttl_missing` | 30 days / 1 day |
 | `page_size` | 100 (at most 100) |
 | `max_items` / `max_filings` | 1,000 / 2,000 |
+| `filing_categories` | `change-of-name`, `incorporation`, `resolution`, `miscellaneous` (`DEFAULT_FILING_CATEGORIES`; empty for the whole history; lowercase letters and `-` only, else `Config`) |
 | `search_size` | 10 (at most 100) |
 
 Confirmed from the Companies House developer documentation and its published enumerations
@@ -629,14 +709,21 @@ password; the 600 requests per 5 minutes and the 429; the endpoints and their `i
 / `start_index` paging; the profile fields (`company_number`, `company_name`,
 `company_status`, `company_status_detail`, `type`, `jurisdiction`, `date_of_creation`,
 `date_of_cessation`, `previous_company_names` with `name` / `effective_from` / `ceased_on`,
-`sic_codes`, `registered_office_address`); the company statuses; the officer roles; the PSC
-kinds and natures of control; the filing-history fields (`category`, `type`, `description`,
-`description_values`, `date`, `action_date`, `transaction_id`) and the name-change
-descriptions. Assumed, and handled defensively: that a 401 is the only answer to a bad key
-(another 4xx is a `Status` warning), that a 404 on a list means no list, the exact form codes
-of merger filings (the enumerations list only `formation-by-merger-of-societas-europaea`;
-`CB<digits>` and legacy text are a best-effort reading), and that `items_per_page` above 100 is
-not honoured (the default asks for 100).
+`sic_codes`, `registered_office_address` with `premises` and `region`); the company statuses
+and status details; the officer roles and `appointed_before`; the PSC kinds and natures of
+control; the PSC statement list (`statement`, `notified_on`, `ceased_on`, `total_results`) and
+its statement values; the list totals (`total_results` for officers, PSCs and statements,
+`total_count` for the filing history); the filing-history fields (`category`, `type`,
+`description`, `date`, `transaction_id`), its categories, its comma-separated `category`
+filter, and the name-change, merger and conversion descriptions. Confirmed only by the
+Companies House developer forum, not the spec: `description_values.description` with the
+description `legacy`, and `action_date` (both read leniently). Assumed, and handled
+defensively: that a 401 is the only answer to a bad key (another 4xx is a `Status` warning),
+that a 404 on a list means no list, the categories under which schemes of arrangement and
+cross-border mergers are filed (the enumerations do not say; `filing_categories` is a setting),
+the form codes of cross-border mergers (they have no enumerated description; `CB<digits>` and
+legacy text are a best-effort reading), and that `items_per_page` above 100 is not honoured
+(the default asks for 100).
 
 ## Tests
 

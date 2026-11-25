@@ -17,7 +17,8 @@ pub struct LeiRecord {
     pub legal_name: String,
     /// The language tag of the legal name, as GLEIF gives it.
     pub legal_name_language: Option<String>,
-    /// Other names (previous legal names, trading names, transliterations).
+    /// Other names (previous legal names, trading names, other-language legal names), then
+    /// the transliterated names (`transliteratedOtherNames`).
     pub other_names: Vec<OtherName>,
     /// ISO 3166-1 alpha-2 country of the legal address.
     pub legal_country: Option<String>,
@@ -25,17 +26,24 @@ pub struct LeiRecord {
     pub legal_city: Option<String>,
     /// The legal jurisdiction (`DE`, `US-DE`).
     pub jurisdiction: Option<String>,
-    /// The registration authority code (`RA000...`), or GLEIF's `other` text.
+    /// The registration authority code (`RA000...`), or GLEIF's `other` text when no code is
+    /// sent.
     pub registered_at: Option<String>,
+    /// GLEIF's `registeredAt.other` (LEI-CDF 3.1 `OtherRegistrationAuthorityID`: a legacy
+    /// code of an authority not yet on GLEIF's RA list), kept beside the code when sent.
+    pub registered_at_other: Option<String>,
     /// The entity's id in that registry (`registeredAs`), for example a company number.
     pub registered_as: Option<String>,
-    /// The ISO 20275 legal form code (ELF), or GLEIF's `other` text.
+    /// The ISO 20275 legal form code (ELF), or GLEIF's `other` text when no code is sent or
+    /// the code is a placeholder (`8888`, `9999`).
     pub legal_form: Option<String>,
-    /// `GENERAL`, `BRANCH`, `FUND`, `SOLE_PROPRIETOR`, ...
+    /// `GENERAL`, `BRANCH`, `FUND`, `SOLE_PROPRIETOR`, `RESIDENT_GOVERNMENT_ENTITY` or
+    /// `INTERNATIONAL_ORGANIZATION`.
     pub category: Option<String>,
     /// Whether the entity is active.
     pub entity_status: EntityStatus,
-    /// The LEI registration status (`ISSUED`, `LAPSED`, `MERGED`, `RETIRED`, `ANNULLED`, ...).
+    /// The LEI registration status (`ISSUED`, `LAPSED`, `RETIRED`, `ANNULLED`, ...). `MERGED`
+    /// is deprecated in LEI-CDF 3.1: see [`LeiRecord::is_merged`].
     pub registration_status: Option<String>,
     /// When the record was last updated at GLEIF.
     pub last_update: Option<Date>,
@@ -52,7 +60,9 @@ pub struct LeiRecord {
 pub struct OtherName {
     /// The name.
     pub name: String,
-    /// GLEIF's type (`PREVIOUS_LEGAL_NAME`, `TRADING_OR_OPERATING_NAME`, ...).
+    /// GLEIF's type (`PREVIOUS_LEGAL_NAME`, `TRADING_OR_OPERATING_NAME`,
+    /// `ALTERNATIVE_LANGUAGE_LEGAL_NAME`, `PREFERRED_ASCII_TRANSLITERATED_LEGAL_NAME`,
+    /// `AUTO_ASCII_TRANSLITERATED_LEGAL_NAME`).
     pub kind: Option<String>,
 }
 
@@ -92,8 +102,11 @@ pub struct EntityEvent {
     pub kind: EventKind,
     /// GLEIF's code, as sent.
     pub code: String,
-    /// `PENDING`, `COMPLETED`, `WITHDRAWN_CANCELLED`, ...
+    /// `IN_PROGRESS`, `WITHDRAWN_CANCELLED` or `COMPLETED` (LEI-CDF 3.1).
     pub status: Option<String>,
+    /// The event group's `groupType`: `STANDALONE`, `CHANGE_LEGAL_FORM_AND_NAME`,
+    /// `COMPLEX_CHANGE_LEGAL_FORM` or `REVERSE_TAKEOVER`.
+    pub group_type: Option<String>,
     /// When it took effect.
     pub effective: Option<Date>,
     /// When it was recorded at GLEIF.
@@ -113,14 +126,19 @@ pub enum EventKind {
     Absorption,
     /// `DEMERGER`.
     Demerger,
-    /// `SPIN_OFF`.
+    /// `SPINOFF`.
     SpinOff,
     /// `BREAKUP`.
     Breakup,
+    /// `ACQUISITION_BRANCH`: a branch acquired by another entity.
+    BranchAcquisition,
     /// `TRANSFORMATION_*`.
     Transformation,
     /// `LIQUIDATION`, `BANKRUPTCY`, `INSOLVENCY`, `DISSOLUTION`.
     Closure,
+    /// `VOLUNTARY_ARRANGEMENT`: an insolvency procedure the entity usually continues
+    /// through (not a closure).
+    VoluntaryArrangement,
     /// Anything else.
     Other,
 }
@@ -133,21 +151,42 @@ impl EventKind {
             "MERGERS_AND_ACQUISITIONS" => Self::MergerOrAcquisition,
             "ABSORPTION" => Self::Absorption,
             "DEMERGER" => Self::Demerger,
-            "SPIN_OFF" => Self::SpinOff,
+            // `SPINOFF` is LEI-CDF 3.1's spelling; `SPIN_OFF` is accepted too.
+            "SPINOFF" | "SPIN_OFF" => Self::SpinOff,
             "BREAKUP" => Self::Breakup,
+            "ACQUISITION_BRANCH" => Self::BranchAcquisition,
             "LIQUIDATION" | "BANKRUPTCY" | "INSOLVENCY" | "DISSOLUTION" => Self::Closure,
+            "VOLUNTARY_ARRANGEMENT" => Self::VoluntaryArrangement,
             c if c.starts_with("TRANSFORMATION_") => Self::Transformation,
             _ => Self::Other,
         }
     }
 
     /// Whether this event moves the entity into a successor (merger, absorption, breakup,
-    /// transformation).
+    /// branch acquisition, transformation).
     pub fn has_successor(&self) -> bool {
         matches!(
             self,
-            Self::MergerOrAcquisition | Self::Absorption | Self::Breakup | Self::Transformation
+            Self::MergerOrAcquisition
+                | Self::Absorption
+                | Self::Breakup
+                | Self::BranchAcquisition
+                | Self::Transformation
         )
+    }
+}
+
+impl EntityEvent {
+    /// Whether the event is completed, or has no status (the only events that count).
+    /// `IN_PROGRESS` and `WITHDRAWN_CANCELLED` events do not.
+    pub fn is_completed(&self) -> bool {
+        self.status.as_deref().is_none_or(|s| s == "COMPLETED")
+    }
+
+    /// Whether the event is part of a `REVERSE_TAKEOVER` group: the succession direction
+    /// may be the opposite of what the event type suggests.
+    pub fn is_reverse_takeover(&self) -> bool {
+        self.group_type.as_deref() == Some("REVERSE_TAKEOVER")
     }
 }
 
@@ -171,7 +210,7 @@ impl LeiRecord {
             .events
             .iter()
             .filter(|e| e.kind.has_successor())
-            .filter(|e| e.status.as_deref().is_none_or(|s| s == "COMPLETED"))
+            .filter(|e| e.is_completed())
             .max_by_key(|e| e.effective);
         let date = event
             .and_then(|e| e.effective)
@@ -186,11 +225,26 @@ impl LeiRecord {
             .collect()
     }
 
-    /// The renames (`CHANGE_LEGAL_NAME` events) with their effective dates.
+    /// The completed (or undated-status) renames (`CHANGE_LEGAL_NAME` events) with their
+    /// effective dates. In-progress and withdrawn renames are left out.
     pub fn renames(&self) -> impl Iterator<Item = &EntityEvent> {
         self.events
             .iter()
-            .filter(|e| e.kind == EventKind::LegalNameChange)
+            .filter(|e| e.kind == EventKind::LegalNameChange && e.is_completed())
+    }
+
+    /// Whether the LEI ended in a merger or another corporate action: registration status
+    /// `RETIRED` with expiration reason `CORPORATE_ACTION` (LEI-CDF 3.1), or the deprecated
+    /// `MERGED`. The successors are in [`LeiRecord::successions`].
+    pub fn is_merged(&self) -> bool {
+        match self.registration_status.as_deref() {
+            Some("MERGED") => true,
+            Some("RETIRED") => self
+                .expiration
+                .as_ref()
+                .is_some_and(|x| x.reason.as_deref() == Some("CORPORATE_ACTION")),
+            _ => false,
+        }
     }
 }
 
@@ -216,6 +270,13 @@ impl ParentKind {
         match self {
             Self::Direct => "IS_DIRECTLY_CONSOLIDATED_BY",
             Self::Ultimate => "IS_ULTIMATELY_CONSOLIDATED_BY",
+        }
+    }
+
+    fn exception_category(self) -> &'static str {
+        match self {
+            Self::Direct => "DIRECT_ACCOUNTING_CONSOLIDATION_PARENT",
+            Self::Ultimate => "ULTIMATE_ACCOUNTING_CONSOLIDATION_PARENT",
         }
     }
 }
@@ -274,9 +335,12 @@ pub struct ReportingException {
     pub code: String,
 }
 
-/// The reasons GLEIF accepts for not reporting a parent.
+/// The reasons GLEIF accepts for not reporting a parent (Reporting Exceptions 2.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExceptionReason {
+    /// `NO_LEI`: the parent does not consent to have an LEI. **A parent exists** but is not
+    /// identified.
+    NoLei,
     /// `NATURAL_PERSONS`: controlled by natural persons, no parent entity.
     NaturalPersons,
     /// `NON_CONSOLIDATING`: the parent does not consolidate it.
@@ -293,6 +357,7 @@ pub enum ExceptionReason {
 impl ExceptionReason {
     fn from_code(code: &str) -> Self {
         match code {
+            "NO_LEI" => Self::NoLei,
             "NATURAL_PERSONS" => Self::NaturalPersons,
             "NON_CONSOLIDATING" => Self::NonConsolidating,
             "NO_KNOWN_PERSON" => Self::NoKnownPerson,
@@ -303,6 +368,18 @@ impl ExceptionReason {
             | "DETRIMENT_NOT_EXCLUDED"
             | "CONSENT_NOT_OBTAINED" => Self::NonPublic,
             _ => Self::Other,
+        }
+    }
+
+    /// Whether the reason says a parent entity exists: `Some(true)` for `NO_LEI` and
+    /// `NON_PUBLIC` (a parent exists but is not identified or not disclosed), `Some(false)`
+    /// for `NATURAL_PERSONS`, `NO_KNOWN_PERSON` and `NON_CONSOLIDATING` (no parent entity),
+    /// `None` for an unknown code. Only `Some(false)` may be read as "has no parent".
+    pub fn parent_exists(&self) -> Option<bool> {
+        match self {
+            Self::NoLei | Self::NonPublic => Some(true),
+            Self::NaturalPersons | Self::NoKnownPerson | Self::NonConsolidating => Some(false),
+            Self::Other => None,
         }
     }
 }
@@ -337,6 +414,7 @@ struct RawRecord {
 struct RawEntity {
     legal_name: Option<RawName>,
     other_names: Option<Vec<RawName>>,
+    transliterated_other_names: Option<Vec<RawName>>,
     legal_address: Option<RawAddress>,
     registered_at: Option<RawCode>,
     registered_as: Option<String>,
@@ -383,7 +461,9 @@ struct RawSuccessor {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RawEventGroup {
+    group_type: Option<String>,
     events: Option<Vec<RawEvent>>,
 }
 
@@ -438,6 +518,7 @@ struct RawPeriod {
 #[derive(Deserialize)]
 struct RawException {
     lei: Option<String>,
+    category: Option<String>,
     reason: Option<String>,
 }
 
@@ -540,6 +621,11 @@ pub(crate) fn exception(
             reporting.value, child.value
         ));
     }
+    match text(attrs.category) {
+        None => {}
+        Some(c) if c == kind.exception_category() => {}
+        Some(c) => return Err(format!("unexpected reporting exception category {c:?}")),
+    }
     let code = text(attrs.reason).ok_or("reporting exception without a reason")?;
     Ok(Some(ReportingException {
         kind,
@@ -581,6 +667,7 @@ fn lei_record(res: Resource<RawRecord>) -> Result<LeiRecord, String> {
             .other_names
             .unwrap_or_default()
             .into_iter()
+            .chain(entity.transliterated_other_names.unwrap_or_default())
             .filter_map(|n| {
                 Some(OtherName {
                     name: text(n.name)?,
@@ -591,9 +678,13 @@ fn lei_record(res: Resource<RawRecord>) -> Result<LeiRecord, String> {
         legal_country: address.as_ref().and_then(|a| country(a.country.as_deref())),
         legal_city: address.and_then(|a| text(a.city)),
         jurisdiction: text(entity.jurisdiction),
+        registered_at_other: entity
+            .registered_at
+            .as_ref()
+            .and_then(|c| text(c.other.clone())),
         registered_at: entity.registered_at.and_then(code),
         registered_as: text(entity.registered_as),
-        legal_form: entity.legal_form.and_then(code),
+        legal_form: entity.legal_form.and_then(legal_form),
         category: text(entity.category),
         entity_status: match entity.status.as_deref() {
             Some("ACTIVE") => EntityStatus::Active,
@@ -614,13 +705,20 @@ fn lei_record(res: Resource<RawRecord>) -> Result<LeiRecord, String> {
             .event_groups
             .unwrap_or_default()
             .into_iter()
-            .flat_map(|g| g.events.unwrap_or_default())
-            .filter_map(|e| {
+            .flat_map(|g| {
+                let group = text(g.group_type);
+                g.events
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(move |e| (group.clone(), e))
+            })
+            .filter_map(|(group_type, e)| {
                 let code = text(e.kind)?;
                 Some(EntityEvent {
                     kind: EventKind::from_code(&code),
                     code,
                     status: text(e.status),
+                    group_type,
                     effective: date(e.effective_date.as_deref()),
                     recorded: date(e.recorded_date.as_deref()),
                 })
@@ -645,6 +743,18 @@ fn successor(s: RawSuccessor) -> Option<Successor> {
 
 fn code(c: RawCode) -> Option<String> {
     text(c.id).or_else(|| text(c.other))
+}
+
+/// The ELF code, unless it is one of LEI-CDF 3.1's placeholders (`8888`, `9999`): then the
+/// `other` text, which holds the real legal form (the code if there is no text).
+fn legal_form(c: RawCode) -> Option<String> {
+    let id = text(c.id);
+    let other = text(c.other);
+    match id.as_deref() {
+        Some("8888" | "9999") => other.or(id),
+        Some(_) => id,
+        None => other,
+    }
 }
 
 /// A valid LEI, or nothing.
@@ -673,6 +783,19 @@ mod tests {
             EventKind::Transformation
         );
         assert_eq!(EventKind::from_code("LIQUIDATION"), EventKind::Closure);
+        assert_eq!(EventKind::from_code("SPINOFF"), EventKind::SpinOff);
+        assert_eq!(EventKind::from_code("SPIN_OFF"), EventKind::SpinOff);
+        assert_eq!(
+            EventKind::from_code("ACQUISITION_BRANCH"),
+            EventKind::BranchAcquisition
+        );
+        assert_eq!(
+            EventKind::from_code("VOLUNTARY_ARRANGEMENT"),
+            EventKind::VoluntaryArrangement
+        );
+        assert!(EventKind::BranchAcquisition.has_successor());
+        assert!(!EventKind::VoluntaryArrangement.has_successor());
+        assert!(!EventKind::SpinOff.has_successor());
         assert_eq!(EventKind::from_code("SOMETHING_NEW"), EventKind::Other);
         assert!(EventKind::MergerOrAcquisition.has_successor());
         assert!(!EventKind::LegalNameChange.has_successor());
@@ -692,6 +815,37 @@ mod tests {
             ExceptionReason::from_code("NEW_CODE"),
             ExceptionReason::Other
         );
+        assert_eq!(ExceptionReason::from_code("NO_LEI"), ExceptionReason::NoLei);
+        assert_eq!(ExceptionReason::NoLei.parent_exists(), Some(true));
+        assert_eq!(ExceptionReason::NonPublic.parent_exists(), Some(true));
+        assert_eq!(ExceptionReason::NaturalPersons.parent_exists(), Some(false));
+        assert_eq!(ExceptionReason::NoKnownPerson.parent_exists(), Some(false));
+        assert_eq!(
+            ExceptionReason::NonConsolidating.parent_exists(),
+            Some(false)
+        );
+        assert_eq!(ExceptionReason::Other.parent_exists(), None);
+    }
+
+    #[test]
+    fn placeholder_legal_forms_give_the_text() {
+        let c = |id: Option<&str>, other: Option<&str>| {
+            legal_form(RawCode {
+                id: id.map(str::to_owned),
+                other: other.map(str::to_owned),
+            })
+        };
+        assert_eq!(
+            c(Some("9999"), Some("LIMITED LIABILITY COMPANY")).as_deref(),
+            Some("LIMITED LIABILITY COMPANY")
+        );
+        assert_eq!(
+            c(Some("8888"), Some("Invented Form")).as_deref(),
+            Some("Invented Form")
+        );
+        assert_eq!(c(Some("8888"), None).as_deref(), Some("8888"));
+        assert_eq!(c(Some("XXXX"), Some("ignored")).as_deref(), Some("XXXX"));
+        assert_eq!(c(None, Some("Some Form")).as_deref(), Some("Some Form"));
     }
 
     #[test]

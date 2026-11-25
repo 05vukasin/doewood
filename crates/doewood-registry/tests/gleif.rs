@@ -77,7 +77,11 @@ async fn lookup_parses_a_record_with_successor_and_events() {
                 "effectiveDate": "2026-03-31T00:00:00+02:00",
                 "recordedDate": "2026-04-02T00:00:00Z"},
             {"type": "MERGERS_AND_ACQUISITIONS", "status": "WITHDRAWN_CANCELLED",
-                "effectiveDate": "2026-06-01T00:00:00Z", "recordedDate": null}
+                "effectiveDate": "2026-06-01T00:00:00Z", "recordedDate": null},
+            {"type": "CHANGE_LEGAL_NAME", "status": "IN_PROGRESS",
+                "effectiveDate": "2026-07-01T00:00:00Z", "recordedDate": null},
+            {"type": "CHANGE_LEGAL_NAME", "status": "WITHDRAWN_CANCELLED",
+                "effectiveDate": "2025-07-01T00:00:00Z", "recordedDate": null}
         ]
     }]);
     let body = json!({"data": r});
@@ -105,7 +109,12 @@ async fn lookup_parses_a_record_with_successor_and_events() {
     );
     // The same successor twice is one; a name-only successor is kept.
     assert_eq!(rec.successors.len(), 2, "{:?}", rec.successors);
-    assert_eq!(rec.events.len(), 3);
+    assert_eq!(rec.events.len(), 5);
+    assert!(
+        rec.events
+            .iter()
+            .all(|e| e.group_type.as_deref() == Some("STANDALONE"))
+    );
 
     // The succession date is the completed merger's effective date, not the cancelled one's.
     let succ = rec.successions();
@@ -121,9 +130,76 @@ async fn lookup_parses_a_record_with_successor_and_events() {
         Some("Invented Holdings AG")
     );
 
+    // Only the completed rename: the in-progress and the withdrawn ones are not renames.
     let renames: Vec<_> = rec.renames().collect();
     assert_eq!(renames.len(), 1);
     assert_eq!(renames[0].effective, Some(date(2019, Month::February, 1)));
+}
+
+#[tokio::test]
+async fn documented_codes_placeholders_and_transliterations() {
+    let target = lei("SPUN");
+    let mut r = record(&target, "Fictive Spun Holdings plc", "GB");
+    let entity = &mut r["attributes"]["entity"];
+    // LEI-CDF 3.1: `9999` / `8888` legal forms carry the real form in `other`.
+    entity["legalForm"] = json!({"id": "9999", "other": "LIMITED LIABILITY COMPANY"});
+    entity["registeredAt"] = json!({"id": "RA888888", "other": "RA-INVENTED-01"});
+    entity["category"] = json!("INTERNATIONAL_ORGANIZATION");
+    entity["transliteratedOtherNames"] = json!([
+        {"name": "FIKTIVNE PUMPE DOO", "language": "sr-Latn",
+            "type": "PREFERRED_ASCII_TRANSLITERATED_LEGAL_NAME"},
+        {"name": "FIKTIVNE PUMPE D.O.O.", "language": "sr-Latn",
+            "type": "AUTO_ASCII_TRANSLITERATED_LEGAL_NAME"}
+    ]);
+    entity["status"] = json!("INACTIVE");
+    entity["expiration"] = json!({"date": "2026-01-31T00:00:00Z", "reason": "CORPORATE_ACTION"});
+    entity["successorEntity"] = json!({"lei": lei("TAKER"), "name": null});
+    entity["eventGroups"] = json!([
+        {"groupType": "STANDALONE", "events": [
+            {"type": "SPINOFF", "status": "COMPLETED",
+                "effectiveDate": "2024-03-01T00:00:00Z", "recordedDate": null},
+            {"type": "VOLUNTARY_ARRANGEMENT", "status": "COMPLETED",
+                "effectiveDate": "2024-06-01T00:00:00Z", "recordedDate": null}
+        ]},
+        {"groupType": "REVERSE_TAKEOVER", "events": [
+            {"type": "ACQUISITION_BRANCH", "status": "COMPLETED",
+                "effectiveDate": "2026-01-31T00:00:00Z", "recordedDate": null}
+        ]}
+    ]);
+    r["attributes"]["registration"]["status"] = json!("RETIRED");
+    let body = json!({"data": r});
+    let server = MockServer::start(move |_, _| Reply::json(&body)).await;
+    let s = setup(&server, |_| {});
+    let rec = s.gleif.lookup(&target).await.unwrap().value.unwrap();
+    assert_eq!(rec.legal_form.as_deref(), Some("LIMITED LIABILITY COMPANY"));
+    assert_eq!(rec.registered_at.as_deref(), Some("RA888888"));
+    assert_eq!(rec.registered_at_other.as_deref(), Some("RA-INVENTED-01"));
+    assert_eq!(rec.category.as_deref(), Some("INTERNATIONAL_ORGANIZATION"));
+    let kinds: Vec<_> = rec.other_names.iter().map(|n| n.kind.as_deref()).collect();
+    assert_eq!(
+        kinds,
+        [
+            Some("PREFERRED_ASCII_TRANSLITERATED_LEGAL_NAME"),
+            Some("AUTO_ASCII_TRANSLITERATED_LEGAL_NAME")
+        ]
+    );
+    let events: Vec<_> = rec.events.iter().map(|e| e.kind.clone()).collect();
+    assert_eq!(
+        events,
+        [
+            EventKind::SpinOff,
+            EventKind::VoluntaryArrangement,
+            EventKind::BranchAcquisition
+        ]
+    );
+    assert!(!rec.events[0].is_reverse_takeover());
+    assert!(rec.events[2].is_reverse_takeover());
+    // RETIRED with CORPORATE_ACTION is the LEI-CDF 3.1 form of the deprecated MERGED.
+    assert!(rec.is_merged());
+    let succ = rec.successions();
+    assert_eq!(succ.len(), 1);
+    assert_eq!(succ[0].event, Some(EventKind::BranchAcquisition));
+    assert_eq!(succ[0].date, Some(date(2026, Month::January, 31)));
 }
 
 #[tokio::test]
@@ -141,6 +217,8 @@ async fn succession_date_falls_back_to_the_expiration() {
     let server = MockServer::start(move |_, _| Reply::json(&body)).await;
     let s = setup(&server, |_| {});
     let rec = s.gleif.lookup(&target).await.unwrap().value.unwrap();
+    // ISSUED, not retired: not merged even with a corporate-action expiration.
+    assert!(!rec.is_merged());
     let succ = rec.successions();
     assert_eq!(succ.len(), 2);
     assert!(
@@ -365,6 +443,7 @@ async fn non_public_and_non_consolidating_exceptions() {
     for (code, reason) in [
         ("NON_CONSOLIDATING", ExceptionReason::NonConsolidating),
         ("NO_KNOWN_PERSON", ExceptionReason::NoKnownPerson),
+        ("NO_LEI", ExceptionReason::NoLei),
         ("NON_PUBLIC", ExceptionReason::NonPublic),
         ("LEGAL_OBSTACLES", ExceptionReason::NonPublic),
         ("A_FUTURE_CODE", ExceptionReason::Other),
@@ -386,6 +465,52 @@ async fn non_public_and_non_consolidating_exceptions() {
         };
         assert_eq!(e.reason, reason, "{code}");
     }
+}
+
+#[tokio::test]
+async fn no_lei_exception_means_a_parent_exists() {
+    let child = lei("HIDDEN");
+    let body = exception(&child, "DIRECT_ACCOUNTING_CONSOLIDATION_PARENT", "NO_LEI");
+    let server = MockServer::start(move |target, _| {
+        if target.ends_with("-reporting-exception") {
+            Reply::json(&body)
+        } else {
+            Reply::not_found()
+        }
+    })
+    .await;
+    let s = setup(&server, |_| {});
+    let got = s.gleif.parent(&child, ParentKind::Direct).await.unwrap();
+    let Parent::Exception(e) = got.value else {
+        panic!("{:?}", got.value)
+    };
+    assert_eq!(e.reason, ExceptionReason::NoLei);
+    assert_eq!(e.reason.parent_exists(), Some(true));
+}
+
+#[tokio::test]
+async fn exception_of_the_other_parent_kind_is_malformed() {
+    let child = lei("WRONGCAT");
+    let body = exception(
+        &child,
+        "ULTIMATE_ACCOUNTING_CONSOLIDATION_PARENT",
+        "NATURAL_PERSONS",
+    );
+    let server = MockServer::start(move |target, _| {
+        if target.ends_with("-reporting-exception") {
+            Reply::json(&body)
+        } else {
+            Reply::not_found()
+        }
+    })
+    .await;
+    let s = setup(&server, |_| {});
+    let w = s
+        .gleif
+        .parent(&child, ParentKind::Direct)
+        .await
+        .unwrap_err();
+    assert!(matches!(w.kind, WarningKind::Malformed(_)), "{w}");
 }
 
 #[tokio::test]

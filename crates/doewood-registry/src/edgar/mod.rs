@@ -4,12 +4,14 @@
 //! - [`Edgar::company`]: a company by CIK: name, former names with dates, tickers, SIC,
 //!   state of incorporation and the recent filings (form, dates, accession number, items,
 //!   primary document). [`Company::acquisitions`] gives the 8-K filings with Item 2.01
-//!   (completed acquisitions); [`Company::latest_annual_report`] the newest 10-K.
+//!   (completed acquisitions); [`Company::latest_annual_report`] the newest 10-K or 20-F.
+//!   The filer's LEI and EIN are kept when the SEC lists them.
 //! - [`Edgar::ticker`] and [`Edgar::search`]: the CIK of a ticker or a name, from the company
 //!   tickers file. The file is fetched whole and searched here: the name never leaves the
 //!   instance.
-//! - [`Edgar::exhibit21`]: the subsidiaries listed in a filing's Exhibit 21, best-effort.
-//!   [`Edgar::subsidiaries`] does it for the newest 10-K of a CIK.
+//! - [`Edgar::exhibit21`]: the subsidiaries listed in a filing's Exhibit 21, best-effort;
+//!   [`Edgar::exhibit8`] the same for a 20-F's Exhibit 8. [`Edgar::subsidiaries`] does it for
+//!   the newest 10-K (Exhibit 21) or 20-F (Exhibit 8) of a CIK.
 //! - [`Edgar::acquisition_text`]: the text of an 8-K from "Item 2.01" on, capped, best-effort.
 //!
 //! Every answer is [`TrustTier::Official`] (SEC filings). A CIK, an accession number and a
@@ -165,8 +167,9 @@ pub fn user_agent(contact: Option<&str>) -> Result<String, Warning> {
     Ok(format!("{c} {USER_AGENT}"))
 }
 
-/// The subsidiaries listed in a filing's Exhibit 21. **Best-effort**: the rows are a
-/// heuristic reading of a free-form document (see [`Extraction`]).
+/// The subsidiaries listed in a filing's Exhibit 21 (or a 20-F's Exhibit 8, which holds the
+/// same list). **Best-effort**: the rows are a heuristic reading of a free-form document (see
+/// [`Extraction`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Exhibit21 {
     /// The filer.
@@ -175,7 +178,7 @@ pub struct Exhibit21 {
     pub accession: Accession,
     /// The filing date, when known (from the submissions, in [`Edgar::subsidiaries`]).
     pub filing_date: Option<time::Date>,
-    /// The exhibit's document type (`EX-21`, `EX-21.1`).
+    /// The exhibit's document type (`EX-21`, `EX-21.1`, or `EX-8`, `EX-8.1` for a 20-F).
     pub exhibit_type: String,
     /// The exhibit's file name in the filing.
     pub document: String,
@@ -382,8 +385,9 @@ impl Edgar {
         Ok((fetch, entries))
     }
 
-    /// The subsidiaries in the Exhibit 21 of the newest 10-K of `cik`. `None` when there is
-    /// no such company, no 10-K among the recent filings, or no Exhibit 21 in it.
+    /// The subsidiaries in the Exhibit 21 of the newest 10-K of `cik`, or in the Exhibit 8 when
+    /// the newest annual report is a 20-F. `None` when there is no such company, no annual
+    /// report among the recent filings, or no such exhibit in it.
     pub async fn subsidiaries(&self, cik: &str) -> Result<Fetched<Option<Exhibit21>>, Warning> {
         self.on()?;
         let cik = parse_cik(cik)?;
@@ -398,7 +402,11 @@ impl Edgar {
                 fetched_at: company.fetched_at,
             });
         };
-        let mut ex = self.exhibit21(cik, &filing.accession).await?;
+        let mut ex = if filing.is_foreign_annual_report() {
+            self.exhibit8(cik, &filing.accession).await?
+        } else {
+            self.exhibit21(cik, &filing.accession).await?
+        };
         if let Some(e) = &mut ex.value {
             e.filing_date = filing.filing_date;
         }
@@ -406,24 +414,56 @@ impl Edgar {
     }
 
     /// The subsidiaries in the Exhibit 21 (`EX-21`, `EX-21.1`, ...) of filing `accession` of
-    /// `cik`, read from the filing index (`<accession>-index.htm`). `None` when the index
-    /// lists no Exhibit 21. A missing index or exhibit is a `Status(404)` warning.
+    /// `cik`, read from the filing index (`<accession>-index.htm`, else `-index.html`, the
+    /// form the SEC's documentation shows). `None` when the index lists no Exhibit 21. A
+    /// missing index or exhibit is a `Status(404)` warning.
     pub async fn exhibit21(
         &self,
         cik: Cik,
         accession: &Accession,
     ) -> Result<Fetched<Option<Exhibit21>>, Warning> {
+        self.subsidiary_exhibit(cik, accession, exhibit::is_ex21)
+            .await
+    }
+
+    /// The subsidiaries in the Exhibit 8 (`EX-8`, `EX-8.1`, ...) of filing `accession` of
+    /// `cik`: a 20-F's list of subsidiaries. As [`Edgar::exhibit21`] otherwise.
+    pub async fn exhibit8(
+        &self,
+        cik: Cik,
+        accession: &Accession,
+    ) -> Result<Fetched<Option<Exhibit21>>, Warning> {
+        self.subsidiary_exhibit(cik, accession, exhibit::is_ex8)
+            .await
+    }
+
+    async fn subsidiary_exhibit(
+        &self,
+        cik: Cik,
+        accession: &Accession,
+        wanted: fn(&str) -> bool,
+    ) -> Result<Fetched<Option<Exhibit21>>, Warning> {
         self.on()?;
         let folder = format!("Archives/edgar/data/{}/{}", cik.value(), accession.plain());
-        let key = format!("{folder}/{accession}-index.htm");
-        let url = join(&self.www, &key)?;
-        let fetch = self.send(&self.index, &key, &url, HTML).await?;
+        let mut found = None;
+        for ext in ["htm", "html"] {
+            let key = format!("{folder}/{accession}-index.{ext}");
+            let url = join(&self.www, &key)?;
+            let fetch = self.send(&self.index, &key, &url, HTML).await?;
+            if matches!(fetch.body, Body::Found(_)) {
+                found = Some((key, fetch));
+                break;
+            }
+        }
+        let Some((key, fetch)) = found else {
+            return Err(warning(WarningKind::Status(404)));
+        };
         let Body::Found(b) = &fetch.body else {
             return Err(warning(WarningKind::Status(404)));
         };
         let docs = exhibit::index_documents(b);
         self.index.remember(&key, &fetch).await;
-        let Some((kind, file)) = docs.into_iter().find(|(k, _)| exhibit::is_ex21(k)) else {
+        let Some((kind, file)) = docs.into_iter().find(|(k, _)| wanted(k)) else {
             return Ok(Fetched::new(None, &fetch));
         };
         let key = format!("{folder}/{file}");
