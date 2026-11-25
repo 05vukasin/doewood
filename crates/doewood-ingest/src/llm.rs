@@ -1178,13 +1178,13 @@ fn wants(policy: &LlmPolicy, body: &RawValue, kind: Option<&str>) -> bool {
 mod tests {
     use super::*;
 
-    fn raw(v: Json) -> Box<RawValue> {
-        to_canonical(&v).unwrap()
+    fn raw(v: &Json) -> Box<RawValue> {
+        to_canonical(v).unwrap()
     }
 
     #[test]
     fn facts_are_read_as_value_indexing_read_them() {
-        let body = raw(serde_json::json!({"facts": [
+        let body = raw(&serde_json::json!({"facts": [
             "not an object",
             ["summary.digest"],
             {"key": 7},
@@ -1199,9 +1199,9 @@ mod tests {
             Some("first")
         );
         assert!(!has_digest(&raw(
-            serde_json::json!({"facts": {"key": "summary.digest"}})
+            &serde_json::json!({"facts": {"key": "summary.digest"}})
         )));
-        assert!(!has_digest(&raw(serde_json::json!([]))));
+        assert!(!has_digest(&raw(&serde_json::json!([]))));
     }
 
     #[test]
@@ -1220,11 +1220,11 @@ mod tests {
 
     #[test]
     fn records_without_a_digest_are_not_prepared() {
-        let body = raw(serde_json::json!({"facts": []}));
+        let body = raw(&serde_json::json!({"facts": []}));
         assert!(Prepared::from_record(&body).is_none());
         assert!(!has_digest(&body));
         assert!(!has_summary(&body));
-        let short = raw(serde_json::json!({"facts": [
+        let short = raw(&serde_json::json!({"facts": [
             {"key": "summary.digest", "value": {"t": "text", "v": "FACTS:\ndoc: letter\n\nTEXT:\nToo short."}, "conf": 1.0, "src": {"name": "summary.digest", "version": 3}}
         ]}));
         assert!(has_digest(&short));
@@ -1234,7 +1234,7 @@ mod tests {
     #[test]
     fn the_digest_splits_into_card_and_text() {
         let text = "word ".repeat(30);
-        let body = raw(serde_json::json!({"pages": 1, "facts": [
+        let body = raw(&serde_json::json!({"pages": 1, "facts": [
             {"key": "summary.digest", "value": {"t": "text", "v": format!("FACTS:\ndoc: letter\nlang: en\n\nTEXT:\n{text}")}, "conf": 1.0, "src": {"name": "summary.digest", "version": 3}},
             {"key": "summary.subject", "value": {"t": "record", "v": {"text": {"t": "text", "v": "The subject."}, "method": {"t": "text", "v": "clause"}}}, "conf": 0.7, "src": {"name": "summary.extractive", "version": 2}},
             {"key": "summary.llm", "value": {"t": "record", "v": {"text": {"t": "text", "v": "x"}, "method": {"t": "text", "v": "extractive_fallback"}}}, "conf": 0.6, "src": {"name": "summary.llm", "version": 5}}
@@ -1245,7 +1245,7 @@ mod tests {
         assert_eq!(p.subject.as_ref().unwrap().text, "The subject.");
         // A fallback is not a model's summary: the queue tries again.
         assert!(!has_summary(&body));
-        let done = raw(serde_json::json!({"facts": [
+        let done = raw(&serde_json::json!({"facts": [
             {"key": "summary.llm", "value": {"t": "record", "v": {"method": {"t": "text", "v": "llm"}}}, "conf": 0.8, "src": {"name": "summary.llm", "version": 5}}
         ]}));
         assert!(has_summary(&done));

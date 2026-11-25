@@ -1,7 +1,7 @@
 //! JSON text without the `serde_json::Value` tree (issue #98).
 //!
 //! [`to_canonical`] writes the text `serde_json::to_value(v)?.to_string()` gives: compact, with
-//! every object's keys sorted (serde_json's maps are B-trees) and the last of duplicate keys
+//! every object's keys sorted (`serde_json`'s maps are B-trees) and the last of duplicate keys
 //! kept. It writes it straight from `v`'s `Serialize`: a record's tree was about 16 times its
 //! text, while this keeps one scratch buffer per nesting level, reused across siblings.
 //!
@@ -537,6 +537,7 @@ fn key_error() -> Error {
     Error::custom("key must be a string")
 }
 
+#[allow(clippy::unnecessary_wraps)] // the key serializer's return type
 fn text<T: ToString>(v: &T) -> Result<String> {
     Ok(v.to_string())
 }
@@ -741,7 +742,7 @@ mod tests {
         ch: char,
         nested: BTreeMap<String, S2>,
         hashed: HashMap<u32, bool>,
-        booleans: HashMap<bool, ()>,
+        booleans: HashMap<bool, u8>,
         esc: String,
     }
 
@@ -794,7 +795,7 @@ mod tests {
                 ),
             ]),
             hashed: (0..50).map(|i| (i, i % 2 == 0)).collect(),
-            booleans: HashMap::from([(true, ()), (false, ())]),
+            booleans: HashMap::from([(true, 1), (false, 0)]),
             esc: "line\n\u{1}\u{2028}\"\\ ünï".into(),
         };
         same(&s);
