@@ -194,7 +194,13 @@ refused: the workbook has more than 1,600,000 cells ...`, and how to raise the c
 
 - **GetRecord** takes a BLAKE3 in hex; the record's JSON is in `body_json`, exactly as stored.
 - **ListRecords** pages through the records of a source's files, ordered by hash: pass
-  `next_page_token` back as `page_token` until it comes back empty.
+  `next_page_token` back as `page_token` until it comes back empty. A page holds up to
+  `page_size` records (default 50, at most 1000) and also ends with the record that brings
+  its bodies to 3 MiB (issue #111), so a page can hold fewer records than asked for and still
+  have a next one; it always holds at least one record when any is left. With records up to
+  about 1 MiB a page stays under the 4 MiB message size that gRPC clients accept by default.
+  A page that ends exactly at the end of the source may still give a token; the next page is
+  then empty. See [ListRecords page budget](#listrecords-page-budget).
 - **GetNode** finds a node by id or by kind and key; **Neighbours** follows its edges with the
   filters of the model's `NeighbourQuery` (direction, edge kinds, neighbour kind, a day the edge
   must hold on, inactive edges); **CompanyDocuments** lists the documents with a live `party`
@@ -679,6 +685,83 @@ it from starting at the page token, so it too read every record before the page.
 compares with `coalesce(?4, x'')` and searches the primary key from the token. In a trial with
 Python's sqlite3 (3.46.1, in memory, 50,000 records, the same query), walking a bucket 50 per
 page took 471 ms before and 69 ms after, with the same results.
+
+## ListRecords page budget
+
+Before issue #111 a `ListRecords` page was only bounded by its size (up to 1000 records), so a
+page of big records was read into memory in full, several times over (the rows, the records,
+the reply), and only then met the 64 MiB message cap. Now `RecordStore::list_records` takes a
+byte budget and stops reading once the bodies reach it: SQLite reads row by row, Postgres reads
+through a portal in batches (8 rows, then about what still fits), so neither the server nor
+doewood holds the rest. The API's budget is `RECORDS_PAGE_BYTES`, 3 MiB of record bodies (not
+configurable). The conformance test (`records_by_source`) and
+`list_records_pages_end_at_the_byte_budget` in `crates/doewood-api/tests/api.rs` walk pages of
+varied sizes and budgets on both backends and see every record exactly once.
+
+```
+DOEWOOD_TEST_POSTGRES_URL=... MALLOC_MMAP_THRESHOLD_=65536 \
+  cargo test -p doewood-api --test records_memory -- --ignored --nocapture
+```
+
+The test (`tests/records_memory.rs`) asks for `page_size` 1000 once, then walks every page,
+and prints the peak RSS above the RSS before each (server and client in one process; glibc
+told to map every allocation above 64 KiB, so freed buffers leave the RSS). Generated records
+in one source; `pgvector/pgvector:pg17` in Docker on the 4-core server, test profile, one run
+each, `origin/main` at `77524d9` before and this change after.
+
+| case | before: one page | after: one page | before: all pages | after: all pages |
+|---|---|---|---|---|
+| SQLite, 150 records of 256 KiB | 150 records, +75.9 MiB, 217 ms | 12 records, +6.3 MiB, 25 ms | 1 page, +75.8 MiB, 211 ms | 13 pages, +6.3 MiB, 330 ms |
+| Postgres, 150 records of 256 KiB | 150 records, +101.1 MiB, 1,651 ms | 12 records, +5.8 MiB, 180 ms | 1 page, +101.5 MiB, 1,622 ms | 13 pages, +7.0 MiB, 1,992 ms |
+| SQLite, 20,000 records of 1 KiB | 1000 records, +2.4 MiB, 32 ms | 1000 records, +3.5 MiB, 22 ms | 21 pages, +4.9 MiB, 687 ms | 21 pages, +4.1 MiB, 518 ms |
+| Postgres, 20,000 records of 1 KiB | 1000 records, +2.9 MiB, 80 ms | 1000 records, +1.1 MiB, 71 ms | 21 pages, +4.4 MiB, 1,450 ms | 21 pages, +8.3 MiB, 1,388 ms |
+
+The peak of a page of big records drops from two to 2.7 times the whole page's 37.5 MiB of
+bodies to about twice the 3 MiB budget. Walking big records takes more pages, so more
+round trips: 20 to 60 % longer in all. Small records page as before.
+
+## Search by company
+
+`Search` with a company checked each candidate document with a correlated `EXISTS` (its node by
+`encode(blake3, 'hex')`, then its party edges). Without words every indexed document is a
+candidate, so the cost grew with the index, not with the company. Since issue #111 a company
+with few documents drives the query instead: its party edges (`edges_by_dst`), each document's
+hash looked up by the `search_index` primary key. The same rows come back in the same order
+(`search_by_company_matches_the_query_before` in `crates/doewood-pg/src/tests/search_company.rs`
+and `crates/doewood-store/src/standalone/search_company.rs`: 5 companies, 5 texts, kind and
+date filters and 4 pages, against the query before, and through `search` itself).
+
+For a company on a large share of the documents (the instance's owner is on every one) the
+check per document is faster on Postgres: it runs in rank order and stops when the page is
+full, while the edges are all read. So Postgres first counts the company's party edges, up to
+a quarter of the indexed documents (`pg_class.reltuples`, at least 1000), and keeps the check
+per document when the count reaches that. SQLite drives from the edges always: its check per
+document was slower in every case measured.
+
+```
+DOEWOOD_TEST_POSTGRES_URL=... DOEWOOD_BENCH_DOCS=50000 \
+  cargo test -p doewood-pg search_by_company_timings -- --ignored --nocapture
+DOEWOOD_BENCH_DOCS=50000 \
+  cargo test -p doewood-store --lib search_by_company_timings -- --ignored --nocapture
+```
+
+50,000 generated documents (47,059 indexed), 5,000 companies of about 10 documents each, and
+company 0 on half of the documents; "a word" is in a third of the titles. Medians of 9 runs of
+the query, in ms; `EXPLAIN (ANALYZE, BUFFERS)` from the same test. Same setup as above; SQLite
+in a file on disk.
+
+| case | Postgres before | Postgres after (from the edges) | `PgStore::search` | SQLite before | SQLite after |
+|---|---|---|---|---|---|
+| 10 documents, no words | 9.30 (5,927 buffers) | 0.63 (80 buffers) | 1.71 (from the edges) | 93.86 | 0.06 |
+| 10 documents, a word | 13.54 (5,927 buffers) | 0.63 (80 buffers) | 0.86 (from the edges) | 42.40 | 4.74 |
+| half of all, no words | 28.27 | 48.64 | 27.64 (per document) | 107.96 | 67.06 |
+| half of all, a word | 20.23 | 45.90 | 25.96 (per document) | 51.20 | 45.83 |
+
+Before, Postgres sorted the whole index (in parallel) and probed each document's edges; after,
+for the small company, it reads its 10 edges and 10 rows. The first attempt guarded the key
+with a regular expression (`~ '^[0-9a-f]{64}$'`), which alone cost 150 ms on 25,000 keys; the
+guard is now `starts_with(d.key, 'ref:')`, since document keys are validated (lowercase hex or
+a `ref:` placeholder).
 
 ## Tests
 

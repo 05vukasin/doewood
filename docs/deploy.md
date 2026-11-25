@@ -714,5 +714,10 @@ Per doewood instance (one pod):
   has spare. Plan about 1500 scanned pages an hour per instance on 4 cores, and more instances
   (each with its own sources) rather than more workers to go faster. A second OCR engine needs a
   memory limit of at least 10 GiB.
+- The API's reads are small next to ingest: a `ListRecords` page holds about twice its 3 MiB
+  byte budget at its peak, whatever the page size (it held the whole page before issue #111,
+  up to the 64 MiB message cap and more), and while the shared Postgres is not connected the
+  in-memory registry and icon caches hold at most 16 MiB each (see
+  [api.md](api.md#listrecords-page-budget)).
 - Postgres for a few instances: 256 MiB to 512 MiB of memory is enough for ingest; size
   `shared_buffers` and the disk for the records (about 40 KiB a scanned page).

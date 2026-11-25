@@ -240,6 +240,25 @@ pub fn records_limit(limit: u32) -> u32 {
     }
 }
 
+/// The byte budget of a page of [`crate::RecordStore::list_records`] that the API uses: 3 MiB
+/// of record bodies (issue #111). A page of 1000 big records would otherwise be held in memory
+/// several times over and only then meet the 64 MiB message cap. A page ends with the record
+/// that reaches the budget, so with records up to about 1 MiB a page stays under the 4 MiB
+/// that gRPC clients accept by default.
+pub const RECORDS_PAGE_BYTES: usize = 3 << 20;
+
+/// What a record counts against a page's byte budget: its body's JSON text.
+pub fn record_page_bytes(record: &Record) -> usize {
+    record.body.get().len()
+}
+
+/// Whether a page [`crate::RecordStore::list_records`] returned for `limit` and `max_bytes`
+/// ended at either bound, so a next page may follow.
+pub fn records_page_full(page: &[Record], limit: u32, max_bytes: usize) -> bool {
+    page.len() >= records_limit(limit) as usize
+        || page.iter().map(record_page_bytes).sum::<usize>() >= max_bytes
+}
+
 /// Checks a batch of hashes for [`crate::RecordStore::record_versions`] and
 /// [`crate::RecordStore::fact_texts`]: at most [`RECORDS_MAX_LIMIT`].
 ///

@@ -1156,6 +1156,64 @@ fn hash(n: u8) -> Blake3 {
     Blake3([n; 32])
 }
 
+/// `ListRecords` pages end at the byte budget (issue #111): ten records of 1 MiB come three
+/// to a page (each page under the 4 MiB a default client accepts), every record exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn list_records_pages_end_at_the_byte_budget() {
+    for shared in Shared::all().await {
+        let a = Instance::start("inst-a", Some(shared.backend.clone())).await;
+        let ch = a.channel().await;
+        let mut req = add_request("http://minio.test:9000", "big", "");
+        req.paused = true;
+        let source = config(&ch).add_source(req).await.unwrap().into_inner();
+        let be = &shared.backend;
+        let pad = "x".repeat(1 << 20);
+        for n in 100..110u8 {
+            be.put_record(
+                &hash(n),
+                &doewood_model::canonical::to_canonical(&json!({"n": n, "pad": pad})).unwrap(),
+                &[("quail".to_owned(), "1".to_owned())].into(),
+            )
+            .await
+            .unwrap();
+            be.upsert_location(
+                &hash(n),
+                &ObjectLocation {
+                    endpoint: "http://minio.test:9000".into(),
+                    bucket: "big".into(),
+                    key: format!("f{n}.pdf"),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let mut records = RecordsServiceClient::new(ch.clone());
+        let (mut seen, mut sizes, mut token) = (Vec::new(), Vec::new(), String::new());
+        loop {
+            let page = records
+                .list_records(pb::ListRecordsRequest {
+                    source_id: source.id.clone(),
+                    page_size: 1000,
+                    page_token: token,
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            sizes.push(page.records.len());
+            seen.extend(page.records.into_iter().map(|r| r.blake3));
+            if page.next_page_token.is_empty() {
+                break;
+            }
+            token = page.next_page_token;
+        }
+        assert_eq!(sizes, [3, 3, 3, 1], "{}", shared.name);
+        let want: Vec<String> = (100..110u8).map(|n| hash(n).to_hex()).collect();
+        assert_eq!(seen, want, "{}", shared.name);
+        a.stop().await;
+        shared.drop_schema().await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn records_graph_and_search() {
     for shared in Shared::all().await {
