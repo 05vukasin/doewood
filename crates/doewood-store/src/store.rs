@@ -37,9 +37,9 @@ const JOURNAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
 /// Prepared statements kept per connection.
 pub(crate) const STATEMENT_CACHE: usize = 128;
 
-/// Read-only connections of an on-disk store when none are asked for: at most this many, and
-/// at most one per CPU.
-pub const DEFAULT_READERS: usize = 2;
+/// Read-only connections of an on-disk store when none are asked for: one per CPU, at most
+/// this many (see [`plan_readers`]).
+pub const DEFAULT_READERS: usize = 8;
 
 /// Most read-only connections a store opens.
 pub const MAX_READERS: usize = 16;
@@ -47,6 +47,17 @@ pub const MAX_READERS: usize = 16;
 /// Reserved secret that proves the master key is the one the store was created with.
 const KEY_CHECK: &str = "_doewood.key_check";
 const KEY_CHECK_VALUE: &[u8] = b"doewood key check v1";
+
+/// Read-only connections for this machine: [`plan_readers`] for its CPUs (as the process sees
+/// them, a cgroup CPU quota included).
+pub fn default_readers() -> usize {
+    plan_readers(std::thread::available_parallelism().map_or(1, NonZeroUsize::get))
+}
+
+/// Read-only connections for `cpus` CPUs: one per CPU, between 1 and [`DEFAULT_READERS`].
+pub fn plan_readers(cpus: usize) -> usize {
+    cpus.clamp(1, DEFAULT_READERS)
+}
 
 /// The instance-local store. Cheap to share behind an `Arc`.
 ///
@@ -156,11 +167,9 @@ impl std::fmt::Debug for Store {
 
 impl Store {
     /// Opens (creating if needed) the store at `path`, applies the pragmas, migrates the schema
-    /// and checks the master key; then opens the read-only connections: [`DEFAULT_READERS`],
-    /// at most one per CPU.
+    /// and checks the master key; then opens the read-only connections: [`default_readers`].
     pub fn open(path: &Path, key: &MasterKey) -> Result<Self, StoreError> {
-        let cpus = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
-        Self::open_with_readers(path, key, DEFAULT_READERS.min(cpus))
+        Self::open_with_readers(path, key, default_readers())
     }
 
     /// [`Store::open`] with `readers` read-only connections (at most [`MAX_READERS`]); 0 runs
@@ -774,8 +783,7 @@ mod tests {
     fn readers_are_for_on_disk_stores_only() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(&tmp.path().join(STORE_FILE), &key(1)).unwrap();
-        let cpus = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
-        assert_eq!(store.readers(), DEFAULT_READERS.min(cpus));
+        assert_eq!(store.readers(), default_readers());
         store.close().unwrap();
         assert_eq!(Store::open_in_memory(&key(1)).unwrap().readers(), 0);
         assert_eq!(on_disk(0).1.readers(), 0);
@@ -784,6 +792,16 @@ mod tests {
         let (_tmp, store) = on_disk(0);
         store.set_setting("k", &serde_json::json!(1)).unwrap();
         assert_eq!(store.setting("k").unwrap(), Some(serde_json::json!(1)));
+    }
+
+    #[test]
+    fn readers_follow_the_cpus() {
+        for (cpus, readers) in [(0, 1), (1, 1), (2, 2), (4, 4), (16, 8), (64, 8)] {
+            assert_eq!(plan_readers(cpus), readers, "{cpus} CPUs");
+        }
+        let cpus = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+        assert_eq!(default_readers(), plan_readers(cpus));
+        const { assert!(DEFAULT_READERS <= MAX_READERS) };
     }
 
     #[test]

@@ -155,7 +155,15 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
   shares the database together**: once one new instance has started, the older ones stay not
   ready until they are upgraded. With schema 5 the instance's own SQLite file went to schema 8
   (the same table and the same move).
-- **Prepared statements.** Each pooled connection (16 per instance) prepares a fixed
+- **Connection pool (issue #108).** Each instance opens at most **4 connections per CPU,
+  between 16 and 64** (16 up to 4 CPUs, 32 on 8, 64 from 16), counting the CPUs the process
+  may use (a container's CPU limit included). Fixed, not a setting; the log line
+  `shared Postgres store ready` shows it (`pool`). Plan the server's `max_connections` for
+  every instance at once: the sum of the instances' pools (for example 3 replicas on 4 CPUs:
+  48), plus a rolling deploy's surge replicas, plus your own tools and superuser slots
+  (Postgres's default `max_connections` is 100). Behind PgBouncer the pools count against
+  its client limit instead. See [deploy.md](deploy.md#api-read-capacity-issue-108).
+- **Prepared statements.** Each pooled connection prepares a fixed
   statement once and reuses it for the connection's life, so a statement is one round trip
   (paged list queries and search are still planned per call). Behind PgBouncer in
   transaction mode this needs PgBouncer 1.21 or newer with `max_prepared_statements` set (for
@@ -178,7 +186,9 @@ same entries as `objects_seen_pending`.
 
 **Read-only connections (issue #83).** Every write goes through the one writer connection,
 behind a mutex: there is exactly one writer (ADR 0001). Next to it, an on-disk store opens
-**2 read-only connections** (fewer on a 1-CPU machine; fixed, not a setting), opened with
+**one read-only connection per CPU, between 1 and 8** (issue #108; counting the CPUs the process
+may use, a container's CPU limit included; fixed, not a setting; the `store open` log line shows
+it as `readers`), opened with
 `SQLITE_OPEN_READ_ONLY` and `query_only = ON`, with the writer's 128-statement cache and 5 s
 busy timeout. In WAL mode they read next to the writer, so these reads no longer wait for
 ingest's write transactions:
@@ -196,8 +206,8 @@ Each read call is one transaction on one connection: it sees what was committed 
 started, never a write still in progress. Every write commits before it returns, so a read made
 after a write returned sees it (a call that writes and then reads, such as `AddSource`, still
 gets what it wrote). Writes, and everything ingest and the scanners read to decide their next
-write (object status, pending objects, the LLM queue), stay on the writer. When both readers
-are busy a read waits for one, never for the writer. An in-memory store (tests) has no
+write (object status, pending objects, the LLM queue), stay on the writer. When every reader
+is busy a read waits for one, never for the writer. An in-memory store (tests) has no
 readers; its reads use the writer, as before.
 - **pgvector** is used when the server has it: doewood creates the extension (this needs a role
   allowed to) and adds `search_index.embedding`. Without it, this is logged once and search runs

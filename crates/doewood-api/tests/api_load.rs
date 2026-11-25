@@ -24,8 +24,9 @@
 //! seeded, default 10000), `DOEWOOD_BENCH_IDLE` (idle connections, default 2000),
 //! `DOEWOOD_BENCH_ONLY` (one method by name, for example `Search`, instead of the mix).
 //!
+//! `DOEWOOD_BENCH_POOL` sets the Postgres pool's size (default as `serve`).
 //! `DOEWOOD_BENCH_DB_CPU_STAT` may name a cgroup's `cpu.stat` (the database container's) to
-//! report its CPU per step too. RSS, threads and CPU are the whole process: the clients run
+//! report its CPU per step too, and its anonymous memory (`memory.stat` next to it) at the end. RSS, threads and CPU are the whole process: the clients run
 //! in it too, so they are upper bounds for the server.
 
 mod common;
@@ -150,6 +151,21 @@ fn db_cpu_seconds() -> Option<f64> {
         .parse()
         .ok()?;
     Some(usec / 1e6)
+}
+
+/// Anonymous memory in MiB (backends' private memory, not shared buffers or page cache) of the
+/// cgroup whose `cpu.stat` is at `DOEWOOD_BENCH_DB_CPU_STAT`, from its `memory.stat`.
+fn db_anon_mib() -> Option<f64> {
+    let path = std::env::var("DOEWOOD_BENCH_DB_CPU_STAT").ok()?;
+    let stat =
+        std::fs::read_to_string(std::path::Path::new(&path).with_file_name("memory.stat")).ok()?;
+    let bytes: f64 = stat
+        .lines()
+        .find_map(|l| l.strip_prefix("anon "))?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(bytes / f64::from(1 << 20))
 }
 
 /// What the load needs to address: the seeded source, documents and companies.
@@ -753,9 +769,10 @@ async fn api_load() {
     };
     a.backend.send_replace(Some(Arc::clone(&backend)));
     println!(
-        "api_load: backend {}, store readers {}, {} CPUs, {secs}s per step",
+        "api_load: backend {}, store readers {}, pool {}, {} CPUs, {secs}s per step",
         if pg.is_some() { "postgres" } else { "sqlite" },
-        readers.map_or_else(|| "default".to_owned(), |n: usize| n.to_string()),
+        a.store.readers(),
+        std::env::var("DOEWOOD_BENCH_POOL").unwrap_or_else(|_| "default".into()),
         std::thread::available_parallelism().map_or(0, std::num::NonZero::get)
     );
     let registry = Registry::new();
@@ -768,6 +785,9 @@ async fn api_load() {
     warm_up(&a, &seeded).await;
     for clients in steps {
         step(&a, &registry, &seeded, clients, secs).await;
+    }
+    if let Some(anon) = db_anon_mib() {
+        println!("api_load: database anon memory after the steps {anon:.1} MiB");
     }
 
     // Memory per idle connection: open them, let the handshakes settle, compare RSS.
