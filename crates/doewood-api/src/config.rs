@@ -4,22 +4,23 @@
 use doewood_core::SourceId;
 use doewood_model::SourceKey;
 use doewood_store::{
-    AI_PRESETS, AiProviderInput, ApiKey, CredentialsChange, IngestSettingsPatch, KeyChange,
-    NewSource, S3Credentials, SUMMARIZE_MAX_CONCURRENT_RANGE, SourcePatch, SourceState,
-    SqsInletInput, UrlStyle, valid_min_jaccard, valid_provider_name,
-    valid_summarize_max_concurrent,
+    AI_PRESETS, AiProviderInput, ApiKey, ApiSettingsPatch, CredentialsChange,
+    DEADLINE_SECONDS_LIMIT, IngestSettingsPatch, KeyChange, MAX_CALLS_IN_FLIGHT_LIMIT, NewSource,
+    S3Credentials, SUMMARIZE_MAX_CONCURRENT_RANGE, SourcePatch, SourceState, SqsInletInput,
+    UrlStyle, valid_deadline_seconds, valid_max_calls_in_flight, valid_min_jaccard,
+    valid_provider_name, valid_summarize_max_concurrent,
 };
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
 use crate::pb::config_service_server::ConfigService;
 use crate::pb::{
-    AddSourceRequest, AiProvider, EnrichmentSettings, GetEnrichmentSettingsRequest,
-    GetIngestSettingsRequest, GetSourceRequest, IngestSettings, ListAiProvidersRequest,
-    ListAiProvidersResponse, ListSourcesRequest, ListSourcesResponse, PauseSourceRequest,
-    RemoveSourceRequest, RemoveSourceResponse, RemoveSqsInletRequest, ResumeSourceRequest,
-    SetAiProviderRequest, SetEnrichmentSettingsRequest, SetIngestSettingsRequest,
-    SetLlmPolicyRequest, SetSqsInletRequest, Source, UpdateSourceRequest,
+    AddSourceRequest, AiProvider, ApiSettings, EnrichmentSettings, GetApiSettingsRequest,
+    GetEnrichmentSettingsRequest, GetIngestSettingsRequest, GetSourceRequest, IngestSettings,
+    ListAiProvidersRequest, ListAiProvidersResponse, ListSourcesRequest, ListSourcesResponse,
+    PauseSourceRequest, RemoveSourceRequest, RemoveSourceResponse, RemoveSqsInletRequest,
+    ResumeSourceRequest, SetAiProviderRequest, SetApiSettingsRequest, SetEnrichmentSettingsRequest,
+    SetIngestSettingsRequest, SetLlmPolicyRequest, SetSqsInletRequest, Source, UpdateSourceRequest,
 };
 use crate::validate::{self, Violations};
 use crate::{Api, ApiState, claims, convert, enrichment, error};
@@ -598,6 +599,51 @@ impl ConfigService for Api {
             "ingest settings set"
         );
         Ok(Response::new(convert::ingest_settings(settings)))
+    }
+
+    async fn get_api_settings(
+        &self,
+        _request: Request<GetApiSettingsRequest>,
+    ) -> Result<Response<ApiSettings>, Status> {
+        let settings = self.state.db(doewood_store::Store::api_settings).await?;
+        Ok(Response::new(convert::api_settings(settings)))
+    }
+
+    async fn set_api_settings(
+        &self,
+        request: Request<SetApiSettingsRequest>,
+    ) -> Result<Response<ApiSettings>, Status> {
+        let req = request.get_ref();
+        let mut v = Violations::default();
+        if let Some(n) = req.max_calls_in_flight
+            && !valid_max_calls_in_flight(n)
+        {
+            v.add(
+                "max_calls_in_flight",
+                format!("must be 1 to {MAX_CALLS_IN_FLIGHT_LIMIT}"),
+            );
+        }
+        if let Some(n) = req.deadline_seconds
+            && !valid_deadline_seconds(n)
+        {
+            v.add(
+                "deadline_seconds",
+                format!("must be 1 to {DEADLINE_SECONDS_LIMIT}"),
+            );
+        }
+        v.check()?;
+        let patch = ApiSettingsPatch {
+            max_calls_in_flight: req.max_calls_in_flight,
+            deadline_seconds: req.deadline_seconds,
+        };
+        let settings = self.state.db(move |s| s.set_api_settings(&patch)).await?;
+        self.state.call_limits().set(settings);
+        info!(
+            max_calls_in_flight = settings.max_calls_in_flight,
+            deadline_seconds = settings.deadline_seconds,
+            "API limits set"
+        );
+        Ok(Response::new(convert::api_settings(settings)))
     }
 
     async fn get_enrichment_settings(
