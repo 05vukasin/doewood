@@ -164,7 +164,6 @@ impl Readers {
         self.wake(&pool);
     }
 
-
     /// Wakes a waiting read of each kind that may take a free connection now.
     fn wake(&self, pool: &Pool) {
         if pool.instance_waiting > 0 && pool.instance_may_take() {

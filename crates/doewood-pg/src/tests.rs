@@ -13,6 +13,7 @@ use crate::PgStore;
 mod companies_due;
 mod list_records;
 mod read_paths;
+mod search_company;
 
 const VAR: &str = "DOEWOOD_TEST_POSTGRES_URL";
 
@@ -236,6 +237,12 @@ async fn migrations_are_idempotent_and_versioned() {
         .as_deref()
         .is_some_and(|d| d.contains("USING gin (tsv)"));
     assert!(gin, "{def:?}");
+    // Its pending list is bounded (schema 7, issue #102), so a search scans at most 256 kB of it.
+    assert!(
+        def.as_deref()
+            .is_some_and(|d| d.contains("gin_pending_list_limit='256'")),
+        "{def:?}"
+    );
     db.drop_schema().await;
 }
 

@@ -362,6 +362,12 @@ due, and what it did), `companies merged` (survivor, absorbed, merge entry, prob
 - **Merger filings** of Companies House name no counterpart; they are kept in
   `registry.companies_house.events`, not as edges. 8-K acquisitions become edges only when
   their text names a known subsidiary.
+- **The in-memory caches.** While the shared store is not connected, registry answers and
+  icons (`GET /icons/{domain}` is public) are cached in memory instead: two `MemoryCache`s of
+  at most 10,000 entries and 16 MiB each (32 MiB together; keys, bodies and about 160 bytes
+  per entry). The oldest fetch goes first, an answer bigger than the budget is not kept, and
+  entries past their expiry are dropped on lookup and insert (issue #111). Neither is
+  configurable; once the store is connected they are no longer used.
 - **Parser assumptions** of the registry clients (field names checked against public
   documentation, and what is still assumed) are listed per registry in
   [registries.md](registries.md).

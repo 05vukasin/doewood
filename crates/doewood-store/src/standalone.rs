@@ -41,6 +41,8 @@ mod merges;
 mod proposals;
 #[cfg(test)]
 mod read_paths;
+#[cfg(test)]
+mod search_company;
 
 /// The candidate query for `bands` band keys, then the excluded hash and the limit. As on
 /// Postgres (issue #74): the bands are counted and limited on `sketch_bands` alone (its
@@ -589,6 +591,7 @@ impl RecordStore for Standalone {
         source: &SourceKey,
         after: Option<&Blake3>,
         limit: u32,
+        max_bytes: usize,
     ) -> Result<Vec<Record>> {
         let (source, after) = (source.clone(), after.copied());
         let limit = i64::from(records_limit(limit));
@@ -626,7 +629,18 @@ impl RecordStore for Standalone {
                         },
                     )
                     .map_err(sql)?;
-                rows.map(|row| row.map_err(sql)).collect::<Result<Vec<_>>>()
+                // Rows are read one at a time; the page ends at the byte budget (issue #111),
+                // counted as `doewood_model::record_page_bytes` counts it (the body's JSON text).
+                let (mut page, mut bytes) = (Vec::new(), 0);
+                for row in rows {
+                    let row = row.map_err(sql)?;
+                    bytes += row.1.len();
+                    page.push(row);
+                    if bytes >= max_bytes {
+                        break;
+                    }
+                }
+                Ok(page)
             },
             // The bodies are checked as JSON once the reader is given back: a page can hold
             // megabytes of them (issue #109).
@@ -1298,11 +1312,15 @@ impl SearchStore for Standalone {
                     .to_owned()
             };
             if let Some(company) = q.company {
+                // Driven by the company's party edges (edges_by_dst), each document's hash
+                // looked up by primary key, rather than a check per indexed document (issue
+                // #111). A document key is its hash in lowercase hex or a `ref:` placeholder
+                // (`validate_node`); unhex gives NULL for the placeholders.
                 sql_text.push_str(
-                    " AND EXISTS (SELECT 1 FROM nodes d JOIN edges e ON e.src = d.id \
-                     WHERE d.kind = 'document' AND d.key = lower(hex(s.blake3)) \
-                     AND e.kind = 'party' AND e.dst = ? \
-                     AND e.state NOT IN ('retracted', 'superseded'))",
+                    " AND s.blake3 IN (SELECT unhex(d.key) FROM edges e \
+                     JOIN nodes d ON d.id = e.src \
+                     WHERE e.dst = ? AND e.kind = 'party' \
+                     AND e.state NOT IN ('retracted', 'superseded') AND d.kind = 'document')",
                 );
                 args.push(Sql::Text(company.to_string()));
             }

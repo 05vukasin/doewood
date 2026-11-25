@@ -749,9 +749,20 @@ pub async fn ended_locations<B: Backend + ?Sized>(s: &B) {
     assert_eq!(gone.edge.edge.valid_to, Some(day(2026, 3, 1)));
     assert!(s.node(first.document).await.unwrap().is_some());
     let src = SourceKey::new("http://end.test:9000", "docs", "in/a").unwrap();
-    assert!(s.list_records(&src, None, 0).await.unwrap().is_empty());
+    assert!(
+        s.list_records(&src, None, 0, usize::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let src = SourceKey::new("http://end.test:9000", "docs", "in/").unwrap();
-    assert_eq!(s.list_records(&src, None, 0).await.unwrap().len(), 1);
+    assert_eq!(
+        s.list_records(&src, None, 0, usize::MAX)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     // Again: nothing left to end there.
     let again = s
         .end_location(&at("in/a.pdf"), day(2026, 3, 2))
@@ -1048,7 +1059,7 @@ pub async fn records_by_source<B: Backend + ?Sized>(s: &B) {
         .unwrap();
     let list = |prefix: &'static str, after: Option<Blake3>, limit| async move {
         let src = SourceKey::new(endpoint, "docs", prefix).unwrap();
-        s.list_records(&src, after.as_ref(), limit)
+        s.list_records(&src, after.as_ref(), limit, usize::MAX)
             .await
             .unwrap()
             .into_iter()
@@ -1063,9 +1074,54 @@ pub async fn records_by_source<B: Backend + ?Sized>(s: &B) {
     assert!(list("in/", Some(hash(33)), 2).await.is_empty());
     assert!(list("nope/", None, 0).await.is_empty());
     let src = SourceKey::new(endpoint, "docs", "in/").unwrap();
-    let page = s.list_records(&src, None, 1).await.unwrap();
+    let page = s.list_records(&src, None, 1, usize::MAX).await.unwrap();
     assert_eq!(page[0].body_value().unwrap(), json!({"n": 31}));
     assert_eq!(page[0].versions, versions("1"));
+
+    // The byte budget (issue #111): a page ends with the record that reaches it, and walking
+    // the pages returns every record once. Records 160..180 under `sized/`, of varied sizes.
+    for n in 160..180u8 {
+        let pad = "x".repeat(usize::from(n % 7) * 300);
+        s.put_record(&hash(n), &raw(&json!({"n": n, "pad": pad})), &versions("1"))
+            .await
+            .unwrap();
+        s.upsert_location(&hash(n), &at("docs", &format!("sized/{n}.pdf")))
+            .await
+            .unwrap();
+    }
+    let src = SourceKey::new(endpoint, "docs", "sized/").unwrap();
+    let all = s.list_records(&src, None, 0, usize::MAX).await.unwrap();
+    assert_eq!(all.len(), 20);
+    for (limit, budget) in [(0, 1), (0, 700), (0, 2000), (3, 1000), (0, usize::MAX)] {
+        let (mut seen, mut after, mut pages) = (Vec::new(), None::<Blake3>, 0);
+        loop {
+            let page = s
+                .list_records(&src, after.as_ref(), limit, budget)
+                .await
+                .unwrap();
+            pages += 1;
+            // Every record but the last stays under the budget.
+            let sizes: Vec<usize> = page.iter().map(crate::record_page_bytes).collect();
+            if let Some((_, before_last)) = sizes.split_last() {
+                assert!(before_last.iter().sum::<usize>() < budget, "{sizes:?}");
+            }
+            assert!(page.len() <= crate::records_limit(limit) as usize);
+            seen.extend(page.iter().map(|r| r.blake3));
+            if !crate::records_page_full(&page, limit, budget) {
+                break;
+            }
+            after = page.last().map(|r| r.blake3);
+            assert!(pages <= 21, "limit {limit}, budget {budget}");
+        }
+        assert_eq!(
+            seen,
+            all.iter().map(|r| r.blake3).collect::<Vec<_>>(),
+            "limit {limit}, budget {budget}"
+        );
+        if budget == 1 {
+            assert_eq!(pages, 21);
+        }
+    }
 }
 
 /// Source claims across two instances.

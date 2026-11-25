@@ -113,7 +113,10 @@ The cache is a trait (`Cache`), with three implementations:
   answer. Times are kept to the second. The store never returns an expired entry, and the
   binary purges expired rows every hour. A store failure is a miss and is logged at debug
   level; while the shared store is not connected, the cache works in memory.
-- `MemoryCache` (in-process, at most 10,000 entries, the oldest fetch evicted first).
+- `MemoryCache` (in-process, at most 10,000 entries and 16 MiB by default, counting keys,
+  bodies and about 160 bytes per entry; the oldest fetch is evicted first, in O(log n), and a
+  body bigger than the budget is not kept). It has no clock: an entry that expired before the
+  newest fetch date put is dropped on lookup and insert (issue #111).
 - `NoCache`.
 
 `doewood-registry` itself has no database dependency: the backends implement `CacheStore`.

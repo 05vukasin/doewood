@@ -50,13 +50,17 @@ pub trait RecordStore: Send + Sync {
     async fn fact_texts(&self, hashes: &[Blake3], key: &str) -> Result<Vec<(Blake3, String)>>;
 
     /// One page of the records that have a location in `source` (its endpoint and bucket, a
-    /// key under its prefix), ordered by hash. A page starts after the hash `after`, and holds
-    /// at most `limit` records (0 means 50, at most [`crate::RECORDS_MAX_LIMIT`]).
+    /// key under its prefix), ordered by hash. A page starts after the hash `after`, holds at
+    /// most `limit` records (0 means 50, at most [`crate::RECORDS_MAX_LIMIT`]), and ends with
+    /// the record that brings its bodies ([`crate::record_page_bytes`]) to `max_bytes` or
+    /// more, so it holds at least one record when there is one. Records past that point are
+    /// not read into memory. [`crate::records_page_full`] tells whether a next page may follow.
     async fn list_records(
         &self,
         source: &SourceKey,
         after: Option<&Blake3>,
         limit: u32,
+        max_bytes: usize,
     ) -> Result<Vec<Record>>;
 }
 

@@ -539,7 +539,8 @@ What the numbers say:
   `DOEWOOD_BENCH_BACKOFF_MS=20`, one run) a 1000-client step sheds 10 times as many calls
   (about 25,000 a second) and Postgres throughput falls to 2,252 calls/s (SQLite: 3,428): the
   refusals cost CPU (the process at 3 to 3.8 cores) that the calls then lack. Clients must
-  back off as documented; see #104.
+  back off as documented, and since #104 the server tells them how long (see
+  [Retries and shed calls](#retries-and-shed-calls-issue-104)).
 - **Memory:** 13 to 13.5 KiB per idle connection (2000 opened at once: +26 MiB, client side
   included), about 70 KiB per busy client (1000 clients with 100 streams: 160 to 210 MiB).
 - **Postgres `Search` is unstable between runs:** in one run of three `Search` took 6.9 ms
@@ -548,10 +549,71 @@ What the numbers say:
   step (2,624 to 4,402 calls/s, the database from 2.8 to 1.8 cores). The likely cause is the GIN
   index's pending list (new search rows wait there until a vacuum, and every search scans it): a
   rare-term lookup on 10,000 rows took 0.54 ms with the list full and 0.065 ms after `VACUUM`.
-  See #102.
+  Fixed in #102: see [Search and the GIN pending list](#search-and-the-gin-pending-list-issue-102).
 - The network layer is not the limit (as the io_uring research expected): the store's
   connections (SQLite) and the pool (Postgres) are, well below the HTTP/2 stack's 60,000+ requests/s on
   this machine.
+
+### Search and the GIN pending list (issue #102)
+
+`search_index.tsv` has a GIN index (`search_tsv`). With Postgres's default (`fastupdate` on,
+`gin_pending_list_limit` 4 MB) a new row's index entries first go to the index's pending
+list, which is merged into the index only by a vacuum or when it passes the limit, and every
+search scans the whole list. So `Search` was fast or slow depending on when autovacuum last
+ran. Since shared schema 7 the index has `gin_pending_list_limit = 256` kB: the list never
+holds more than about 32 pages, and an insert that fills it merges it.
+
+Measured with `api_load` (issue #80; `DOEWOOD_BENCH_ONLY=Search DOEWOOD_BENCH_CLIENTS=10`,
+10,000 seeded documents, release build), Postgres 17.12 (`pgvector/pgvector:pg17`) on the
+machine above, on a Docker network created with `--internal`; ranges of 3 runs:
+
+| `search_tsv` | pending pages at the start | `Search` calls/s | p50 | p99 |
+|---|---|---|---|---|
+| default (before), as seeded | 282 to 297 | 2,749 to 2,765 | 3.34 to 3.36 ms | 8.1 to 8.4 ms |
+| default, `VACUUM` after seeding | 0 | 6,898 to 7,143 | 1.32 to 1.38 ms | 2.8 to 3.0 ms |
+| `gin_pending_list_limit = 256` (now) | 0 to 30 | 5,857 to 6,934 | 1.34 to 1.61 ms | 3.3 to 3.6 ms |
+| `fastupdate = off` | 0 | 6,840 to 7,347 | 1.29 to 1.38 ms | 2.7 to 3.1 ms |
+
+Writing cost. `throughput` (`DOEWOOD_BENCH_JOBS=4 DOEWOOD_BENCH_FILES=2000`, test profile,
+medians of 3, before the fewer round trips of #103): 246 files/s before (238 to 249), 242
+with 256 kB (240 to 250), 240 with `fastupdate = off` (238 to 250): within the noise,
+because the graph stage's round trips dominated there (see
+[Ingest on Postgres](#ingest-on-postgres-issue-69)). Inserts
+alone, `pgbench` (20 s, one run each) with 4 clients each inserting one search row per
+statement into a copy of the table (generated text, the tsvector built in the insert):
+
+| text per row | default | 256 kB | `fastupdate = off` |
+|---|---|---|---|
+| 300 words (about 2 KiB, like the small files) | 2,571 rows/s | 2,369 (-8%) | 1,463 (-43%) |
+| 5,000 words (about the 32 KiB search body cap) | 233 rows/s | 210 (-10%) | 139 (-40%) |
+
+- **The pending list was the cause**: the same data with the list merged (`VACUUM`) answers
+  `Search` 2.5x faster, and a full list made every run slow. With 256 kB the list holds at
+  most about 32 pages, so a search stays within about 20% of the merged index whatever
+  autovacuum did.
+- **Why not `fastupdate = off`:** it gives the same search latency but makes every insert
+  update the GIN entries directly, about 40% fewer search rows a second with concurrent
+  writers. The 256 kB list keeps most of the batching (8 to 10% fewer rows a second, in the
+  writer that fills the list).
+- Nothing needs tuning: the limit is on the index (it overrides the server's
+  `gin_pending_list_limit`), and autovacuum still merges the list as before.
+
+### Retries and shed calls (issue #104)
+
+A call over `max_calls_in_flight` is refused at once with `UNAVAILABLE` and a
+`grpc-retry-pushback-ms` trailer of 100 to 199 ms (see [api.md](api.md#limits)). Refusing is
+cheap per call but not free, so clients that retry fast take CPU from the calls that run.
+Measured with `api_load` (issue #80; 1000 clients, `max_calls_in_flight` 256, Postgres, the
+mix of calls, release build, one 10 s run each):
+
+| client retry | calls/s served | shed / 10 s | p50 / p99 | process CPU |
+|---|---|---|---|---|
+| as docs/api.md advises: 100 ms doubling to 10 s, jitter | 5,410 | 38,722 | 47 / 100 ms | 2.2 cores |
+| a fixed 20 ms (`DOEWOOD_BENCH_BACKOFF_MS=20`) | 2,125 | 247,843 | 129 / 289 ms | 3.1 cores |
+| a fixed 20 ms, but the pushback when the server sends one (`DOEWOOD_BENCH_PUSHBACK=1`) | 5,185 | 49,439 | 50 / 106 ms | 2.3 cores |
+
+A client that honours the pushback (as a gRPC client with a retry policy does) keeps
+throughput within 5% of the documented backoff, even if its own backoff is too short.
 
 ### API read capacity (issue #108)
 
@@ -652,5 +714,10 @@ Per doewood instance (one pod):
   has spare. Plan about 1500 scanned pages an hour per instance on 4 cores, and more instances
   (each with its own sources) rather than more workers to go faster. A second OCR engine needs a
   memory limit of at least 10 GiB.
+- The API's reads are small next to ingest: a `ListRecords` page holds about twice its 3 MiB
+  byte budget at its peak, whatever the page size (it held the whole page before issue #111,
+  up to the 64 MiB message cap and more), and while the shared Postgres is not connected the
+  in-memory registry and icon caches hold at most 16 MiB each (see
+  [api.md](api.md#listrecords-page-budget)).
 - Postgres for a few instances: 256 MiB to 512 MiB of memory is enough for ingest; size
   `shared_buffers` and the disk for the records (about 40 KiB a scanned page).
