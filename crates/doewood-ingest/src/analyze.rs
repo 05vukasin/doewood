@@ -61,6 +61,11 @@ pub struct AnalyzerConfig {
     pub cpus: usize,
     /// Where the OCR models are.
     pub ocr_models: PathBuf,
+    /// Pages OCR'd at the same time, each by its own engine with `cpus / jobs` threads (at
+    /// most 4), at most `workers` (`DOEWOOD_OCR_JOBS`). `None`: quail's plan from the memory
+    /// (one engine per GiB of 20 % of the total memory, so one below 10 GiB). Only speed and
+    /// memory change: the output is the same for any job and thread count (issue #116).
+    pub ocr_jobs: Option<usize>,
 }
 
 impl Default for AnalyzerConfig {
@@ -72,6 +77,7 @@ impl Default for AnalyzerConfig {
             workers: 1,
             cpus: 1,
             ocr_models: PathBuf::from("ocr-models"),
+            ocr_jobs: None,
         }
     }
 }
@@ -145,7 +151,12 @@ impl Analyzer {
             timeout: config.file_timeout,
             ..Limits::default()
         };
-        let ocr = Ocr::setup(&config.ocr_models, config.workers, &mut limits);
+        let ocr = Ocr::setup(
+            &config.ocr_models,
+            config.workers,
+            config.ocr_jobs,
+            &mut limits,
+        );
         let profile = if ocr.analyzer_ready() {
             Profile::Deep
         } else {
@@ -440,7 +451,7 @@ struct Ocr {
 
 impl Ocr {
     #[cfg(feature = "ocr")]
-    fn setup(dir: &Path, workers: usize, limits: &mut Limits) -> Self {
+    fn setup(dir: &Path, workers: usize, jobs: Option<usize>, limits: &mut Limits) -> Self {
         use std::sync::Arc;
 
         use quail_ocr::paddle::{PaddleConfig, PaddleFactory};
@@ -461,7 +472,10 @@ impl Ocr {
                 analyzer: None,
             };
         }
-        let r = OcrResources::auto(workers.max(1));
+        // A worker reads its file's pages one after another: more jobs than workers would
+        // only hold engines nobody uses.
+        let jobs = jobs.map(|j| j.clamp(1, workers.max(1)));
+        let r = OcrResources::auto(workers.max(1)).with_overrides(jobs, None);
         let paddle = PaddleConfig {
             intra_threads: r.threads.max(1),
             ..PaddleConfig::default()
@@ -496,7 +510,7 @@ impl Ocr {
     }
 
     #[cfg(not(feature = "ocr"))]
-    fn setup(_dir: &Path, _workers: usize, _limits: &mut Limits) -> Self {
+    fn setup(_dir: &Path, _workers: usize, _jobs: Option<usize>, _limits: &mut Limits) -> Self {
         Self {
             state: OcrState::NotBuilt,
         }

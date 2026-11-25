@@ -60,12 +60,13 @@ see [registries.md](registries.md#configuring-the-registries).
 | `DOEWOOD_INGEST_BUDGET_MIB` | from the workers and memory | Ingest's memory budget, in MiB (16 to 1048576): the listed sizes of the files over 16 MiB held at once, from their fetch to the end of their analysis. The default is half the workers' plan (workers x 512 MiB, at most half the available memory), at least 256 MiB: 1 GiB with 4 workers, 768 MiB under a 4 GiB limit with 3. A bigger file waits; one bigger than the budget runs with no other big file. See [ingest.md](ingest.md#memory). |
 | `DOEWOOD_INGEST_MAX_CELLS` | from the workers and memory | Most cells (and shared strings) read from one spreadsheet (10000 to 100000000); a bigger workbook fails. The default is what each worker's share of half the available memory holds at 320 bytes a cell, rounded down to 100,000, from 1,600,000 to 10,000,000 (hedgehog's own default): 1,600,000 for a 512 MiB worker, 6,700,000 for a 2 GiB one. Above 10,000,000 only when set here. See [ingest.md](ingest.md#memory). |
 | `DOEWOOD_OCR_MODELS` | `<data>/ocr-models` | Directory of quail's OCR model files (`quail models fetch` downloads them). Missing models are a `WARN` at start, never an error: scanned pages are then flagged `needs_ocr`. |
+| `DOEWOOD_OCR_JOBS` | from the memory | Scanned pages OCR'd at the same time (1 to 64, at most the ingest workers), each by its own engine with `CPUs / jobs` threads (at most 4). The default is quail's plan: one engine per GiB of 20 % of the total memory (a cgroup limit counts), so one below 10 GiB. More jobs read more pages a second on the same cores and need about 0.5 GiB more each; the text is the same. See [deploy.md](deploy.md#ocr-per-page). |
 
 `RUST_LOG` sets the log filter (default `info`), for example `RUST_LOG=doewood=debug,info`.
 
 ### Why the ingest variables stay bootstrap values
 
-Tuning values that change what ingest writes are runtime settings. Four ingest variables
+Tuning values that change what ingest writes are runtime settings. Five ingest variables
 are not, because the API cannot set them:
 
 - `DOEWOOD_INGEST_JOBS` sizes the process: the worker pool and the engine's threads are built
@@ -79,6 +80,9 @@ are not, because the API cannot set them:
   deployment, and is read once at start like them. Unlike the budget it can change an
   outcome (a workbook over it fails instead of being read), which is why its default follows
   the memory the deployment gives each worker rather than being fixed.
+- `DOEWOOD_OCR_JOBS` sizes the process like the workers: each job is an OCR engine that holds
+  about 0.5 GiB from its first page on, and together they must fit the container's memory
+  limit. It changes how fast scans are read, never what is read.
 - `DOEWOOD_OCR_MODELS` is part of the image layout: a path to model files that the image (or a
   volume mounted into it) provides. It is fixed by how the container is built, not by an
   operator at run time, and the analyzer checks the models once at start.

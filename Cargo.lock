@@ -1241,6 +1241,7 @@ dependencies = [
  "quail-core",
  "quail-engine",
  "quail-ocr",
+ "quail-pdf",
  "quail-signals",
  "quail-sketch",
  "quail-summary",
