@@ -12,8 +12,9 @@
 //!   that identifier, when no company has it), by Wikidata item or by name (only when a company
 //!   already has it). An edge to a company that cannot be found is dropped.
 //! - **Props:** `registry.<name>` (each registry's facts and fetch date), `ids`,
-//!   `registry_ids`, `legal_name`, `former_names`, `merge_proposals`, `registry_proposals`
-//!   and `enriched_at`.
+//!   `registry_ids`, `legal_name`, `former_names` and `enriched_at`. The props lists of
+//!   proposals before schema 5 (`merge_proposals`, `registry_proposals`) are removed.
+//! - **Proposals** go to the proposals table (`ProposalStore::propose`, issue #52).
 
 // `b` (the backend), `s` (the company) and `f` (the findings) are used throughout.
 #![allow(clippy::many_single_char_names)]
@@ -50,8 +51,16 @@ pub(crate) async fn live_id(b: &dyn Backend, mut id: Uuid) -> Result<Uuid> {
     Ok(id)
 }
 
-/// Writes the findings for `s`. Returns how many edges were written.
-pub(crate) async fn write(job: &Job<'_>, s: &Subject, f: &Findings, g: &Gated) -> Result<u64> {
+/// What [`write`] wrote.
+pub(crate) struct Written {
+    /// Edges.
+    pub edges: u64,
+    /// Proposals opened or updated.
+    pub proposed: u64,
+}
+
+/// Writes the findings for `s`.
+pub(crate) async fn write(job: &Job<'_>, s: &Subject, f: &Findings, g: &Gated) -> Result<Written> {
     let b = job.backend.as_ref();
     let me = s.id();
     // 1. Identifiers.
@@ -132,8 +141,37 @@ pub(crate) async fn write(job: &Job<'_>, s: &Subject, f: &Findings, g: &Gated) -
     // 4. Two current parents: the later dated one is current.
     written += former_parents(b, me).await?;
     // 5. Props.
-    update_props(b, me, f, g, &owned).await?;
-    Ok(written)
+    update_props(b, me, f, &owned).await?;
+    // 6. Proposals.
+    let proposed = proposals(b, me, f, g).await?;
+    Ok(Written {
+        edges: written,
+        proposed,
+    })
+}
+
+/// The gate's proposals, into the proposals table: a new open one, or the open one updated.
+/// A dismissed one is never opened again. Returns how many were opened or updated.
+async fn proposals(b: &dyn Backend, me: Uuid, f: &Findings, g: &Gated) -> Result<u64> {
+    let mut n = 0;
+    let records = f.proposals.iter().map(|p| {
+        // The company as it is now (a merge may have made another the survivor).
+        let mut p = p.clone();
+        p.company = me;
+        p
+    });
+    for p in records.chain(g.proposals.iter().cloned()) {
+        match b.propose(&p).await? {
+            Some(stored) => {
+                debug!(company = %me, proposal = %stored.id, kind = %stored.kind, candidate = %stored.candidate, "proposal recorded");
+                n += 1;
+            }
+            None => {
+                debug!(company = %me, kind = %p.kind, candidate = %p.candidate, "proposal dismissed before; not opened");
+            }
+        }
+    }
+    Ok(n)
 }
 
 /// The company `other` names, created for an LEI or a Companies House number.
@@ -318,7 +356,6 @@ async fn update_props(
     b: &dyn Backend,
     me: Uuid,
     f: &Findings,
-    g: &Gated,
     owned: &BTreeSet<String>,
 ) -> Result<()> {
     // Every list and map the job keeps is there, empty if need be.
@@ -326,8 +363,11 @@ async fn update_props(
     for key in ["registry", "ids", "registry_ids"] {
         patch = patch.set_if_absent(&[key], json!({}));
     }
-    for key in ["former_names", "merge_proposals", "registry_proposals"] {
-        patch = patch.set_if_absent(&[key], json!([]));
+    patch = patch.set_if_absent(&["former_names"], json!([]));
+    // Proposals live in their own table since schema 5; an undo of an older merge can bring
+    // the old lists back, so they are removed here too.
+    for key in ["merge_proposals", "registry_proposals"] {
+        patch = patch.remove(&[key]);
     }
     for (name, facts) in &f.facts {
         patch = patch.set(&["registry", name], facts.clone());
@@ -353,21 +393,6 @@ async fn update_props(
         patch = patch.push_capped(&["former_names"], v, &["name"], MAX_LIST);
     }
     let at = super::unix_now();
-    for p in &g.proposals {
-        let mut p = p.clone();
-        p["at"] = json!(at);
-        patch = patch.push_capped(&["merge_proposals"], p, &["company"], MAX_LIST);
-    }
-    for p in &f.proposals {
-        let mut p = p.clone();
-        p["at"] = json!(at);
-        patch = patch.push_capped(
-            &["registry_proposals"],
-            p,
-            &["registry", "record"],
-            MAX_LIST,
-        );
-    }
     patch = patch.set(&["enriched_at"], json!(at));
     b.update_props(me, &patch).await?;
     Ok(())

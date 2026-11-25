@@ -9,8 +9,8 @@
 //!   (the identifier's country first, then GLEIF, then Wikidata); without an identifier a name
 //!   search gives candidates, scored with doewood-enrich's fuzzy score and veto. The evidence is
 //!   fused with noisy-OR and passed through the gate ([`gate`]): merge at 0.90 or more, review
-//!   in between (a proposal on the company, never a merge), nothing below 0.50. A dismissed
-//!   pair is never merged.
+//!   in between (a proposal in the proposals table, for a person; never a merge), nothing
+//!   below 0.50. A dismissed pair is never merged or proposed.
 //! - **What it writes** ([`write`]): the registry identifiers on the company, its registry facts
 //!   in its props, and dated edges (`parent_of` / `subsidiary_of`, `former_parent_of`,
 //!   `merged_into`, `renamed_to`, `acquired`, `liquidated`) with `source = registry`, the

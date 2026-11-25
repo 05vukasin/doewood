@@ -72,7 +72,7 @@ nothing below 0.50**; two conflicting high-precision hits are always for review.
   missing on one side the legal-form-blind 0.85, otherwise the fuzzy score (scaled by its
   Jaccard) with the jurisdiction veto. A record in another country than the company's is never
   a candidate. A record at 0.90 or more is adopted: its identifiers join the company. Records in
-  the review band are kept as `registry_proposals` on the company, for a person.
+  the review band become registry record proposals, for a person (see [Proposals](#proposals)).
 - **Other companies.** A company that owns an identifier the registry gave for this one is a
   registry identifier hit (0.95); a company that owns a key of the registry's legal name or a
   former name is a name-ladder hit (0.90, 0.88 squashed, 0.85 legal-form-blind). A company that
@@ -80,10 +80,10 @@ nothing below 0.50**; two conflicting high-precision hits are always for review.
   number, CIK) or is in another country is never a candidate. At 0.90 or more the two are
   merged through the merge log (`MergeStore::merge_companies`, actor `enrichment`, with the
   evidence, the confidence and the fused probability; the survivor is the one with more
-  documents), so a person can undo it. The review band and conflicts become `merge_proposals`
-  on the company.
-- **Dismissals are permanent.** A dismissed pair (`MergeStore::dismissal`) is never merged,
-  whatever the evidence; it is recorded as a proposal with reason `dismissed`.
+  documents), so a person can undo it. The review band and conflicts become merge proposals.
+- **Dismissals are permanent.** A dismissed pair (`MergeStore::dismissal`) is never merged
+  or proposed, whatever the evidence, and is no candidate at all (so it makes no conflict for
+  the others).
 - **No circular evidence.** An identifier adopted from a name match is never a registry
   identifier hit: a company that owns one is a proposal. Wikidata items never count as one
   either (the lowest tier).
@@ -96,9 +96,10 @@ and the verified website `domain:…`. One another company owns stays its own (t
 the two, or recorded a proposal). Former names become learned aliases (`name:<key>|<form>`).
 
 **Props** of the company: `registry.<name>` (each registry's facts and fetch date: status,
-legal form, registered name, events), `ids` and `registry_ids`, `legal_name`, `former_names`,
-`merge_proposals`, `registry_proposals` (at most 20 each), `website`, `icon` and
-`enriched_at`. The document name (`name`) is kept. The job writes only these keys, as one
+legal form, registered name, events), `ids` and `registry_ids`, `legal_name`, `former_names` (at
+most 20), `website`, `icon` and `enriched_at`. The proposals lists of schema 4
+(`merge_proposals`, `registry_proposals`) are removed when the job writes (the migration
+moved them, and an undo of an older merge can bring them back). The document name (`name`) is kept. The job writes only these keys, as one
 atomic patch (`GraphStore::update_props`, see [ingest.md](ingest.md#company-props)), so what
 ingest writes to the same company at the same moment is never lost.
 
@@ -132,6 +133,33 @@ end date, not an ultimate parent), the later dated one stays current; each earli
 that day (its `parent_of` and `subsidiary_of` become superseded, with `valid_to`), and a
 `former_parent_of` edge records it, from its start to that day. So "who owned X on
 2022-05-01" is a query.
+
+## Proposals
+
+What the gate leaves to a person (ADR 0002 section 1.6) goes to the proposals table
+(`ProposalStore::propose`, issue #52), not to company props:
+
+| kind | candidate | from |
+|---|---|---|
+| `registry_record` | `<registry>:<record>` (`apr:companies/<MB>`, `company/<number>`, `submissions/CIK<cik>`, `lei-records/<LEI>`) | a name search's record in the review band, or one of conflicting records |
+| `merge` | the other company's id (the pair in id order) | a company in the review band, conflicting companies, or a company that owns an identifier the job adopted from a name match |
+
+Each has its evidence (the same objects a merge logs), the fused probability, a reason
+(`review_band` or `conflict`) and a detail object (a record's registry, id, name and country).
+There is one open proposal per kind, company and candidate: on a later pass the job updates
+its evidence, probability and reason instead of adding another. A proposal rejected with a
+dismissal is never opened again, and a merge proposal is never opened for a dismissed pair.
+`proposed` counts the proposals opened or updated.
+
+A person lists, accepts and rejects them through `GraphService` (see
+[api.md](api.md#enrichment-proposals)). Accepting a merge merges through the merge log (actor
+`manual`, the proposal's evidence), so it can be undone. Accepting a record adopts its
+identifier as an alias of the company and makes the record's registry due, so the next pass
+looks the company up by that identifier, as for any company that has it, and writes the
+record's facts and edges.
+
+Schema 5 (shared) and 8 (standalone) moved the props lists of earlier versions into the table
+(see [configuration.md](configuration.md)).
 
 ## Website and favicon
 
@@ -210,8 +238,6 @@ due, and what it did), `companies merged` (survivor, absorbed, merge entry, prob
 - **Parser assumptions** of the registry clients (field names checked against public
   documentation, and what is still assumed) are listed per registry in
   [registries.md](registries.md).
-- **Proposals** are kept on the company's props; there is no API to list them across
-  companies yet.
 
 ## Tests
 
@@ -220,8 +246,9 @@ due, and what it did), `companies merged` (survivor, absorbed, merge entry, prob
 invented companies and identifiers (valid check digits only), `*.test` host names resolved to
 the mock by a fake resolver, reached under a test-only address policy (the production policy is
 unchanged). They cover identifiers through APR, GLEIF and Wikidata to identifiers, props and
-dated edges; the gate's merge (registry identifier), dismissed pair, adopted name match, review
-band and no match; the trust order (official active, Wikidata and Exhibit 21 proposed); a later
+dated edges; the gate's merge (registry identifier), dismissed pair (never merged or proposed),
+adopted name match, review band (a registry record proposal in the table, accepted, and the
+record's facts written on the next pass) and no match; the trust order (official active, Wikidata and Exhibit 21 proposed); a later
 dated parent superseding the other into a former parent; leases between two instances
 (Postgres); a registry down while the others answer; switched-off registries and Companies
 House without a key never asked; website verification by name and by an identifier on the

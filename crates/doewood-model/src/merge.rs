@@ -299,7 +299,7 @@ pub struct OwnedAlias {
     pub props: Value,
 }
 
-fn validate_evidence(evidence: &Value) -> Result<()> {
+pub(crate) fn validate_evidence(evidence: &Value) -> Result<()> {
     if !evidence.is_array() {
         return Err(Error::Invalid("evidence must be a JSON array".to_owned()));
     }
@@ -311,7 +311,7 @@ fn validate_evidence(evidence: &Value) -> Result<()> {
     Ok(())
 }
 
-fn validate_unit(what: &str, v: f32) -> Result<()> {
+pub(crate) fn validate_unit(what: &str, v: f32) -> Result<()> {
     if (0.0..=1.0).contains(&v) {
         Ok(())
     } else {
@@ -319,7 +319,7 @@ fn validate_unit(what: &str, v: f32) -> Result<()> {
     }
 }
 
-fn validate_reason(reason: &str) -> Result<()> {
+pub(crate) fn validate_reason(reason: &str) -> Result<()> {
     if reason.len() > REASON_MAX_LEN || reason.contains('\0') {
         return Err(Error::Invalid(format!(
             "a reason is at most {REASON_MAX_LEN} bytes, without NUL"

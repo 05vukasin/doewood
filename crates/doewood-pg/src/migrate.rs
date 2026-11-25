@@ -10,11 +10,12 @@ use crate::backend::pg;
 
 /// The migrations, in order. Migration `i` takes the schema from version `i` to `i + 1`.
 /// Never edit a released migration: add a new one.
-const MIGRATIONS: &[&str] = &[
+pub(crate) const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_init.sql"),
     include_str!("migrations/0002_ingest.sql"),
     include_str!("migrations/0003_enrichment.sql"),
     include_str!("migrations/0004_merges.sql"),
+    include_str!("migrations/0005_proposals.sql"),
 ];
 
 /// The schema version this binary writes.

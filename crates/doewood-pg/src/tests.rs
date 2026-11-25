@@ -485,3 +485,155 @@ async fn a_start_waits_for_the_schema_lock() {
     drop(holder);
     db.drop_db().await;
 }
+
+/// Schema 5 moves the props lists of schema 4 into the proposals table, once: duplicates keep
+/// the latest entry, a dismissed pair is closed, malformed entries are left out, and the lists
+/// leave the props (the other props stay).
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+#[tokio::test]
+async fn schema_5_moves_proposals_out_of_props() {
+    use doewood_model::{
+        ProposalKind, ProposalQuery, ProposalReason, ProposalRequest, ProposalState, ProposalStore,
+    };
+    use serde_json::json;
+
+    let Some(url) = test_url() else { return };
+    let db = Scratch::new(&url).await;
+    let (a, b, c) = (
+        Uuid::from_u128(0xa),
+        Uuid::from_u128(0xb),
+        Uuid::from_u128(0xc),
+    );
+    {
+        let client = db.client().await;
+        client
+            .batch_execute(
+                "CREATE TABLE doewood_schema (version integer PRIMARY KEY, \
+                 applied_at timestamptz NOT NULL DEFAULT now())",
+            )
+            .await
+            .unwrap();
+        for (version, sql) in (1_i32..).zip(&crate::migrate::MIGRATIONS[..4]) {
+            client.batch_execute(sql).await.unwrap();
+            client
+                .execute(
+                    "INSERT INTO doewood_schema (version) VALUES ($1)",
+                    &[&version],
+                )
+                .await
+                .unwrap();
+        }
+        let props_a = json!({
+            "name": "Alfa d.o.o.",
+            "kept": 1,
+            "merge_proposals": [
+                {"company": b.to_string(), "probability": 0.7, "reason": "uncertain",
+                 "evidence": [{"source": "name_ladder"}], "at": 1_700_000_000},
+                {"company": b.to_string(), "probability": 0.8, "reason": "conflict",
+                 "evidence": [{"source": "registry_id"}], "at": 1_700_000_100},
+                {"company": c.to_string(), "probability": 0.95, "reason": "dismissed",
+                 "dismissal": 1, "evidence": [], "at": 1_700_000_200},
+                {"company": "not-an-id", "probability": 0.6},
+                {"company": a.to_string(), "probability": 0.6},
+                {"company": Uuid::from_u128(0xdead).to_string(), "probability": 0.6},
+                "junk"
+            ],
+            "registry_proposals": [
+                {"registry": "apr", "record": "companies/12345678", "name": "Alfa DOO",
+                 "probability": 0.75, "reason": "uncertain", "at": 1_700_000_300},
+                {"registry": "apr"}
+            ]
+        });
+        let props_b = json!({
+            "name": "Alfa Plus d.o.o.",
+            "merge_proposals": [
+                {"company": a.to_string(), "probability": 0.6, "reason": "uncertain",
+                 "at": 1_700_000_050}
+            ],
+            "registry_proposals": []
+        });
+        for (id, key, props) in [
+            (a, "a", props_a),
+            (b, "b", props_b),
+            (c, "c", json!({"name": "Gama"})),
+        ] {
+            client
+                .execute(
+                    "INSERT INTO nodes (id, kind, key, props) VALUES ($1, 'company', $2, $3)",
+                    &[&id, &key, &props],
+                )
+                .await
+                .unwrap();
+        }
+    }
+    let s = db.store().await;
+    let all = s.list_proposals(&ProposalQuery::default()).await.unwrap();
+    assert_eq!(all.len(), 3, "{all:#?}");
+    let pair = all
+        .iter()
+        .find(|p| p.kind == ProposalKind::Merge && p.state == ProposalState::Open)
+        .expect("the open pair");
+    assert_eq!(
+        (pair.company, pair.candidate.as_str()),
+        (a, b.to_string().as_str())
+    );
+    assert!((pair.probability - 0.8).abs() < 1e-6, "the latest entry");
+    assert_eq!(pair.reason, ProposalReason::Conflict);
+    assert_eq!(pair.evidence, json!([{"source": "registry_id"}]));
+    assert_eq!(pair.created_at, 1_700_000_100);
+    assert_eq!(pair.detail["from_props"], a.to_string());
+    let closed = all
+        .iter()
+        .find(|p| p.state == ProposalState::Rejected)
+        .expect("the dismissed pair");
+    assert_eq!(
+        (closed.company, closed.candidate.as_str()),
+        (a, c.to_string().as_str())
+    );
+    assert_eq!(closed.reason, ProposalReason::Dismissed);
+    let r = closed.resolution.clone().expect("closed");
+    assert!(r.dismissed);
+    assert_eq!((r.actor, r.at), (None, 1_700_000_200));
+    let rec = all
+        .iter()
+        .find(|p| p.kind == ProposalKind::RegistryRecord)
+        .expect("the record");
+    assert_eq!(rec.company, a);
+    assert_eq!(rec.registry_record(), Some(("apr", "companies/12345678")));
+    assert_eq!(rec.detail["name"], "Alfa DOO");
+    assert_eq!(
+        (rec.reason, rec.state),
+        (ProposalReason::ReviewBand, ProposalState::Open)
+    );
+    let props = |id: Uuid| {
+        let s = s.clone();
+        async move {
+            doewood_model::GraphStore::node(&s, id)
+                .await
+                .unwrap()
+                .unwrap()
+                .props
+        }
+    };
+    assert_eq!(props(a).await, json!({"name": "Alfa d.o.o.", "kept": 1}));
+    assert_eq!(props(b).await, json!({"name": "Alfa Plus d.o.o."}));
+    assert_eq!(props(c).await, json!({"name": "Gama"}));
+    let again =
+        ProposalRequest::merge(c, a, json!({}), json!([]), 0.95, ProposalReason::ReviewBand);
+    assert_eq!(
+        s.propose(&again).await.unwrap(),
+        None,
+        "the dismissed pair stays closed"
+    );
+    // A second instance starting migrates nothing twice.
+    let second = db.store().await;
+    assert_eq!(
+        second
+            .list_proposals(&ProposalQuery::default())
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+    db.drop_schema().await;
+}
