@@ -14,7 +14,7 @@ use serde_json::{Map, Value};
 use crate::Error;
 
 /// Most operations in one patch.
-pub const PATCH_MAX_OPS: usize = 256;
+pub const PATCH_MAX_OPS: usize = 1024;
 /// Most keys in one path.
 pub const PATCH_MAX_DEPTH: usize = 4;
 
