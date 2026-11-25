@@ -11,6 +11,36 @@ with its SSRF guard; see [favicons.md](favicons.md).
 Nothing calls the clients yet: the enrichment job (ADR 0002 section 6) that turns their answers
 into company identifiers and dated edges comes later.
 
+## Configuring the registries
+
+Which registries run, their keys and the EDGAR contact are runtime settings (ADR 0002 section
+7, ADR 0001 section 3): set with `ConfigService.SetEnrichmentSettings`, read with
+`GetEnrichmentSettings` (see [api.md](api.md#enrichment-settings)), kept in the instance's
+store. The enrichment job reads them on every pass (`Store::enrichment_config`), so a change
+needs no restart. The keys and APR's extra roots are write-only secrets: no response returns
+them, only whether one is set. With nothing configured, the keyless registries run and
+Companies House is skipped.
+
+| registry | switch (default) | what else to configure |
+|---|---|---|
+| GLEIF | `gleif_enabled` (on) | nothing |
+| VIES | `vies_enabled` (on) | nothing |
+| Wikidata | `wikidata_enabled` (on) | nothing |
+| SEC EDGAR | `edgar_enabled` (on) | `edgar_contact`: your name and email for the SEC's User-Agent rule (see [EDGAR](#sec-edgar)); empty sends the generic `USER_AGENT` |
+| APR | `apr_enabled` (on) | `apr_extra_roots_pem`, only if the download fails on the missing intermediate (see [APR](#apr)) |
+| Companies House | `companies_house_enabled` (on) | `companies_house_api_key`: asked only once a key is set (`companies_house_active` says so) |
+| OpenCorporates | none (no client yet) | `opencorporates_api_key`: stored only |
+
+```sh
+grpcurl -plaintext -d '{"companies_house_api_key": "<your key>",
+  "edgar_contact": "Example Ops ops@example.invalid", "wikidata_enabled": false}' \
+  127.0.0.1:7443 doewood.v1.ConfigService/SetEnrichmentSettings
+```
+
+The values are checked by the clients' own code: a key with `ApiKey::new`, the contact with
+EDGAR's `user_agent`, the PEM by building APR's TLS client with it. A refused value is
+`INVALID_ARGUMENT` naming the field, never echoing a secret, and changes nothing.
+
 ## What is sent
 
 Only identifiers and names: an LEI, a VAT number, a Wikidata item id, an EDGAR CIK and
@@ -181,9 +211,9 @@ Search results with an invalid LEI or no legal name are skipped.
 | `ttl_found` / `ttl_missing` | 30 days / 1 day |
 | `search_size` | 10 (at most 200) |
 
-The on/off switch is not yet a runtime setting: it becomes one (store and API, ADR 0001
-section 3) together with the other registries' switches and keys, when the enrichment job uses
-the clients.
+The on/off switch is the runtime setting `gleif_enabled` (see
+[Configuring the registries](#configuring-the-registries)); every registry's switch works the
+same way.
 
 Checked against GLEIF's API documentation (its example responses and field enums), the LEI-CDF
 3.1 schema and the Reporting Exceptions 2.1 schema: the endpoints, the JSON:API media type, the
@@ -562,8 +592,9 @@ added soon.
 
 UK Companies House's public data API (`https://api.company-information.service.gov.uk/`),
 JSON, `TrustTier::Official`. It needs a **free API key**, which the operator registers with
-Companies House and configures (`CompaniesHouseConfig::api_key`; later from the encrypted
-settings store, ADR 0002 section 7). The key is sent as Companies House specifies: as the user
+Companies House and configures (`CompaniesHouseConfig::api_key`, from the runtime setting
+`companies_house_api_key`, a write-only secret: see
+[Configuring the registries](#configuring-the-registries)). The key is sent as Companies House specifies: as the user
 name of HTTP basic auth, with an empty password (`Authorization: Basic base64("<key>:")`).
 doewood ships no key.
 

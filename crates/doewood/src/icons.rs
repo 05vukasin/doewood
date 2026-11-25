@@ -4,8 +4,9 @@
 //! instance fetches an icon once, or the instance's SQLite file standalone. While the shared
 //! store is not connected yet, icons are cached in memory.
 //!
-//! The runtime settings (`favicon.fallback`, off by default, and `favicon.egress_proxy`) are
-//! read from the store for every lookup, so a change applies without a restart. A new proxy
+//! The runtime settings (`favicon.fallback`, off by default, and `favicon.egress_proxy`, set
+//! with `ConfigService.SetEnrichmentSettings`) are read from the store for every lookup, so a
+//! change applies without a restart. A new proxy
 //! builds a new client; the cache is kept. A proxy that the guard refuses fails closed: no
 //! icon is fetched, rather than going out directly.
 
@@ -122,6 +123,52 @@ mod tests {
         let store = Store::open_in_memory(&MasterKey::from_bytes([7; 32])).unwrap();
         let (_tx, rx) = watch::channel(None);
         FaviconIcons::new(Arc::new(store), rx)
+    }
+
+    fn proxy_in_use(icons: &FaviconIcons) -> Option<String> {
+        icons
+            .current
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|(p, _)| p.clone())
+    }
+
+    #[tokio::test]
+    async fn a_settings_change_applies_on_the_next_lookup() {
+        let icons = icons();
+        // `printer.local` is refused before any DNS lookup, after the client is chosen.
+        assert_eq!(
+            icons.icon("printer.local".to_owned()).await,
+            IconAnswer::Missing
+        );
+        assert_eq!(proxy_in_use(&icons), None);
+        // What SetEnrichmentSettings writes.
+        icons
+            .store
+            .set_enrichment_settings(&doewood_store::EnrichmentSettingsPatch {
+                favicon_fallback: Some(true),
+                favicon_egress_proxy: Some(Some("http://egress.svc:3128".to_owned())),
+                ..doewood_store::EnrichmentSettingsPatch::default()
+            })
+            .unwrap();
+        assert_eq!(
+            icons.icon("printer.local".to_owned()).await,
+            IconAnswer::Missing
+        );
+        assert_eq!(
+            proxy_in_use(&icons).as_deref(),
+            Some("http://egress.svc:3128")
+        );
+        icons
+            .store
+            .set_enrichment_settings(&doewood_store::EnrichmentSettingsPatch {
+                favicon_egress_proxy: Some(None),
+                ..doewood_store::EnrichmentSettingsPatch::default()
+            })
+            .unwrap();
+        icons.icon("printer.local".to_owned()).await;
+        assert_eq!(proxy_in_use(&icons), None);
     }
 
     #[tokio::test]

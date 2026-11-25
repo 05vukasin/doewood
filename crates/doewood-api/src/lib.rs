@@ -21,6 +21,7 @@ mod auth;
 mod claims;
 mod config;
 mod convert;
+mod enrichment;
 mod error;
 mod graph;
 mod icons;
