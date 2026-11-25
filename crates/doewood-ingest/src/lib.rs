@@ -24,7 +24,8 @@ pub mod sheet;
 
 pub use analyze::{Analysis, Analyzer, AnalyzerConfig, OcrState, Outcome};
 pub use enrichment::{
-    Enrichment, EnrichmentOptions, EnrichmentParts, EnrichmentStats, Templates, WebClientFactory,
+    Enrichment, EnrichmentOptions, EnrichmentParts, EnrichmentStats, Feed, FeedOptions, FeedStats,
+    FeedTemplates, Templates, WebClientFactory,
 };
 pub use graph::{GraphWriter, SimilarityConfig, WriteStats};
 pub use llm::{

@@ -10,8 +10,8 @@ use std::time::Duration;
 use doewood_registry::favicon::{GuardOptions, GuardedClient, PublicOnly, SystemDns};
 use doewood_registry::{HttpTransport, edgar};
 use doewood_store::{
-    ApiKey, EnrichmentSettings, EnrichmentSettingsPatch, KeyChange, RegistrySwitchesPatch,
-    RootsChange, RootsPem, valid_edgar_contact, valid_egress_proxy,
+    ApiKey, EnrichmentSettings, EnrichmentSettingsPatch, FeedSwitchesPatch, KeyChange,
+    RegistrySwitchesPatch, RootsChange, RootsPem, valid_edgar_contact, valid_egress_proxy,
 };
 use tonic::Status;
 use url::Url;
@@ -146,6 +146,18 @@ pub(crate) fn check(
             &req.companies_house_api_key,
             req.clear_companies_house_api_key,
         ),
+        feeds: FeedSwitchesPatch {
+            gleif: req.gleif_feed_enabled,
+            edgar: req.edgar_feed_enabled,
+            apr: req.apr_feed_enabled,
+            companies_house: req.companies_house_feed_enabled,
+        },
+        companies_house_stream_key: key_change(
+            &mut v,
+            "companies_house_stream_key",
+            &req.companies_house_stream_key,
+            req.clear_companies_house_stream_key,
+        ),
         opencorporates_key: key_change(
             &mut v,
             "opencorporates_api_key",
@@ -181,5 +193,11 @@ pub(crate) fn settings_pb(s: &EnrichmentSettings) -> pb::EnrichmentSettings {
         apr_extra_roots_set: s.apr_extra_roots_set,
         favicon_fallback: s.favicon.fallback,
         favicon_egress_proxy: s.favicon.egress_proxy.clone().unwrap_or_default(),
+        gleif_feed_enabled: s.feeds.gleif,
+        edgar_feed_enabled: s.feeds.edgar,
+        apr_feed_enabled: s.feeds.apr,
+        companies_house_feed_enabled: s.feeds.companies_house,
+        companies_house_stream_key_set: s.companies_house_stream_key_set,
+        companies_house_feed_active: s.companies_house_feed_active(),
     }
 }

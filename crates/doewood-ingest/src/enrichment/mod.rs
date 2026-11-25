@@ -27,6 +27,7 @@
 
 mod clients;
 mod company;
+mod feeds;
 mod gate;
 mod subject;
 mod website;
@@ -47,7 +48,8 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 pub use clients::{Clients, Templates, WebClientFactory};
-pub use company::refresh_interval;
+pub use company::{fed_refresh_interval, refresh_interval};
+pub use feeds::{Feed, FeedOptions, FeedStats, FeedTemplates};
 
 /// Where the caches live: the backend's `CacheStore` once there is one (in memory before).
 pub(crate) type CacheSource = Arc<dyn Fn() -> Option<Arc<dyn CacheStore>> + Send + Sync>;
@@ -67,6 +69,8 @@ pub struct EnrichmentOptions {
     pub retry_after_failure: Duration,
     /// How long to wait for the companies in flight at shutdown.
     pub drain: Duration,
+    /// The registry delta feeds.
+    pub feeds: FeedOptions,
 }
 
 impl Default for EnrichmentOptions {
@@ -78,6 +82,7 @@ impl Default for EnrichmentOptions {
             page: 100,
             retry_after_failure: Duration::from_hours(6),
             drain: Duration::from_secs(10),
+            feeds: FeedOptions::default(),
         }
     }
 }
@@ -108,6 +113,8 @@ pub struct EnrichmentStats {
     pub last_pass_completed_at: i64,
     /// Whether a pass is running now.
     pub running: bool,
+    /// The registry delta feeds, in [`Feed::ALL`] order.
+    pub feeds: [FeedStats; 4],
 }
 
 #[derive(Default)]
@@ -126,7 +133,7 @@ struct Counters {
 }
 
 impl Counters {
-    fn snapshot(&self) -> EnrichmentStats {
+    fn snapshot(&self, feeds: &[feeds::FeedCounters; 4]) -> EnrichmentStats {
         let get = |a: &AtomicU64| a.load(Ordering::Relaxed);
         EnrichmentStats {
             enriched: get(&self.enriched),
@@ -140,6 +147,7 @@ impl Counters {
             passes: get(&self.passes),
             last_pass_completed_at: self.last_pass_completed_at.load(Ordering::Relaxed),
             running: self.running.load(Ordering::Relaxed),
+            feeds: Feed::ALL.map(|f| feeds[feed_index(f)].snapshot(f)),
         }
     }
 }
@@ -158,6 +166,8 @@ pub struct EnrichmentParts {
     pub settings: SettingsSource,
     /// The clients' endpoints and limits.
     pub templates: Templates,
+    /// The feed clients' endpoints and limits.
+    pub feed_templates: FeedTemplates,
     /// The guarded web client for websites and favicons.
     pub web: WebClientFactory,
     /// Tuning.
@@ -186,6 +196,10 @@ struct Inner {
     clients: tokio::sync::Mutex<clients::ClientSet>,
     options: EnrichmentOptions,
     counters: Counters,
+    feed_counters: [feeds::FeedCounters; 4],
+    feed_templates: FeedTemplates,
+    /// EDGAR's archives root, for the daily index.
+    edgar_www_url: String,
     on_change: Arc<dyn Fn(EnrichmentStats) + Send + Sync>,
     wake: Notify,
     /// The companies this instance's tasks work on now: a lease is the instance's, so this
@@ -269,6 +283,7 @@ impl Enrichment {
                 .as_ref()
                 .map(|b| Arc::clone(b) as Arc<dyn CacheStore>)
         });
+        let edgar_www_url = parts.templates.edgar.www_url.clone();
         Self {
             inner: Arc::new(Inner {
                 instance: parts.instance,
@@ -281,6 +296,9 @@ impl Enrichment {
                 )),
                 options: parts.options,
                 counters: Counters::default(),
+                feed_counters: Default::default(),
+                feed_templates: parts.feed_templates,
+                edgar_www_url,
                 on_change: parts.on_change,
                 wake: Notify::new(),
                 busy: Busy::default(),
@@ -290,7 +308,7 @@ impl Enrichment {
 
     /// The counters since start.
     pub fn stats(&self) -> EnrichmentStats {
-        self.inner.counters.snapshot()
+        self.inner.counters.snapshot(&self.inner.feed_counters)
     }
 
     /// Starts the next pass now instead of after the interval.
@@ -308,6 +326,15 @@ impl Enrichment {
                 interval_s = me.inner.options.interval.as_secs(),
                 "enrichment started"
             );
+            // One loop per delta feed; each takes its feed's lease only when it is on.
+            let feed_loops: Vec<JoinHandle<()>> = Feed::ALL
+                .into_iter()
+                .map(|f| {
+                    let me = me.clone();
+                    let shutdown = shutdown.clone();
+                    tokio::spawn(async move { me.feed_loop(f, shutdown).await })
+                })
+                .collect();
             loop {
                 if stopping(&shutdown) {
                     break;
@@ -322,15 +349,22 @@ impl Enrichment {
                     _ = shutdown.wait_for(|s| *s) => break,
                 }
             }
+            let drain = me.inner.options.drain;
+            for l in feed_loops {
+                let abort = l.abort_handle();
+                if tokio::time::timeout(drain, l).await.is_err() {
+                    abort.abort();
+                }
+            }
             info!("enrichment stopped");
         })
     }
 
-    fn changed(&self) {
+    pub(crate) fn changed(&self) {
         (self.inner.on_change)(self.stats());
     }
 
-    async fn settings(&self) -> Option<EnrichmentConfig> {
+    pub(crate) async fn settings(&self) -> Option<EnrichmentConfig> {
         let source = Arc::clone(&self.inner.settings);
         match tokio::task::spawn_blocking(move || source()).await {
             Ok(Ok(s)) => Some(s),
@@ -534,6 +568,10 @@ impl Enrichment {
         self.changed();
         worked
     }
+}
+
+fn feed_index(f: Feed) -> usize {
+    Feed::ALL.iter().position(|x| *x == f).unwrap_or(0)
 }
 
 fn current(rx: &watch::Receiver<Option<Arc<dyn Backend>>>) -> Option<Arc<dyn Backend>> {

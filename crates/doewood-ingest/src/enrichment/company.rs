@@ -40,7 +40,7 @@ use super::{Outcome, due_registries, schedule_name};
 
 /// How long a registry's answer is good for: its client's refresh (docs/registries.md, ADR
 /// 0002 section 2). EDGAR's is the submissions' one day, standing in for "when new filings
-/// appear" until its feed is read.
+/// appear" while its daily index feed is off ([`fed_refresh_interval`] when it is on).
 pub fn refresh_interval(r: Registry) -> Duration {
     const DAY: u64 = 24 * 60 * 60;
     Duration::from_secs(match r {
@@ -48,6 +48,15 @@ pub fn refresh_interval(r: Registry) -> Duration {
         Registry::Vies => 90 * DAY,
         Registry::Edgar => DAY,
     })
+}
+
+/// The refresh with EDGAR's daily index feed on: new filings make the company due, so EDGAR
+/// is refreshed every 30 days like the other official registries.
+pub fn fed_refresh_interval(r: Registry) -> Duration {
+    match r {
+        Registry::Edgar => refresh_interval(Registry::Gleif),
+        r => refresh_interval(r),
+    }
 }
 
 /// Confidence of an official registry's edge (the registry identifier's reliability).
@@ -173,12 +182,17 @@ impl Findings {
 
     /// The freshness schedule: each registry asked, at its refresh, or sooner after a
     /// failure.
-    pub fn schedule(&self, retry: Duration) -> Vec<(String, Duration)> {
+    pub fn schedule(&self, retry: Duration, edgar_fed: bool) -> Vec<(String, Duration)> {
+        let interval = if edgar_fed {
+            fed_refresh_interval
+        } else {
+            refresh_interval
+        };
         self.asked
             .iter()
             .map(|(r, ok)| {
                 let every = if *ok {
-                    registry_named(r).map_or(retry, refresh_interval)
+                    registry_named(r).map_or(retry, interval)
                 } else {
                     retry
                 };
@@ -437,12 +451,12 @@ impl<'a> Job<'a> {
         let schedule = match gated.deferred {
             Some(lease) => {
                 out.deferred = lease == OtherLease::Here;
-                f.schedule(self.retry)
+                f.schedule(self.retry, self.clients.edgar_fed)
                     .into_iter()
                     .map(|(r, _)| (r, self.retry))
                     .collect()
             }
-            None => f.schedule(self.retry),
+            None => f.schedule(self.retry, self.clients.edgar_fed),
         };
         b.record_enrichment(subject.id(), &schedule).await?;
         Ok(())

@@ -1301,11 +1301,13 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "time",
  "tokio",
  "tracing",
  "url",
+ "zip 9.8.2",
 ]
 
 [[package]]

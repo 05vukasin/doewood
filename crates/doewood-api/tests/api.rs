@@ -926,6 +926,7 @@ async fn enrichment_settings_round_trip_and_secrets_stay_write_only() {
             .unwrap()
             .into_inner()
     };
+    let stream_key = "test-stream-key-not-real-9";
     let leaks = |what: &str, text: &str| {
         for secret in [CH_KEY, OC_KEY, "MIIBrzCCAVWg"] {
             assert!(!text.contains(secret), "{what} leaks a secret: {text}");
@@ -943,6 +944,10 @@ async fn enrichment_settings_round_trip_and_secrets_stay_write_only() {
             edgar_enabled: true,
             apr_enabled: true,
             companies_house_enabled: true,
+            // The delta feeds: GLEIF, EDGAR and APR on, Companies House streaming off.
+            gleif_feed_enabled: true,
+            edgar_feed_enabled: true,
+            apr_feed_enabled: true,
             ..pb::EnrichmentSettings::default()
         }
     );
@@ -958,12 +963,18 @@ async fn enrichment_settings_round_trip_and_secrets_stay_write_only() {
             apr_extra_roots_pem: TEST_ROOT_PEM.into(),
             favicon_fallback: Some(true),
             favicon_egress_proxy: Some("http://egress.svc:3128".into()),
+            apr_feed_enabled: Some(false),
+            companies_house_feed_enabled: Some(true),
+            companies_house_stream_key: stream_key.into(),
             ..pb::SetEnrichmentSettingsRequest::default()
         })
         .await
         .unwrap()
         .into_inner();
     leaks("SetEnrichmentSettings", &format!("{set:?}"));
+    assert!(!format!("{set:?}").contains(stream_key));
+    assert!(set.gleif_feed_enabled && !set.apr_feed_enabled);
+    assert!(set.companies_house_stream_key_set && set.companies_house_feed_active);
     assert!(!set.wikidata_enabled && set.gleif_enabled);
     assert!(set.companies_house_api_key_set && set.companies_house_active);
     assert!(set.opencorporates_api_key_set && set.apr_extra_roots_set);
@@ -983,6 +994,12 @@ async fn enrichment_settings_round_trip_and_secrets_stay_write_only() {
         TEST_ROOT_PEM
     );
     leaks("EnrichmentConfig", &format!("{job:?}"));
+    assert!(!format!("{job:?}").contains(stream_key));
+    assert_eq!(
+        job.companies_house_stream_key.as_ref().unwrap().expose(),
+        stream_key
+    );
+    assert!(job.feeds.companies_house && !job.feeds.apr);
     let favicon = a.store.favicon_settings().unwrap();
     assert!(favicon.fallback);
     assert_eq!(

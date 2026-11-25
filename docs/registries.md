@@ -31,6 +31,12 @@ Companies House is skipped.
 | Companies House | `companies_house_enabled` (on) | `companies_house_api_key`: asked only once a key is set (`companies_house_active` says so) |
 | OpenCorporates | none (no client yet) | `opencorporates_api_key`: stored only |
 
+Each registry with a delta feed (ADR 0002 section 6) has a feed switch too:
+`gleif_feed_enabled`, `edgar_feed_enabled` and `apr_feed_enabled` (default on), and
+`companies_house_feed_enabled` (default off), which also needs `companies_house_stream_key`
+(write-only). A feed runs only while its registry is on. See [Delta feeds](#delta-feeds)
+and [enrichment.md](enrichment.md#delta-feeds).
+
 ```sh
 grpcurl -plaintext -d '{"companies_house_api_key": "<your key>",
   "edgar_contact": "Example Ops ops@example.invalid", "wikidata_enabled": false}' \
@@ -452,10 +458,11 @@ submissions API, `www.sec.gov` for the company tickers file and the filing archi
   pages, exhibits, 8-K documents) for 30 days: a filing under an accession number does not
   change. A missing index or exhibit is a `Status(404)` warning and is not cached; a missing 8-K
   document is `None`, cached for a day.
-- **Refresh.** ADR 0002 refreshes EDGAR "when new filings appear (RSS)". Without the feed, the
-  1-day submissions TTL bounds how late a new filing is seen. Reading EDGAR's RSS (or the
-  daily index) to refresh only the companies with new filings is an open item, for the
-  enrichment job (ADR 0002 section 6).
+- **Refresh.** ADR 0002 refreshes EDGAR "when new filings appear (RSS)". The daily index feed
+  (see [Delta feeds](#delta-feeds)) makes a company with a new 10-K, 20-F or 8-K due and
+  drops its cached submissions; with the feed on, the enrichment job refreshes EDGAR every
+  30 days otherwise. With the feed off, the 1-day submissions TTL bounds how late a new filing
+  is seen.
 
 ### Settings
 
@@ -689,8 +696,8 @@ doewood ships no key.
   `category` filter first in the query) and `companies_house:search/companies?<query>` for 30
   days (the ADR's refresh); a 404 for a
   day. Failures and malformed bodies are never cached.
-- **Streaming API.** ADR 0002 lists the Companies House streaming API as optional. It is not
-  implemented: it is an open item for the enrichment job's refresh (ADR 0002 section 6).
+- **Streaming API.** ADR 0002 lists the Companies House streaming API as optional: see
+  [Delta feeds](#delta-feeds). It needs a streaming key of its own.
 
 ### Personal data
 
@@ -758,6 +765,46 @@ cross-border mergers are filed (the enumerations do not say; `filing_categories`
 the form codes of cross-border mergers (they have no enumerated description; `CB<digits>` and
 legacy text are a best-effort reading), and that `items_per_page` above 100 is not honoured
 (the default asks for 100).
+
+## Delta feeds
+
+`doewood_registry::feeds` holds the feed clients (ADR 0002 section 6, issue #49). They tell
+which records changed; the enrichment job applies that to the companies it already knows (see
+[enrichment.md](enrichment.md#delta-feeds)). Each streams: a file goes into a capped temporary
+file, or is read line by line with a capped line, never held whole, and only identifiers are
+kept. They send nothing about a company. Failures are typed `Warning`s; nothing is retried
+inside a feed client (the job runs the feed again later).
+
+| client | requests | gives |
+|---|---|---|
+| `GleifFeed::latest` | `GET goldencopy.gleif.org/api/v2/golden-copies/publishes/latest` (at most 256 KiB) | `Publication`: `data.publish_date` (UTC) and, for `lei2` and `rr`, `delta_files.<IntraDay\|LastDay\|LastWeek\|LastMonth>.csv.url`; files on another host than the API's are ignored |
+| `GleifFeed::read(url, set)` | `GET` the zipped CSV, spooled to a temporary file (at most 512 MiB) | the LEIs in batches of 500: the LEI-CDF `LEI` column, the RR-CDF `…StartNode.NodeID` and `…EndNode.NodeID` columns; every LEI checked (ISO 17442) |
+| `EdgarFeed::day(date)` | `GET www.sec.gov/Archives/edgar/daily-index/<y>/QTR<q>/master.<yyyymmdd>.idx` (at most 64 MiB, the EDGAR contact's User-Agent) | `(CIK, form)` of the rows after the dashes line whose form is `10-K`, `10-K/A`, `20-F`, `20-F/A`, `8-K` or `8-K/A` (at most 100,000); `None` for a 404 |
+| `ChStream::open(stream, timepoint)` | `GET stream.companieshouse.gov.uk/<companies\|officers\|persons-with-significant-control>?timepoint=<n>`, basic auth with the streaming key | a `Connection` whose `next()` gives each event's `timepoint` and the company number of its `resource_uri` (`/company/<number>/...`), skipping heartbeats (blank lines) and lines that are not events; 2 minutes without a line is a `Timeout` |
+| `Apr::refresh` / `Apr::update_cached(mb)` | the set, downloaded again whatever its age | the set swapped in for every caller; then per MB, the new record written to the cache and whether it differs from the cached one (the snapshot date aside) |
+
+- **Companies House events** carry the resource in `data`: for officers and PSCs mostly a
+  natural person. The client never parses or keeps `data` (it is skipped as it is read); only
+  the timepoint and the company number leave the client, and nothing of an event is logged.
+  A 416 (the timepoint is too far back, or the client too slow) is `Status(416)`, a 429
+  `RateLimited` (Companies House asks for a minute's wait), a refused key `KeyRefused`; the
+  key is scrubbed from every warning text.
+- **GLEIF's CSV** is read by a small bounded reader in the crate (RFC 4180 quotes and
+  escapes, line breaks inside quotes, a byte order mark on the header); the archive's first
+  `.csv` entry is read through `zip` (deflate). A record over 256 KiB, a file without the
+  columns, or an archive without CSV is `Malformed`.
+
+Checked against GLEIF's golden copy page (three publications a day, four delta spans: 8 hours,
+24 hours, 7 days, 31 days) and the publication API's answer (`publish_date` as `YYYY-MM-DD
+HH:MM:SS`, `delta_files` keys, `csv.url`); the SEC's EDGAR index page (the daily index
+directory, the master index's columns, built nightly from about 10 p.m. Eastern); and the
+Companies House streaming guide (one JSON event per line, blank heartbeats, `timepoint`
+to resume, 416 for a timepoint too far back, 429 with a minute's wait, two connections per
+account). Assumed, and handled defensively: the golden copy CSV column names (`LEI`,
+`Relationship.StartNode.NodeID`, `Relationship.EndNode.NodeID`; matched by suffix), the
+master index layout's header lines (everything before the dashes line is skipped), the
+`timepoint` query parameter's name, the streams' host and paths, and that a streaming key
+authenticates like a REST key (basic auth, key as the user name).
 
 ## Tests
 

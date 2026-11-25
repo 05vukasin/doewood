@@ -29,6 +29,7 @@ use crate::Store;
 use crate::store::now;
 
 mod enrichment;
+mod feeds;
 mod merges;
 mod proposals;
 

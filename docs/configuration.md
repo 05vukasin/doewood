@@ -27,6 +27,8 @@ Set through the API, kept in `doewood.sqlite`, applied without a restart:
 | Enrichment: the registry switches for GLEIF, VIES, Wikidata, EDGAR, APR and Companies House (all default on; Companies House is asked only once its key is set) | `SetEnrichmentSettings`, read with `GetEnrichmentSettings` | settings `registry.<gleif\|vies\|wikidata\|edgar\|apr\|companies_house>.enabled` |
 | Enrichment: the EDGAR contact for the SEC's `User-Agent` (printable ASCII, at most 200 characters; default none: the generic `User-Agent`) | `SetEnrichmentSettings` | setting `registry.edgar.contact` |
 | Enrichment: the Companies House API key | `SetEnrichmentSettings` | secret `registry/companies_house/api_key` (sealed, write-only) |
+| Enrichment: the registry delta feed switches: GLEIF's delta files, EDGAR's daily index and APR's monthly set (default on), Companies House streaming (default off; it needs a streaming key). A feed runs only while its registry is on. | `SetEnrichmentSettings` | settings `feed.<gleif\|edgar\|apr\|companies_house>.enabled` |
+| Enrichment: the Companies House streaming key (its own key, not the REST key) | `SetEnrichmentSettings` | secret `registry/companies_house/stream_key` (sealed, write-only) |
 | Enrichment: the OpenCorporates API key (no client uses it yet) | `SetEnrichmentSettings` | secret `registry/opencorporates/api_key` (sealed, write-only) |
 | Enrichment: extra root certificates for APR's download (PEM, at most 64 KiB; default none) | `SetEnrichmentSettings` | secret `registry/apr/extra_roots_pem` (sealed, write-only) |
 | Company icons: ask the public fallback service (default off). Read for every icon lookup. | `SetEnrichmentSettings` (see [favicons.md](favicons.md#settings)) | setting `favicon.fallback` |
@@ -102,18 +104,22 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
   5 minutes, then they retry with backoff) and find the schema migrated. The version is in
   the `doewood_schema` table. A database migrated by a newer doewood is
   refused (not ready) until this one is upgraded.
-- **Schema 5** (the enrichment proposals of issue #52: the new table `company_proposals`,
-  and the `merge_proposals` and `registry_proposals` lists of company props moved into it and
-  removed from the props) is the current version. The move is part of the migration: it runs
-  once, in the same transaction that records schema 5, so it is never repeated or half done.
+- **Schema 6** (the registry delta feeds of issue #49: the new table `registry_feeds`, one
+  row per feed with its lease, cursor and next run, and an index on company aliases in byte
+  order) is the current version. It only adds; as with every schema, older instances refuse
+  it, so all instances are upgraded together (below). The instance's own SQLite file goes to
+  schema 9 with the same table. **Schema 5** (the enrichment proposals of issue #52: the new
+  table `company_proposals`, and the `merge_proposals` and `registry_proposals` lists of
+  company props moved into it and removed from the props) was the one before. Its move is part of the migration: it
+  runs once, in the same transaction that records schema 5, so it is never repeated or half done.
   A malformed entry is left out; a pair kept as `dismissed` becomes a rejected, dismissed
   proposal. Schema 4 added the merge log and dismissals of ADR 0002 section 1.8
   (`company_merges` and `company_dismissals`), schema 3 the enrichment storage (the registry
   and favicon caches, company freshness, and the prefix index on `locations`). An instance
   from before a schema refuses a database migrated to it, so **upgrade every instance that
   shares the database together**: once one new instance has started, the older ones stay not
-  ready until they are upgraded. The instance's own SQLite file goes to schema 8 at the same
-  time (the same table and the same move).
+  ready until they are upgraded. With schema 5 the instance's own SQLite file went to schema 8
+  (the same table and the same move).
 - **Prepared statements.** Each pooled connection (16 per instance) prepares a fixed
   statement once and reuses it for the connection's life, so a statement is one round trip
   (paged list queries and search are still planned per call). Behind PgBouncer in

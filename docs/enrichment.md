@@ -1,6 +1,7 @@
 # Enrichment
 
-The enrichment job of [ADR 0002](adr/0002-company-enrichment.md) (sections 1 to 3, 5 and 6):
+The enrichment job of [ADR 0002](adr/0002-company-enrichment.md) (sections 1 to 3, 5 and 6,
+with the registry [delta feeds](#delta-feeds)):
 it links the companies the documents mention to public registries, merges the ones that are
 the same company, writes what the registries say as company props and dated edges, and finds
 each company's website and favicon. It lives in `doewood-ingest` (`enrichment` module) and
@@ -24,7 +25,8 @@ A company is due (ADR 0002 section 6):
 
 - **new:** it has a document and was never enriched: right away;
 - **documents doubled:** its document count is at least twice what it was (and at least 2);
-- **scheduled:** a registry's refresh time has passed.
+- **scheduled:** a registry's refresh time has passed, or a [delta feed](#delta-feeds) said
+  the registry changed it.
 
 A new or doubled company is asked of every registry; a scheduled one of the due registries
 and of any registry it was never asked (switched on since, say).
@@ -213,11 +215,71 @@ and for each registry asked the time it is due again, at the client's refresh
 |---|---|
 | GLEIF, APR, Companies House, Wikidata | 30 days |
 | VIES | 90 days |
-| EDGAR | 1 day (the submissions' freshness, standing in for "when new filings appear") |
+| EDGAR | 30 days while its daily index feed is on (new filings make the company due); 1 day with the feed off (the submissions' freshness, standing in for "when new filings appear") |
 | any registry that failed | 6 hours |
 
 A registry that was not asked (switched off, not configured, nothing to ask it) keeps no due
 time; it is asked when the company is next due and it is switched on.
+
+## Delta feeds
+
+ADR 0002 section 6: registry delta feeds are applied when configured, so a known company is
+refreshed when a registry changes it, not only on its schedule (issue #49). The feeds live in
+the job (`enrichment::feeds`), their clients in `doewood_registry::feeds`.
+
+| feed | source | checked | a record makes due | default |
+|---|---|---|---|---|
+| `gleif` | the golden copy's delta files: LEI-CDF (`lei2`) and RR-CDF (`rr`), zipped CSV, published at 00:00, 08:00 and 16:00 UTC | hourly | the company owning the LEI (`id:lei:`); for a relationship, the child's and the parent's | on |
+| `edgar` | the daily index, `Archives/edgar/daily-index/<y>/QTR<q>/master.<yyyymmdd>.idx` | hourly | the company owning the CIK (`reg:edgar:`) of a `10-K`, `10-K/A`, `20-F`, `20-F/A`, `8-K` or `8-K/A` | on |
+| `apr` | APR's open-data set (no deltas exist): downloaded again and swapped in for the client's index | weekly; daily once the set applied is over 31 days old | the company owning the MB (`id:rs_mb:`) whose record (name, status, legal form, seat, activity, founding date) differs from the cached one | on |
+| `companies_house` | the streaming API: `companies`, `officers` and `persons-with-significant-control` | continuously, the three streams in turns of 5 minutes on one connection (an account may hold two) | the company owning the number (`reg:companies_house:`) of an event's `resource_uri` | off (needs a streaming key) |
+
+- **Known companies only.** A feed looks the identifiers it reads up among the company
+  aliases the graph already has (`FeedStore::companies_by_alias`, 500 at a time); anything else
+  is dropped. It never creates a company or writes a fact: it drops the company's cached
+  answers of that registry (`CacheStore::cache_invalidate`: `gleif:lei-records/<LEI>`,
+  `edgar:submissions/CIK<cik>`, `companies_house:company/<number>`, each with what is under it)
+  and makes that registry due now (`FreshnessStore::mark_many_due`; a company never enriched is
+  due anyway). The next pass (the job is woken) asks the registry again, through the gate and
+  the writer as always. APR is the exception to the cache drop: the feed writes the new set's
+  record into the cache (`apr:companies/<MB>`), so the next lookup reads it on every instance
+  without a download.
+- **Bounded.** GLEIF's files are spooled into a temporary file (at most 512 MiB) and read
+  record by record (a record at most 256 KiB, at most 5 million records, at most 4 GiB out of
+  the zip); EDGAR's index and the stream are read line by line (4 KiB and 1 MiB lines). Only
+  identifiers are kept. The feeds send nothing about a company: the files and streams are
+  the same for everyone.
+- **One instance per cluster** reads each feed: the feed's row in `registry_feeds` (shared
+  schema 6, instance schema 9) holds a lease (`FeedStore::lease_feed`, 15 minutes, renewed as
+  the feed goes; an abandoned one expires), the feed's **cursor** and its next run. Another
+  instance carries on from the cursor after a restart or a crash. The Companies House stream
+  keeps its lease between connections; the others give it back after each run. An instance
+  where a feed is switched off never takes its lease.
+- **Cursors.** `gleif`: the publication last applied (Unix seconds); the next run takes the
+  shortest delta that reaches back to it (`IntraDay` 8 hours, `LastDay`, `LastWeek`,
+  `LastMonth` 31 days). Further behind than a month, or on the first run, the latest
+  publication becomes the cursor and the 30-day schedule covers the gap. `edgar`: the last
+  day applied (`YYYY-MM-DD`; at most 31 days back, 14 days per run); the first run starts
+  with yesterday. A day without an index (404) is skipped once a later day has one, or when
+  it is a weekend or five days old; otherwise the feed waits for it (the SEC builds the index
+  in the evening, Eastern time). `apr`: the date of the set last applied (`DatumPreseka`); a
+  set with the same date compares nothing. `companies_house`: each stream's last timepoint
+  (`companies=<n>,officers=<n>,persons-with-significant-control=<n>`), saved as it reads; a
+  connection resumes after it. A timepoint too old (416) restarts that stream from now; the
+  schedule covers the gap.
+- **Switches** (runtime settings, read every minute): `gleif_feed_enabled`,
+  `edgar_feed_enabled`, `apr_feed_enabled` (default on) and `companies_house_feed_enabled`
+  (default off). A feed runs only while its registry is on too; the Companies House stream
+  also needs a streaming key (`companies_house_stream_key`, write-only: Companies House issues
+  streaming keys apart from REST keys) besides the REST key. See
+  [api.md](api.md#enrichment-settings).
+- **Failure-soft.** A failed run (the source down, refusing, a malformed file, a store error)
+  is logged at `WARN` (`feed run failed`), counted in `failures`, keeps the cursor, and is
+  tried again after 30 minutes. A stream connection that ends or goes quiet (no heartbeat
+  for 2 minutes) keeps what it read; the next stream takes its turn. A 429 waits a minute.
+- **Log lines:** `gleif feed: delta file read` / `publication applied`, `edgar feed: daily
+  index applied`, `apr feed: new set swapped in`, `companies house stream: connection ended`,
+  `feed run failed`, `feed lease lost ...`; each company made due at debug level.
 
 ## Settings
 
@@ -242,7 +304,11 @@ pass). Nothing the job does blocks ingest.
 instance started, as `KIND_ENRICHMENT` updates (see [api.md](api.md)): `enriched`, `merged`,
 `proposed`, `failed`, `registry_warnings`, `edges`, `redirected` (edges that landed on the
 company an end was merged into while the company was worked on), `websites`, `passes`,
-`last_pass_completed_at` and `running`.
+`last_pass_completed_at` and `running`, and per delta feed (`feeds`): `enabled` (here),
+`leader` (this instance holds its lease), `runs`, `records` (records read), `companies_due`,
+`failures`, `last_run_at` and `position` (the publication time, the last index day or the
+set's date as Unix seconds; the Companies House timepoint). Only the instance reading a feed
+counts its runs.
 
 Log lines: `enrichment started` / `stopped`, `company enriched` (with the company, why it was
 due, and what it did), `companies merged` (survivor, absorbed, merge entry, probability),
@@ -250,8 +316,14 @@ due, and what it did), `companies merged` (survivor, absorbed, merge entry, prob
 
 ## Limits and assumptions
 
-- **No delta feeds yet.** GLEIF's daily files, Companies House streaming and EDGAR's RSS are
-  not read; the schedule above stands in (EDGAR daily).
+- **Delta feeds mark, they do not write.** A feed makes the registry due; the facts come from
+  the registry's answer on the next pass. A feed that is down for longer than its reach
+  (GLEIF's monthly delta, EDGAR's 31 days, an expired stream timepoint) leaves the gap to the
+  30-day schedule. Only the six EDGAR forms above trigger a refresh (`10-Q`, `S-1`, `4` and
+  the rest do not).
+- **APR's set on other instances.** The instance reading the APR feed swaps its own index in
+  and writes the changed records to the shared cache; other instances keep their index (used
+  for name searches) until its 30 days are up.
 - **APR's open data** has no PIB, no dates of status changes, no mergers and no deleted
   companies, so APR gives no dated events beyond the status.
 - **Merger filings** of Companies House name no counterpart; they are kept in
@@ -263,8 +335,8 @@ due, and what it did), `companies merged` (survivor, absorbed, merge entry, prob
 
 ## Tests
 
-`cargo test -p doewood-ingest --test enrichment`, against SQLite and, with
-`DOEWOOD_TEST_POSTGRES_URL`, Postgres. Mock registries and mock websites on 127.0.0.1 only:
+`cargo test -p doewood-ingest --test enrichment` and `--test feeds`, against SQLite and,
+with `DOEWOOD_TEST_POSTGRES_URL`, Postgres. Mock registries and mock websites on 127.0.0.1 only:
 invented companies and identifiers (valid check digits only), `*.test` host names resolved to
 the mock by a fake resolver, reached under a test-only address policy (the production policy is
 unchanged). They cover identifiers through APR, GLEIF and Wikidata to identifiers, props and
@@ -275,4 +347,12 @@ dated parent superseding the other into a former parent; leases between two inst
 (Postgres); a registry down while the others answer; switched-off registries and Companies
 House without a key never asked; website verification by name and by an identifier on the
 legal notice, refused for an unrelated page, a domain another company owns and free mail; and
-the favicon in the icon cache.
+the favicon in the icon cache. The feeds' tests cover GLEIF delta files (invented zipped
+CSVs) making the companies that own their LEIs due, their cached answers dropped and the new
+answer written on the next pass, unknown and invalid LEIs left alone, the cursor (nothing
+applied twice); one instance per feed under the lease, a failed run kept soft and retried
+after its interval, a feed switched off never read; an EDGAR daily index making a known
+CIK's 10-K due (not a 10-Q, not unknown CIKs) and EDGAR's 30-day refresh with the feed on;
+APR's new set making only the changed MB due, read from the cache on the next pass; and the
+Companies House stream (with basic auth) making a company due, resuming each stream from its
+timepoint, and restarting a stream whose timepoint is too old (416).

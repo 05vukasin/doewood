@@ -43,6 +43,7 @@ pub async fn run<B: Backend + ?Sized>(a: &B, b: &B) {
     search(a).await;
     caches(a, b).await;
     freshness(a, b).await;
+    feeds(a, b).await;
     merges(a).await;
     proposals(a, b).await;
     decisions(a).await;
@@ -891,6 +892,233 @@ pub async fn leases<B: Backend + ?Sized>(a: &B, b: &B) {
     assert!(a.lease_company(co, &ia, Duration::ZERO).await.unwrap());
     assert!(b.lease_company(co, &ib, minute).await.unwrap());
     assert!(!a.lease_company(co, &ia, minute).await.unwrap());
+}
+
+/// Registry delta feeds (issue #49): the feed lease across two instances, the cursor written
+/// only under it, the alias lookups, cache invalidation by prefix, and marking companies due.
+///
+/// # Panics
+///
+/// When the backend misbehaves.
+#[allow(clippy::too_many_lines)]
+pub async fn feeds<B: Backend + ?Sized>(a: &B, b: &B) {
+    let (ia, ib) = (instance("inst-a"), instance("inst-b"));
+    let minute = Duration::from_mins(1);
+    assert_eq!(a.feed_state("gleif").await.unwrap(), None);
+    assert!(a.lease_feed("Bad-Name", &ia, minute).await.is_err());
+
+    // One instance at a time; renewal; release; take-over of an expired lease.
+    assert!(a.lease_feed("gleif", &ia, minute).await.unwrap());
+    assert!(!b.lease_feed("gleif", &ib, minute).await.unwrap());
+    assert!(a.lease_feed("gleif", &ia, minute).await.unwrap(), "renewal");
+    let state = b.feed_state("gleif").await.unwrap().unwrap();
+    assert_eq!(
+        (state.cursor.as_str(), state.next_run_at, state.updated_at),
+        ("", 0, 0)
+    );
+    assert_eq!(state.owner.as_deref(), Some("inst-a"));
+    // Only the holder writes the cursor.
+    assert!(!b.save_feed("gleif", &ib, "nope", 5).await.unwrap());
+    let before = unix_now();
+    assert!(
+        a.save_feed("gleif", &ia, "2026-11-25T08:00:00Z", before + 3600)
+            .await
+            .unwrap()
+    );
+    assert!(a.save_feed("gleif", &ia, "bad\ncursor", 0).await.is_err());
+    let state = b.feed_state("gleif").await.unwrap().unwrap();
+    assert_eq!(state.cursor, "2026-11-25T08:00:00Z");
+    assert_eq!(state.next_run_at, before + 3600);
+    assert!(state.updated_at >= before - 1, "{state:?}");
+    assert!(!b.release_feed("gleif", &ib).await.unwrap());
+    assert!(a.release_feed("gleif", &ia).await.unwrap());
+    let state = b.feed_state("gleif").await.unwrap().unwrap();
+    assert_eq!(state.owner, None);
+    assert_eq!(state.cursor, "2026-11-25T08:00:00Z", "the cursor stays");
+    assert!(
+        !a.save_feed("gleif", &ia, "x", 0).await.unwrap(),
+        "no lease"
+    );
+    assert!(b.lease_feed("gleif", &ib, minute).await.unwrap());
+    assert!(!a.lease_feed("gleif", &ia, minute).await.unwrap());
+    assert!(b.lease_feed("gleif", &ib, Duration::ZERO).await.unwrap());
+    assert_eq!(a.feed_state("gleif").await.unwrap().unwrap().owner, None);
+    assert!(a.lease_feed("gleif", &ia, minute).await.unwrap(), "expired");
+    assert!(!b.save_feed("gleif", &ib, "late", 0).await.unwrap());
+    // Feeds are independent.
+    assert!(b.lease_feed("edgar", &ib, minute).await.unwrap());
+    assert!(a.release_feed("gleif", &ia).await.unwrap());
+    assert!(b.release_feed("edgar", &ib).await.unwrap());
+
+    // Alias lookups: owned company aliases only, by exact alias or by prefix in byte order.
+    let x = a
+        .upsert_node(NodeKind::Company, "feed-x", &json!({}))
+        .await
+        .unwrap();
+    let y = a
+        .upsert_node(NodeKind::Company, "feed-y", &json!({}))
+        .await
+        .unwrap();
+    let props = json!({"step": "test"});
+    for (alias, node) in [
+        ("id:rs_mb:99000011", x),
+        ("id:rs_mb:99000029", y),
+        ("id:lei:FEEDTEST0000000000X1", x),
+        ("reg:edgar:9990000001", y),
+    ] {
+        a.claim_alias(NodeKind::Company, alias, node, &props)
+            .await
+            .unwrap();
+    }
+    a.block_alias(NodeKind::Company, "id:rs_mb:99000037", &json!({}))
+        .await
+        .unwrap();
+    let want = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    assert_eq!(
+        b.companies_by_alias(&want(&[
+            "reg:edgar:9990000001",
+            "id:lei:FEEDTEST0000000000X1",
+            "id:rs_mb:99000037",
+            "id:lei:NOBODY",
+        ]))
+        .await
+        .unwrap(),
+        [
+            ("id:lei:FEEDTEST0000000000X1".to_owned(), x),
+            ("reg:edgar:9990000001".to_owned(), y),
+        ]
+    );
+    assert_eq!(b.companies_by_alias(&[]).await.unwrap(), []);
+    let too_many = vec!["id:lei:X".to_owned(); crate::FEED_BATCH_MAX + 1];
+    assert!(b.companies_by_alias(&too_many).await.is_err());
+    assert_eq!(
+        b.company_aliases("id:rs_mb:", None, 0).await.unwrap(),
+        [
+            ("id:rs_mb:99000011".to_owned(), x),
+            ("id:rs_mb:99000029".to_owned(), y),
+        ]
+    );
+    assert_eq!(
+        b.company_aliases("id:rs_mb:", Some("id:rs_mb:99000011"), 1)
+            .await
+            .unwrap(),
+        [("id:rs_mb:99000029".to_owned(), y)]
+    );
+    assert_eq!(
+        b.company_aliases("id:rs_mb:", Some("id:rs_mb:99000029"), 10)
+            .await
+            .unwrap(),
+        []
+    );
+
+    // Cache invalidation by key prefix, one registry only.
+    let now = unix_now();
+    for (registry, key) in [
+        ("gleif", "lei-records/FEEDTEST0000000000X1"),
+        (
+            "gleif",
+            "lei-records/FEEDTEST0000000000X1/direct-parent-relationship",
+        ),
+        ("gleif", "lei-records/FEEDTEST0000000000Y2"),
+        ("wikidata", "lei-records/FEEDTEST0000000000X1"),
+    ] {
+        a.cache_put(&CacheRow {
+            registry: registry.to_owned(),
+            key: key.to_owned(),
+            body: Some(b"{}".to_vec()),
+            fetched_at: now,
+            expires_at: now + 3600,
+        })
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        b.cache_invalidate("gleif", "lei-records/FEEDTEST0000000000X1")
+            .await
+            .unwrap(),
+        2
+    );
+    assert!(
+        a.cache_get(
+            "gleif",
+            "lei-records/FEEDTEST0000000000X1/direct-parent-relationship"
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        a.cache_get("gleif", "lei-records/FEEDTEST0000000000Y2")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        a.cache_get("wikidata", "lei-records/FEEDTEST0000000000X1")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(a.cache_invalidate("gleif", "").await.is_err());
+
+    // Marking due: only companies enriched before; the other registries keep their time.
+    let doc = a
+        .upsert_node(NodeKind::Document, &hash(250).to_hex(), &json!({}))
+        .await
+        .unwrap();
+    for co in [x, y] {
+        a.upsert_edge(&Edge::new(doc, co, EdgeKind::Party, EdgeSource::Document))
+            .await
+            .unwrap();
+    }
+    let day = Duration::from_hours(24);
+    a.record_enrichment(
+        x,
+        &[
+            ("gleif".to_owned(), day * 30),
+            ("vies".to_owned(), day * 90),
+        ],
+    )
+    .await
+    .unwrap();
+    let due_of = |due: Vec<DueCompany>, co: Uuid| due.into_iter().find(|d| d.company == co);
+    assert_eq!(
+        due_of(a.companies_due(&ia, None, 0).await.unwrap(), x),
+        None
+    );
+    assert_eq!(
+        b.mark_many_due(&[x, y, Uuid::now_v7()], "gleif")
+            .await
+            .unwrap(),
+        1,
+        "y was never enriched (it is new anyway)"
+    );
+    let due = due_of(a.companies_due(&ia, None, 0).await.unwrap(), x).unwrap();
+    assert_eq!(
+        (due.reason, due.due),
+        (DueReason::Scheduled, vec!["gleif".to_owned()])
+    );
+    let after = a.enrichment(x).await.unwrap().unwrap();
+    // Postgres rounds its times to the second (up, at times).
+    assert!(after.next_due["gleif"] <= unix_now() + 1);
+    assert!(after.next_due["vies"] > unix_now() + 80 * 86_400);
+    // A registry not in the schedule yet is added; an earlier due time is kept.
+    assert_eq!(b.mark_many_due(&[x], "edgar").await.unwrap(), 1);
+    assert_eq!(b.mark_many_due(&[], "edgar").await.unwrap(), 0);
+    assert!(b.mark_many_due(&[x], "Bad").await.is_err());
+    let due = due_of(a.companies_due(&ia, None, 0).await.unwrap(), x).unwrap();
+    assert_eq!(due.due, ["edgar", "gleif"]);
+    // Re-enriching sets them again.
+    a.record_enrichment(
+        x,
+        &[("gleif".to_owned(), day * 30), ("edgar".to_owned(), day)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        due_of(a.companies_due(&ia, None, 0).await.unwrap(), x),
+        None
+    );
 }
 
 /// Search: text, every filter, paging and re-indexing.

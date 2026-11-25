@@ -5,9 +5,13 @@
 //! - `registry.<name>.enabled` (`gleif`, `vies`, `wikidata`, `edgar`, `apr`,
 //!   `companies_house`): the registry switches. All on by default; Companies House is still
 //!   asked only once its key is set.
+//! - `feed.<name>.enabled` (`gleif`, `edgar`, `apr`, `companies_house`): the registry delta
+//!   feed switches (ADR 0002 section 6, issue #49). GLEIF, EDGAR and APR on by default,
+//!   Companies House streaming off (it needs a stream key).
 //! - `registry.edgar.contact`: the operator's contact for the SEC's `User-Agent` rule. Unset:
 //!   the generic `User-Agent`.
-//! - The secrets `registry/companies_house/api_key`, `registry/opencorporates/api_key` (no
+//! - The secrets `registry/companies_house/api_key`, `registry/companies_house/stream_key` (the
+//!   streaming API's own key), `registry/opencorporates/api_key` (no
 //!   client yet: only stored) and `registry/apr/extra_roots_pem` (the certificates APR's
 //!   download trusts next to the system's). Write-only, like every secret.
 //! - The favicon settings are the ones of [`super::favicon`] (`favicon.fallback`,
@@ -39,11 +43,22 @@ pub const EDGAR_ENABLED: &str = "registry.edgar.enabled";
 pub const APR_ENABLED: &str = "registry.apr.enabled";
 /// Settings key of the UK Companies House switch.
 pub const COMPANIES_HOUSE_ENABLED: &str = "registry.companies_house.enabled";
+/// Settings key of the GLEIF delta feed switch (the golden copy's delta files).
+pub const GLEIF_FEED_ENABLED: &str = "feed.gleif.enabled";
+/// Settings key of the EDGAR feed switch (the daily index).
+pub const EDGAR_FEED_ENABLED: &str = "feed.edgar.enabled";
+/// Settings key of the APR feed switch (the monthly set, swapped in).
+pub const APR_FEED_ENABLED: &str = "feed.apr.enabled";
+/// Settings key of the Companies House streaming switch.
+pub const COMPANIES_HOUSE_FEED_ENABLED: &str = "feed.companies_house.enabled";
 /// Settings key of the EDGAR contact.
 pub const EDGAR_CONTACT: &str = "registry.edgar.contact";
 
 /// Secret holding the Companies House API key.
 pub const COMPANIES_HOUSE_KEY_SECRET: &str = "registry/companies_house/api_key";
+/// Secret holding the Companies House streaming API key (a key of its own: Companies House
+/// issues streaming keys apart from REST keys).
+pub const COMPANIES_HOUSE_STREAM_KEY_SECRET: &str = "registry/companies_house/stream_key";
 /// Secret holding the `OpenCorporates` API key.
 pub const OPENCORPORATES_KEY_SECRET: &str = "registry/opencorporates/api_key";
 /// Secret holding APR's extra root certificates.
@@ -91,6 +106,45 @@ impl Default for RegistrySwitches {
             companies_house: true,
         }
     }
+}
+
+/// The registry delta feed switches (ADR 0002 section 6, issue #49). A feed runs only while
+/// its registry is asked too. The default: GLEIF, EDGAR and APR on, Companies House off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct FeedSwitches {
+    /// GLEIF's golden copy delta files (LEI-CDF and RR-CDF).
+    pub gleif: bool,
+    /// EDGAR's daily index.
+    pub edgar: bool,
+    /// APR's monthly set, swapped in.
+    pub apr: bool,
+    /// Companies House's streaming API: runs only with a stream key too.
+    pub companies_house: bool,
+}
+
+impl Default for FeedSwitches {
+    fn default() -> Self {
+        Self {
+            gleif: true,
+            edgar: true,
+            apr: true,
+            companies_house: false,
+        }
+    }
+}
+
+/// A change to [`FeedSwitches`]: `None` keeps the stored value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FeedSwitchesPatch {
+    /// GLEIF.
+    pub gleif: Option<bool>,
+    /// EDGAR.
+    pub edgar: Option<bool>,
+    /// APR.
+    pub apr: Option<bool>,
+    /// Companies House.
+    pub companies_house: Option<bool>,
 }
 
 /// A change to [`RegistrySwitches`]: `None` keeps the stored value.
@@ -161,6 +215,10 @@ pub struct EnrichmentSettings {
     pub registries: RegistrySwitches,
     /// Whether a Companies House key is stored.
     pub companies_house_key_set: bool,
+    /// The delta feed switches, as stored.
+    pub feeds: FeedSwitches,
+    /// Whether a Companies House streaming key is stored.
+    pub companies_house_stream_key_set: bool,
     /// Whether an `OpenCorporates` key is stored.
     pub opencorporates_key_set: bool,
     /// The EDGAR contact; `None`: the generic `User-Agent`.
@@ -175,6 +233,14 @@ impl EnrichmentSettings {
     /// Whether Companies House is asked: switched on and a key is set.
     pub fn companies_house_active(&self) -> bool {
         self.registries.companies_house && self.companies_house_key_set
+    }
+
+    /// Whether the Companies House stream is read: its switch on, a stream key set, and
+    /// Companies House asked.
+    pub fn companies_house_feed_active(&self) -> bool {
+        self.feeds.companies_house
+            && self.companies_house_stream_key_set
+            && self.companies_house_active()
     }
 }
 
@@ -198,6 +264,11 @@ pub struct EnrichmentConfig {
     pub companies_house: bool,
     /// The Companies House key.
     pub companies_house_key: Option<ApiKey>,
+    /// The delta feed switches, as stored (each feed also needs its registry asked; the
+    /// Companies House stream its key).
+    pub feeds: FeedSwitches,
+    /// The Companies House streaming key.
+    pub companies_house_stream_key: Option<ApiKey>,
     /// The `OpenCorporates` key (no client uses it yet).
     pub opencorporates_key: Option<ApiKey>,
     /// The EDGAR contact (`EdgarConfig::contact`); `None`: the generic `User-Agent`.
@@ -216,6 +287,10 @@ pub struct EnrichmentSettingsPatch {
     pub registries: RegistrySwitchesPatch,
     /// The Companies House key.
     pub companies_house_key: KeyChange,
+    /// The delta feed switches.
+    pub feeds: FeedSwitchesPatch,
+    /// The Companies House streaming key.
+    pub companies_house_stream_key: KeyChange,
     /// The `OpenCorporates` key.
     pub opencorporates_key: KeyChange,
     /// `Some(None)` removes the contact; `Some(Some(c))` sets it (see
@@ -234,6 +309,8 @@ impl Default for EnrichmentSettingsPatch {
         Self {
             registries: RegistrySwitchesPatch::default(),
             companies_house_key: KeyChange::Keep,
+            feeds: FeedSwitchesPatch::default(),
+            companies_house_stream_key: KeyChange::Keep,
             opencorporates_key: KeyChange::Keep,
             edgar_contact: None,
             apr_extra_roots: RootsChange::Keep,
@@ -266,9 +343,26 @@ fn text_or_null(v: Option<&String>) -> serde_json::Value {
 
 impl Store {
     fn switch(&self, key: &str) -> Result<bool, StoreError> {
+        self.switch_or(key, true)
+    }
+
+    fn switch_or(&self, key: &str, default: bool) -> Result<bool, StoreError> {
         // A stored value of the wrong type (only possible by editing the file by hand) reads
-        // as the default, on.
-        Ok(self.setting(key)?.and_then(|v| v.as_bool()).unwrap_or(true))
+        // as the default.
+        Ok(self
+            .setting(key)?
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default))
+    }
+
+    fn feed_switches(&self) -> Result<FeedSwitches, StoreError> {
+        let d = FeedSwitches::default();
+        Ok(FeedSwitches {
+            gleif: self.switch_or(GLEIF_FEED_ENABLED, d.gleif)?,
+            edgar: self.switch_or(EDGAR_FEED_ENABLED, d.edgar)?,
+            apr: self.switch_or(APR_FEED_ENABLED, d.apr)?,
+            companies_house: self.switch_or(COMPANIES_HOUSE_FEED_ENABLED, d.companies_house)?,
+        })
     }
 
     fn registry_switches(&self) -> Result<RegistrySwitches, StoreError> {
@@ -294,6 +388,9 @@ impl Store {
         Ok(EnrichmentSettings {
             registries: self.registry_switches()?,
             companies_house_key_set: self.secret_exists(COMPANIES_HOUSE_KEY_SECRET)?,
+            feeds: self.feed_switches()?,
+            companies_house_stream_key_set: self
+                .secret_exists(COMPANIES_HOUSE_STREAM_KEY_SECRET)?,
             opencorporates_key_set: self.secret_exists(OPENCORPORATES_KEY_SECRET)?,
             edgar_contact: self.edgar_contact()?,
             apr_extra_roots_set: self.secret_exists(APR_EXTRA_ROOTS_SECRET)?,
@@ -315,6 +412,7 @@ impl Store {
             ApiKey::new(text).map(Some)
         };
         let companies_house_key = key(COMPANIES_HOUSE_KEY_SECRET)?;
+        let companies_house_stream_key = key(COMPANIES_HOUSE_STREAM_KEY_SECRET)?;
         let opencorporates_key = key(OPENCORPORATES_KEY_SECRET)?;
         let apr_extra_roots = match self.reveal(APR_EXTRA_ROOTS_SECRET)? {
             None => None,
@@ -332,6 +430,8 @@ impl Store {
             apr: switches.apr,
             companies_house: switches.companies_house && companies_house_key.is_some(),
             companies_house_key,
+            feeds: self.feed_switches()?,
+            companies_house_stream_key,
             opencorporates_key,
             edgar_contact: self.edgar_contact()?,
             apr_extra_roots,
@@ -364,6 +464,10 @@ impl Store {
             KeyChange::Keep | KeyChange::Clear => Ok(None),
         };
         let ch_sealed = seal_key(COMPANIES_HOUSE_KEY_SECRET, &patch.companies_house_key)?;
+        let stream_sealed = seal_key(
+            COMPANIES_HOUSE_STREAM_KEY_SECRET,
+            &patch.companies_house_stream_key,
+        )?;
         let oc_sealed = seal_key(OPENCORPORATES_KEY_SECRET, &patch.opencorporates_key)?;
         let roots_sealed = match &patch.apr_extra_roots {
             RootsChange::Set(p) => Some(
@@ -384,6 +488,10 @@ impl Store {
             (APR_ENABLED, r.apr),
             (COMPANIES_HOUSE_ENABLED, r.companies_house),
             (FAVICON_FALLBACK, patch.favicon_fallback),
+            (GLEIF_FEED_ENABLED, patch.feeds.gleif),
+            (EDGAR_FEED_ENABLED, patch.feeds.edgar),
+            (APR_FEED_ENABLED, patch.feeds.apr),
+            (COMPANIES_HOUSE_FEED_ENABLED, patch.feeds.companies_house),
         ] {
             if let Some(on) = value {
                 put_setting(&tx, key, &serde_json::json!(on), now)?;
@@ -401,6 +509,11 @@ impl Store {
                 COMPANIES_HOUSE_KEY_SECRET,
                 patch.companies_house_key == KeyChange::Clear,
                 &ch_sealed,
+            ),
+            (
+                COMPANIES_HOUSE_STREAM_KEY_SECRET,
+                patch.companies_house_stream_key == KeyChange::Clear,
+                &stream_sealed,
             ),
             (
                 OPENCORPORATES_KEY_SECRET,
@@ -480,6 +593,7 @@ mod tests {
                 apr_extra_roots: RootsChange::Set(RootsPem::new(PEM).unwrap()),
                 favicon_fallback: Some(true),
                 favicon_egress_proxy: Some(Some("http://egress.svc:3128".to_owned())),
+                ..EnrichmentSettingsPatch::default()
             })
             .unwrap();
         assert!(!set.registries.wikidata && !set.registries.apr && set.registries.gleif);
@@ -620,14 +734,67 @@ mod tests {
     }
 
     #[test]
+    fn feed_switches_default_and_the_stream_key_is_write_only() {
+        const STREAM_KEY: &str = "test-stream-key-not-real-03";
+        let s = store();
+        let settings = s.enrichment_settings().unwrap();
+        assert_eq!(settings.feeds, FeedSwitches::default());
+        assert!(settings.feeds.gleif && settings.feeds.edgar && settings.feeds.apr);
+        assert!(!settings.feeds.companies_house);
+        assert!(!settings.companies_house_stream_key_set);
+        assert!(!settings.companies_house_feed_active());
+        let set = s
+            .set_enrichment_settings(&EnrichmentSettingsPatch {
+                feeds: FeedSwitchesPatch {
+                    gleif: Some(false),
+                    companies_house: Some(true),
+                    ..FeedSwitchesPatch::default()
+                },
+                companies_house_stream_key: KeyChange::Set(ApiKey::new(STREAM_KEY).unwrap()),
+                ..EnrichmentSettingsPatch::default()
+            })
+            .unwrap();
+        assert!(!set.feeds.gleif && set.feeds.edgar && set.feeds.companies_house);
+        assert!(set.companies_house_stream_key_set);
+        // The stream also needs Companies House asked (its REST key).
+        assert!(!set.companies_house_feed_active());
+        let set = s
+            .set_enrichment_settings(&EnrichmentSettingsPatch {
+                companies_house_key: KeyChange::Set(ApiKey::new(CH_KEY).unwrap()),
+                ..EnrichmentSettingsPatch::default()
+            })
+            .unwrap();
+        assert!(set.companies_house_feed_active());
+        assert!(!format!("{set:?}").contains(STREAM_KEY));
+        let config = s.enrichment_config().unwrap();
+        assert_eq!(config.feeds, set.feeds);
+        assert_eq!(
+            config.companies_house_stream_key.as_ref().unwrap().expose(),
+            STREAM_KEY
+        );
+        assert!(!format!("{config:?}").contains(STREAM_KEY));
+        let cleared = s
+            .set_enrichment_settings(&EnrichmentSettingsPatch {
+                companies_house_stream_key: KeyChange::Clear,
+                ..EnrichmentSettingsPatch::default()
+            })
+            .unwrap();
+        assert!(!cleared.companies_house_stream_key_set && cleared.companies_house_key_set);
+        assert!(!cleared.companies_house_feed_active());
+    }
+
+    #[test]
     fn bad_stored_values_read_as_the_default() {
         let s = store();
         s.set_setting(GLEIF_ENABLED, &serde_json::json!("no"))
             .unwrap();
         s.set_setting(EDGAR_CONTACT, &serde_json::json!("bad\u{7f}"))
             .unwrap();
+        s.set_setting(COMPANIES_HOUSE_FEED_ENABLED, &serde_json::json!(1))
+            .unwrap();
         let settings = s.enrichment_settings().unwrap();
         assert!(settings.registries.gleif);
+        assert!(!settings.feeds.companies_house);
         assert_eq!(settings.edgar_contact, None);
     }
 }
