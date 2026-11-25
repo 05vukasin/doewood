@@ -17,6 +17,8 @@ Set through the API, kept in `doewood.sqlite`, applied without a restart:
 |---|---|---|
 | S3 sources and their options | `AddSource`, `UpdateSource` | `sources` rows |
 | S3 credentials | `AddSource`, `UpdateSource` | secret `s3/<source id>` (sealed, write-only) |
+| A source's SQS inlet: queue URL, region, on/off (see [sources.md](sources.md#sqs)) | `SetSqsInlet`, `RemoveSqsInlet` | setting `sqs_inlet/<source id>` |
+| The SQS inlet's own credentials (unset: the source's) | `SetSqsInlet` | secret `sqs/<source id>` (sealed, write-only) |
 | A source's LLM policy: mode (`off` (default), `all`, `kinds`, `on_demand`), kinds, concurrency (1 to 64, default 2), daily token budget (tokens per UTC day, unset: no limit) | `SetLlmPolicy`, `AddSource` | `sources.policy_json` |
 | AI providers: preset, model, base URL | `SetAiProvider` | setting `ai.provider.<name>` |
 | An AI provider's API key | `SetAiProvider` | secret `ai/<name>/api_key` (sealed, write-only) |
