@@ -32,7 +32,7 @@ The S3 event webhook is not part of the gRPC API: it is on the ops server (see
 | `ConfigService` | `AddSource`, `UpdateSource`, `PauseSource`, `ResumeSource`, `RemoveSource`, `ListSources`, `GetSource`, `SetLlmPolicy`, `SetAiProvider`, `ListAiProviders`, `GetIngestSettings`, `SetIngestSettings`, `GetEnrichmentSettings`, `SetEnrichmentSettings` |
 | `JobsService` | `WatchProgress` (server stream), `ReprocessJob`, `WatchReprocess` (server stream) |
 | `RecordsService` | `GetRecord`, `ListRecords` |
-| `GraphService` | `GetNode`, `Neighbours`, `CompanyDocuments`, `ListMerges`, `MergeCompanies`, `UndoMerge`, `SplitCompany`, `DismissPair`, `ListDismissals` |
+| `GraphService` | `GetNode`, `Neighbours`, `CompanyDocuments`, `ListMerges`, `MergeCompanies`, `UndoMerge`, `SplitCompany`, `DismissPair`, `ListDismissals`, `ListProposals`, `AcceptProposal`, `RejectProposal` |
 | `SearchService` | `Search` |
 | `SummarizeService` | `Summarize` |
 
@@ -185,6 +185,39 @@ Every company merge and split is reversible (ADR 0002 section 1.8). The rules ar
   Dismissing a pair again returns the first dismissal; a pair merged now is refused (undo the
   merge with `dismiss`). **ListDismissals** pages through them, newest first.
 
+### Enrichment proposals
+
+What the enrichment gate leaves to a person (ADR 0002 section 1.6; see
+[enrichment.md](enrichment.md#proposals)): a **registry record** a name search found in the
+review band (`candidate` is `<registry>:<record>`, such as `apr:companies/12345678`), or
+another company that may be the same, to **merge** with (`candidate` is its id; the pair is
+named in id order, `company_id` the smaller). Each has its evidence (`evidence_json`), the
+fused probability, the reason (`REVIEW_BAND`, `CONFLICT`, or `DISMISSED` for the dismissed
+pairs schema 5 moved out of props), `detail_json` (a record's registry, id and name) and its
+state (`OPEN`, `ACCEPTED`, `REJECTED`, with `resolved_at`, `resolved_by`, `note`, and
+`dismissed` or `merge_id`). There is one open proposal per kind, company and candidate: the
+job proposing it again updates its evidence and probability.
+
+- **ListProposals** pages through them, newest first, filtered by `state`, `kind` and
+  `company_id` (a company's own proposals and the merge proposals naming it).
+- **AcceptProposal** (actor `manual`, this instance):
+  - a **merge** goes through the merge log like MergeCompanies, with the proposal's evidence
+    and probability, so **UndoMerge** of the returned `merge` undoes it. The survivor is
+    `survivor_id` when given (one of the two), else the one with more documents. Companies
+    merged meanwhile are followed to the company they are now; a pair that is one company
+    already is accepted without a merge.
+  - a **registry record**: its identifier (`alias`: the MB for APR, the LEI for GLEIF, the
+    company number for Companies House, the CIK for EDGAR) becomes an alias of the company,
+    as when the job adopts a name match, and the record's registry is made due, so the next
+    enrichment pass (within 30 seconds) looks the company up by it and writes its facts and
+    edges. To take it back, split the alias off (SplitCompany).
+  - `FAILED_PRECONDITION` when the proposal is not open, the pair is dismissed, or the
+    record's identifier belongs to another company (merge the two first).
+- **RejectProposal** closes it. With `dismiss` it is permanent: the same proposal is never
+  opened again, and for a merge the two companies are recorded as a dismissed pair
+  (`dismissal`), so they are never merged or proposed either. A plain rejection is not
+  permanent: the job may propose the same again on a later pass.
+
 Page tokens are opaque: pass `next_page_token` back as `page_token` until it comes back empty.
 
 ### Reprocessing
@@ -315,6 +348,12 @@ grpcurl -plaintext -d '{"merge_id": "<uuid>", "dismiss": true, "reason": "not th
     127.0.0.1:7443 doewood.v1.GraphService/UndoMerge
 grpcurl -plaintext -d '{"company_id": "<uuid>", "name": "ACME Trading", "document_ids": ["<uuid>"]}' \
     127.0.0.1:7443 doewood.v1.GraphService/SplitCompany
+grpcurl -plaintext -d '{"state": "PROPOSAL_STATE_OPEN", "kind": "PROPOSAL_KIND_MERGE", "page_size": 20}' \
+    127.0.0.1:7443 doewood.v1.GraphService/ListProposals
+grpcurl -plaintext -d '{"proposal_id": "<uuid>", "note": "same company"}' \
+    127.0.0.1:7443 doewood.v1.GraphService/AcceptProposal
+grpcurl -plaintext -d '{"proposal_id": "<uuid>", "dismiss": true, "note": "not the same company"}' \
+    127.0.0.1:7443 doewood.v1.GraphService/RejectProposal
 grpcurl -plaintext -d '{"text": "invoice", "kind": "invoice", "date_from": "2026-01-01", "amount_min": 100, "limit": 20}' \
     127.0.0.1:7443 doewood.v1.SearchService/Search
 ```

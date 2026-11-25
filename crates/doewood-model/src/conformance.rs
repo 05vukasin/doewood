@@ -1912,7 +1912,7 @@ fn resolve_req(id: Uuid, state: ProposalState, dismissed: bool) -> ResolveReques
 /// # Panics
 ///
 /// When the backend misbehaves.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
 pub async fn proposals<B: Backend + ?Sized>(s: &B, other: &B) {
     let company = |key: &'static str| async move {
         s.upsert_node(NodeKind::Company, key, &json!({"name": key}))
@@ -2106,7 +2106,7 @@ pub async fn proposals<B: Backend + ?Sized>(s: &B, other: &B) {
 /// # Panics
 ///
 /// When the backend misbehaves.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
 pub async fn decisions<B: Backend + ?Sized>(s: &B) {
     use crate::proposal::{accept, reject};
     let company = |key: &'static str| async move {

@@ -360,6 +360,7 @@ fn dismissed(d: &Dismissal) -> Error {
 ///
 /// Fails with [`Error::NotFound`] for an unknown proposal and [`Error::Precondition`] for
 /// one that is not open, a dismissed pair, or an identifier that cannot be adopted.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
 pub async fn accept<B: Backend + ?Sized>(
     b: &B,
     id: Uuid,
@@ -399,24 +400,21 @@ pub async fn accept<B: Backend + ?Sized>(
             if let Some(d) = b.dismissal(x, y).await? {
                 return Err(dismissed(&d));
             }
-            let (keep, gone) = match survivor {
-                Some(s) => {
-                    let s = live(b, s).await?;
-                    if s == x {
-                        (x, y)
-                    } else if s == y {
-                        (y, x)
-                    } else {
-                        return Err(Error::Invalid(format!(
-                            "the survivor must be one of the proposal's companies, {x} or {y}"
-                        )));
-                    }
+            let (keep, gone) = if let Some(chosen) = survivor {
+                let chosen = live(b, chosen).await?;
+                if chosen == x {
+                    (x, y)
+                } else if chosen == y {
+                    (y, x)
+                } else {
+                    return Err(Error::Invalid(format!(
+                        "the survivor must be one of the proposal's companies, {x} or {y}"
+                    )));
                 }
-                None => {
-                    let dx = b.company_documents(x).await?.len();
-                    let dy = b.company_documents(y).await?.len();
-                    if dy > dx { (y, x) } else { (x, y) }
-                }
+            } else {
+                let dx = b.company_documents(x).await?.len();
+                let dy = b.company_documents(y).await?.len();
+                if dy > dx { (y, x) } else { (x, y) }
             };
             let entry = b
                 .merge_companies(&MergeRequest {
@@ -511,6 +509,7 @@ pub async fn accept<B: Backend + ?Sized>(
 /// Fails with [`Error::NotFound`] for an unknown proposal and [`Error::Precondition`] for
 /// one that is not open, or a dismissal of two companies that are one now (undo that merge
 /// with `dismiss` instead).
+#[allow(clippy::many_single_char_names)]
 pub async fn reject<B: Backend + ?Sized>(
     b: &B,
     id: Uuid,

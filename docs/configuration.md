@@ -100,13 +100,18 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
   5 minutes, then they retry with backoff) and find the schema migrated. The version is in
   the `doewood_schema` table. A database migrated by a newer doewood is
   refused (not ready) until this one is upgraded.
-- **Schema 4** (the merge log and dismissals of ADR 0002 section 1.8: the new tables
-  `company_merges` and `company_dismissals`; nothing else changes) is the current version.
-  Schema 3 added the enrichment storage (the registry and favicon caches, company freshness,
-  and the prefix index on `locations`). An instance from before a schema refuses a database
-  migrated to it, so **upgrade every instance that shares the database together**: once one
-  new instance has started, the older ones stay not ready until they are upgraded. The
-  instance's own SQLite file goes to schema 7 at the same time (the same two tables).
+- **Schema 5** (the enrichment proposals of issue #52: the new table `company_proposals`,
+  and the `merge_proposals` and `registry_proposals` lists of company props moved into it and
+  removed from the props) is the current version. The move is part of the migration: it runs
+  once, in the same transaction that records schema 5, so it is never repeated or half done.
+  A malformed entry is left out; a pair kept as `dismissed` becomes a rejected, dismissed
+  proposal. Schema 4 added the merge log and dismissals of ADR 0002 section 1.8
+  (`company_merges` and `company_dismissals`), schema 3 the enrichment storage (the registry
+  and favicon caches, company freshness, and the prefix index on `locations`). An instance
+  from before a schema refuses a database migrated to it, so **upgrade every instance that
+  shares the database together**: once one new instance has started, the older ones stay not
+  ready until they are upgraded. The instance's own SQLite file goes to schema 8 at the same
+  time (the same table and the same move).
 - **Cache purge.** Every hour (first a minute after the start), each instance deletes the
   expired registry answers and icons. Every instance does it; the delete is idempotent.
 - **pgvector** is used when the server has it: doewood creates the extension (this needs a role

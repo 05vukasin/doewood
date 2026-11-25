@@ -2198,7 +2198,7 @@ async fn merges_undo_split_and_dismissals() {
 }
 
 /// Enrichment proposals through `GraphService` (issue #52): list with filters and pages,
-/// accept a merge (through the merge log, so UndoMerge undoes it), accept a registry record,
+/// accept a merge (through the merge log, so `UndoMerge` undoes it), accept a registry record,
 /// reject with a dismissal that blocks the merge and the proposal, a dismissed pair refused,
 /// and the validation errors.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2396,7 +2396,7 @@ async fn proposals_list_accept_and_reject() {
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(undone.undone_ids, [m.id.clone()], "{name}");
+        assert_eq!(undone.undone_ids, std::slice::from_ref(&m.id), "{name}");
         let accepted_only = list(pb::ListProposalsRequest {
             state: pb::ProposalState::Accepted as i32,
             ..Default::default()

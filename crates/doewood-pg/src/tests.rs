@@ -489,6 +489,7 @@ async fn a_start_waits_for_the_schema_lock() {
 /// Schema 5 moves the props lists of schema 4 into the proposals table, once: duplicates keep
 /// the latest entry, a dismissed pair is closed, malformed entries are left out, and the lists
 /// leave the props (the other props stay).
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
 #[tokio::test]
 async fn schema_5_moves_proposals_out_of_props() {
     use doewood_model::{

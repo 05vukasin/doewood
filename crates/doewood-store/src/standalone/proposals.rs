@@ -277,6 +277,7 @@ mod tests {
     /// Schema 8 moves the props lists of schema 7 into the table, once: duplicates keep the
     /// latest entry, a dismissed pair is closed, malformed entries are left out, and the
     /// lists leave the props (the other props stay).
+    #[allow(clippy::too_many_lines, clippy::many_single_char_names)]
     #[tokio::test]
     async fn schema_8_moves_proposals_out_of_props() {
         let tmp = tempfile::tempdir().unwrap();
