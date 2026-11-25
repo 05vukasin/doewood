@@ -24,8 +24,8 @@ use doewood_ingest::{
 use doewood_model::{Backend, Blake3};
 use doewood_s3::{EventKind, EventOrigin, ObjectEvent, ObjectVersion};
 use doewood_store::{
-    AiProviderInput, ApiKey, KeyChange, LlmJobStatus, LlmMode, LlmPolicy, NewSource, ObjectChange,
-    SeenObject, SourcePatch, Standalone, Store, utc_day,
+    AiProviderInput, ApiKey, IngestSettingsPatch, KeyChange, LlmJobStatus, LlmMode, LlmPolicy,
+    NewSource, ObjectChange, SeenObject, SourcePatch, Standalone, Store, utc_day,
 };
 use quail_summary::ApiConfig;
 use quail_summary::api::RetryPolicy;
@@ -852,5 +852,121 @@ async fn summarize_stores_nothing() {
         doewood_store::LlmUsage::default()
     );
     assert!(h.store.pending_llm_jobs(10).unwrap().is_empty());
+    h.stop().await;
+}
+
+/// The `Summarize` cap: calls beyond it are refused at once with `RESOURCE_EXHAUSTED`, the
+/// setting applies to the next call without a restart, and a refused, failed or cancelled call
+/// leaves no slot taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn summarize_cap_refuses_extra_calls_and_frees_slots() {
+    let mock = Mock::start(good());
+    let h = Harness::start(Some(&mock.url()), Duration::from_secs(10));
+    let s = h.source("objects", LlmMode::OnDemand, 2, None);
+    h.fetch.put("in/held.txt", agreement(600));
+    let gate = h.fetch.hold("in/held.txt");
+    let location = |key: &str| SummarizeInput::Location {
+        source: s,
+        key: key.to_owned(),
+    };
+    let spawn = |key: &str| {
+        let (summaries, input) = (h.summaries.clone(), location(key));
+        tokio::spawn(async move { summaries.summarize(input, None).await })
+    };
+    let busy = |err: &SummarizeError| matches!(err, SummarizeError::ResourceExhausted(m) if m.contains("retry later") && m.contains("summarize_max_concurrent"));
+    let set_cap = |n: u32| {
+        h.store
+            .set_ingest_settings(&IngestSettingsPatch {
+                summarize_max_concurrent: Some(n),
+                ..IngestSettingsPatch::default()
+            })
+            .unwrap();
+    };
+
+    // The default cap is 2: two calls held while they read the object.
+    let held = [spawn("in/held.txt"), spawn("in/held.txt")];
+    h.until("two calls hold a slot", |h| {
+        h.summaries.summarize_in_flight() == 2
+    })
+    .await;
+    // A third is refused at once, with content or a location, and takes no slot.
+    let err = h
+        .summaries
+        .summarize(
+            SummarizeInput::Content {
+                bytes: agreement(601),
+                name: "a.txt".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(busy(&err), "{err:?}");
+    let err = h
+        .summaries
+        .summarize(location("in/held.txt"), None)
+        .await
+        .unwrap_err();
+    assert!(busy(&err), "{err:?}");
+    assert_eq!(h.summaries.summarize_rejected(), 2);
+    assert_eq!(h.summaries.summarize_in_flight(), 2);
+    assert_eq!(mock.count(), 0);
+
+    // Raising the cap applies to the next call, without a restart.
+    set_cap(3);
+    let third = spawn("in/held.txt");
+    h.until("a third call holds a slot", |h| {
+        h.summaries.summarize_in_flight() == 3
+    })
+    .await;
+    // Lowering it keeps the calls in flight and refuses new ones.
+    set_cap(1);
+    let err = h
+        .summaries
+        .summarize(location("in/held.txt"), None)
+        .await
+        .unwrap_err();
+    assert!(busy(&err), "{err:?}");
+    assert_eq!(h.summaries.summarize_in_flight(), 3);
+
+    // A cancelled call (the client went away) frees its slot.
+    third.abort();
+    assert!(third.await.unwrap_err().is_cancelled());
+    h.until("the cancelled call freed its slot", |h| {
+        h.summaries.summarize_in_flight() == 2
+    })
+    .await;
+
+    // Released, the held calls finish with the model's summary and free their slots.
+    gate.add_permits(2);
+    for j in held {
+        let r = j.await.unwrap().unwrap();
+        assert!(!r.extractive, "{r:?}");
+    }
+    assert_eq!(h.summaries.summarize_in_flight(), 0);
+    assert_eq!(mock.count(), 2);
+
+    // A failed call frees its slot too: with a cap of 1, a missing object, then a summary.
+    let err = h
+        .summaries
+        .summarize(location("in/missing.txt"), None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SummarizeError::Unavailable(_)), "{err:?}");
+    assert_eq!(h.summaries.summarize_in_flight(), 0);
+    let r = h
+        .summaries
+        .summarize(
+            SummarizeInput::Content {
+                bytes: agreement(602),
+                name: "a.txt".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(!r.extractive, "{r:?}");
+    assert_eq!(h.summaries.summarize_in_flight(), 0);
+    assert_eq!(h.summaries.summarize_rejected(), 3);
     h.stop().await;
 }

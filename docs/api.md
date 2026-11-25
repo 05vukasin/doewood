@@ -103,7 +103,10 @@ The comments in the `.proto` files are the reference for every field. In short:
   the next file without a restart. Edges already written are kept; `ReprocessJob` with
   `force: true` compares a source's documents again (a lower value adds edges, a higher one
   removes none). It replaces the old `DOEWOOD_SIMILAR_MIN_JACCARD` variable (see
-  [configuration.md](configuration.md)).
+  [configuration.md](configuration.md)). `summarize_max_concurrent` is how many `Summarize`
+  calls read and analyze a file at once: 1 to 16 (default 2), anything else is
+  `INVALID_ARGUMENT`. It is read for every `Summarize` call, so it applies to the next one;
+  calls in flight keep running.
 
 ### Enrichment settings
 
@@ -270,6 +273,13 @@ its output fails the fact check, the answer is quail's extractive summary with `
 set and the reason in `warnings`. Without a configured provider it answers
 `FAILED_PRECONDITION`. See [llm.md](llm.md).
 
+At most `summarize_max_concurrent` calls (an ingest setting, default 2) read and analyze a file
+at once. A call beyond that is answered `RESOURCE_EXHAUSTED` at once ("... Summarize analyses
+are in flight ...: retry later"); nothing waits in a queue. Retry with backoff. `content` is
+bounded by the message limit (`DOEWOOD_API_MAX_MESSAGE_MIB`, default 64 MiB), an object by its
+source's `max_object_bytes`; a file larger than ingest analyzes (512 MiB) is
+`FAILED_PRECONDITION`.
+
 ## Errors
 
 | code | when |
@@ -278,7 +288,8 @@ set and the reason in `warnings`. Without a configured provider it answers
 | `NOT_FOUND` | the source, record, node or provider does not exist |
 | `ALREADY_EXISTS` | the source exists on this instance, or another instance has claimed it (named in the message) |
 | `UNAVAILABLE` | the shared Postgres is not connected (yet), or a call to it failed; retry. `ReprocessJob` and `Summarize` on an instance without ingest; `Summarize` of an object that cannot be read |
-| `FAILED_PRECONDITION` | the shared database was migrated by a newer doewood. A merge of a dismissed pair or of a merged-away company; an undo that later merges depend on (named in the message), of an entry already undone, or of a split that dismissed its pair; a dismissal of two companies merged now. `Summarize` without a configured AI provider (or with one missing its key or base URL), of a source whose LLM policy is off, or of a file without text |
+| `FAILED_PRECONDITION` | the shared database was migrated by a newer doewood. A merge of a dismissed pair or of a merged-away company; an undo that later merges depend on (named in the message), of an entry already undone, or of a split that dismissed its pair; a dismissal of two companies merged now. `Summarize` without a configured AI provider (or with one missing its key or base URL), of a source whose LLM policy is off, of a file without text, or of a file larger than ingest analyzes |
+| `RESOURCE_EXHAUSTED` | `Summarize` while as many calls as `summarize_max_concurrent` allows are reading or analyzing a file; retry later |
 | `OUT_OF_RANGE` | a message larger than the limit |
 | `INTERNAL` | anything else; the details are in the server log, not in the message |
 

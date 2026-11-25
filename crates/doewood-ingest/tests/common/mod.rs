@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use doewood_ingest::{Fetch, IngestError};
@@ -26,17 +26,33 @@ pub struct MemFetch {
     pub objects: Mutex<HashMap<String, Vec<u8>>>,
     /// Keys that fail with a transient error this many more times.
     pub flaky: Mutex<HashMap<String, u32>>,
+    /// Keys whose reads wait for a permit of their gate (one permit per read).
+    pub held: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
 }
 
 impl MemFetch {
     pub fn put(&self, key: &str, bytes: Vec<u8>) {
         self.objects.lock().unwrap().insert(key.to_owned(), bytes);
     }
+
+    /// Holds every read of `key` until the returned gate gets a permit (one per read).
+    pub fn hold(&self, key: &str) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        self.held
+            .lock()
+            .unwrap()
+            .insert(key.to_owned(), Arc::clone(&gate));
+        gate
+    }
 }
 
 #[async_trait]
 impl Fetch for MemFetch {
     async fn fetch(&self, _source: &Source, key: &str) -> Result<Vec<u8>, IngestError> {
+        let gate = self.held.lock().unwrap().get(key).cloned();
+        if let Some(gate) = gate {
+            gate.acquire().await.unwrap().forget();
+        }
         if let Some(n) = self.flaky.lock().unwrap().get_mut(key)
             && *n > 0
         {
