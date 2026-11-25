@@ -9,9 +9,9 @@
 //! - The schema is migrated on open from SQL embedded in the binary.
 //! - Secrets are sealed with XChaCha20-Poly1305 under the master key and are **write-only**
 //!   through the public API: they can be set, deleted and tested for, never read back. The
-//!   exceptions are the connectors' access paths ([`Store::source_credentials`] for the S3 client,
-//!   [`Store::ai_api_key`] for the LLM, [`Store::enrichment_config`] for the enrichment job),
-//!   which the API never calls.
+//!   exceptions are the connectors' access paths ([`Store::source_credentials`] for the S3
+//!   client, [`Store::sqs_credentials`] for the SQS inlet, [`Store::ai_api_key`] for the LLM,
+//!   [`Store::enrichment_config`] for the enrichment job), which the API never calls.
 
 mod crypto;
 mod error;
@@ -48,5 +48,9 @@ pub use store::sources::{
     DEFAULT_LLM_CONCURRENCY, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_SCAN_INTERVAL, LlmMode, LlmPolicy,
     MAX_LLM_CONCURRENCY, MAX_LLM_KINDS, NewSource, ObjectCounts, S3Credentials, Source,
     SourcePatch, SourceState, UrlStyle, valid_kind,
+};
+pub use store::sqs::{
+    CredentialsChange, QUEUE_URL_MAX_LEN, SQS_DEFAULT_REGION, SqsInlet, SqsInletInput,
+    queue_url_region, valid_queue_url,
 };
 pub use store::{SECRET_MAX_LEN, STORE_FILE, Store};

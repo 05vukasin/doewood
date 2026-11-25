@@ -16,6 +16,7 @@ pub(crate) mod ingest;
 pub(crate) mod llm;
 pub(crate) mod objects;
 pub(crate) mod sources;
+pub(crate) mod sqs;
 
 /// Name of the store file inside the data directory.
 pub const STORE_FILE: &str = "doewood.sqlite";
