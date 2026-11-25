@@ -26,6 +26,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use doewood_model::{
     Backend, Blake3, Direction, Edge, EdgeKind, EdgeSource, EdgeState, NeighbourQuery, NodeKind,
@@ -80,6 +81,10 @@ pub struct WriteStats {
     /// `party` edges that landed on the survivor of a merge that committed after the
     /// company was matched (issue #48).
     pub redirects: usize,
+    /// Time spent waiting for the instance's company-resolution lock.
+    pub company_lock_wait: Duration,
+    /// Time the company-resolution lock was held (party matching and alias writes).
+    pub company_lock_hold: Duration,
 }
 
 /// How a party matched a company.
@@ -337,7 +342,10 @@ impl GraphWriter {
     ) -> Result<()> {
         // One edge per company: candidates that resolve to the same one merge their roles.
         let mut edges: BTreeMap<Uuid, (Party, Match)> = BTreeMap::new();
+        let waited = Instant::now();
         let serial = self.companies.lock().await;
+        let held = Instant::now();
+        stats.company_lock_wait += held - waited;
         let attached = self.attached(doc).await?;
         for p in &facts.parties {
             let Some(name) = CompanyName::parse(&p.surface) else {
@@ -363,6 +371,7 @@ impl GraphWriter {
             }
         }
         drop(serial);
+        stats.company_lock_hold += held.elapsed();
         for (company, (p, m)) in edges {
             let mentions: Vec<Value> = p
                 .mentions
