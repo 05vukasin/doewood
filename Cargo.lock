@@ -1315,6 +1315,7 @@ dependencies = [
  "bytes",
  "doewood-core",
  "doewood-store",
+ "hmac",
  "jiff",
  "percent-encoding",
  "reqwest",
@@ -1322,9 +1323,11 @@ dependencies = [
  "rusty-s3",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "url",
 ]
 

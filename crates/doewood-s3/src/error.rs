@@ -22,6 +22,18 @@ pub enum S3Error {
         /// The S3 error message.
         message: Option<String>,
     },
+    /// An SQS queue answered with an error status (the SQS inlet).
+    #[error("SQS {op} failed: HTTP {status}{}{}", code.as_deref().map(|c| format!(" {c}")).unwrap_or_default(), message.as_deref().map(|m| format!(": {m}")).unwrap_or_default())]
+    Queue {
+        /// The action.
+        op: &'static str,
+        /// The HTTP status.
+        status: u16,
+        /// The error code (`QueueDoesNotExist`, `RequestThrottled`, …).
+        code: Option<String>,
+        /// The error message.
+        message: Option<String>,
+    },
     /// The request did not complete: connection, TLS or timeout, after any retries.
     #[error("S3 {op} failed: {reason}")]
     Transport {
@@ -62,10 +74,10 @@ pub enum S3Error {
 }
 
 impl S3Error {
-    /// The HTTP status of a [`S3Error::Status`].
+    /// The HTTP status of a [`S3Error::Status`] or [`S3Error::Queue`].
     pub fn status(&self) -> Option<u16> {
         match self {
-            Self::Status { status, .. } => Some(*status),
+            Self::Status { status, .. } | Self::Queue { status, .. } => Some(*status),
             _ => None,
         }
     }
