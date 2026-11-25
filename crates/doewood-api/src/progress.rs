@@ -7,19 +7,21 @@
 //! - the store holds what is durable: the objects seen and their ingest status
 //!   (`processed`, `failed`, `pending`), the state and the scan checkpoint.
 //!
-//! A watch recomputes a snapshot when [`Progress`] reports a change (debounced) and at a
-//! fixed interval (state changes the scanners write to the store), and sends what changed.
-//! A watch of every source also gets the enrichment job's counters ([`EnrichmentCounts`]),
-//! when the instance runs one.
+//! One task per instance ([`Snapshots`]) recomputes a snapshot of every source when
+//! [`Progress`] reports a change (debounced) and at a fixed interval (state changes the
+//! scanners write to the store); every stream filters it to its sources and sends what
+//! changed. A watch of every source also gets the enrichment job's counters
+//! ([`EnrichmentCounts`]), when the instance runs one.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use doewood_core::SourceId;
 use doewood_s3::{EventKind, ObjectEvent};
 use doewood_store::{Source, Store, StoreError};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tonic::Status;
 
 use crate::convert;
@@ -215,91 +217,150 @@ impl Progress {
     }
 }
 
-/// How a watch runs.
-pub(crate) struct Watch {
-    pub store: Arc<Store>,
-    pub progress: Arc<Progress>,
-    pub running: Arc<dyn Fn(SourceId) -> bool + Send + Sync>,
-    /// Only these sources; empty means all.
-    pub only: Vec<SourceId>,
-    /// How often the store is looked at without a change notification.
-    pub interval: Duration,
-    pub shutdown: watch::Receiver<bool>,
+/// The latest progress of every source, computed by one task per instance and shared by
+/// every `WatchProgress` stream: the store is read once per update, however many streams are
+/// open.
+#[derive(Clone, Debug)]
+pub(crate) struct Snapshot {
+    /// The highest subscription this snapshot was computed for (see [`Snapshots::subscribe`]).
+    generation: u64,
+    /// Every source; the error ends the streams that see it.
+    sources: Result<Arc<BTreeMap<SourceId, SourceProgress>>, Status>,
+    /// The enrichment job's counters when the snapshot was taken.
+    enrichment: Option<EnrichmentCounts>,
 }
 
-/// Shortest time between two snapshots, so a busy scan does not flood the stream.
+/// Whether a scanner runs for a source.
+pub(crate) type Running = Arc<dyn Fn(SourceId) -> bool + Send + Sync>;
+
+/// Produces the shared [`Snapshot`]s: one task, running while at least one stream is open.
+/// It computes a snapshot when [`Progress`] reports a change (at most one per [`DEBOUNCE`])
+/// and at a fixed interval (state changes the scanners write to the store), and at once
+/// when a stream opens, so that a new stream's first message is current.
+pub(crate) struct Snapshots {
+    store: Arc<Store>,
+    progress: Arc<Progress>,
+    running: Running,
+    interval: Duration,
+    shutdown: watch::Receiver<bool>,
+    latest: watch::Sender<Option<Snapshot>>,
+    /// Subscriptions so far: a stream waits for a snapshot of at least its own number.
+    subscribed: AtomicU64,
+    /// Wakes the producer for a new stream.
+    opened: Notify,
+    /// Whether the producer task runs; held while it is started or stops.
+    producing: Mutex<bool>,
+}
+
+impl std::fmt::Debug for Snapshots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Snapshots").finish_non_exhaustive()
+    }
+}
+
+/// Shortest time between two snapshots, so a busy scan does not flood the streams.
 const DEBOUNCE: Duration = Duration::from_millis(100);
 
-impl Watch {
-    /// Sends updates to `tx` until the client goes away or shutdown.
-    pub(crate) async fn run(mut self, tx: mpsc::Sender<Result<ProgressUpdate, Status>>) {
+impl Snapshots {
+    /// Nothing computed yet; the producer starts with the first stream.
+    pub(crate) fn new(
+        store: Arc<Store>,
+        progress: Arc<Progress>,
+        running: Running,
+        interval: Duration,
+        shutdown: watch::Receiver<bool>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            store,
+            progress,
+            running,
+            interval,
+            shutdown,
+            latest: watch::Sender::new(None),
+            subscribed: AtomicU64::new(0),
+            opened: Notify::new(),
+            producing: Mutex::new(false),
+        })
+    }
+
+    /// A receiver of the snapshots, and the generation its first one must have. Starts the
+    /// producer if no stream was open.
+    fn subscribe(self: &Arc<Self>) -> (watch::Receiver<Option<Snapshot>>, u64) {
+        let rx = {
+            let mut producing = self
+                .producing
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let rx = self.latest.subscribe();
+            if !*producing {
+                *producing = true;
+                tokio::spawn(Arc::clone(self).produce());
+            }
+            rx
+        };
+        let generation = self.subscribed.fetch_add(1, Ordering::SeqCst) + 1;
+        self.opened.notify_one();
+        (rx, generation)
+    }
+
+    /// Whether the producer task runs (for tests).
+    #[cfg(test)]
+    fn is_producing(&self) -> bool {
+        *self
+            .producing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Computes and publishes snapshots until no stream is open, or shutdown.
+    async fn produce(self: Arc<Self>) {
         let mut changes = self.progress.subscribe();
-        let mut last: BTreeMap<SourceId, SourceProgress> = BTreeMap::new();
-        let mut last_enrichment: Option<EnrichmentCounts> = None;
-        let mut first = true;
+        let mut shutdown = self.shutdown.clone();
         loop {
-            if *self.shutdown.borrow() {
-                return;
+            {
+                let mut producing = self
+                    .producing
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if self.latest.receiver_count() == 0 || *shutdown.borrow() {
+                    *producing = false;
+                    return;
+                }
             }
             changes.mark_unchanged();
-            let now = match self.snapshot().await {
-                Ok(now) => now,
-                Err(status) => {
-                    let _ = tx.try_send(Err(status));
-                    return;
-                }
+            // Read before the store: a stream that subscribed by now sees what is current.
+            let generation = self.subscribed.load(Ordering::SeqCst);
+            let enrichment = self.progress.enrichment();
+            let sources = self.compute().await.map(Arc::new);
+            self.latest.send_replace(Some(Snapshot {
+                generation,
+                sources,
+                enrichment,
+            }));
+            let opened = tokio::select! {
+                _ = changes.changed() => false,
+                () = tokio::time::sleep(self.interval) => false,
+                () = self.opened.notified() => true,
+                () = self.latest.closed() => continue,
+                _ = shutdown.wait_for(|s| *s) => continue,
             };
-            let mut updates = diff(&last, &now, first);
-            if self.only.is_empty()
-                && let Some(e) = self.progress.enrichment()
-                && last_enrichment != Some(e)
-            {
-                last_enrichment = Some(e);
-                updates.push(ProgressUpdate {
-                    kind: Kind::Enrichment as i32,
-                    progress: None,
-                    previous_state: 0,
-                    at: unix_now(),
-                    enrichment: Some(e.into()),
-                });
-            }
-            for update in updates {
-                // A client that stops reading must not hold the task (and the store) past
-                // shutdown.
-                let sent = tokio::select! {
-                    sent = tx.send(Ok(update)) => sent.is_ok(),
-                    _ = self.shutdown.wait_for(|s| *s) => false,
-                };
-                if !sent {
-                    return;
+            if !opened {
+                tokio::select! {
+                    () = tokio::time::sleep(DEBOUNCE.min(self.interval)) => {}
+                    () = self.opened.notified() => {}
+                    () = self.latest.closed() => {}
+                    _ = shutdown.wait_for(|s| *s) => {}
                 }
-            }
-            last = now;
-            first = false;
-            tokio::select! {
-                _ = changes.changed() => {}
-                () = tokio::time::sleep(self.interval) => {}
-                () = tx.closed() => return,
-                _ = self.shutdown.wait_for(|s| *s) => return,
-            }
-            tokio::select! {
-                () = tokio::time::sleep(DEBOUNCE.min(self.interval)) => {}
-                () = tx.closed() => return,
-                _ = self.shutdown.wait_for(|s| *s) => return,
             }
         }
     }
 
-    async fn snapshot(&self) -> Result<BTreeMap<SourceId, SourceProgress>, Status> {
+    /// Every source's progress, from the store and [`Progress`].
+    async fn compute(&self) -> Result<BTreeMap<SourceId, SourceProgress>, Status> {
         let store = Arc::clone(&self.store);
-        let only = self.only.clone();
         let rows = tokio::task::spawn_blocking(move || -> Result<_, StoreError> {
-            let sources: Vec<Source> = store
+            store
                 .sources()?
-                .into_iter()
-                .filter(|s| only.is_empty() || only.contains(&s.id))
-                .collect();
-            sources
                 .into_iter()
                 .map(|s| {
                     let counts = store.object_counts(s.id)?;
@@ -308,7 +369,7 @@ impl Watch {
                     let spent = store.llm_usage(s.id, doewood_store::utc_day(unix_now()))?;
                     Ok((s, counts, checkpoint, (llm, spent)))
                 })
-                .collect::<Result<Vec<_>, _>>()
+                .collect::<Result<Vec<(Source, _, _, _)>, _>>()
         })
         .await
         .map_err(|e| crate::error::join(&e))?
@@ -343,6 +404,88 @@ impl Watch {
                 (s.id, p)
             })
             .collect())
+    }
+}
+
+/// One `WatchProgress` stream.
+pub(crate) struct Watch {
+    pub snapshots: Arc<Snapshots>,
+    /// Only these sources; empty means all.
+    pub only: Vec<SourceId>,
+    pub shutdown: watch::Receiver<bool>,
+}
+
+impl Watch {
+    /// Sends updates to `tx` until the client goes away or shutdown.
+    pub(crate) async fn run(mut self, tx: mpsc::Sender<Result<ProgressUpdate, Status>>) {
+        let (mut snapshots, wanted) = self.snapshots.subscribe();
+        let mut last: BTreeMap<SourceId, SourceProgress> = BTreeMap::new();
+        let mut last_enrichment: Option<EnrichmentCounts> = None;
+        let mut first = true;
+        loop {
+            let snapshot = {
+                let next = async {
+                    if first {
+                        snapshots
+                            .wait_for(|s| s.as_ref().is_some_and(|s| s.generation >= wanted))
+                            .await
+                            .map(|s| s.clone())
+                    } else {
+                        snapshots
+                            .changed()
+                            .await
+                            .map(|()| snapshots.borrow_and_update().clone())
+                    }
+                };
+                tokio::select! {
+                    s = next => match s {
+                        Ok(Some(s)) => s,
+                        // The producer is gone: only at shutdown.
+                        Ok(None) | Err(_) => return,
+                    },
+                    () = tx.closed() => return,
+                    _ = self.shutdown.wait_for(|s| *s) => return,
+                }
+            };
+            let now = match &snapshot.sources {
+                Ok(all) if self.only.is_empty() => (**all).clone(),
+                Ok(all) => all
+                    .iter()
+                    .filter(|(id, _)| self.only.contains(id))
+                    .map(|(id, p)| (*id, p.clone()))
+                    .collect(),
+                Err(status) => {
+                    let _ = tx.try_send(Err(status.clone()));
+                    return;
+                }
+            };
+            let mut updates = diff(&last, &now, first);
+            if self.only.is_empty()
+                && let Some(e) = snapshot.enrichment
+                && last_enrichment != Some(e)
+            {
+                last_enrichment = Some(e);
+                updates.push(ProgressUpdate {
+                    kind: Kind::Enrichment as i32,
+                    progress: None,
+                    previous_state: 0,
+                    at: unix_now(),
+                    enrichment: Some(e.into()),
+                });
+            }
+            for update in updates {
+                // A client that stops reading must not hold the task past shutdown.
+                let sent = tokio::select! {
+                    sent = tx.send(Ok(update)) => sent.is_ok(),
+                    _ = self.shutdown.wait_for(|s| *s) => false,
+                };
+                if !sent {
+                    return;
+                }
+            }
+            last = now;
+            first = false;
+        }
     }
 }
 
@@ -486,6 +629,181 @@ mod tests {
             ),
             ("gleif", true, true, 3, 2)
         );
+    }
+
+    use doewood_core::MasterKey;
+    use doewood_store::{NewSource, ObjectChange, SeenObject, SourceState};
+
+    /// A stream's updates without their send time.
+    fn untimed(mut u: ProgressUpdate) -> ProgressUpdate {
+        u.at = 0;
+        u
+    }
+
+    struct Streams {
+        rx: Vec<mpsc::Receiver<Result<ProgressUpdate, Status>>>,
+        got: Vec<Vec<ProgressUpdate>>,
+    }
+
+    impl Streams {
+        /// Waits until stream `i` holds `n` updates in all.
+        async fn wait(&mut self, want: &[usize]) {
+            for (i, n) in want.iter().enumerate() {
+                while self.got[i].len() < *n {
+                    let u = tokio::time::timeout(Duration::from_secs(5), self.rx[i].recv())
+                        .await
+                        .unwrap_or_else(|_| panic!("stream {i}: {:?}", self.got[i]))
+                        .unwrap()
+                        .unwrap();
+                    self.got[i].push(untimed(u));
+                }
+            }
+            // Nothing more than that comes.
+            tokio::time::sleep(DEBOUNCE * 3).await;
+            for (i, rx) in self.rx.iter_mut().enumerate() {
+                assert!(rx.try_recv().is_err(), "stream {i} got more");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::too_many_lines)]
+    async fn streams_share_one_snapshot_and_each_gets_its_updates() {
+        let store = Arc::new(Store::open_in_memory(&MasterKey::from_bytes([3; 32])).unwrap());
+        let progress = Arc::new(Progress::new());
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let snapshots = Snapshots::new(
+            Arc::clone(&store),
+            Arc::clone(&progress),
+            Arc::new(|_| false),
+            // Only notifications wake the producer in this test.
+            Duration::from_hours(1),
+            shutdown.clone(),
+        );
+        let add = |bucket: &str| {
+            store
+                .add_source(&NewSource::new("http://objects.test:9000", bucket), None)
+                .unwrap()
+        };
+        let (a, b) = (add("a"), add("b"));
+        assert!(
+            !snapshots.is_producing(),
+            "nothing runs before a stream opens"
+        );
+
+        // Three streams of every source, two of `a` only.
+        let mut streams = Streams {
+            rx: Vec::new(),
+            got: Vec::new(),
+        };
+        for only in [vec![], vec![], vec![a], vec![], vec![a]] {
+            let (tx, rx) = mpsc::channel(64);
+            tokio::spawn(
+                Watch {
+                    snapshots: Arc::clone(&snapshots),
+                    only,
+                    shutdown: shutdown.clone(),
+                }
+                .run(tx),
+            );
+            streams.rx.push(rx);
+            streams.got.push(Vec::new());
+        }
+        let all = [0, 1, 3];
+        let only_a = [2, 4];
+        let counts = |all_n, a_n| {
+            let mut v = vec![0; 5];
+            for i in all {
+                v[i] = all_n;
+            }
+            for i in only_a {
+                v[i] = a_n;
+            }
+            v
+        };
+        // The first message of each stream: a snapshot of each of its sources.
+        streams.wait(&counts(2, 1)).await;
+        assert!(snapshots.is_producing());
+
+        let v = ObjectVersion {
+            etag: None,
+            size: 1,
+            last_modified: None,
+        };
+        progress.record(&event(a, EventKind::New(v.clone())));
+        streams.wait(&counts(3, 2)).await;
+        progress.record(&event(b, EventKind::New(v)));
+        streams.wait(&counts(4, 2)).await;
+        store
+            .record_objects(
+                a,
+                &[ObjectChange::Upsert(SeenObject {
+                    key: "k".into(),
+                    etag: None,
+                    size: 1,
+                    last_modified: None,
+                })],
+                None,
+            )
+            .unwrap();
+        store
+            .set_source_state(b, SourceState::Paused, None)
+            .unwrap();
+        progress.touch();
+        streams.wait(&counts(6, 3)).await;
+        store.delete_source(b).unwrap();
+        progress.forget(b);
+        streams.wait(&counts(7, 3)).await;
+
+        let kinds = |u: &[ProgressUpdate]| u.iter().map(|u| u.kind).collect::<Vec<_>>();
+        let reference = &streams.got[0];
+        assert_eq!(
+            kinds(reference),
+            [
+                Kind::Snapshot as i32,
+                Kind::Snapshot as i32,
+                Kind::Counters as i32,
+                Kind::Counters as i32,
+                Kind::Counters as i32,
+                Kind::StateChanged as i32,
+                Kind::Removed as i32,
+            ]
+        );
+        for i in all {
+            assert_eq!(&streams.got[i], reference, "stream {i}");
+        }
+        let a_id = a.to_string();
+        let of_a: Vec<_> = reference
+            .iter()
+            .filter(|u| u.progress.as_ref().is_some_and(|p| p.source_id == a_id))
+            .cloned()
+            .collect();
+        for i in only_a {
+            assert_eq!(streams.got[i], of_a, "stream {i}");
+        }
+
+        // The producer stops with the last stream, and starts again with the next one.
+        streams.rx.clear();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while snapshots.is_producing() {
+            assert!(tokio::time::Instant::now() < deadline, "the producer stops");
+            progress.touch();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (tx, mut rx) = mpsc::channel(64);
+        tokio::spawn(
+            Watch {
+                snapshots: Arc::clone(&snapshots),
+                only: vec![],
+                shutdown: shutdown.clone(),
+            }
+            .run(tx),
+        );
+        let first = rx.recv().await.unwrap().unwrap();
+        assert_eq!(first.kind, Kind::Snapshot as i32);
+        assert_eq!(first.progress.unwrap().counters.unwrap().seen, 1);
+        shutdown_tx.send_replace(true);
+        assert!(rx.recv().await.is_none(), "the stream ends on shutdown");
     }
 
     #[test]

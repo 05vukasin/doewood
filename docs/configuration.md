@@ -128,6 +128,18 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
   prepared statements. Session mode and a direct connection need nothing.
 - **Cache purge.** Every hour (first a minute after the start), each instance deletes the
   expired registry answers and icons. Every instance does it; the delete is idempotent.
+
+### The instance store
+
+`doewood.sqlite` runs in WAL mode with `synchronous = NORMAL`, and a `journal_size_limit` of
+64 MiB: after a large transaction the `-wal` file shrinks back to that at the next checkpoint.
+Its one connection keeps up to 128 prepared statements. At open it runs
+`PRAGMA optimize = 0x10002`, and the hourly cache purge task runs `PRAGMA optimize`, so the
+planner statistics follow tables that grow from empty to millions of rows. Schema 10 (issues
+#72 and #73) keeps per-source status counters of `objects_seen` and `llm_jobs`
+(`object_counts`, `llm_job_counts`, updated by triggers in the same transaction), adds an
+index for a source's newest failed summary, and drops `objects_seen_by_status`, which held the
+same entries as `objects_seen_pending`.
 - **pgvector** is used when the server has it: doewood creates the extension (this needs a role
   allowed to) and adds `search_index.embedding`. Without it, this is logged once and search runs
   on full text only.

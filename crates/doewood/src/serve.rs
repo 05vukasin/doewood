@@ -160,8 +160,9 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
         None
     };
 
-    // Expired registry answers and icons are purged from the backend every hour.
-    let purging = cleanup::start(backend_rx.clone(), shutdown_rx.clone());
+    // Expired registry answers and icons are purged from the backend every hour, and the
+    // instance store's planner statistics refreshed.
+    let purging = cleanup::start(Arc::clone(&store), backend_rx.clone(), shutdown_rx.clone());
 
     let progress = Arc::new(Progress::new());
     let ingest = ingest::build(&config, &store, backend_rx.clone(), &progress).await;
