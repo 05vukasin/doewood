@@ -7,7 +7,8 @@
 //! - `favicon.egress_proxy`: an `http://` or `https://` proxy URL (no credentials) all favicon
 //!   requests go through. Unset: direct.
 //!
-//! There is no RPC to set them yet; `Store::set_favicon_settings` is the one writer.
+//! `ConfigService.SetEnrichmentSettings` sets them (through `Store::set_enrichment_settings`,
+//! which writes the same rows).
 
 use super::Store;
 use crate::StoreError;

@@ -6,7 +6,7 @@ doewood has two kinds of settings, and each setting has exactly one source
 - **Bootstrap values** come from environment variables, listed below. Every one has a default,
   so `doewood serve` starts with no environment at all.
 - **Runtime settings** (S3 sources and credentials, AI providers, policies, schedules, ingest
-  tuning) are set through the [gRPC API](api.md) and kept in the instance's SQLite store.
+  tuning, company enrichment and icons) are set through the [gRPC API](api.md) and kept in the instance's SQLite store.
   Secrets are encrypted with the master key and are write-only: the API never returns them.
 
 ## Runtime settings
@@ -22,13 +22,21 @@ Set through the API, kept in `doewood.sqlite`, applied without a restart:
 | An AI provider's API key | `SetAiProvider` | secret `ai/<name>/api_key` (sealed, write-only) |
 | The default AI provider (the LLM queue's) | `SetAiProvider` (`make_default`; the first one set) | setting `ai.default_provider` |
 | Ingest: least MinHash Jaccard estimate for a `similar_to` edge (above 0, at most 1, default `0.8`). Read for every file, so a change applies to the next file ingested. Edges already written are kept; `ReprocessJob` with `force` compares a source's documents again (a lower value adds edges, a higher one removes none). | `SetIngestSettings`, read with `GetIngestSettings` | setting `ingest.similar_min_jaccard` |
-| Company icons: ask the public fallback service (default off) | none yet (see [favicons.md](favicons.md#settings)) | setting `favicon.fallback` |
-| Company icons: the egress proxy (`http://` or `https://`, no credentials; default none) | none yet | setting `favicon.egress_proxy` |
+| Enrichment: the registry switches for GLEIF, VIES, Wikidata, EDGAR, APR and Companies House (all default on; Companies House is asked only once its key is set) | `SetEnrichmentSettings`, read with `GetEnrichmentSettings` | settings `registry.<gleif\|vies\|wikidata\|edgar\|apr\|companies_house>.enabled` |
+| Enrichment: the EDGAR contact for the SEC's `User-Agent` (printable ASCII, at most 200 characters; default none: the generic `User-Agent`) | `SetEnrichmentSettings` | setting `registry.edgar.contact` |
+| Enrichment: the Companies House API key | `SetEnrichmentSettings` | secret `registry/companies_house/api_key` (sealed, write-only) |
+| Enrichment: the OpenCorporates API key (no client uses it yet) | `SetEnrichmentSettings` | secret `registry/opencorporates/api_key` (sealed, write-only) |
+| Enrichment: extra root certificates for APR's download (PEM, at most 64 KiB; default none) | `SetEnrichmentSettings` | secret `registry/apr/extra_roots_pem` (sealed, write-only) |
+| Company icons: ask the public fallback service (default off). Read for every icon lookup. | `SetEnrichmentSettings` (see [favicons.md](favicons.md#settings)) | setting `favicon.fallback` |
+| Company icons: the egress proxy (`http://` or `https://`, no credentials; default none). Read for every icon lookup. | `SetEnrichmentSettings` | setting `favicon.egress_proxy` |
 
 The LLM queue's state is in the store too: `llm_jobs` (queued documents) and `llm_usage` (each
 source's spend per UTC day). The provider variables quail and hedgehog read (`AI_PROVIDER`,
 `OPENAI_API_KEY`, `AI_MAX_CONCURRENT_LLM`, ...) are **not** read by doewood: providers come only
 from the store. See [llm.md](llm.md).
+
+The enrichment job reads its settings on every pass, so a change applies to the next pass;
+see [registries.md](registries.md#configuring-the-registries).
 
 ## Bootstrap variables
 

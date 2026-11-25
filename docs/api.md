@@ -29,7 +29,7 @@ The S3 event webhook is not part of the gRPC API: it is on the ops server (see
 
 | service | RPCs |
 |---|---|
-| `ConfigService` | `AddSource`, `UpdateSource`, `PauseSource`, `ResumeSource`, `RemoveSource`, `ListSources`, `GetSource`, `SetLlmPolicy`, `SetAiProvider`, `ListAiProviders`, `GetIngestSettings`, `SetIngestSettings` |
+| `ConfigService` | `AddSource`, `UpdateSource`, `PauseSource`, `ResumeSource`, `RemoveSource`, `ListSources`, `GetSource`, `SetLlmPolicy`, `SetAiProvider`, `ListAiProviders`, `GetIngestSettings`, `SetIngestSettings`, `GetEnrichmentSettings`, `SetEnrichmentSettings` |
 | `JobsService` | `WatchProgress` (server stream), `ReprocessJob`, `WatchReprocess` (server stream) |
 | `RecordsService` | `GetRecord`, `ListRecords` |
 | `GraphService` | `GetNode`, `Neighbours`, `CompanyDocuments` |
@@ -93,6 +93,33 @@ The comments in the `.proto` files are the reference for every field. In short:
   `force: true` compares a source's documents again (a lower value adds edges, a higher one
   removes none). It replaces the old `DOEWOOD_SIMILAR_MIN_JACCARD` variable (see
   [configuration.md](configuration.md)).
+
+### Enrichment settings
+
+Company enrichment's runtime settings (ADR 0002 section 7). The enrichment job reads them on
+every pass and the icon route on every lookup, so a change needs no restart.
+
+- **GetEnrichmentSettings** returns them, defaults filled in: the registry switches
+  (`gleif_enabled`, `vies_enabled`, `wikidata_enabled`, `edgar_enabled`, `apr_enabled`,
+  `companies_house_enabled`, all default `true`), `edgar_contact` (default empty: the generic
+  User-Agent), `favicon_fallback` (default `false`) and `favicon_egress_proxy` (default
+  empty: direct). Secrets come back only as `companies_house_api_key_set`,
+  `opencorporates_api_key_set` and `apr_extra_roots_set`. `companies_house_active` is
+  `companies_house_enabled` and a key set: Companies House is asked only then.
+- **SetEnrichmentSettings** changes them, all or nothing; an unset field keeps its value. The
+  write-only fields work as `SetAiProvider`'s `api_key`: empty keeps the stored value, the
+  `clear_` field deletes it, and both at once is `INVALID_ARGUMENT`.
+  - `companies_house_api_key`, `opencorporates_api_key`: 8 to 256 printable ASCII characters,
+    without spaces or `:` (surrounding white space is trimmed).
+  - `apr_extra_roots_pem`: a PEM bundle of at most 64 KiB whose certificates parse.
+  - `edgar_contact`: at most 200 printable ASCII characters; empty goes back to the generic
+    User-Agent.
+  - `favicon_egress_proxy`: `http://` or `https://`, a host, no credentials (the favicon
+    guard's check); empty removes it.
+
+  A wrong value is `INVALID_ARGUMENT` with the field, and the message never echoes a key or
+  the PEM. See [registries.md](registries.md#configuring-the-registries) for what each
+  registry needs.
 
 ### Progress
 
@@ -222,6 +249,17 @@ Ingest settings:
 grpcurl -plaintext -d '{"similar_min_jaccard": 0.85}' \
     127.0.0.1:7443 doewood.v1.ConfigService/SetIngestSettings
 grpcurl -plaintext 127.0.0.1:7443 doewood.v1.ConfigService/GetIngestSettings
+```
+
+Enrichment settings (the key is a placeholder; a key is never returned):
+
+```sh
+grpcurl -plaintext -d '{"companies_house_api_key": "<your key>",
+    "edgar_contact": "Example Ops ops@example.invalid", "favicon_fallback": true}' \
+    127.0.0.1:7443 doewood.v1.ConfigService/SetEnrichmentSettings
+grpcurl -plaintext -d '{"clear_companies_house_api_key": true}' \
+    127.0.0.1:7443 doewood.v1.ConfigService/SetEnrichmentSettings
+grpcurl -plaintext 127.0.0.1:7443 doewood.v1.ConfigService/GetEnrichmentSettings
 ```
 
 Progress, records, the graph and search:

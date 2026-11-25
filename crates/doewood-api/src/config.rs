@@ -1,5 +1,5 @@
-//! `ConfigService`: sources, LLM policies, AI providers and ingest's settings. Every change
-//! applies without a restart; secrets are write-only.
+//! `ConfigService`: sources, LLM policies, AI providers, ingest's and enrichment's settings.
+//! Every change applies without a restart; secrets are write-only.
 
 use doewood_core::SourceId;
 use doewood_model::SourceKey;
@@ -12,14 +12,15 @@ use tracing::{info, warn};
 
 use crate::pb::config_service_server::ConfigService;
 use crate::pb::{
-    AddSourceRequest, AiProvider, GetIngestSettingsRequest, GetSourceRequest, IngestSettings,
-    ListAiProvidersRequest, ListAiProvidersResponse, ListSourcesRequest, ListSourcesResponse,
-    PauseSourceRequest, RemoveSourceRequest, RemoveSourceResponse, ResumeSourceRequest,
-    SetAiProviderRequest, SetIngestSettingsRequest, SetLlmPolicyRequest, Source,
+    AddSourceRequest, AiProvider, EnrichmentSettings, GetEnrichmentSettingsRequest,
+    GetIngestSettingsRequest, GetSourceRequest, IngestSettings, ListAiProvidersRequest,
+    ListAiProvidersResponse, ListSourcesRequest, ListSourcesResponse, PauseSourceRequest,
+    RemoveSourceRequest, RemoveSourceResponse, ResumeSourceRequest, SetAiProviderRequest,
+    SetEnrichmentSettingsRequest, SetIngestSettingsRequest, SetLlmPolicyRequest, Source,
     UpdateSourceRequest,
 };
 use crate::validate::{self, Violations};
-use crate::{Api, ApiState, claims, convert, error};
+use crate::{Api, ApiState, claims, convert, enrichment, error};
 
 /// Longest model name accepted.
 const MODEL_MAX_LEN: usize = 256;
@@ -495,5 +496,45 @@ impl ConfigService for Api {
             "ingest settings set"
         );
         Ok(Response::new(convert::ingest_settings(settings)))
+    }
+
+    async fn get_enrichment_settings(
+        &self,
+        _request: Request<GetEnrichmentSettingsRequest>,
+    ) -> Result<Response<EnrichmentSettings>, Status> {
+        let settings = self
+            .state
+            .db(doewood_store::Store::enrichment_settings)
+            .await?;
+        Ok(Response::new(enrichment::settings_pb(&settings)))
+    }
+
+    async fn set_enrichment_settings(
+        &self,
+        request: Request<SetEnrichmentSettingsRequest>,
+    ) -> Result<Response<EnrichmentSettings>, Status> {
+        let patch = enrichment::check(request.get_ref())?;
+        let settings = self
+            .state
+            .db(move |s| s.set_enrichment_settings(&patch))
+            .await?;
+        // Switches and "is set" only: never a secret, nor the contact (personal data).
+        let r = settings.registries;
+        info!(
+            gleif = r.gleif,
+            vies = r.vies,
+            wikidata = r.wikidata,
+            edgar = r.edgar,
+            apr = r.apr,
+            companies_house = r.companies_house,
+            companies_house_active = settings.companies_house_active(),
+            opencorporates_api_key_set = settings.opencorporates_key_set,
+            edgar_contact_set = settings.edgar_contact.is_some(),
+            apr_extra_roots_set = settings.apr_extra_roots_set,
+            favicon_fallback = settings.favicon.fallback,
+            favicon_egress_proxy_set = settings.favicon.egress_proxy.is_some(),
+            "enrichment settings set"
+        );
+        Ok(Response::new(enrichment::settings_pb(&settings)))
     }
 }

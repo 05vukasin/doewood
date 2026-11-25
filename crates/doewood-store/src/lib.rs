@@ -8,9 +8,10 @@
 //! - A single writer: every statement goes through one connection behind a mutex.
 //! - The schema is migrated on open from SQL embedded in the binary.
 //! - Secrets are sealed with XChaCha20-Poly1305 under the master key and are **write-only**
-//!   through the public API: they can be set, deleted and tested for, never read back. The one
-//!   exception is the connectors' access path, [`Store::source_credentials`], which decrypts only
-//!   the secret a source names, for the S3 client; the API never calls it.
+//!   through the public API: they can be set, deleted and tested for, never read back. The
+//!   exceptions are the connectors' access paths ([`Store::source_credentials`] for the S3 client,
+//!   [`Store::ai_api_key`] for the LLM, [`Store::enrichment_config`] for the enrichment job),
+//!   which the API never calls.
 
 mod crypto;
 mod error;
@@ -25,6 +26,13 @@ pub use standalone::Standalone;
 pub use store::ai::{
     AI_PRESETS, AiProvider, AiProviderInput, ApiKey, DEFAULT_AI_PROVIDER, KeyChange,
     valid_provider_name,
+};
+pub use store::enrichment::{
+    APR_ENABLED, APR_EXTRA_ROOTS_SECRET, COMPANIES_HOUSE_ENABLED, COMPANIES_HOUSE_KEY_SECRET,
+    EDGAR_CONTACT, EDGAR_CONTACT_MAX_CHARS, EDGAR_ENABLED, EnrichmentConfig, EnrichmentSettings,
+    EnrichmentSettingsPatch, GLEIF_ENABLED, OPENCORPORATES_KEY_SECRET, PEM_MAX_LEN,
+    RegistrySwitches, RegistrySwitchesPatch, RootsChange, RootsPem, VIES_ENABLED, WIKIDATA_ENABLED,
+    valid_edgar_contact,
 };
 pub use store::favicon::{
     FAVICON_EGRESS_PROXY, FAVICON_FALLBACK, FaviconSettings, FaviconSettingsPatch,
