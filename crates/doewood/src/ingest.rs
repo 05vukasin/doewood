@@ -30,10 +30,7 @@ pub async fn build(
     backend: watch::Receiver<Option<Arc<dyn Backend>>>,
     progress: &Arc<Progress>,
 ) -> Option<(Ingest, Summaries)> {
-    let mut ingest_config = IngestConfig::new(config.ingest_jobs, &config.ocr_models);
-    if let Some(bytes) = config.ingest_budget_bytes {
-        ingest_config.memory_budget = bytes;
-    }
+    let ingest_config = ingest_config(config);
     let analyzer_config = ingest_config.analyzer.clone();
     // Checking the OCR models reads (and hashes) them: off the async threads.
     let analyzer = tokio::task::spawn_blocking(move || Analyzer::new(&analyzer_config)).await;
@@ -51,6 +48,7 @@ pub async fn build(
     info!(
         jobs = ingest_config.jobs,
         memory_budget_mib = ingest_config.memory_budget >> 20,
+        sheet_max_cells = ingest_config.analyzer.sheet_max_cells,
         ocr = ?analyzer.ocr(),
         "ingest configured"
     );
@@ -164,6 +162,19 @@ fn forward(mut from: watch::Receiver<ReprocessStatus>) -> watch::Receiver<Reproc
     rx
 }
 
+/// Ingest's configuration: sized from the CPUs and memory, with the bootstrap overrides
+/// (`DOEWOOD_INGEST_BUDGET_MIB`, `DOEWOOD_INGEST_MAX_CELLS`) on top.
+fn ingest_config(config: &BootstrapConfig) -> IngestConfig {
+    let mut ingest_config = IngestConfig::new(config.ingest_jobs, &config.ocr_models);
+    if let Some(bytes) = config.ingest_budget_bytes {
+        ingest_config.memory_budget = bytes;
+    }
+    if let Some(cells) = config.ingest_max_cells {
+        ingest_config.analyzer.sheet_max_cells = cells;
+    }
+    ingest_config
+}
+
 fn view(s: &ReprocessStatus) -> ReprocessView {
     ReprocessView {
         job: s.job,
@@ -181,5 +192,51 @@ fn view(s: &ReprocessStatus) -> ReprocessView {
         failed: s.failed,
         pending: s.pending,
         error: s.error.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+
+    use doewood_core::BootstrapConfig;
+    use doewood_ingest::sheet;
+
+    use super::ingest_config;
+
+    fn config(env: &[(&str, &str)]) -> BootstrapConfig {
+        let env: Vec<(String, OsString)> = env
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), OsString::from(v)))
+            .collect();
+        let lookup = |var: &str| env.iter().find(|(k, _)| k == var).map(|(_, v)| v.clone());
+        BootstrapConfig::from_lookup(lookup, || Some(OsString::from("h"))).config
+    }
+
+    #[test]
+    fn the_bootstrap_overrides_win() {
+        let auto = ingest_config(&config(&[("DOEWOOD_INGEST_JOBS", "2")]));
+        let cells = auto.analyzer.sheet_max_cells;
+        assert!(
+            (sheet::MIN_AUTO_CELLS..=sheet::MAX_AUTO_CELLS).contains(&cells),
+            "{cells}"
+        );
+        let set = ingest_config(&config(&[
+            ("DOEWOOD_INGEST_JOBS", "2"),
+            ("DOEWOOD_INGEST_BUDGET_MIB", "64"),
+            ("DOEWOOD_INGEST_MAX_CELLS", "20000000"),
+        ]));
+        assert_eq!(set.memory_budget, 64 << 20);
+        assert_eq!(set.analyzer.sheet_max_cells, 20_000_000);
+        // An invalid value warns (see doewood-core) and leaves the automatic cap.
+        let bad = ingest_config(&config(&[
+            ("DOEWOOD_INGEST_JOBS", "2"),
+            ("DOEWOOD_INGEST_MAX_CELLS", "lots"),
+        ]));
+        let cells = bad.analyzer.sheet_max_cells;
+        assert!(
+            (sheet::MIN_AUTO_CELLS..=sheet::MAX_AUTO_CELLS).contains(&cells),
+            "{cells}"
+        );
     }
 }

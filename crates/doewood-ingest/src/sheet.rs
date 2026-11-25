@@ -20,7 +20,7 @@ pub const READ_ID: AnalyzerId = AnalyzerId::new("sheet.read", 1);
 /// The step that finds the tables.
 pub const TABLES_ID: AnalyzerId = AnalyzerId::new("sheet.tables", 1);
 /// The hedgehog revision doewood is built with (a step version for reprocessing).
-pub const HEDGEHOG_REV: &str = "c418c2b";
+pub const HEDGEHOG_REV: &str = "fac6eba";
 
 /// Fact keys of the `sheet.*` namespace.
 pub mod keys {
@@ -57,12 +57,37 @@ const MAX_SHEETS: usize = 200;
 /// workbook and its normalizer. Measured with `big_spreadsheets` (`tests/pipeline.rs`): 200 to
 /// 300 bytes a cell for numbers and text, file included; 380 MiB for 960k cells in #63.
 pub const CELL_BYTES: u64 = 320;
-/// Most cells read from one workbook (hedgehog's `max_cells`, and `max_shared_strings`): what
-/// one worker's plan ([`WORKER_BYTES`](crate::pipeline::WORKER_BYTES), 512 MiB) holds at
-/// [`CELL_BYTES`] a cell, rounded down to 100,000: 1,600,000. A bigger workbook fails like any
-/// other refused file (`sheet.read@1: file refused: the workbook has more than 1,600,000
-/// cells ...`), with its identity facts kept.
-pub const MAX_CELLS: u64 = crate::pipeline::WORKER_BYTES / CELL_BYTES / 100_000 * 100_000;
+/// The smallest automatic cell cap: what one worker's plan
+/// ([`WORKER_BYTES`](crate::pipeline::WORKER_BYTES), 512 MiB) holds, by [`cells_for`]:
+/// 1,600,000.
+pub const MIN_AUTO_CELLS: u64 =
+    crate::pipeline::WORKER_BYTES / CELL_BYTES / CELLS_STEP * CELLS_STEP;
+/// The largest automatic cell cap: hedgehog's own default (10,000,000). Only
+/// `DOEWOOD_INGEST_MAX_CELLS` goes above it.
+pub const MAX_AUTO_CELLS: u64 = hh_core::reader::DEFAULT_MAX_CELLS;
+/// Automatic cell caps are whole multiples of this.
+const CELLS_STEP: u64 = 100_000;
+/// The bootstrap variable that sets the cell cap, named in the refusal.
+const MAX_CELLS_VAR: &str = doewood_core::config::vars::INGEST_MAX_CELLS;
+
+/// The cell cap (hedgehog's `max_cells`, and `max_shared_strings`) for `worker_bytes` of
+/// memory per worker: what they hold at [`CELL_BYTES`] a cell, rounded down to 100,000, from
+/// [`MIN_AUTO_CELLS`] to [`MAX_AUTO_CELLS`]. 512 MiB: 1,600,000; 2 GiB: 6,700,000.
+pub const fn cells_for(worker_bytes: u64) -> u64 {
+    let cells = worker_bytes / CELL_BYTES / CELLS_STEP * CELLS_STEP;
+    if cells < MIN_AUTO_CELLS {
+        MIN_AUTO_CELLS
+    } else if cells > MAX_AUTO_CELLS {
+        MAX_AUTO_CELLS
+    } else {
+        cells
+    }
+}
+
+/// Whether hedgehog refused a workbook over the cell cap (its cells or its shared strings).
+fn over_cell_cap(error: &str) -> bool {
+    error.contains(" cells (limit ") || error.contains(" shared strings (limit ")
+}
 
 /// What hedgehog made of a workbook.
 #[derive(Debug, Default)]
@@ -80,13 +105,15 @@ pub struct SheetOutcome {
 /// Reads and analyzes a workbook, stopping at `deadline` (the file's): hedgehog's read checks
 /// it per sheet and every 65,536 cells, its normalizer per sheet. A read past it fails the
 /// workbook (`sheet.read@1: file refused: ...time limit`); tables past it are a problem
-/// (`sheet.tables@1: ...`). At most [`MAX_CELLS`] cells are read.
+/// (`sheet.tables@1: ...`). At most [`MIN_AUTO_CELLS`] cells are read.
 pub fn analyze(bytes: &[u8], name: &str, format: &str, deadline: Option<Instant>) -> SheetOutcome {
-    analyze_with(bytes, name, format, deadline, MAX_CELLS)
+    analyze_with(bytes, name, format, deadline, MIN_AUTO_CELLS)
 }
 
 /// [`analyze`] with another cell cap: a workbook of more than `max_cells` cells (or shared
-/// strings) fails (`sheet.read@1: file refused: the workbook has more than ... cells`).
+/// strings) fails like any other refused file, with its identity facts kept
+/// (`sheet.read@1: file refused: the workbook has more than ... cells (limit ...); ...`, which
+/// says how to raise the cap).
 pub fn analyze_with(
     bytes: &[u8],
     name: &str,
@@ -109,7 +136,15 @@ pub fn analyze_with(
     let wb = match read {
         Ok(Ok(wb)) => wb,
         Ok(Err(e)) => {
-            out.failed = Some(format!("{READ_ID}: {e}"));
+            let e = e.to_string();
+            out.failed = Some(if over_cell_cap(&e) {
+                format!(
+                    "{READ_ID}: {e}; {MAX_CELLS_VAR} raises the cap (it follows the memory per \
+                     ingest worker)"
+                )
+            } else {
+                format!("{READ_ID}: {e}")
+            });
             return out;
         }
         Err(panic) => {

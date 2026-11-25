@@ -46,7 +46,9 @@ pub struct AnalyzerConfig {
     pub file_timeout: Duration,
     /// Largest file analyzed (`Limits::max_bytes`); bigger ones get identity only.
     pub max_bytes: u64,
-    /// Most cells read from one workbook ([`sheet::MAX_CELLS`]); a bigger one fails.
+    /// Most cells read from one workbook (`DOEWOOD_INGEST_MAX_CELLS`, else
+    /// [`plan_cells`](crate::pipeline::plan_cells); by default [`sheet::MIN_AUTO_CELLS`]); a
+    /// bigger one fails.
     pub sheet_max_cells: u64,
     /// File workers that share the engine (sizes the OCR permits).
     pub workers: usize,
@@ -59,7 +61,7 @@ impl Default for AnalyzerConfig {
         Self {
             file_timeout: Limits::default().timeout,
             max_bytes: Limits::default().max_bytes,
-            sheet_max_cells: sheet::MAX_CELLS,
+            sheet_max_cells: sheet::MIN_AUTO_CELLS,
             workers: 1,
             ocr_models: PathBuf::from("ocr-models"),
         }
