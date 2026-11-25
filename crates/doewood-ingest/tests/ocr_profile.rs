@@ -133,7 +133,8 @@ fn page_lines(seed: u64) -> Vec<String> {
             line = format!("{:>2}. {line}", i / 3 + 1);
         }
         if i % 2 == 0 {
-            line.push_str(&format!("  {}.{:02} EUR", next() % 9000 + 10, next() % 100));
+            let (units, cents) = (next() % 9000 + 10, next() % 100);
+            line = format!("{line}  {units}.{cents:02} EUR");
         }
         lines.push(line);
     }
@@ -194,13 +195,13 @@ fn scan_pdf(images: &[Image]) -> Vec<u8> {
         ];
         let content = Content { operations: ops };
         let content_id = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
-        let page_id = doc.add_object(dictionary! {
+        let leaf = doc.add_object(dictionary! {
             "Type" => "Page",
             "Parent" => pages_id,
             "Contents" => content_id,
             "Resources" => dictionary! { "XObject" => dictionary! { "Im1" => image_id } },
         });
-        kids.push(page_id.into());
+        kids.push(leaf.into());
     }
     let count = i64::try_from(kids.len()).unwrap();
     doc.objects.insert(
@@ -570,12 +571,12 @@ fn analyzer_workers() {
     let n = env_usize("OCR_FILES").unwrap_or(8).max(1);
     let pages = env_usize("OCR_FILE_PAGES").unwrap_or(1).max(1);
     let files = scan_files(n, pages);
-    let (a, load) = measure(|| analyzer(dir, workers, env_usize("OCR_JOBS")));
+    let (analyzer, load) = measure(|| analyzer(dir, workers, env_usize("OCR_JOBS")));
     load.report("analyzer built");
-    println!("{workers} worker(s), {:?}", a.ocr());
+    println!("{workers} worker(s), {:?}", analyzer.ocr());
     let next = AtomicUsize::new(0);
     let results = Mutex::new(Vec::new());
-    let ((), u) = measure(|| {
+    let ((), usage) = measure(|| {
         std::thread::scope(|s| {
             for _ in 0..workers {
                 s.spawn(|| {
@@ -583,7 +584,7 @@ fn analyzer_workers() {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         let Some(f) = files.get(i) else { break };
                         let t = Instant::now();
-                        let (_, steps, ocr) = record_text(&a, f.clone());
+                        let (_, steps, ocr) = record_text(&analyzer, f.clone());
                         results.lock().unwrap().push((t.elapsed(), steps, ocr));
                     }
                 });
@@ -593,13 +594,13 @@ fn analyzer_workers() {
     let results = results.into_inner().unwrap();
     let total = n * pages;
     let read: i64 = results.iter().map(|r| r.2).sum();
-    assert_eq!(read, total as i64, "every page OCR'd");
-    u.report(&format!("{n} files x {pages} page(s), {workers} worker(s)"));
+    assert_eq!(read, i64::try_from(total).unwrap(), "every page OCR'd");
+    usage.report(&format!("{n} files x {pages} page(s), {workers} worker(s)"));
     println!(
         "  {:.3} pages/s, {:.2} s wall a page, {:.2} CPU s a page; file time median {:.2} s",
-        total as f64 / u.wall.as_secs_f64(),
-        u.wall.as_secs_f64() / total as f64,
-        u.cpu / total as f64,
+        total as f64 / usage.wall.as_secs_f64(),
+        usage.wall.as_secs_f64() / total as f64,
+        usage.cpu / total as f64,
         median(results.iter().map(|r| r.0.as_secs_f64()).collect())
     );
     let mut steps: BTreeMap<String, u64> = BTreeMap::new();
@@ -674,6 +675,9 @@ fn engines() {
     );
 }
 
+/// Ingest workers and `DOEWOOD_OCR_JOBS`.
+type Setting = (usize, Option<usize>);
+
 /// The settings measured give the same bytes: the engine's output for every thread count, and
 /// the analyzer's records (without timings) for 1 and 4 workers and 1, 2 and 4 OCR jobs.
 #[test]
@@ -706,7 +710,7 @@ fn same_output() {
 
     // The analyzer as configured by `DOEWOOD_INGEST_JOBS` and `DOEWOOD_OCR_JOBS`; with 4
     // workers and several OCR jobs the files are read side by side.
-    let mut runs: Vec<((usize, Option<usize>), Vec<String>)> = Vec::new();
+    let mut runs: Vec<(Setting, Vec<String>)> = Vec::new();
     for (workers, jobs) in [(1, None), (4, None), (4, Some(2)), (4, Some(4))] {
         let a = analyzer(dir.clone(), workers, jobs);
         let next = AtomicUsize::new(0);
