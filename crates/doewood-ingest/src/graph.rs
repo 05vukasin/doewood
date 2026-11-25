@@ -340,6 +340,9 @@ impl GraphWriter {
         facts: &DocFacts,
         stats: &mut WriteStats,
     ) -> Result<()> {
+        if facts.parties.is_empty() {
+            return Ok(()); // nothing to match: no lock, no reads
+        }
         // One edge per company: candidates that resolve to the same one merge their roles.
         let mut edges: BTreeMap<Uuid, (Party, Match)> = BTreeMap::new();
         let waited = Instant::now();
