@@ -1882,3 +1882,131 @@ async fn a_merge_that_waits_for_the_other_company_is_done_later() {
     }
     backends.drop_schema().await;
 }
+
+/// A person merges company C into W while GLEIF is asked about C (issue #62): C's job stops
+/// at its first own write, so no alias, props or freshness land on the merged-away C, and W
+/// is due for every registry. The next pass enriches W, which now owns C's LEI.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_company_merged_away_during_its_job_gets_no_aliases_props_or_freshness() {
+    let lei_c = lei("HUSKWRITES");
+    let ch = "99000031";
+    let mut records = BTreeMap::new();
+    records.insert(
+        lei_c.clone(),
+        (
+            gleif_record(&lei_c, "FICTIVE HUSK WRITES LIMITED", "GB", ch),
+            None,
+        ),
+    );
+    let (open, gate) = watch::channel(false);
+    let parent_path = format!("/gleif/lei-records/{lei_c}/direct-parent-relationship");
+    let held = parent_path.clone();
+    let mock = Mock::start(move |_, target| {
+        if target == held {
+            return gleif(target, &records).unwrap().held(&gate);
+        }
+        if let Some(r) = gleif(target, &records) {
+            return r;
+        }
+        Reply::status(404)
+    })
+    .await;
+    let backends = Backends::all().await;
+    for (name, b, store) in &backends.list {
+        settings(store, &[("wikidata", false)], None);
+        open.send_replace(false);
+        let c = company(
+            b,
+            "Fictive Husk Writes Limited",
+            "GB",
+            &[(IdKind::Lei, &lei_c)],
+            &[],
+            1,
+            None,
+        )
+        .await;
+        // W was enriched a while ago and is not due; another instance holds it in this pass.
+        let w = company(b, "Fictive Husk Keeper Limited", "GB", &[], &[], 2, None).await;
+        let month = Duration::from_hours(30 * 24);
+        let w_before = b
+            .record_enrichment(w, &[("gleif".to_owned(), month)])
+            .await
+            .unwrap();
+        let elsewhere = InstanceId::new("enrich-elsewhere").unwrap();
+        assert!(
+            b.lease_company(w, &elsewhere, Duration::from_mins(5))
+                .await
+                .unwrap()
+        );
+        let job = job(b, store, &mock, "enrich-husk-writes");
+        let before = mock.count(&parent_path);
+        let run = spawn_pass(&job, b);
+        // C's job has its GLEIF record and asks for the parent; the answer waits.
+        let (m, path) = (&mock, &parent_path);
+        until(
+            "the parent request",
+            || async move { m.count(path) > before },
+        )
+        .await;
+        b.merge_companies(&MergeRequest {
+            survivor: w,
+            absorbed: c,
+            actor: MergeActor {
+                kind: MergeActorKind::Manual,
+                instance: InstanceId::new("person").unwrap(),
+            },
+            evidence: json!([]),
+            confidence: 1.0,
+            probability: 1.0,
+        })
+        .await
+        .unwrap();
+        let husk = props(b, c).await;
+        open.send_replace(true);
+        assert_eq!(run.await.unwrap(), 1, "{name}");
+
+        // Nothing landed on the husk C.
+        assert_eq!(props(b, c).await, husk, "{name}");
+        for key in ["registry", "legal_name", "enriched_at", "registry_ids"] {
+            assert!(husk.get(key).is_none(), "{name}: {key} on the husk {husk}");
+        }
+        assert!(b.aliases_of(c).await.unwrap().is_empty(), "{name}");
+        let ch_alias = format!("reg:companies_house:{ch}");
+        assert_eq!(owner(b, &ch_alias).await, None, "{name}: not claimed");
+        assert_eq!(owner(b, &format!("id:lei:{lei_c}")).await, Some(w));
+        assert_eq!(b.enrichment(c).await.unwrap(), None, "{name}");
+        assert_eq!(job.stats().enriched, 0, "{name} {:?}", job.stats());
+        // W is due now; its last enrichment is as it was.
+        let w_now = b.enrichment(w).await.unwrap().unwrap();
+        assert_eq!(
+            (w_now.enriched_at, w_now.documents),
+            (w_before.enriched_at, w_before.documents),
+            "{name}"
+        );
+        assert!(
+            w_now.next_due["gleif"] < w_before.next_due["gleif"] - 86_400,
+            "{name}: W due again {w_now:?}"
+        );
+
+        // Once W is free, the next pass enriches it with C's LEI.
+        b.release_company(w, &elsewhere).await.unwrap();
+        assert_eq!(pass(&job, b).await, 1, "{name}");
+        assert_eq!(owner(b, &ch_alias).await, Some(w), "{name}");
+        let wp = props(b, w).await;
+        assert_eq!(
+            wp["legal_name"],
+            json!("FICTIVE HUSK WRITES LIMITED"),
+            "{name}"
+        );
+        assert!(wp["registry"].get("gleif").is_some(), "{name} {wp}");
+        let w_after = b.enrichment(w).await.unwrap().unwrap();
+        assert_eq!(
+            (w_after.next_due["gleif"] - w_after.enriched_at) / 86_400,
+            30,
+            "{name} {w_after:?}"
+        );
+        assert_eq!(props(b, c).await, husk, "{name}");
+        assert_eq!(job.stats().enriched, 1, "{name} {:?}", job.stats());
+    }
+    backends.drop_schema().await;
+}

@@ -11,8 +11,9 @@ use doewood_model::{
     LiveEdge, Located, LocationEnded, MERGE_CHAIN_MAX, Neighbour, NeighbourQuery, Node, NodeAlias,
     NodeKind, ObjectLocation, OwnedAlias, PropsPatch, PutOutcome, Record, RecordStore, Result,
     SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore, Sketch, SketchStore,
-    SourceClaim, SourceKey, StepVersions, StoredEdge, band_to_i64, records_limit, sketch_limit,
-    validate_alias, validate_node, validate_sketch, versions_from_json, versions_to_json,
+    SourceClaim, SourceKey, StepVersions, StoredEdge, band_to_i64, merged_into, records_limit,
+    sketch_limit, validate_alias, validate_node, validate_sketch, versions_from_json,
+    versions_to_json,
 };
 use serde_json::Value;
 use time::Date;
@@ -279,6 +280,73 @@ async fn upsert_live_edge(c: &mut Object, edge: &Edge) -> Result<LiveEdge> {
     }
 }
 
+/// [`GraphStore::update_props`]; with `live`, a husk is refused
+/// ([`GraphStore::update_live_props`]), checked under the same row lock as the write.
+async fn update_props(
+    pool: &Pool,
+    id: Uuid,
+    patch: &PropsPatch,
+    live: bool,
+) -> Result<Option<Node>> {
+    patch.validate()?;
+    let mut c = client(pool).await?;
+    let tx = c.transaction().await.map_err(pg)?;
+    // The row lock orders this after any other writer of the node (another patch, an
+    // upsert, a merge) and lets it read what that writer committed.
+    let Some(row) = tx
+        .query_opt(
+            &format!("SELECT {NODE_COLUMNS} FROM nodes n WHERE n.id = $1 FOR UPDATE"),
+            &[&id],
+        )
+        .await
+        .map_err(pg)?
+    else {
+        return Ok(None);
+    };
+    let mut node = node_at(&row, 0)?;
+    if live && let Some(into) = merged_into(&node) {
+        return Err(Error::MergedAway { company: id, into });
+    }
+    let before = std::mem::take(&mut node.props);
+    let mut props = match &before {
+        Value::Object(m) => m.clone(),
+        _ => serde_json::Map::new(),
+    };
+    patch.apply(&mut props);
+    node.props = Value::Object(props);
+    if node.props != before {
+        tx.execute(
+            "UPDATE nodes SET props = $2, updated_at = now() WHERE id = $1",
+            &[&id, &node.props],
+        )
+        .await
+        .map_err(pg)?;
+    }
+    tx.commit().await.map_err(pg)?;
+    Ok(Some(node))
+}
+
+/// Locks node `id` `FOR SHARE` in the transaction `c` and refuses a husk with
+/// [`Error::MergedAway`] (issue #62). A merge locks its companies `FOR UPDATE`, so this waits
+/// for a merge in flight and reads what it committed, and no merge of the node starts until
+/// the transaction ends. `false` when there is no node `id`.
+pub(crate) async fn lock_live(c: &impl GenericClient, id: Uuid) -> Result<bool> {
+    let row = c
+        .query_opt(
+            "SELECT props->>'merged_into' FROM nodes WHERE id = $1 FOR SHARE",
+            &[&id],
+        )
+        .await
+        .map_err(pg)?;
+    match row {
+        None => Ok(false),
+        Some(r) => match merged_into_column(&r) {
+            Some(into) => Err(Error::MergedAway { company: id, into }),
+            None => Ok(true),
+        },
+    }
+}
+
 fn claim_from(key: &SourceKey, row: &Row) -> Result<SourceClaim> {
     let owner: &str = row.try_get(0).map_err(pg)?;
     Ok(SourceClaim {
@@ -399,39 +467,11 @@ impl GraphStore for PgStore {
     }
 
     async fn update_props(&self, id: Uuid, patch: &PropsPatch) -> Result<Option<Node>> {
-        patch.validate()?;
-        let mut c = client(&self.pool).await?;
-        let tx = c.transaction().await.map_err(pg)?;
-        // The row lock orders this after any other writer of the node (another patch, an
-        // upsert, a merge) and lets it read what that writer committed.
-        let Some(row) = tx
-            .query_opt(
-                &format!("SELECT {NODE_COLUMNS} FROM nodes n WHERE n.id = $1 FOR UPDATE"),
-                &[&id],
-            )
-            .await
-            .map_err(pg)?
-        else {
-            return Ok(None);
-        };
-        let mut node = node_at(&row, 0)?;
-        let before = std::mem::take(&mut node.props);
-        let mut props = match &before {
-            Value::Object(m) => m.clone(),
-            _ => serde_json::Map::new(),
-        };
-        patch.apply(&mut props);
-        node.props = Value::Object(props);
-        if node.props != before {
-            tx.execute(
-                "UPDATE nodes SET props = $2, updated_at = now() WHERE id = $1",
-                &[&id, &node.props],
-            )
-            .await
-            .map_err(pg)?;
-        }
-        tx.commit().await.map_err(pg)?;
-        Ok(Some(node))
+        update_props(&self.pool, id, patch, false).await
+    }
+
+    async fn update_live_props(&self, id: Uuid, patch: &PropsPatch) -> Result<Option<Node>> {
+        update_props(&self.pool, id, patch, true).await
     }
 
     async fn node(&self, id: Uuid) -> Result<Option<Node>> {
@@ -642,6 +682,35 @@ impl GraphStore for PgStore {
             node: row.try_get(0).map_err(pg)?,
             props: row.try_get(1).map_err(pg)?,
         })
+    }
+
+    async fn claim_live_alias(
+        &self,
+        kind: NodeKind,
+        alias: &str,
+        node: Uuid,
+        props: &Value,
+    ) -> Result<NodeAlias> {
+        validate_alias(alias, props)?;
+        let mut c = client(&self.pool).await?;
+        let tx = c.transaction().await.map_err(pg)?;
+        // A missing node: the insert below fails as `claim_alias` does.
+        lock_live(&*tx, node).await?;
+        let row = tx
+            .query_one(
+                "INSERT INTO node_aliases (kind, alias, node_id, props) VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (kind, alias) DO UPDATE SET kind = node_aliases.kind \
+                 RETURNING node_id, props",
+                &[&kind.as_str(), &alias, &node, props],
+            )
+            .await
+            .map_err(pg)?;
+        let got = NodeAlias {
+            node: row.try_get(0).map_err(pg)?,
+            props: row.try_get(1).map_err(pg)?,
+        };
+        tx.commit().await.map_err(pg)?;
+        Ok(got)
     }
 
     async fn alias(&self, kind: NodeKind, alias: &str) -> Result<Option<NodeAlias>> {
