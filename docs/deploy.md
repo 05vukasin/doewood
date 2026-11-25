@@ -95,14 +95,16 @@ them, which suits only reads of the shared store (see [Load balancing](#load-bal
 | `podAnnotations`, `podLabels`, `nodeSelector`, `tolerations`, `affinity` | empty | scheduling and metadata |
 
 `/metrics` is on the ops port; add scrape annotations through `podAnnotations` if your
-Prometheus uses them.
+Prometheus uses them. See [Metrics and alerts](#metrics-and-alerts).
 
 ## Load balancing
 
 A Kubernetes `ClusterIP` Service balances **TCP connections**, not calls. A gRPC client keeps
 one HTTP/2 connection and sends every call over it, so without help all of a client's calls
 stay on the pod it first reached, and replicas added later get no existing clients. doewood
-therefore ages its connections: at 30 minutes it sends GOAWAY, the client opens a new
+therefore ages its connections: at 30 minutes (each connection draws its own age within
+±10%, so clients that connected together, for example after a deploy, do not all reconnect at
+the same moment) it sends GOAWAY, the client opens a new
 connection for new calls (which the Service may send to another pod), and the old one is
 closed 5 minutes later, open streams included (see [api.md](api.md#limits)). Load spreads
 again within about half an hour after a scale-up or a restart.
@@ -132,6 +134,27 @@ Clients:
 - Watch again when a stream ends with an error; the first message is a full snapshot.
 - HTTP/2 keepalive: the server PINGs idle connections every 30 s and accepts PINGs from
   clients; a client that wants its own keepalive should not PING more often than every 30 s.
+
+## Metrics and alerts
+
+`/metrics` on the ops port lists the gRPC metrics (calls by method and code, duration, calls
+in flight, shed calls, connections; see [api.md](api.md#metrics)) next to `doewood_ready`.
+Alerts worth setting (tune the thresholds to your traffic):
+
+- **Shedding:** `rate(doewood_grpc_shed_total[5m]) > 0` for 10 minutes. The instance refuses
+  calls because `max_calls_in_flight` is reached: add replicas, or raise the cap if CPU and
+  memory have room.
+- **Errors:** the share of `INTERNAL`, `UNKNOWN` and `DATA_LOSS` among
+  `doewood_grpc_calls_total`, for example above 1% over 10 minutes. `UNAVAILABLE` also rises
+  while the shared Postgres is not connected (see `doewood_ready`).
+- **Latency:** p99 of unary calls,
+  `histogram_quantile(0.99, sum by (le, method) (rate(doewood_grpc_call_duration_seconds_bucket{method!~".*/(Watch.*|ServerReflectionInfo)"}[5m])))`,
+  above a few seconds, or near `deadline_seconds`. Leave the streams (`WatchProgress`,
+  `WatchReprocess`, health `Watch`, reflection) out: their duration is their lifetime.
+- **Load:** `sum(doewood_grpc_calls_in_flight)` near `max_calls_in_flight` (minus the open
+  streams, which do not count against it), and `doewood_grpc_connections_open` per pod, to
+  see whether the clients spread over the replicas.
+- **Not ready:** `doewood_ready == 0` for more than a few minutes.
 
 ## Sizing
 

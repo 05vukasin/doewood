@@ -17,6 +17,10 @@ doewood-model.workspace = true
 doewood-registry.workspace = true
 doewood-s3.workspace = true
 doewood-store.workspace = true
+# The response body wrapper of the request metrics.
+http-body = "1"
+# The request metrics, registered on the binary's ops registry. Text exposition only.
+prometheus = { version = "0.14", default-features = false }
 prost = "0.14"
 serde_json.workspace = true
 time.workspace = true

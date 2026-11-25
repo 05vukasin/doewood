@@ -327,7 +327,7 @@ to do:
 | Streams (calls) at the same time on one HTTP/2 connection | 256 (fixed) | the next call waits in the client until one ends (HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS`); open another connection, or a channel per 256 watches |
 | HTTP/2 keepalive | PING after 30 s without traffic, closed if no answer within 20 s (fixed) | nothing; a dead or vanished peer's connection, streams and tasks are freed |
 | TCP keepalive | probes after 60 s idle (fixed) | nothing; half-open connections behind a NAT or load balancer are found |
-| Connection age | GOAWAY at 30 min, closed 5 min later (fixed) | new calls go to a new connection (which the load balancer may send to another replica); calls already running get the 5 minutes to finish; an open stream still running then ends with a transport error (the connection is closed): watch again |
+| Connection age | GOAWAY at 30 min ± 10% (each connection draws its own age, so clients that connected together do not reconnect together), closed 5 min later (fixed) | new calls go to a new connection (which the load balancer may send to another replica); calls already running get the 5 minutes to finish; an open stream still running then ends with a transport error (the connection is closed): watch again |
 | Calls in flight, per instance | `max_calls_in_flight`, default 256 (runtime setting) | `UNAVAILABLE`, at once, with `overloaded` in the message; retry with backoff (another replica may answer) |
 | Server deadline | `deadline_seconds`, default 60 s (runtime setting) | `DEADLINE_EXCEEDED`; a shorter client `grpc-timeout` wins |
 
@@ -351,6 +351,30 @@ to do:
   exponential backoff with jitter (for example 100 ms doubling to 10 s), and a client
   deadline on every unary call. gRPC clients reconnect on GOAWAY by themselves.
 - **Load balancing** across replicas: see [deploy.md](deploy.md#load-balancing).
+
+## Metrics
+
+The API's metrics are on the ops port's `/metrics` (Prometheus text format), next to
+`doewood_ready` and the others. gRPC-Web calls are counted like gRPC calls.
+
+| metric | type | labels | what |
+|---|---|---|---|
+| `doewood_grpc_calls_total` | counter | `method`, `code` | calls that ended, by status code (`OK`, `INVALID_ARGUMENT`, `UNAVAILABLE`, ...); a call the client dropped before its end (a closed stream, a cancelled call) is `CANCELLED` |
+| `doewood_grpc_call_duration_seconds` | histogram | `method` | until the answer for a unary call, the whole lifetime for a stream; buckets from 1 ms to 30 min |
+| `doewood_grpc_calls_in_flight` | gauge | `method` | calls running now, open streams included |
+| `doewood_grpc_shed_total` | counter | | calls refused at once because `max_calls_in_flight` was reached (also counted as `UNAVAILABLE`) |
+| `doewood_grpc_connections_open` | gauge | | connections to the API port accepted and not yet closed |
+| `doewood_grpc_connections_total` | counter | | connections accepted |
+| `doewood_icons_requests_total` | counter | `outcome` | `GET /icons/{domain}`: `found`, `missing`, `invalid`, `busy` |
+
+- `method` is the full method name, for example `doewood.v1.RecordsService/GetRecord` or
+  `grpc.health.v1.Health/Check`. It comes from the fixed list of served methods; any other
+  path is `other`, so the number of series stays bounded. A method or a code appears once it
+  has been called.
+- A call is counted when it ends; shed calls and calls cut by the server deadline are
+  included, with their codes.
+- Cost: a few atomic operations and one small allocation per call.
+- Alerts worth setting: see [deploy.md](deploy.md#metrics-and-alerts).
 
 ## Examples with grpcurl
 

@@ -14,6 +14,7 @@ use tonic::Status;
 
 use crate::icons::Icons;
 use crate::limits::CallLimits;
+use crate::metrics::ApiMetrics;
 use crate::progress::{Progress, Snapshots};
 use crate::reprocess::Reprocessor;
 use crate::summarize::OnDemand;
@@ -85,6 +86,8 @@ struct Inner {
     /// The per-call limits in effect (`SetApiSettings`); the stored ones once `serve` read
     /// them, the defaults before.
     call_limits: Arc<CallLimits>,
+    /// The request and connection metrics.
+    metrics: Arc<ApiMetrics>,
 }
 
 impl ApiState {
@@ -106,6 +109,7 @@ impl ApiState {
                 sources: tokio::sync::Mutex::new(()),
                 claims_checked,
                 call_limits: Arc::new(CallLimits::new(doewood_store::ApiSettings::default())),
+                metrics: Arc::new(ApiMetrics::new()),
             }),
         }
     }
@@ -135,6 +139,16 @@ impl ApiState {
 
     pub(crate) fn claims_done(&self) {
         self.inner.claims_checked.store(true, Ordering::Release);
+    }
+
+    /// Registers the API's metrics (`doewood_grpc_*`, `doewood_icons_requests_total`) on
+    /// `registry`, the one `/metrics` serves. Fails if they are registered there already.
+    pub fn register_metrics(&self, registry: &prometheus::Registry) -> prometheus::Result<()> {
+        self.inner.metrics.register(registry)
+    }
+
+    pub(crate) fn metrics(&self) -> &Arc<ApiMetrics> {
+        &self.inner.metrics
     }
 
     pub(crate) fn call_limits(&self) -> &Arc<CallLimits> {

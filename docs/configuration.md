@@ -96,7 +96,7 @@ set anything, and a new bootstrap variable would extend ADR 0001's table (issue 
 | HTTP/2 streams per connection | 256 |
 | HTTP/2 keepalive | PING after 30 s without traffic, closed after 20 s without an answer |
 | TCP keepalive | probes after 60 s idle (the kernel's interval and count) |
-| Connection age | GOAWAY at 30 min, closed 5 min later |
+| Connection age | GOAWAY at 30 min ± 10% (drawn per connection), closed 5 min later |
 
 They are `doewood_api::MAX_CONCURRENT_STREAMS` and the constants next to it. See
 [api.md](api.md#limits) for what clients see, and [deploy.md](deploy.md#load-balancing) for
