@@ -6,8 +6,9 @@ use doewood_model::SourceKey;
 use doewood_store::{
     AI_PRESETS, AiProviderInput, ApiKey, ApiSettingsPatch, CredentialsChange,
     DEADLINE_SECONDS_LIMIT, IngestSettingsPatch, KeyChange, MAX_CALLS_IN_FLIGHT_LIMIT, NewSource,
-    S3Credentials, SourcePatch, SourceState, SqsInletInput, UrlStyle, valid_deadline_seconds,
-    valid_max_calls_in_flight, valid_min_jaccard, valid_provider_name,
+    S3Credentials, SUMMARIZE_MAX_CONCURRENT_RANGE, SourcePatch, SourceState, SqsInletInput,
+    UrlStyle, valid_deadline_seconds, valid_max_calls_in_flight, valid_min_jaccard,
+    valid_provider_name, valid_summarize_max_concurrent,
 };
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
@@ -571,9 +572,22 @@ impl ConfigService for Api {
         {
             v.add("similar_min_jaccard", "must be above 0 and at most 1");
         }
+        if let Some(n) = req.summarize_max_concurrent
+            && !valid_summarize_max_concurrent(n)
+        {
+            v.add(
+                "summarize_max_concurrent",
+                format!(
+                    "must be {} to {}",
+                    SUMMARIZE_MAX_CONCURRENT_RANGE.start(),
+                    SUMMARIZE_MAX_CONCURRENT_RANGE.end()
+                ),
+            );
+        }
         v.check()?;
         let patch = IngestSettingsPatch {
             similar_min_jaccard: req.similar_min_jaccard,
+            summarize_max_concurrent: req.summarize_max_concurrent,
         };
         let settings = self
             .state
@@ -581,6 +595,7 @@ impl ConfigService for Api {
             .await?;
         info!(
             similar_min_jaccard = settings.similar_min_jaccard,
+            summarize_max_concurrent = settings.summarize_max_concurrent,
             "ingest settings set"
         );
         Ok(Response::new(convert::ingest_settings(settings)))

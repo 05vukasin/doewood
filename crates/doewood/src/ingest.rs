@@ -96,6 +96,7 @@ impl OnDemand for OnDemandSummaries {
                     SummarizeError::NotFound(m) => OnDemandError::NotFound(m),
                     SummarizeError::FailedPrecondition(m) => OnDemandError::FailedPrecondition(m),
                     SummarizeError::Unavailable(m) => OnDemandError::Unavailable(m),
+                    SummarizeError::ResourceExhausted(m) => OnDemandError::ResourceExhausted(m),
                     SummarizeError::Internal(m) => OnDemandError::Internal(m),
                 })?;
             Ok(OnDemandResult {

@@ -16,7 +16,7 @@
 //! either it runs under `Profile::Standard`, and scanned pages are only flagged `needs_ocr`.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use doewood_model::{Blake3, StepVersions};
 use quail_core::{Blob, FileRecord, Format, Limits, Profile, Status};
@@ -199,7 +199,18 @@ impl Analyzer {
     /// Analyzes one file. CPU-bound: call it from a blocking thread. `key` is the object key
     /// (its extension is a hint for spreadsheet containers only).
     pub fn analyze(&self, bytes: Vec<u8>, key: &str) -> Analysis {
-        let blake3 = Blake3(*blake3::hash(&bytes).as_bytes());
+        let blake3 = content_hash(&bytes);
+        self.analyze_hashed(bytes, blake3, key)
+    }
+
+    /// [`analyze`](Self::analyze) for bytes the caller already hashed with [`content_hash`].
+    ///
+    /// The file has one deadline, `Limits::timeout` from now: quail's engine starts its own
+    /// clock here too (it stops between steps and inside the steps that check), and hedgehog's
+    /// read and its normalizer get the same instant, so a spreadsheet takes at most the file
+    /// timeout, not quail's plus hedgehog's.
+    pub fn analyze_hashed(&self, bytes: Vec<u8>, blake3: Blake3, key: &str) -> Analysis {
+        let deadline = Instant::now().checked_add(self.limits.timeout);
         let sniff = quail_engine::detect(&bytes);
         let route = route(sniff, &bytes, key);
         let blob = Blob::from(bytes);
@@ -208,8 +219,14 @@ impl Analyzer {
         let record = self
             .engine
             .process_blob(format!("blake3:{}", blake3.to_hex()), &blob);
+        debug_assert!(
+            quail_hash_matches(&record, &blake3),
+            "the hash passed in is not quail's hash.blake3"
+        );
         let (body, versions, outcome) = match route {
-            Route::Sheet(format) => self.sheet_record(record, blob.as_bytes(), key, format),
+            Route::Sheet(format) => {
+                self.sheet_record(record, blob.as_bytes(), key, format, deadline)
+            }
             Route::Quail(format) => {
                 let outcome = match &record.status {
                     Status::Failed { error } => Outcome::Failed(error.clone()),
@@ -239,9 +256,10 @@ impl Analyzer {
         bytes: &[u8],
         key: &str,
         format: crate::route::SheetFormat,
+        deadline: Option<Instant>,
     ) -> (Json, StepVersions, Outcome) {
         let name = key.rsplit('/').next().unwrap_or(key);
-        let out = sheet::analyze(bytes, name, format.as_str(), self.limits.timeout);
+        let out = sheet::analyze(bytes, name, format.as_str(), deadline);
         record.facts.extend(out.facts);
         record.steps.extend(out.steps);
         let mut problems = out.problems;
@@ -280,6 +298,37 @@ impl Analyzer {
         }
         v
     }
+}
+
+/// The BLAKE3 of a file's bytes, the key of its record. CPU-bound (a full pass over the
+/// bytes): call it from a blocking thread.
+pub fn content_hash(bytes: &[u8]) -> Blake3 {
+    let h = Blake3(*blake3::hash(bytes).as_bytes());
+    #[cfg(test)]
+    {
+        *HASHED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(h.0)
+            .or_default() += 1;
+    }
+    h
+}
+
+/// How often [`content_hash`] ran per content, for the tests (keyed by content, so tests
+/// running at the same time do not see each other's files).
+#[cfg(test)]
+pub(crate) static HASHED: std::sync::Mutex<std::collections::BTreeMap<[u8; 32], u32>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Whether quail's `hash.blake3` fact, when present, is `blake3` (a debug check that the hash
+/// passed to [`Analyzer::analyze_hashed`] is the file's).
+fn quail_hash_matches(record: &FileRecord, blake3: &Blake3) -> bool {
+    record
+        .facts
+        .iter()
+        .filter(|f| f.key.as_str() == "hash.blake3")
+        .all(|f| matches!(&f.value, quail_core::Value::Bytes(b) if b[..] == blake3.0[..]))
 }
 
 fn to_json(record: &FileRecord) -> Json {

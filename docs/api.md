@@ -105,7 +105,10 @@ The comments in the `.proto` files are the reference for every field. In short:
   the next file without a restart. Edges already written are kept; `ReprocessJob` with
   `force: true` compares a source's documents again (a lower value adds edges, a higher one
   removes none). It replaces the old `DOEWOOD_SIMILAR_MIN_JACCARD` variable (see
-  [configuration.md](configuration.md)).
+  [configuration.md](configuration.md)). `summarize_max_concurrent` is how many `Summarize`
+  calls read and analyze a file at once: 1 to 16 (default 2), anything else is
+  `INVALID_ARGUMENT`. It is read for every `Summarize` call, so it applies to the next one;
+  calls in flight keep running.
 
 ### API settings
 
@@ -284,6 +287,13 @@ its output fails the fact check, the answer is quail's extractive summary with `
 set and the reason in `warnings`. Without a configured provider it answers
 `FAILED_PRECONDITION`. See [llm.md](llm.md).
 
+At most `summarize_max_concurrent` calls (an ingest setting, default 2) read and analyze a file
+at once. A call beyond that is answered `RESOURCE_EXHAUSTED` at once ("... Summarize analyses
+are in flight ...: retry later"); nothing waits in a queue. Retry with backoff. `content` is
+bounded by the message limit (`DOEWOOD_API_MAX_MESSAGE_MIB`, default 64 MiB), an object by its
+source's `max_object_bytes`; a file larger than ingest analyzes (512 MiB) is
+`FAILED_PRECONDITION`.
+
 ## Errors
 
 | code | when |
@@ -294,7 +304,8 @@ set and the reason in `warnings`. Without a configured provider it answers
 | `UNAVAILABLE` | the shared Postgres is not connected (yet), or a call to it failed; retry. `ReprocessJob` and `Summarize` on an instance without ingest; `Summarize` of an object that cannot be read. The server is overloaded: more calls are in flight than `max_calls_in_flight` (the message says `overloaded`; nothing ran, retry with backoff). |
 | `DEADLINE_EXCEEDED` | the call ran longer than the server's deadline (`deadline_seconds`, default 60 s), or than the client's own deadline |
 | `CANCELLED` | the client's `grpc-timeout` ran out on the server side (the client usually reports its own `DEADLINE_EXCEEDED` first) |
-| `FAILED_PRECONDITION` | the shared database was migrated by a newer doewood. A merge of a dismissed pair or of a merged-away company; an undo that later merges depend on (named in the message), of an entry already undone, or of a split that dismissed its pair; a dismissal of two companies merged now. `Summarize` without a configured AI provider (or with one missing its key or base URL), of a source whose LLM policy is off, or of a file without text |
+| `FAILED_PRECONDITION` | the shared database was migrated by a newer doewood. A merge of a dismissed pair or of a merged-away company; an undo that later merges depend on (named in the message), of an entry already undone, or of a split that dismissed its pair; a dismissal of two companies merged now. `Summarize` without a configured AI provider (or with one missing its key or base URL), of a source whose LLM policy is off, of a file without text, or of a file larger than ingest analyzes |
+| `RESOURCE_EXHAUSTED` | `Summarize` while as many calls as `summarize_max_concurrent` allows are reading or analyzing a file; retry later |
 | `OUT_OF_RANGE` | a message larger than the limit |
 | `INTERNAL` | anything else; the details are in the server log, not in the message |
 
@@ -317,8 +328,9 @@ to do:
   has answered with the stream. An open stream is never shed or cut by the deadline; the
   streams per connection bound how many one connection holds.
 - **`Summarize`** counts against the in-flight cap but has no server deadline: its analysis
-  and provider call are bounded on their own and can take minutes. Give it a client deadline
-  if you need one.
+  and provider call are bounded on their own and can take minutes, and its analyses have
+  their own cap (`summarize_max_concurrent`, `RESOURCE_EXHAUSTED` beyond it). Give it a
+  client deadline if you need one.
 - **Health checks** (`grpc.health.v1.Health`) are never shed nor given the deadline, so a
   probe answers under load.
 - **gRPC-Web** calls get the same limits and errors (the status in the response headers). The

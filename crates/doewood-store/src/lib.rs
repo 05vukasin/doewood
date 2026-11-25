@@ -46,8 +46,9 @@ pub use store::favicon::{
     valid_egress_proxy,
 };
 pub use store::ingest::{
-    DEFAULT_SIMILAR_MIN_JACCARD, IngestSettings, IngestSettingsPatch, SIMILAR_MIN_JACCARD,
-    valid_min_jaccard,
+    DEFAULT_SIMILAR_MIN_JACCARD, DEFAULT_SUMMARIZE_MAX_CONCURRENT, IngestSettings,
+    IngestSettingsPatch, SIMILAR_MIN_JACCARD, SUMMARIZE_MAX_CONCURRENT,
+    SUMMARIZE_MAX_CONCURRENT_RANGE, valid_min_jaccard, valid_summarize_max_concurrent,
 };
 pub use store::llm::{LlmCounts, LlmJob, LlmJobStatus, LlmUsage, SECONDS_PER_DAY, utc_day};
 pub use store::objects::{IngestOutcome, IngestStatus, ObjectChange, ScanCheckpoint, SeenObject};

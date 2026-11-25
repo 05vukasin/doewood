@@ -86,9 +86,30 @@ is the caller's choice).
   an output that fails the fact check gives the extractive summary with `extractive` set and
   the reason in `warnings`.
 - Errors: `FAILED_PRECONDITION` without a provider (or one without its key, or without a base
-  URL where the preset needs one), for a source whose policy is `off`, or a file without text;
-  `NOT_FOUND` for an unknown provider or source; `UNAVAILABLE` without ingest or when the object
-  cannot be read.
+  URL where the preset needs one), for a source whose policy is `off`, a file without text, or
+  a file larger than ingest analyzes (512 MiB); `NOT_FOUND` for an unknown provider or source;
+  `UNAVAILABLE` without ingest or when the object cannot be read; `RESOURCE_EXHAUSTED` over the
+  cap below.
+
+### Cap
+
+An analysis (OCR of a scanned PDF takes 0.6 to 1 GB per page in flight) runs on the request
+path, outside ingest's bounded workers, so `Summarize` has its own cap:
+
+- At most `summarize_max_concurrent` calls read and analyze a file at once. It is an ingest
+  setting (`ConfigService.SetIngestSettings`, 1 to 16, default 2), read for every call: a
+  change applies to the next call without a restart; calls in flight keep running.
+- The slot covers reading the object (`location`) and the analysis. It is freed when the
+  analysis ends, also when the client went away or the call timed out first (the analysis
+  cannot be stopped midway, so its slot stays until it does). The provider call after it holds
+  no slot: it is bounded with the queue's calls (at most 64 in flight in all).
+- Beyond the cap, the call fails at once with `RESOURCE_EXHAUSTED` and a message to retry
+  later. There is no queue and no wait: a waiting call would hold its request (up to the
+  message limit) in memory, and a client can retry with backoff instead.
+- Size: `content` is bounded by `DOEWOOD_API_MAX_MESSAGE_MIB` (default 64 MiB), an object by its
+  source's `max_object_bytes` (as for ingest), and both by what ingest analyzes (512 MiB).
+- The log has a debug line per call started (`in_flight`, `cap`) and a warning per call
+  refused (`in_flight`, `cap`, and `rejected`, the refusals since start).
 
 ## Privacy
 
