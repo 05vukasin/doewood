@@ -239,7 +239,7 @@ the job (`enrichment::feeds`), their clients in `doewood_registry::feeds`.
   is dropped. It never creates a company or writes a fact: it drops the company's cached
   answers of that registry (`CacheStore::cache_invalidate`: `gleif:lei-records/<LEI>`,
   `edgar:submissions/CIK<cik>`, `companies_house:company/<number>`, each with what is under it)
-  and makes that registry due now (`FreshnessStore::mark_due`; a company never enriched is
+  and makes that registry due now (`FreshnessStore::mark_many_due`; a company never enriched is
   due anyway). The next pass (the job is woken) asks the registry again, through the gate and
   the writer as always. APR is the exception to the cache drop: the feed writes the new set's
   record into the cache (`apr:companies/<MB>`), so the next lookup reads it on every instance

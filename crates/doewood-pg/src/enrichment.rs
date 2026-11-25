@@ -324,7 +324,7 @@ impl FreshnessStore for PgStore {
             .collect()
     }
 
-    async fn mark_due(&self, companies: &[Uuid], registry: &str) -> Result<u64> {
+    async fn mark_many_due(&self, companies: &[Uuid], registry: &str) -> Result<u64> {
         validate_registry(registry)?;
         validate_batch(companies.len())?;
         if companies.is_empty() {

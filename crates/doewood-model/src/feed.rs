@@ -5,7 +5,7 @@
 //! A feed never writes company facts: it finds the companies it names among the ones the graph
 //! already has ([`crate::FeedStore::companies_by_alias`]), drops their cached registry answers
 //! ([`crate::CacheStore::cache_invalidate`]) and makes the registry due for them
-//! ([`crate::FreshnessStore::mark_due`]); the enrichment job then asks the registry again.
+//! ([`crate::FreshnessStore::mark_many_due`]); the enrichment job then asks the registry again.
 
 use crate::Error;
 

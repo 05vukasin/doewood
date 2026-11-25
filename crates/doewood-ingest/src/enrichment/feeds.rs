@@ -301,7 +301,7 @@ impl Run<'_> {
                 companies.insert(*company);
             }
             let companies: Vec<Uuid> = companies.into_iter().collect();
-            let n = self.backend.mark_due(&companies, registry).await?;
+            let n = self.backend.mark_many_due(&companies, registry).await?;
             for c in &companies {
                 debug!(feed = registry, company = %c, "feed: company made due");
             }

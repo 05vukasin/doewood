@@ -371,7 +371,7 @@ impl FreshnessStore for Standalone {
         .await
     }
 
-    async fn mark_due(&self, companies: &[Uuid], registry: &str) -> Result<u64> {
+    async fn mark_many_due(&self, companies: &[Uuid], registry: &str) -> Result<u64> {
         validate_registry(registry)?;
         validate_batch(companies.len())?;
         let (companies, registry) = (companies.to_vec(), registry.to_owned());

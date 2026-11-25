@@ -1087,7 +1087,7 @@ pub async fn feeds<B: Backend + ?Sized>(a: &B, b: &B) {
         None
     );
     assert_eq!(
-        b.mark_due(&[x, y, Uuid::now_v7()], "gleif").await.unwrap(),
+        b.mark_many_due(&[x, y, Uuid::now_v7()], "gleif").await.unwrap(),
         1,
         "y was never enriched (it is new anyway)"
     );
@@ -1101,9 +1101,9 @@ pub async fn feeds<B: Backend + ?Sized>(a: &B, b: &B) {
     assert!(after.next_due["gleif"] <= unix_now() + 1);
     assert!(after.next_due["vies"] > unix_now() + 80 * 86_400);
     // A registry not in the schedule yet is added; an earlier due time is kept.
-    assert_eq!(b.mark_due(&[x], "edgar").await.unwrap(), 1);
-    assert_eq!(b.mark_due(&[], "edgar").await.unwrap(), 0);
-    assert!(b.mark_due(&[x], "Bad").await.is_err());
+    assert_eq!(b.mark_many_due(&[x], "edgar").await.unwrap(), 1);
+    assert_eq!(b.mark_many_due(&[], "edgar").await.unwrap(), 0);
+    assert!(b.mark_many_due(&[x], "Bad").await.is_err());
     let due = due_of(a.companies_due(&ia, None, 0).await.unwrap(), x).unwrap();
     assert_eq!(due.due, ["edgar", "gleif"]);
     // Re-enriching sets them again.

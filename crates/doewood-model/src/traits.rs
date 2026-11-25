@@ -332,7 +332,7 @@ pub trait FreshnessStore: Send + Sync {
     /// enriched is due anyway, as new): a delta feed said its record changed (issue #49).
     /// Other registries keep their due time. At most [`crate::FEED_BATCH_MAX`] companies;
     /// unknown ids are skipped. Returns how many were made due.
-    async fn mark_due(&self, companies: &[Uuid], registry: &str) -> Result<u64>;
+    async fn mark_many_due(&self, companies: &[Uuid], registry: &str) -> Result<u64>;
 }
 
 /// Registry delta feeds (ADR 0002 section 6, issue #49): one instance per cluster pulls each
