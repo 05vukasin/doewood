@@ -11,10 +11,10 @@ use doewood_model::{
     Result, StoredIcon, due_limit, validate_batch, validate_cache_key, validate_registry,
     validate_schedule,
 };
-use rusqlite::{Connection, OptionalExtension as _, params};
+use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 use uuid::Uuid;
 
-use super::{Standalone, backend, sql, uuid};
+use super::{Standalone, backend, check_live, sql, uuid};
 use crate::store::now;
 
 /// A company's document count: documents with a live `party` edge to `n.id`.
@@ -207,7 +207,13 @@ impl FreshnessStore for Standalone {
         validate_schedule(schedule)?;
         let schedule = schedule.to_vec();
         self.run(move |conn| {
-            let tx = conn.transaction().map_err(sql)?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql)?;
+            // A husk is never recorded (issue #62).
+            if !check_live(&tx, company)? {
+                return Err(Error::NotFound(format!("no company {company}")));
+            }
             let at = now();
             let id = company.to_string();
             let written = tx
@@ -245,6 +251,49 @@ impl FreshnessStore for Standalone {
 
     async fn enrichment(&self, company: Uuid) -> Result<Option<Enrichment>> {
         self.run(move |conn| enrichment(conn, company)).await
+    }
+
+    async fn mark_due(&self, company: Uuid, registries: &[String]) -> Result<()> {
+        for r in registries {
+            validate_registry(r)?;
+        }
+        let registries = registries.to_vec();
+        self.run(move |conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql)?;
+            if !check_live(&tx, company)? {
+                return Err(Error::NotFound(format!("no company {company}")));
+            }
+            let id = company.to_string();
+            let (kind, enriched): (String, bool) = tx
+                .query_row(
+                    "SELECT n.kind, f.company_id IS NOT NULL FROM nodes n \
+                     LEFT JOIN company_enrichment f ON f.company_id = n.id WHERE n.id = ?1",
+                    [&id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(sql)?;
+            if kind != "company" {
+                return Err(Error::NotFound(format!("no company {company}")));
+            }
+            // Never enriched: due already.
+            if enriched {
+                let at = now();
+                for registry in &registries {
+                    tx.execute(
+                        "INSERT INTO company_registry_due (company_id, registry, next_due_at) \
+                         VALUES (?1, ?2, ?3) ON CONFLICT (company_id, registry) DO UPDATE SET \
+                         next_due_at = min(next_due_at, excluded.next_due_at)",
+                        params![id, registry, at],
+                    )
+                    .map_err(sql)?;
+                }
+            }
+            tx.commit().map_err(sql)?;
+            Ok(())
+        })
+        .await
     }
 
     async fn companies_due(

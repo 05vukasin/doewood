@@ -15,7 +15,7 @@ use tokio_postgres::GenericClient;
 use uuid::Uuid;
 
 use crate::PgStore;
-use crate::backend::{bad, client, pg};
+use crate::backend::{bad, client, lock_live, pg};
 
 /// A company's document count: documents with a live `party` edge to `n.id`.
 const DOCUMENTS: &str = "(SELECT count(DISTINCT e.src) FROM edges e JOIN nodes d ON d.id = e.src \
@@ -196,6 +196,10 @@ impl FreshnessStore for PgStore {
         validate_schedule(schedule)?;
         let mut c = client(&self.pool).await?;
         let tx = c.transaction().await.map_err(pg)?;
+        // A husk is never recorded (issue #62); the lock holds back a merge until the commit.
+        if !lock_live(&*tx, company).await? {
+            return Err(Error::NotFound(format!("no company {company}")));
+        }
         let written = tx
             .execute(
                 &format!(
@@ -232,6 +236,44 @@ impl FreshnessStore for PgStore {
 
     async fn enrichment(&self, company: Uuid) -> Result<Option<Enrichment>> {
         enrichment(&**client(&self.pool).await?, company).await
+    }
+
+    async fn mark_due(&self, company: Uuid, registries: &[String]) -> Result<()> {
+        for r in registries {
+            validate_registry(r)?;
+        }
+        let mut c = client(&self.pool).await?;
+        let tx = c.transaction().await.map_err(pg)?;
+        if !lock_live(&*tx, company).await? {
+            return Err(Error::NotFound(format!("no company {company}")));
+        }
+        let kind = tx
+            .query_opt(
+                "SELECT n.kind, f.company_id IS NOT NULL FROM nodes n \
+                 LEFT JOIN company_enrichment f ON f.company_id = n.id WHERE n.id = $1",
+                &[&company],
+            )
+            .await
+            .map_err(pg)?;
+        let Some(row) = kind.filter(|r| r.try_get::<_, &str>(0).is_ok_and(|k| k == "company"))
+        else {
+            return Err(Error::NotFound(format!("no company {company}")));
+        };
+        // Never enriched: due already.
+        if row.try_get::<_, bool>(1).map_err(pg)? {
+            for registry in registries {
+                tx.execute(
+                    "INSERT INTO company_registry_due (company_id, registry, next_due_at) \
+                     VALUES ($1, $2, now()) ON CONFLICT (company_id, registry) DO UPDATE SET \
+                     next_due_at = least(company_registry_due.next_due_at, EXCLUDED.next_due_at)",
+                    &[&company, registry],
+                )
+                .await
+                .map_err(pg)?;
+            }
+        }
+        tx.commit().await.map_err(pg)?;
+        Ok(())
     }
 
     async fn companies_due(

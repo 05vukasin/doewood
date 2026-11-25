@@ -17,7 +17,9 @@ use std::time::Duration;
 
 use doewood_core::InstanceId;
 use doewood_enrich::{CompanyName, IdKind, Identifier};
-use doewood_model::{Backend, DueCompany, EdgeKind, EdgeState, ProposalRequest, Result};
+use doewood_model::{
+    Backend, DueCompany, EdgeKind, EdgeState, Error, MERGE_CHAIN_MAX, ProposalRequest, Result,
+};
 use doewood_registry::apr::Company as AprCompany;
 use doewood_registry::companies_house::{CompanyNumber, PscKind, Status as ChStatus};
 use doewood_registry::edgar::Cik;
@@ -28,7 +30,7 @@ use doewood_registry::wikidata::{Period, QId, Relation, WikidataItem};
 use doewood_registry::{Registry, Warning, WarningKind};
 use serde_json::{Value, json};
 use time::{Date, OffsetDateTime};
-use tracing::warn;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::clients::Clients;
@@ -415,13 +417,34 @@ impl<'a> Job<'a> {
             ..Outcome::default()
         };
         self.renew(subject.id()).await;
-        let gated = gate::run(self, &mut subject, &f).await?;
+        match self.gate_and_write(&mut subject, &f, &mut out).await {
+            Ok(()) => Ok(out),
+            // A person (or another instance) merged the company away while the job ran
+            // (issue #62): its writes stop, nothing more lands on the husk, and the company
+            // it was merged into is enriched again with what it has now.
+            Err(Error::MergedAway { company, into }) => {
+                let survivor = self.survivor_due(into).await?;
+                info!(company = %company, survivor = %survivor, "company merged away during its enrichment; its survivor is due");
+                out.merged_away = true;
+                Ok(out)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The gate, the writes, the website and the freshness of `subject`. The company's own
+    /// writes fail with [`Error::MergedAway`] once it was merged away.
+    async fn gate_and_write(
+        &self,
+        subject: &mut Subject,
+        f: &Findings,
+        out: &mut Outcome,
+    ) -> Result<()> {
+        let b = self.backend.as_ref();
+        let gated = gate::run(self, subject, f).await?;
         out.merged = gated.merged;
-        let written = super::write::write(self, &subject, &f, &gated).await?;
-        out.edges = written.edges;
-        out.proposed = written.proposed;
-        out.redirected = written.redirected;
-        out.website = super::website::run(self, &subject, &f).await?;
+        super::write::write(self, subject, f, &gated, out).await?;
+        out.website = super::website::run(self, subject, f).await?;
         // A merge that waits for the other company's lease is done later (issue #60): the
         // pass runs the company again once its own tasks are done ([`OtherLease::Here`]),
         // and every registry is due again after the retry interval, as after a failure.
@@ -436,7 +459,28 @@ impl<'a> Job<'a> {
             None => f.schedule(self.retry, self.clients.edgar_fed),
         };
         b.record_enrichment(subject.id(), &schedule).await?;
-        Ok(out)
+        Ok(())
+    }
+
+    /// Makes the live company `into` stands for due for every enabled registry. Returns it.
+    async fn survivor_due(&self, mut into: Uuid) -> Result<Uuid> {
+        let b = self.backend.as_ref();
+        let registries: Vec<String> = self
+            .clients
+            .enabled()
+            .into_iter()
+            .map(|r| r.as_str().to_owned())
+            .collect();
+        for _ in 0..MERGE_CHAIN_MAX {
+            match b.mark_due(into, &registries).await {
+                Ok(()) => return Ok(into),
+                Err(Error::MergedAway { into: next, .. }) => into = next,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Error::Precondition(format!(
+            "company {into} has more than {MERGE_CHAIN_MAX} merges in a chain"
+        )))
     }
 
     /// Which registries to ask: all for a new or doubled company; else the due ones and any

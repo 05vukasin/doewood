@@ -236,6 +236,8 @@ impl std::fmt::Debug for Enrichment {
 }
 
 /// What one company's enrichment did, for the counters.
+// Independent facts about one run, not states of one machine.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Outcome {
     /// Another instance held the lease: nothing was done.
@@ -255,6 +257,9 @@ pub struct Outcome {
     /// A merge waited for a company another task of this instance worked on: the company is
     /// run again once the page's tasks are done.
     pub deferred: bool,
+    /// The company was merged away while it was worked on (issue #62): its job stopped and
+    /// the company it was merged into is due.
+    pub merged_away: bool,
 }
 
 /// What [`Enrichment::one`] did.
@@ -530,7 +535,7 @@ impl Enrichment {
                 if o.deferred && !retried {
                     // Counted once, on its second run.
                     worked = Worked::Again;
-                } else {
+                } else if !o.merged_away {
                     c.enriched.fetch_add(1, Ordering::Relaxed);
                 }
                 c.merged.fetch_add(o.merged, Ordering::Relaxed);
@@ -551,6 +556,7 @@ impl Enrichment {
                     warnings = o.warnings,
                     website = o.website,
                     merge_waits = o.deferred,
+                    merged_away = o.merged_away,
                     "company enriched"
                 );
             }

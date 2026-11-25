@@ -64,6 +64,12 @@ pub trait GraphStore: Send + Sync {
     /// the node as written, `None` when there is no node `id`.
     async fn update_props(&self, id: Uuid, patch: &PropsPatch) -> Result<Option<Node>>;
 
+    /// [`GraphStore::update_props`] onto a live company only (issue #62): when the node is a
+    /// husk (merged away, with `merged_into`) nothing is written and the call fails with
+    /// [`crate::Error::MergedAway`]. The check and the write are atomic and ordered after any
+    /// merge of the node, so a merge never commits between them.
+    async fn update_live_props(&self, id: Uuid, patch: &PropsPatch) -> Result<Option<Node>>;
+
     /// A node by id.
     async fn node(&self, id: Uuid) -> Result<Option<Node>>;
 
@@ -111,6 +117,18 @@ pub trait GraphStore: Send + Sync {
     /// result is the alias as stored, owned by `node` or by whoever claimed it before (or by
     /// nobody when it is blocked). The node must exist.
     async fn claim_alias(
+        &self,
+        kind: NodeKind,
+        alias: &str,
+        node: Uuid,
+        props: &Value,
+    ) -> Result<NodeAlias>;
+
+    /// [`GraphStore::claim_alias`] for a live company only (issue #62): when `node` is a husk
+    /// (merged away, with `merged_into`) nothing is claimed and the call fails with
+    /// [`crate::Error::MergedAway`]. The check and the claim are atomic and ordered after any
+    /// merge of the node: a claim made before a merge is moved by it, none lands after.
+    async fn claim_live_alias(
         &self,
         kind: NodeKind,
         alias: &str,
@@ -280,12 +298,20 @@ pub trait FreshnessStore: Send + Sync {
     /// Records that `company` was enriched now: its current document count, and for each
     /// registry in `schedule` the time it is due again (now plus the interval). Registries not
     /// in `schedule` keep their due time. Fails with [`crate::Error::NotFound`] when there is
-    /// no such company node.
+    /// no such company node, and with [`crate::Error::MergedAway`] when it was merged away (a
+    /// husk is never recorded as enriched; checked atomically with the write, issue #62).
     async fn record_enrichment(
         &self,
         company: Uuid,
         schedule: &[(String, Duration)],
     ) -> Result<Enrichment>;
+
+    /// Makes each registry in `registries` due now for `company`, so the next pass enriches
+    /// it (a registry due sooner keeps its time). Its last enrichment and document count stay
+    /// as they are. Fails like [`FreshnessStore::record_enrichment`]: with
+    /// [`crate::Error::NotFound`] when there is no such company node, with
+    /// [`crate::Error::MergedAway`] when it was merged away.
+    async fn mark_due(&self, company: Uuid, registries: &[String]) -> Result<()>;
 
     /// The company's freshness, if it was ever enriched.
     async fn enrichment(&self, company: Uuid) -> Result<Option<Enrichment>>;

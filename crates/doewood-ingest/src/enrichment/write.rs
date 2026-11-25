@@ -15,6 +15,12 @@
 //!   `registry_ids`, `legal_name`, `former_names` and `enriched_at`. The props lists of
 //!   proposals before schema 5 (`merge_proposals`, `registry_proposals`) are removed.
 //! - **Proposals** go to the proposals table (`ProposalStore::propose`, issue #52).
+//!
+//! The order: edges first (onto live companies, so a merge committed since the company was
+//! resolved moves them to the survivor, issue #60), then the company's own aliases and props,
+//! with the live variants (`claim_live_alias`, `update_live_props`, issue #62): when a person
+//! merged the company away while the job ran, they fail with `Error::MergedAway` and the job
+//! stops for it ([`super::company::Job::run`]); nothing lands on the husk.
 
 // `b` (the backend), `s` (the company) and `f` (the findings) are used throughout.
 #![allow(clippy::many_single_char_names)]
@@ -31,6 +37,7 @@ use time::Date;
 use tracing::debug;
 use uuid::Uuid;
 
+use super::Outcome;
 use super::company::{Findings, Job, Other, Planned};
 use super::gate::Gated;
 use super::subject::{Subject, ch_alias, qid_alias};
@@ -51,16 +58,6 @@ pub(crate) async fn live_id(b: &dyn Backend, mut id: Uuid) -> Result<Uuid> {
     Ok(id)
 }
 
-/// What [`write`] wrote.
-pub(crate) struct Written {
-    /// Edges.
-    pub edges: u64,
-    /// Proposals opened or updated.
-    pub proposed: u64,
-    /// Edges that landed on the company an end was merged into since it was resolved.
-    pub redirected: u64,
-}
-
 /// Writes `edge` onto live companies ([`doewood_model::GraphStore::upsert_live_edge`], issue
 /// #60): a merge committed since its ends were resolved (by a person, or on another instance)
 /// moves it to the survivor, never leaves it on a husk. Counts a redirect in `redirected`.
@@ -79,64 +76,36 @@ async fn put(b: &dyn Backend, edge: &Edge, redirected: &mut u64) -> Result<()> {
     Ok(())
 }
 
-/// Writes the findings for `s`.
-pub(crate) async fn write(job: &Job<'_>, s: &Subject, f: &Findings, g: &Gated) -> Result<Written> {
+/// Writes the findings for `s`, counting into `out` (`edges`, `redirected`, `proposed`) as it
+/// goes. The edges come first: they follow a merge onto the survivor (issue #60). The
+/// company's own aliases and props come after, onto the live company only (issue #62): once
+/// it was merged away they fail with [`doewood_model::Error::MergedAway`] and the rest is not
+/// written.
+pub(crate) async fn write(
+    job: &Job<'_>,
+    s: &Subject,
+    f: &Findings,
+    g: &Gated,
+    out: &mut Outcome,
+) -> Result<()> {
     let b = job.backend.as_ref();
     let me = s.id();
-    // 1. Identifiers.
-    let mut owned = BTreeSet::new();
-    for found in &f.found {
-        let props = json!({
-            "step": "registry",
-            "confidence": found.by_name.unwrap_or(0.95),
-            "registry": found.evidence,
-            "by_name": found.by_name.is_some(),
-        });
-        let got = b
-            .claim_alias(NodeKind::Company, &found.alias, me, &props)
-            .await?;
-        if got.node == Some(me) {
-            owned.insert(found.alias.clone());
-        } else {
-            debug!(company = %me, alias = %found.alias, "identifier owned by another company; not claimed");
-        }
-    }
-    // 2. Former names: learned aliases, and dated renames.
+    // 1. Edges, with the dated renames from the former names.
     let mut edges: Vec<Planned> = f.edges.clone();
     let current = f.names.first().cloned();
-    for former in &f.former {
-        let Some(old) = CompanyName::parse(&former.name) else {
-            continue;
-        };
-        let form = old
-            .legal_form
-            .or_else(|| s.name.as_ref().and_then(|n| n.legal_form))
-            .unwrap_or("");
-        let step = LadderStep::LearnedAlias;
-        b.claim_alias(
-            NodeKind::Company,
-            &format!("name:{}|{form}", old.key),
-            me,
-            &json!({"step": step.as_str(), "confidence": step.confidence(), "registry": former.evidence, "surface": former.name}),
-        )
-        .await?;
-        if former.until.is_some() {
-            edges.push(Planned {
-                kind: EdgeKind::RenamedTo,
-                outgoing: true,
-                other: Other::Itself,
-                valid_from: former.until,
-                valid_to: None,
-                state: EdgeState::Active,
-                confidence: super::company::OFFICIAL,
-                evidence: former.evidence.clone(),
-                props: json!({"from": former.name, "to": current}),
-            });
-        }
+    for former in f.former.iter().filter(|n| n.until.is_some()) {
+        edges.push(Planned {
+            kind: EdgeKind::RenamedTo,
+            outgoing: true,
+            other: Other::Itself,
+            valid_from: former.until,
+            valid_to: None,
+            state: EdgeState::Active,
+            confidence: super::company::OFFICIAL,
+            evidence: former.evidence.clone(),
+            props: json!({"from": former.name, "to": current}),
+        });
     }
-    // 3. Edges.
-    let mut written = 0;
-    let mut redirected = 0;
     for p in &edges {
         let Some(other) = resolve(b, s, &p.other).await? else {
             debug!(company = %me, other = ?p.other, kind = %p.kind, "the other company is unknown; edge dropped");
@@ -156,20 +125,52 @@ pub(crate) async fn write(job: &Job<'_>, s: &Subject, f: &Findings, g: &Gated) -
             .with_confidence(p.confidence)
             .with_state(p.state)
             .valid(p.valid_from, to);
-        put(b, &edge, &mut redirected).await?;
-        written += 1;
+        put(b, &edge, &mut out.redirected).await?;
+        out.edges += 1;
     }
-    // 4. Two current parents: the later dated one is current.
-    written += former_parents(b, me, &mut redirected).await?;
+    // 2. Two current parents: the later dated one is current.
+    out.edges += former_parents(b, me, &mut out.redirected).await?;
+    // 3. Identifiers.
+    let mut owned = BTreeSet::new();
+    for found in &f.found {
+        let props = json!({
+            "step": "registry",
+            "confidence": found.by_name.unwrap_or(0.95),
+            "registry": found.evidence,
+            "by_name": found.by_name.is_some(),
+        });
+        let got = b
+            .claim_live_alias(NodeKind::Company, &found.alias, me, &props)
+            .await?;
+        if got.node == Some(me) {
+            owned.insert(found.alias.clone());
+        } else {
+            debug!(company = %me, alias = %found.alias, "identifier owned by another company; not claimed");
+        }
+    }
+    // 4. Former names: learned aliases.
+    for former in &f.former {
+        let Some(old) = CompanyName::parse(&former.name) else {
+            continue;
+        };
+        let form = old
+            .legal_form
+            .or_else(|| s.name.as_ref().and_then(|n| n.legal_form))
+            .unwrap_or("");
+        let step = LadderStep::LearnedAlias;
+        b.claim_live_alias(
+            NodeKind::Company,
+            &format!("name:{}|{form}", old.key),
+            me,
+            &json!({"step": step.as_str(), "confidence": step.confidence(), "registry": former.evidence, "surface": former.name}),
+        )
+        .await?;
+    }
     // 5. Props.
     update_props(b, me, f, &owned).await?;
     // 6. Proposals.
-    let proposed = proposals(b, me, f, g).await?;
-    Ok(Written {
-        edges: written,
-        proposed,
-        redirected,
-    })
+    out.proposed += proposals(b, me, f, g).await?;
+    Ok(())
 }
 
 /// The gate's proposals, into the proposals table: a new open one, or the open one updated.
@@ -416,6 +417,6 @@ async fn update_props(
     }
     let at = super::unix_now();
     patch = patch.set(&["enriched_at"], json!(at));
-    b.update_props(me, &patch).await?;
+    b.update_live_props(me, &patch).await?;
     Ok(())
 }
