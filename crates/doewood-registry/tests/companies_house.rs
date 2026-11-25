@@ -9,7 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use doewood_registry::companies_house::{
-    ApiKey, CompaniesHouse, CompaniesHouseConfig, FilingEvent, PscKind, Status, TrustTier,
+    ApiKey, CompaniesHouse, CompaniesHouseConfig, DEFAULT_FILING_CATEGORIES, FilingEvent, PscKind,
+    StatementKind, Status, TrustTier,
 };
 use doewood_registry::{
     Cache, Cached, Clock, HttpTransport, ManualClock, MemoryCache, Registry, USER_AGENT,
@@ -67,8 +68,9 @@ fn profile(number: &str, status: &str) -> Value {
             {"name": "", "effective_from": "2000-01-01", "ceased_on": "2000-02-01"}
         ],
         "sic_codes": ["99999", 12],
-        "registered_office_address": {"address_line_1": "1 Example Street",
-            "locality": "Exampletown", "postal_code": "ZZ99 9ZZ", "country": "England"},
+        "registered_office_address": {"premises": "Unit 9", "address_line_1": "1 Example Street",
+            "locality": "Exampletown", "region": "Exampleshire", "postal_code": "ZZ99 9ZZ",
+            "country": "England"},
         "has_insolvency_history": false,
         "has_charges": true,
         "links": {"self": format!("/company/{number}")}
@@ -166,7 +168,7 @@ fn pscs() -> Value {
 fn filings(start: usize) -> Value {
     let items = if start == 0 {
         json!([
-            {"category": "accounts", "type": "AA", "description": "accounts-with-accounts-type-full",
+            {"category": "miscellaneous", "type": "OC138", "description": "scheme-of-arrangement",
                 "date": "2025-09-01", "transaction_id": "FAKETX0001"},
             {"category": "officers", "type": "AP01",
                 "description": "appoint-person-director-company-with-name-date",
@@ -180,13 +182,36 @@ fn filings(start: usize) -> Value {
                 "description": "certificate-change-of-name-company",
                 "description_values": {"officer_name": "not kept"},
                 "date": "2015-06-30", "action_date": "2015-06-29", "transaction_id": "FAKETX0003"},
-            {"category": "other", "type": "CB01", "description": "legacy",
+            {"category": "miscellaneous", "type": "CB01", "description": "legacy",
                 "description_values": {"description": "Notice of cross border merger"},
                 "date": "2012-02-03", "transaction_id": "FAKETX0004"}
         ])
     };
+    // The filing history sends `total_count`, not `total_results`.
     json!({"items": items, "items_per_page": 2, "start_index": start, "total_count": 4,
-        "total_results": 4, "filing_history_status": "filing-history-available"})
+        "filing_history_status": "filing-history-available"})
+}
+
+fn statements() -> Value {
+    json!({
+        "items": [
+            {"kind": "persons-with-significant-control-statement",
+                "statement": "psc-exists-but-not-identified",
+                "notified_on": "2017-03-01", "etag": "fakeetag",
+                "links": {"self": "/company/99000001/persons-with-significant-control-statements/FAKE1"}},
+            {"kind": "persons-with-significant-control-statement",
+                "statement": "psc-has-failed-to-confirm-changed-details",
+                "linked_psc_name": "Mx Testina Fictiva EXAMPLETON",
+                "notified_on": "2018-04-05", "ceased_on": "2019-01-02", "etag": "fakeetag"},
+            {"kind": "persons-with-significant-control-statement",
+                "statement": "no-individual-or-entity-with-signficant-control",
+                "notified_on": "2016-04-06", "ceased_on": "2017-03-01"},
+            {"kind": "persons-with-significant-control-statement", "statement": ""}
+        ],
+        "items_per_page": 25, "start_index": 0, "total_results": 4,
+        "active_count": 1, "ceased_count": 2,
+        "links": {"self": "/company/99000001/persons-with-significant-control-statements"}
+    })
 }
 
 fn search_hits() -> Value {
@@ -239,14 +264,24 @@ async fn registry() -> MockServer {
             )),
             "company/99000001/officers" if start == 2 => Reply::json(&officers_page(
                 2,
-                &[person_officer(
-                    "SAMPLEWORTH, Placeholder",
-                    "secretary",
-                    "2010-05-06",
-                    Some("2016-01-01"),
-                )],
+                &[{
+                    // A pre-1992 appointment: `appointed_before`, no `appointed_on`.
+                    let mut o = person_officer(
+                        "SAMPLEWORTH, Placeholder",
+                        "secretary",
+                        "1991-01-01",
+                        Some("2016-01-01"),
+                    );
+                    o["appointed_on"] = Value::Null;
+                    o["appointed_before"] = json!("1991-12-31");
+                    o["is_pre_1992_appointment"] = json!(true);
+                    o
+                }],
             )),
             "company/99000001/persons-with-significant-control" => Reply::json(&pscs()),
+            "company/99000001/persons-with-significant-control-statements" => {
+                Reply::json(&statements())
+            }
             "company/99000001/filing-history" => Reply::json(&filings(start)),
             "search/companies" => Reply::json(&search_hits()),
             _ => Reply::raw(
@@ -311,8 +346,11 @@ async fn company_profile() {
     assert_eq!(c.previous_names[0].name, "FICTIVE GADGETS EXAMPLE LIMITED");
     assert_eq!(c.previous_names[0].to, day(2015, Month::June, 30));
     assert_eq!(c.sic_codes, ["99999"]);
+    assert!(!c.is_conversion());
     let office = c.registered_office.unwrap();
-    assert_eq!(office.lines, ["1 Example Street"]);
+    // The registered office keeps its premises and region (a company's address only).
+    assert_eq!(office.lines, ["Unit 9", "1 Example Street"]);
+    assert_eq!(office.region.as_deref(), Some("Exampleshire"));
     assert_eq!(office.postal_code.as_deref(), Some("ZZ99 9ZZ"));
     assert_eq!(c.has_insolvency_history, Some(false));
     assert_eq!(c.tier, TrustTier::Official);
@@ -452,6 +490,7 @@ async fn officers_every_page_without_personal_extras() {
     assert_eq!(d.role.as_deref(), Some("director"));
     assert!(!d.corporate);
     assert_eq!(d.appointed, day(2016, Month::January, 1));
+    assert!(!d.appointed_before);
     assert_eq!(d.resigned, None);
     assert_eq!(d.nationality.as_deref(), Some("Fictionian"));
     assert_eq!(d.country_of_residence.as_deref(), Some("Exampleland"));
@@ -465,6 +504,8 @@ async fn officers_every_page_without_personal_extras() {
 
     let resigned = &list.items[2];
     assert_eq!(resigned.resigned, day(2016, Month::January, 1));
+    assert_eq!(resigned.appointed, day(1991, Month::December, 31));
+    assert!(resigned.appointed_before);
 
     // Dropped when read, and never cached.
     assert_no_personal_extras(&format!("{list:?}"));
@@ -594,16 +635,27 @@ async fn filing_history_name_changes_and_mergers() {
     let server = registry().await;
     let s = setup(&server, |c| c.page_size = 2);
     let list = s.ch.filing_events("99000001").await.unwrap().value;
-    assert_eq!(server.requests().len(), 2);
+    // `total_count` is read: the second page ends the list, no third (empty) request.
+    let filter = "category=change-of-name%2Cincorporation%2Cresolution%2Cmiscellaneous";
+    assert_eq!(
+        server.requests(),
+        [
+            format!("{P}company/99000001/filing-history?{filter}&items_per_page=2&start_index=0"),
+            format!("{P}company/99000001/filing-history?{filter}&items_per_page=2&start_index=2"),
+        ]
+    );
     assert_eq!(list.total, Some(4));
-    assert_eq!(list.items.len(), 2, "{list:?}");
-    let rename = &list.items[0];
+    assert_eq!(list.items.len(), 3, "{list:?}");
+    let scheme = &list.items[0];
+    assert_eq!(scheme.event, FilingEvent::Merger);
+    assert_eq!(scheme.description.as_deref(), Some("scheme-of-arrangement"));
+    let rename = &list.items[1];
     assert_eq!(rename.event, FilingEvent::NameChange);
     assert_eq!(rename.form.as_deref(), Some("CERTNM"));
     assert_eq!(rename.date, day(2015, Month::June, 30));
     assert_eq!(rename.action_date, day(2015, Month::June, 29));
     assert_eq!(rename.text, None);
-    let merger = &list.items[1];
+    let merger = &list.items[2];
     assert_eq!(merger.event, FilingEvent::Merger);
     assert_eq!(merger.form.as_deref(), Some("CB01"));
     assert_eq!(merger.date, day(2012, Month::February, 3));
@@ -614,8 +666,8 @@ async fn filing_history_name_changes_and_mergers() {
 
     // Officer names in other filings are neither returned nor cached.
     let keys = [
-        "company/99000001/filing-history?items_per_page=2&start_index=0".to_owned(),
-        "company/99000001/filing-history?items_per_page=2&start_index=2".to_owned(),
+        format!("company/99000001/filing-history?{filter}&items_per_page=2&start_index=0"),
+        format!("company/99000001/filing-history?{filter}&items_per_page=2&start_index=2"),
     ];
     let cached = cached_text(&s.cache, &keys).await;
     assert!(cached.contains("CERTNM"), "{cached}");
@@ -628,6 +680,66 @@ async fn filing_history_name_changes_and_mergers() {
 }
 
 #[tokio::test]
+async fn filing_history_without_a_category_filter() {
+    let server = registry().await;
+    let s = setup(&server, |c| {
+        c.page_size = 2;
+        c.filing_categories = Vec::new();
+    });
+    let list = s.ch.filing_events("99000001").await.unwrap().value;
+    assert_eq!(list.items.len(), 3);
+    assert!(
+        server.requests().iter().all(|r| !r.contains("category")),
+        "{:?}",
+        server.requests()
+    );
+    assert_eq!(
+        CompaniesHouseConfig::default().filing_categories,
+        DEFAULT_FILING_CATEGORIES
+    );
+}
+
+#[tokio::test]
+async fn psc_statements_tell_no_psc_from_unidentified() {
+    let server = registry().await;
+    let s = setup(&server, |_| {});
+    let list = s.ch.psc_statements("99000001").await.unwrap().value;
+    assert_eq!(
+        server.requests(),
+        [format!(
+            "{P}company/99000001/persons-with-significant-control-statements\
+             ?items_per_page=100&start_index=0"
+        )]
+    );
+    assert_eq!(list.total, Some(4));
+    // The statement without a text is skipped.
+    assert_eq!(list.items.len(), 3, "{list:?}");
+    assert_eq!(list.items[0].kind, StatementKind::Unidentified);
+    assert_eq!(list.items[0].statement, "psc-exists-but-not-identified");
+    assert_eq!(list.items[0].notified, day(2017, Month::March, 1));
+    assert_eq!(list.items[0].ceased, None);
+    assert_eq!(list.items[1].kind, StatementKind::Unidentified);
+    assert_eq!(list.items[2].kind, StatementKind::NoPsc);
+    assert_eq!(list.items[2].ceased, day(2017, Month::March, 1));
+
+    // The linked PSC's name is neither returned nor cached.
+    assert!(!format!("{list:?}").contains("EXAMPLETON"));
+    let keys = [
+        "company/99000001/persons-with-significant-control-statements\
+         ?items_per_page=100&start_index=0"
+            .to_owned(),
+    ];
+    let cached = cached_text(&s.cache, &keys).await;
+    assert!(cached.contains("psc-exists-but-not-identified"), "{cached}");
+    for banned in ["EXAMPLETON", "linked_psc_name", "etag", "links"] {
+        assert!(!cached.contains(banned), "{banned} in {cached}");
+    }
+    let again = s.ch.psc_statements("99000001").await.unwrap().value;
+    assert_eq!(again, list);
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[tokio::test]
 async fn lists_of_an_unknown_company_are_empty() {
     let server = registry().await;
     let s = setup(&server, |_| {});
@@ -637,7 +749,9 @@ async fn lists_of_an_unknown_company_are_empty() {
     assert!(p.items.is_empty());
     let f = s.ch.filing_events("99000009").await.unwrap().value;
     assert!(f.items.is_empty());
-    assert_eq!(server.requests().len(), 3);
+    let st = s.ch.psc_statements("99000009").await.unwrap().value;
+    assert!(st.items.is_empty());
+    assert_eq!(server.requests().len(), 4);
 }
 
 #[tokio::test]
@@ -889,6 +1003,20 @@ async fn configuration_errors() {
         )
         .unwrap_err();
         assert!(matches!(err.kind, WarningKind::Config(_)), "{bad}");
+    }
+    for bad in ["", "Change-Of-Name", "accounts&x=1", "a,b"] {
+        let config = CompaniesHouseConfig {
+            filing_categories: vec![bad.to_owned()],
+            ..CompaniesHouseConfig::default()
+        };
+        let err = CompaniesHouse::with_parts(
+            &config,
+            Arc::new(HttpTransport::new(Duration::from_secs(1), Duration::from_secs(1)).unwrap()),
+            Arc::new(MemoryCache::default()),
+            Arc::new(ManualClock::new(OffsetDateTime::UNIX_EPOCH)),
+        )
+        .unwrap_err();
+        assert!(matches!(err.kind, WarningKind::Config(_)), "{bad:?}");
     }
     drop(server);
 }

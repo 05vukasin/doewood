@@ -165,6 +165,18 @@ pub struct Company {
     pub tier: TrustTier,
 }
 
+impl Company {
+    /// Whether `company_status_detail` says the company was converted or transferred into
+    /// another form or jurisdiction (`transformed-to-se`, `converted-to-plc`,
+    /// `converted-to-uk-societas`, `converted-to-ukeig`, `transferred-from-uk`): a
+    /// succession signal.
+    pub fn is_conversion(&self) -> bool {
+        self.status_detail.as_deref().is_some_and(|d| {
+            d == "transformed-to-se" || d == "transferred-from-uk" || d.starts_with("converted-to-")
+        })
+    }
+}
+
 /// An earlier name of the company.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreviousName {
@@ -176,13 +188,16 @@ pub struct PreviousName {
     pub to: Option<Date>,
 }
 
-/// A company's registered office.
+/// A company's registered office (never a natural person's address).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Office {
-    /// `address_line_1`, `address_line_2`, as given.
+    /// `premises` (the building number or name), `address_line_1`, `address_line_2`, as
+    /// given.
     pub lines: Vec<String>,
     /// `locality`.
     pub locality: Option<String>,
+    /// `region`.
+    pub region: Option<String>,
     /// `postal_code`.
     pub postal_code: Option<String>,
     /// `country`.
@@ -194,7 +209,7 @@ pub struct Office {
 pub struct Listing<T> {
     /// The items, in Companies House's order.
     pub items: Vec<T>,
-    /// `total_results` of the list, when sent.
+    /// `total_results` of the list (`total_count` for the filing history), when sent.
     pub total: Option<u64>,
     /// Whether reading stopped at the configured cap before the end of the list.
     pub truncated: bool,
@@ -229,8 +244,11 @@ pub struct Officer {
     /// Whether the officer is a company or firm (a `corporate-*` role, or identification
     /// given with one).
     pub corporate: bool,
-    /// `appointed_on`.
+    /// `appointed_on`; for a pre-1992 appointment, which has none, `appointed_before`.
     pub appointed: Option<Date>,
+    /// Whether `appointed` is only an upper bound: the `appointed_before` date of a pre-1992
+    /// appointment.
+    pub appointed_before: bool,
     /// `resigned_on`.
     pub resigned: Option<Date>,
     /// `nationality` (natural persons).
@@ -307,14 +325,74 @@ pub struct Psc {
     pub registration: Option<Registration>,
 }
 
+/// What a PSC statement says (`statement`, from Companies House's `psc_descriptions.yml`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StatementKind {
+    /// `no-individual-or-entity-with-signficant-control` (sic; and its `-partnership` form):
+    /// there is no PSC.
+    NoPsc,
+    /// A PSC (or beneficial owner) exists or may exist but is not identified or confirmed:
+    /// `psc-exists-but-not-identified`, `psc-details-not-confirmed`,
+    /// `steps-to-find-psc-not-yet-completed`, `psc-contacted-but-no-response`,
+    /// `psc-has-failed-to-confirm-changed-details`, `restrictions-notice-issued-to-psc` (and
+    /// their `-partnership` forms), `awaiting-confirmation-from-psc`,
+    /// `no-beneficial-owner-identified`, `at-least-one-beneficial-owner-unidentified*`.
+    Unidentified,
+    /// Any other statement (the overseas-entity period statements, ...).
+    Other,
+}
+
+impl StatementKind {
+    fn from_code(code: &str) -> Self {
+        let c = code.trim();
+        let c = c.strip_suffix("-partnership").unwrap_or(c);
+        match c {
+            // The enumeration spells it `signficant`; the correct spelling is accepted too.
+            "no-individual-or-entity-with-signficant-control"
+            | "no-individual-or-entity-with-significant-control" => Self::NoPsc,
+            "psc-exists-but-not-identified"
+            | "psc-details-not-confirmed"
+            | "steps-to-find-psc-not-yet-completed"
+            | "psc-contacted-but-no-response"
+            | "psc-has-failed-to-confirm-changed-details"
+            | "restrictions-notice-issued-to-psc"
+            | "awaiting-confirmation-from-psc"
+            | "no-beneficial-owner-identified" => Self::Unidentified,
+            c if c.starts_with("at-least-one-beneficial-owner-unidentified") => Self::Unidentified,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// A PSC statement (`GET /company/{number}/persons-with-significant-control-statements`):
+/// what the company says when it gives no PSC, or not all of them. It tells "no PSC" from "a
+/// PSC exists but is unidentified" (Companies House's counterpart of GLEIF's reporting
+/// exceptions). No `linked_psc_name` is kept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PscStatement {
+    /// What it says.
+    pub kind: StatementKind,
+    /// `statement`, as sent.
+    pub statement: String,
+    /// `notified_on`.
+    pub notified: Option<Date>,
+    /// `ceased_on`: the statement no longer applies.
+    pub ceased: Option<Date>,
+}
+
 /// Why a filing is kept.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FilingEvent {
     /// A change of name (category `change-of-name`).
     NameChange,
-    /// A merger (a `*merger*` description, a cross-border merger form `CB..`, or a legacy
-    /// filing whose text mentions a merger). Best-effort.
+    /// A merger or takeover (a `*merger*` description, `scheme-of-arrangement`, the formation
+    /// of a holding SE, a cross-border merger form `CB..`, or a legacy filing whose text
+    /// mentions a merger). Best-effort.
     Merger,
+    /// A conversion between a public limited company and a societas europaea
+    /// (`conversion-societas-europaea-to-public-limited-company`, `formation-terms-
+    /// conversion-*`, `transformation-public-limited-company-to-societas-europaea`).
+    Conversion,
 }
 
 /// A filing of the filing history that is a name change or merger.
@@ -390,9 +468,11 @@ struct RawPreviousName {
 
 #[derive(Deserialize)]
 struct RawOffice {
+    premises: Option<String>,
     address_line_1: Option<String>,
     address_line_2: Option<String>,
     locality: Option<String>,
+    region: Option<String>,
     postal_code: Option<String>,
     country: Option<String>,
 }
@@ -402,7 +482,11 @@ struct RawOffice {
 struct RawPage {
     #[serde(default)]
     items: Vec<Value>,
+    /// The officer, PSC and statement lists send `total_results`.
     total_results: Option<u64>,
+    /// The filing history sends `total_count` instead (two fields rather than a serde alias,
+    /// so a page with both still reads).
+    total_count: Option<u64>,
 }
 
 /// A list page as cached: the kept fields of the kept items, the list's total, and how many
@@ -440,6 +524,8 @@ pub(super) struct KeptOfficer {
     officer_role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     appointed_on: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    appointed_before: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     resigned_on: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -469,6 +555,35 @@ pub(super) struct KeptPsc {
     natures_of_control: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     identification: Option<KeptRegistration>,
+}
+
+/// The kept fields of a PSC statement. No `linked_psc_name` (it may name a person), `etag`
+/// or `links`.
+#[derive(Serialize, Deserialize)]
+pub(super) struct KeptStatement {
+    statement: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notified_on: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ceased_on: Option<String>,
+}
+
+impl KeptStatement {
+    /// Statements without a `statement` are refused.
+    pub(super) fn minimise(self) -> Option<Self> {
+        text(self.statement.clone())?;
+        Some(self)
+    }
+
+    pub(super) fn statement(self) -> Option<PscStatement> {
+        let statement: String = text(self.statement)?.chars().take(200).collect();
+        Some(PscStatement {
+            kind: StatementKind::from_code(&statement),
+            statement,
+            notified: date(self.notified_on.as_deref()),
+            ceased: date(self.ceased_on.as_deref()),
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -552,11 +667,12 @@ pub(super) fn company(body: &[u8], number: &CompanyNumber) -> Result<Company, St
         .registered_office_address
         .and_then(|v| serde_json::from_value::<RawOffice>(v).ok())
         .map(|o| Office {
-            lines: [o.address_line_1, o.address_line_2]
+            lines: [o.premises, o.address_line_1, o.address_line_2]
                 .into_iter()
                 .filter_map(text)
                 .collect(),
             locality: text(o.locality),
+            region: text(o.region),
             postal_code: text(o.postal_code),
             country: text(o.country),
         });
@@ -588,7 +704,7 @@ pub(super) fn page<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<Stored<T
         .collect();
     Ok(Stored {
         items,
-        total: raw.total_results,
+        total: raw.total_results.or(raw.total_count),
         consumed,
     })
 }
@@ -631,11 +747,14 @@ impl KeptOfficer {
     pub(super) fn officer(self) -> Option<Officer> {
         let corporate = self.corporate();
         let name = text(self.name)?;
+        let on = date(self.appointed_on.as_deref());
+        let before = date(self.appointed_before.as_deref()).filter(|_| on.is_none());
         Some(Officer {
             name,
             role: text(self.officer_role),
             corporate,
-            appointed: date(self.appointed_on.as_deref()),
+            appointed: on.or(before),
+            appointed_before: before.is_some(),
             resigned: date(self.resigned_on.as_deref()),
             nationality: text(self.nationality),
             country_of_residence: text(self.country_of_residence),
@@ -732,7 +851,19 @@ impl KeptFiling {
         let category = self.category.as_deref().unwrap_or("").trim();
         let description = self.description.as_deref().unwrap_or("").trim();
         let form = self.form.as_deref().unwrap_or("").trim();
+        if description == "conversion-societas-europaea-to-public-limited-company"
+            || description == "transformation-public-limited-company-to-societas-europaea"
+            || description.starts_with("formation-terms-conversion-")
+        {
+            return Some(FilingEvent::Conversion);
+        }
         if description.contains("merger")
+            || matches!(
+                description,
+                "scheme-of-arrangement"
+                    | "formation-of-holding-societas-europaea"
+                    | "formation-terms-holding-societas-europaea"
+            )
             || (form.len() > 2
                 && form.starts_with("CB")
                 && form[2..].bytes().all(|b| b.is_ascii_digit()))
@@ -743,7 +874,12 @@ impl KeptFiling {
         {
             return Some(FilingEvent::Merger);
         }
-        if description.contains("exemption") {
+        // Not renames themselves: an exemption, comments on a request, the satisfaction of
+        // a conditional resolution (the dated rename is in `previous_company_names`).
+        if description.contains("exemption")
+            || description == "change-of-name-request-comments"
+            || description == "change-of-name-conditional-resolution-satisfaction"
+        {
             return None;
         }
         if category == "change-of-name" || description.contains("change-of-name") {
@@ -829,6 +965,41 @@ mod tests {
     }
 
     #[test]
+    fn statement_kinds() {
+        for (code, kind) in [
+            (
+                "no-individual-or-entity-with-signficant-control",
+                StatementKind::NoPsc,
+            ),
+            (
+                "no-individual-or-entity-with-signficant-control-partnership",
+                StatementKind::NoPsc,
+            ),
+            ("psc-exists-but-not-identified", StatementKind::Unidentified),
+            (
+                "steps-to-find-psc-not-yet-completed-partnership",
+                StatementKind::Unidentified,
+            ),
+            (
+                "restrictions-notice-issued-to-psc",
+                StatementKind::Unidentified,
+            ),
+            (
+                "at-least-one-beneficial-owner-unidentified",
+                StatementKind::Unidentified,
+            ),
+            (
+                "no-beneficial-owner-identified",
+                StatementKind::Unidentified,
+            ),
+            ("all-beneficial-owners-identified", StatementKind::Other),
+            ("a-future-statement", StatementKind::Other),
+        ] {
+            assert_eq!(StatementKind::from_code(code), kind, "{code}");
+        }
+    }
+
+    #[test]
     fn filing_events() {
         let f = |category: &str, form: &str, description: &str, legacy: Option<&str>| {
             KeptFiling {
@@ -871,13 +1042,43 @@ mod tests {
             Some(FilingEvent::Merger)
         );
         assert_eq!(
-            f("other", "CB01", "legacy", None),
+            f("miscellaneous", "CB01", "legacy", None),
             Some(FilingEvent::Merger)
         );
-        assert_eq!(f("other", "CBX", "legacy", None), None);
+        assert_eq!(f("miscellaneous", "CBX", "legacy", None), None);
+        assert_eq!(
+            f("miscellaneous", "OC138", "scheme-of-arrangement", None),
+            Some(FilingEvent::Merger)
+        );
         assert_eq!(
             f(
-                "other",
+                "incorporation",
+                "SE",
+                "formation-of-holding-societas-europaea",
+                None
+            ),
+            Some(FilingEvent::Merger)
+        );
+        for d in [
+            "conversion-societas-europaea-to-public-limited-company",
+            "formation-terms-conversion-public-limited-company-to-societas-europaea",
+            "transformation-public-limited-company-to-societas-europaea",
+        ] {
+            assert_eq!(
+                f("incorporation", "SE", d, None),
+                Some(FilingEvent::Conversion),
+                "{d}"
+            );
+        }
+        for d in [
+            "change-of-name-request-comments",
+            "change-of-name-conditional-resolution-satisfaction",
+        ] {
+            assert_eq!(f("change-of-name", "NM", d, None), None, "{d}");
+        }
+        assert_eq!(
+            f(
+                "miscellaneous",
                 "MISC",
                 "legacy",
                 Some("Notice of cross border MERGER")
