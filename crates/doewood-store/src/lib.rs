@@ -27,6 +27,11 @@ pub use store::ai::{
     AI_PRESETS, AiProvider, AiProviderInput, ApiKey, DEFAULT_AI_PROVIDER, KeyChange,
     valid_provider_name,
 };
+pub use store::api::{
+    API_DEADLINE_SECONDS, API_MAX_CALLS_IN_FLIGHT, ApiSettings, ApiSettingsPatch,
+    DEADLINE_SECONDS_LIMIT, DEFAULT_DEADLINE_SECONDS, DEFAULT_MAX_CALLS_IN_FLIGHT,
+    MAX_CALLS_IN_FLIGHT_LIMIT, valid_deadline_seconds, valid_max_calls_in_flight,
+};
 pub use store::enrichment::{
     APR_ENABLED, APR_EXTRA_ROOTS_SECRET, APR_FEED_ENABLED, COMPANIES_HOUSE_ENABLED,
     COMPANIES_HOUSE_FEED_ENABLED, COMPANIES_HOUSE_KEY_SECRET, COMPANIES_HOUSE_STREAM_KEY_SECRET,

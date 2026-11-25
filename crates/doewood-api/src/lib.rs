@@ -12,7 +12,9 @@
 //!   interceptor, where tokens or OIDC go later.
 //! - **Limits:** messages up to [`ApiOptions::max_message_bytes`] (64 MiB by default, room
 //!   for a file sent to `Summarize`); every input is validated, and problems come back as
-//!   INVALID_ARGUMENT with their field paths.
+//!   INVALID_ARGUMENT with their field paths. Streams per connection, keepalive and the
+//!   connection age are constants; calls in flight (shed with UNAVAILABLE beyond the cap) and
+//!   the server deadline are runtime settings (`SetApiSettings`). See docs/api.md, "Limits".
 //! - **Secrets** are write-only: no response or error carries one.
 //! - **`GET /icons/{domain}`** (plain HTTP, on the same port): company icons, always proxied
 //!   through doewood (ADR 0002 section 5), behind the [`Icons`] trait.
@@ -26,6 +28,7 @@ mod error;
 mod graph;
 mod icons;
 mod jobs;
+mod limits;
 mod merges;
 mod progress;
 mod proposals;
@@ -42,6 +45,7 @@ use std::sync::Arc;
 use doewood_model::Backend;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
+use tokio_stream::StreamExt as _;
 use tonic::service::Routes;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Server;
@@ -50,6 +54,9 @@ use tonic_health::ServingStatus;
 use tonic_health::server::HealthReporter;
 use tonic_web::GrpcWebLayer;
 use tower_layer::Layer as _;
+use tracing::warn;
+
+use limits::{Aged, Limited};
 
 pub use auth::Authorize;
 pub use claims::{Reclaimed, reclaim_sources};
@@ -57,6 +64,10 @@ pub use config::add_source;
 pub use icons::{
     CACHE_HIT, CACHE_MISS, CSP, ICON_CONTENT_TYPES, ICONS_PATH, IconAnswer, Icons,
     respond as icon_response,
+};
+pub use limits::{
+    HTTP2_KEEPALIVE_INTERVAL, HTTP2_KEEPALIVE_TIMEOUT, MAX_CONCURRENT_STREAMS, MAX_CONNECTION_AGE,
+    MAX_CONNECTION_AGE_GRACE, TCP_KEEPALIVE,
 };
 pub use progress::{EnrichmentCounts, EventCounts, FeedCounts, Progress};
 pub use reprocess::{ReprocessPhase, ReprocessView, Reprocessor};
@@ -130,6 +141,12 @@ pub async fn serve(
     shutdown: impl Future<Output = ()> + Send,
 ) -> Result<(), ServeError> {
     let limit = state.parts().options.max_message_bytes;
+    match state.db(doewood_store::Store::api_settings).await {
+        Ok(settings) => state.call_limits().set(settings),
+        Err(e) => {
+            warn!(error = %e.message(), "API limits not read from the store; using the defaults")
+        }
+    }
     let api = Api {
         state: state.clone(),
     };
@@ -179,19 +196,34 @@ pub async fn serve(
         .add_service(guarded!(SearchServiceServer))
         .add_service(guarded!(SummarizeServiceServer));
     // gRPC-Web wraps the gRPC services only: it answers 400 to any other HTTP/1.1 request,
-    // so the icon route sits next to it, and everything else falls through to it.
-    let grpc = GrpcWebLayer::new().layer(grpc.routes().prepare());
+    // so the icon route sits next to it, and everything else falls through to it. The call
+    // limits sit inside gRPC-Web, so its calls get them too; the icon route has its own.
+    let grpc = Limited::new(grpc.routes().prepare(), Arc::clone(state.call_limits()));
+    let grpc = GrpcWebLayer::new().layer(grpc);
     let app = icons::router(state.parts().icons.clone()).fallback_service(grpc);
 
-    Server::builder()
-        .accept_http1(true)
+    // Connections: tonic sends GOAWAY at the age; `Aged` closes them after the grace period,
+    // open streams included (tonic's own grace would skip the GOAWAY).
+    let lifetime = limits::MAX_CONNECTION_AGE + limits::MAX_CONNECTION_AGE_GRACE;
+    let incoming = TcpIncoming::from(listener)
+        .with_nodelay(Some(true))
+        .with_keepalive(Some(limits::TCP_KEEPALIVE))
+        .map(move |conn| conn.map(|io| Aged::new(io, lifetime)));
+    server_builder()
         .add_routes(Routes::from(app))
-        .serve_with_incoming_shutdown(
-            TcpIncoming::from(listener).with_nodelay(Some(true)),
-            shutdown,
-        )
+        .serve_with_incoming_shutdown(incoming, shutdown)
         .await
         .map_err(ServeError::Transport)
+}
+
+/// The server with the connection limits ([`MAX_CONCURRENT_STREAMS`] and the rest).
+fn server_builder() -> Server {
+    Server::builder()
+        .accept_http1(true)
+        .max_concurrent_streams(limits::MAX_CONCURRENT_STREAMS)
+        .http2_keepalive_interval(Some(limits::HTTP2_KEEPALIVE_INTERVAL))
+        .http2_keepalive_timeout(Some(limits::HTTP2_KEEPALIVE_TIMEOUT))
+        .max_connection_age(limits::MAX_CONNECTION_AGE)
 }
 
 /// Keeps the backed services' health in step with the backend, and reports everything not
