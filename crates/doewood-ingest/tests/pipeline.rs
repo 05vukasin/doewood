@@ -116,7 +116,7 @@ impl Harness {
         file_timeout: Option<Duration>,
         on_change: Arc<dyn Fn(SourceId) + Send + Sync>,
     ) -> Self {
-        Self::start_tuned(store, backend, jobs, retry, file_timeout, |_| {})
+        Self::start_tuned(store, backend, jobs, retry, file_timeout, on_change, |_| {})
     }
 
     fn start_tuned(
@@ -125,6 +125,7 @@ impl Harness {
         jobs: usize,
         retry: Duration,
         file_timeout: Option<Duration>,
+        on_change: Arc<dyn Fn(SourceId) + Send + Sync>,
         tune: impl FnOnce(&mut IngestConfig),
     ) -> Self {
         let source = store
@@ -1336,6 +1337,7 @@ async fn big_spreadsheets() {
         jobs,
         Duration::from_millis(10),
         None,
+        Arc::new(|_| {}),
         |c| {
             if budget > 0 {
                 c.memory_budget = budget << 20;
