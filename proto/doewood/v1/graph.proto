@@ -12,6 +12,25 @@ service GraphService {
   rpc Neighbours(NeighboursRequest) returns (NeighboursResponse);
   // The documents with a live `party` edge to a company, ordered by key.
   rpc CompanyDocuments(CompanyDocumentsRequest) returns (CompanyDocumentsResponse);
+
+  // Reversible company merges (ADR 0002 section 1.8). The merge log, newest first: every
+  // merge and split, with its actor, evidence, confidence, fused probability and undo state.
+  rpc ListMerges(ListMergesRequest) returns (ListMergesResponse);
+  // A person's merge: `absorbed_id` into `survivor_id`, logged. FAILED_PRECONDITION when
+  // either company was merged away already or the pair is dismissed.
+  rpc MergeCompanies(MergeCompaniesRequest) returns (MergeEntry);
+  // Undoes a merge or split from its undo payload. FAILED_PRECONDITION, naming them, when
+  // later merges or splits involve the same companies, unless `cascade` is set: then they are
+  // undone first, newest first.
+  rpc UndoMerge(UndoMergeRequest) returns (UndoMergeResponse);
+  // Splits a company in two: a new company takes the named aliases, documents and edges.
+  // Logged like a merge, so UndoMerge reverses it.
+  rpc SplitCompany(SplitCompanyRequest) returns (MergeEntry);
+  // Records a permanent "not the same" pair, in both directions: it never merges, whatever
+  // the evidence. FAILED_PRECONDITION when the two are merged now (undo with `dismiss`).
+  rpc DismissPair(DismissPairRequest) returns (Dismissal);
+  // Dismissed pairs, newest first.
+  rpc ListDismissals(ListDismissalsRequest) returns (ListDismissalsResponse);
 }
 
 enum NodeKind {
@@ -143,4 +162,143 @@ message CompanyDocumentsRequest {
 
 message CompanyDocumentsResponse {
   repeated Node documents = 1;
+}
+
+// Who merged or split.
+enum MergeActorKind {
+  MERGE_ACTOR_KIND_UNSPECIFIED = 0;
+  // Ingest's company matching.
+  MERGE_ACTOR_KIND_INGEST = 1;
+  // The enrichment job.
+  MERGE_ACTOR_KIND_ENRICHMENT = 2;
+  // A person, through this API.
+  MERGE_ACTOR_KIND_MANUAL = 3;
+}
+
+enum MergeOp {
+  MERGE_OP_UNSPECIFIED = 0;
+  MERGE_OP_MERGE = 1;
+  MERGE_OP_SPLIT = 2;
+}
+
+message MergeActor {
+  MergeActorKind kind = 1;
+  // The instance that did it.
+  string instance_id = 2;
+}
+
+message MergeEntry {
+  string id = 1;
+  // Its place in the log: later entries have larger numbers.
+  int64 seq = 2;
+  MergeOp op = 3;
+  // Unix seconds.
+  int64 at = 4;
+  MergeActor actor = 5;
+  // A merge's surviving company; a split's company that was split.
+  string survivor_id = 6;
+  // A merge's absorbed company (now a husk with `merged_into`); a split's new company.
+  string absorbed_id = 7;
+  // Why, as a JSON array.
+  string evidence_json = 8;
+  // The actor's confidence, 0 to 1.
+  float confidence = 9;
+  // The fused (noisy-OR) probability of the evidence, 0 to 1.
+  float probability = 10;
+  // What moved (aliases, edges, props), as a JSON object; an undo restores exactly that.
+  string undo_json = 11;
+  // Set once undone: Unix seconds (0 while live) and by whom.
+  int64 undone_at = 12;
+  MergeActor undone_by = 13;
+}
+
+message ListMergesRequest {
+  // Only entries where this company is the survivor or the absorbed one; empty for all.
+  string company_id = 1;
+  // 0 means 50; at most 1000.
+  uint32 page_size = 2;
+  // `next_page_token` of the previous page; empty for the first.
+  string page_token = 3;
+}
+
+message ListMergesResponse {
+  repeated MergeEntry merges = 1;
+  // Empty on the last page.
+  string next_page_token = 2;
+}
+
+message MergeCompaniesRequest {
+  string survivor_id = 1;
+  string absorbed_id = 2;
+  // Why, as a JSON array; empty means `[]`.
+  string evidence_json = 3;
+}
+
+message UndoMergeRequest {
+  string merge_id = 1;
+  // Undo the later entries that depend on this one first, instead of refusing.
+  bool cascade = 2;
+  // Also record the two companies of the merge as a permanent "not the same" pair.
+  bool dismiss = 3;
+  // Why (kept on the dismissal); at most 2000 bytes.
+  string reason = 4;
+}
+
+message UndoMergeResponse {
+  // The entries undone, in order: dependents first, `merge_id` last.
+  repeated string undone_ids = 1;
+  // Parts of a payload not restored because something else changed them since.
+  repeated string skipped = 2;
+  // The dismissal recorded, when `dismiss` was set.
+  Dismissal dismissal = 3;
+}
+
+message SplitCompanyRequest {
+  string company_id = 1;
+  // The new company's name (its props' `name`); required.
+  string name = 2;
+  // Company aliases that move to the new company (identifiers such as `id:rs_pib:<pib>`, name
+  // keys); each must be owned by `company_id`.
+  repeated string aliases = 3;
+  // Documents whose `party` edges to `company_id` move to the new company.
+  repeated string document_ids = 4;
+  // Other edges at `company_id` that move (company to company).
+  repeated string edge_ids = 5;
+  // Also record the two as a permanent "not the same" pair. Such a split cannot be undone.
+  bool dismiss = 6;
+  // Why; kept as the entry's evidence. At most 2000 bytes.
+  string reason = 7;
+}
+
+message DismissPairRequest {
+  string company_a_id = 1;
+  string company_b_id = 2;
+  // Why; at most 2000 bytes.
+  string reason = 3;
+}
+
+message Dismissal {
+  // The smaller company id first; it holds in both directions.
+  string company_a_id = 1;
+  string company_b_id = 2;
+  // Unix seconds.
+  int64 at = 3;
+  MergeActor actor = 4;
+  string reason = 5;
+  // The merge whose undo recorded it, if any.
+  string merge_id = 6;
+  int64 seq = 7;
+}
+
+message ListDismissalsRequest {
+  // Only dismissals of this company; empty for all.
+  string company_id = 1;
+  // 0 means 50; at most 1000.
+  uint32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListDismissalsResponse {
+  repeated Dismissal dismissals = 1;
+  string next_page_token = 2;
 }

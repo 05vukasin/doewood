@@ -1630,6 +1630,310 @@ async fn grpc_web_over_http1() {
     a.stop().await;
 }
 
+/// The merge log through `GraphService` (ADR 0002 section 1.8): a person's merge, the log, undo
+/// with its later-merge rule, split and its undo, dismissals, and the validation errors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn merges_undo_split_and_dismissals() {
+    for shared in Shared::all().await {
+        let name = shared.name;
+        let a = Instance::start("inst-a", Some(shared.backend.clone())).await;
+        let mut graph = GraphServiceClient::new(a.channel().await);
+        let be = &shared.backend;
+        let company = |key: &'static str| async move {
+            be.upsert_node(NodeKind::Company, key, &json!({"name": key}))
+                .await
+                .unwrap()
+        };
+        let (s, x, t) = (
+            company("api-s").await,
+            company("api-x").await,
+            company("api-t").await,
+        );
+        let doc = be
+            .upsert_node(NodeKind::Document, &hash(90).to_hex(), &json!({}))
+            .await
+            .unwrap();
+        be.upsert_edge(&Edge::new(doc, x, EdgeKind::Party, EdgeSource::Document))
+            .await
+            .unwrap();
+        be.claim_alias(NodeKind::Company, "id:rs_pib:100000002", x, &json!({}))
+            .await
+            .unwrap();
+        let reader = graph.clone();
+        let docs_of = |c: uuid::Uuid| {
+            let mut g = reader.clone();
+            async move {
+                g.company_documents(pb::CompanyDocumentsRequest {
+                    company_id: c.to_string(),
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .documents
+                .len()
+            }
+        };
+
+        // Validation.
+        invalid(
+            &graph
+                .merge_companies(pb::MergeCompaniesRequest {
+                    survivor_id: s.to_string(),
+                    absorbed_id: s.to_string(),
+                    evidence_json: "{}".into(),
+                })
+                .await
+                .unwrap_err(),
+            &["absorbed_id", "evidence_json"],
+        );
+        invalid(
+            &graph
+                .list_merges(pb::ListMergesRequest {
+                    company_id: "nope".into(),
+                    page_size: 5000,
+                    page_token: "x".into(),
+                })
+                .await
+                .unwrap_err(),
+            &["company_id", "page_size", "page_token"],
+        );
+        invalid(
+            &graph
+                .split_company(pb::SplitCompanyRequest {
+                    company_id: s.to_string(),
+                    document_ids: vec!["bad".into()],
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err(),
+            &["name", "document_ids[0]"],
+        );
+        invalid(
+            &graph
+                .dismiss_pair(pb::DismissPairRequest {
+                    company_a_id: s.to_string(),
+                    company_b_id: s.to_string(),
+                    reason: "x".repeat(3000),
+                })
+                .await
+                .unwrap_err(),
+            &["company_b_id", "reason"],
+        );
+        let err = graph
+            .merge_companies(pb::MergeCompaniesRequest {
+                survivor_id: s.to_string(),
+                absorbed_id: uuid::Uuid::now_v7().to_string(),
+                evidence_json: String::new(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::NotFound, "{name}: {err:?}");
+
+        // A person's merge, logged with the instance.
+        let m1 = graph
+            .merge_companies(pb::MergeCompaniesRequest {
+                survivor_id: s.to_string(),
+                absorbed_id: x.to_string(),
+                evidence_json: r#"[{"source": "manual", "note": "same PIB"}]"#.into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(m1.op, pb::MergeOp::Merge as i32);
+        let who = m1.actor.clone().unwrap();
+        assert_eq!(who.kind, pb::MergeActorKind::Manual as i32);
+        assert_eq!(who.instance_id, "inst-a");
+        assert_eq!(docs_of(s).await, 1, "{name}");
+        assert_eq!(docs_of(x).await, 0, "{name}");
+        let husk = graph
+            .get_node(pb::GetNodeRequest {
+                lookup: Some(pb::get_node_request::Lookup::Id(x.to_string())),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let props: serde_json::Value = serde_json::from_str(&husk.props_json).unwrap();
+        assert_eq!(props["merged_into"], s.to_string());
+        let m2 = graph
+            .merge_companies(pb::MergeCompaniesRequest {
+                survivor_id: t.to_string(),
+                absorbed_id: s.to_string(),
+                evidence_json: String::new(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+
+        // The log, newest first, paged.
+        let page = graph
+            .list_merges(pb::ListMergesRequest {
+                company_id: s.to_string(),
+                page_size: 1,
+                page_token: String::new(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(page.merges.len(), 1);
+        assert_eq!(page.merges[0].id, m2.id);
+        let next = graph
+            .list_merges(pb::ListMergesRequest {
+                company_id: s.to_string(),
+                page_size: 1,
+                page_token: page.next_page_token,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(next.merges[0].id, m1.id);
+
+        // Undo: refused while m2 depends on m1, then cascaded with a dismissal.
+        let err = graph
+            .undo_merge(pb::UndoMergeRequest {
+                merge_id: m1.id.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition, "{name}: {err:?}");
+        assert!(err.message().contains(&m2.id), "{}", err.message());
+        let out = graph
+            .undo_merge(pb::UndoMergeRequest {
+                merge_id: m1.id.clone(),
+                cascade: true,
+                dismiss: true,
+                reason: "two companies".into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(out.undone_ids, [m2.id.clone(), m1.id.clone()]);
+        let d = out.dismissal.unwrap();
+        assert_eq!(d.merge_id, m1.id);
+        assert_eq!(d.reason, "two companies");
+        assert_eq!(docs_of(x).await, 1, "{name}: back where it was");
+        let err = graph
+            .merge_companies(pb::MergeCompaniesRequest {
+                survivor_id: x.to_string(),
+                absorbed_id: s.to_string(),
+                evidence_json: String::new(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition, "{name}: dismissed");
+        let err = graph
+            .undo_merge(pb::UndoMergeRequest {
+                merge_id: m1.id.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::FailedPrecondition,
+            "{name}: already undone"
+        );
+        let listed = graph
+            .list_merges(pb::ListMergesRequest {
+                company_id: x.to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            listed
+                .merges
+                .iter()
+                .all(|m| m.undone_at > 0 && m.undone_by.is_some())
+        );
+        assert!(listed.next_page_token.is_empty());
+
+        // Split and its undo.
+        let sp = graph
+            .split_company(pb::SplitCompanyRequest {
+                company_id: x.to_string(),
+                name: "X Trading".into(),
+                aliases: vec!["id:rs_pib:100000002".into()],
+                document_ids: vec![doc.to_string()],
+                reason: "a different company with the same name".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(sp.op, pb::MergeOp::Split as i32);
+        let new: uuid::Uuid = sp.absorbed_id.parse().unwrap();
+        assert_eq!(docs_of(new).await, 1, "{name}");
+        assert_eq!(docs_of(x).await, 0, "{name}");
+        let err = graph
+            .split_company(pb::SplitCompanyRequest {
+                company_id: x.to_string(),
+                name: "Again".into(),
+                aliases: vec!["id:rs_pib:100000002".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::InvalidArgument,
+            "{name}: not x's alias now"
+        );
+        graph
+            .undo_merge(pb::UndoMergeRequest {
+                merge_id: sp.id.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(docs_of(x).await, 1, "{name}");
+
+        // Dismissals: a pair merged now is refused; otherwise recorded once.
+        let p = company("api-p").await;
+        let first = graph
+            .dismiss_pair(pb::DismissPairRequest {
+                company_a_id: p.to_string(),
+                company_b_id: t.to_string(),
+                reason: "not the same".into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(first.actor.unwrap().instance_id, "inst-a");
+        let all = graph
+            .list_dismissals(pb::ListDismissalsRequest {
+                company_id: p.to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(all.dismissals.len(), 1, "{name}");
+        let page = graph
+            .list_dismissals(pb::ListDismissalsRequest {
+                page_size: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(page.dismissals.len(), 1);
+        assert!(!page.next_page_token.is_empty(), "{name}: two dismissals");
+        let err = graph
+            .dismiss_pair(pb::DismissPairRequest {
+                company_a_id: doc.to_string(),
+                company_b_id: p.to_string(),
+                reason: String::new(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument, "{name}: a document");
+        a.stop().await;
+        shared.drop_schema().await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn health_and_reflection() {
     use tonic_reflection::pb::v1::ServerReflectionRequest;
