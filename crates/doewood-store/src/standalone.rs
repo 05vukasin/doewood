@@ -105,9 +105,20 @@ impl Standalone {
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
     {
+        self.read_then(f, Ok).await
+    }
+
+    /// [`Standalone::read`], then `then` on what it read, on the same blocking thread once
+    /// the reader is given back: work that needs no connection does not hold one.
+    async fn read_then<R, T, F, G>(&self, f: F, then: G) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<R> + Send + 'static,
+        G: FnOnce(R) -> Result<T> + Send + 'static,
+    {
         let store = Arc::clone(&self.store);
         let caller = Caller::current();
-        tokio::task::spawn_blocking(move || caller.run(|| store.read(sql, f)))
+        tokio::task::spawn_blocking(move || caller.run(|| store.read(sql, f)).and_then(then))
             .await
             .map_err(|e| backend(format!("blocking task failed: {e}")))?
     }
@@ -581,11 +592,12 @@ impl RecordStore for Standalone {
     ) -> Result<Vec<Record>> {
         let (source, after) = (source.clone(), after.copied());
         let limit = i64::from(records_limit(limit));
-        let rows = self.read(move |conn| {
-            // `> coalesce(?4, x'')` rather than `?4 IS NULL OR ...`: the OR kept SQLite from
-            // starting the scan at the page token, so every page read the records before it
-            // (issue #13). Every hash is 32 bytes, so all are greater than the empty blob.
-            let mut stmt = conn
+        self.read_then(
+            move |conn| {
+                // `> coalesce(?4, x'')` rather than `?4 IS NULL OR ...`: the OR kept SQLite from
+                // starting the scan at the page token, so every page read the records before it
+                // (issue #13). Every hash is 32 bytes, so all are greater than the empty blob.
+                let mut stmt = conn
                 .prepare_cached(
                     "SELECT r.blake3, r.body_json, r.versions_json, r.updated_at FROM records r \
                      WHERE r.blake3 > coalesce(?4, x'') \
@@ -595,40 +607,43 @@ impl RecordStore for Standalone {
                      ORDER BY r.blake3 LIMIT ?5",
                 )
                 .map_err(sql)?;
-            let rows = stmt
-                .query_map(
-                    params![
-                        source.endpoint(),
-                        source.bucket(),
-                        source.prefix(),
-                        after.as_ref().map(|h| h.as_bytes().as_slice()),
-                        limit
-                    ],
-                    |r| {
-                        Ok((
-                            r.get::<_, Vec<u8>>(0)?,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, String>(2)?,
-                            r.get::<_, i64>(3)?,
-                        ))
-                    },
-                )
-                .map_err(sql)?;
-            rows.map(|row| row.map_err(sql)).collect::<Result<Vec<_>>>()
-        })
-        .await?;
-        // The bodies are checked as JSON after the reader is given back: a page can hold
-        // megabytes of them (issue #109).
-        rows.into_iter()
-            .map(|(h, body, versions, updated_at)| {
-                Ok(Record {
-                    blake3: Blake3::from_slice(&h)?,
-                    body: raw_json(body)?,
-                    versions: versions_from_json(&json(&versions)?)?,
-                    updated_at,
-                })
-            })
-            .collect()
+                let rows = stmt
+                    .query_map(
+                        params![
+                            source.endpoint(),
+                            source.bucket(),
+                            source.prefix(),
+                            after.as_ref().map(|h| h.as_bytes().as_slice()),
+                            limit
+                        ],
+                        |r| {
+                            Ok((
+                                r.get::<_, Vec<u8>>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, String>(2)?,
+                                r.get::<_, i64>(3)?,
+                            ))
+                        },
+                    )
+                    .map_err(sql)?;
+                rows.map(|row| row.map_err(sql)).collect::<Result<Vec<_>>>()
+            },
+            // The bodies are checked as JSON once the reader is given back: a page can hold
+            // megabytes of them (issue #109).
+            |rows| {
+                rows.into_iter()
+                    .map(|(h, body, versions, updated_at)| {
+                        Ok(Record {
+                            blake3: Blake3::from_slice(&h)?,
+                            body: raw_json(body)?,
+                            versions: versions_from_json(&json(&versions)?)?,
+                            updated_at,
+                        })
+                    })
+                    .collect()
+            },
+        )
+        .await
     }
 }
 

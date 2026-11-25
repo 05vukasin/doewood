@@ -928,7 +928,9 @@ mod tests {
         let (_tmp, store) = on_disk(2);
         let order = Mutex::new(Vec::new());
         // The API holds both readers, and more of its reads wait.
-        let mut held: Vec<_> = (0..2).map(|_| api_call_blocking(|| store.reader())).collect();
+        let mut held: Vec<_> = (0..2)
+            .map(|_| api_call_blocking(|| store.reader()))
+            .collect();
         std::thread::scope(|s| {
             for _ in 0..3 {
                 s.spawn(|| api_call_blocking(|| noted(&store, &order, "api")));

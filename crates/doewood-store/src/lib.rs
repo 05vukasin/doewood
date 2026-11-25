@@ -54,6 +54,7 @@ pub use store::ingest::{
 };
 pub use store::llm::{LlmCounts, LlmJob, LlmJobStatus, LlmUsage, SECONDS_PER_DAY, utc_day};
 pub use store::objects::{IngestOutcome, IngestStatus, ObjectChange, ScanCheckpoint, SeenObject};
+pub use store::readers::{api_call, api_call_blocking};
 pub use store::sources::{
     DEFAULT_LLM_CONCURRENCY, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_SCAN_INTERVAL, LlmMode, LlmPolicy,
     MAX_LLM_CONCURRENCY, MAX_LLM_KINDS, NewSource, ObjectCounts, S3Credentials, Source,
@@ -63,7 +64,6 @@ pub use store::sqs::{
     CredentialsChange, QUEUE_URL_MAX_LEN, SQS_DEFAULT_REGION, SqsInlet, SqsInletInput,
     queue_url_region, valid_queue_url,
 };
-pub use store::readers::{api_call, api_call_blocking};
 pub use store::{
     DEFAULT_READERS, MAX_READERS, SECRET_MAX_LEN, STORE_FILE, Snapshot, Store, default_readers,
     plan_readers,
