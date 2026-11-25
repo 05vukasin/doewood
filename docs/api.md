@@ -16,6 +16,8 @@ changes go to a new package (`doewood.v2`), never into v1.
   tokens or OIDC go later without changing the API. Health and reflection stay open.
 - **Message size:** up to `DOEWOOD_API_MAX_MESSAGE_MIB` (default 64 MiB) each way, room for a
   file sent to `Summarize`. Larger messages are refused (`OUT_OF_RANGE`).
+- **Limits** on streams per connection, keepalive, connection age, calls in flight and a
+  server deadline: see [Limits](#limits).
 - **Secrets are write-only.** S3 credentials and AI API keys are sealed with the master key;
   no response and no error carries one, only `credentials_set` or `api_key_set`. Error
   messages never echo a value that may hold a secret (an endpoint with `user:password@`, a
@@ -29,7 +31,7 @@ The S3 event webhook is not part of the gRPC API: it is on the ops server (see
 
 | service | RPCs |
 |---|---|
-| `ConfigService` | `AddSource`, `UpdateSource`, `PauseSource`, `ResumeSource`, `RemoveSource`, `ListSources`, `GetSource`, `SetLlmPolicy`, `SetSqsInlet`, `RemoveSqsInlet`, `SetAiProvider`, `ListAiProviders`, `GetIngestSettings`, `SetIngestSettings`, `GetEnrichmentSettings`, `SetEnrichmentSettings` |
+| `ConfigService` | `AddSource`, `UpdateSource`, `PauseSource`, `ResumeSource`, `RemoveSource`, `ListSources`, `GetSource`, `SetLlmPolicy`, `SetSqsInlet`, `RemoveSqsInlet`, `SetAiProvider`, `ListAiProviders`, `GetIngestSettings`, `SetIngestSettings`, `GetEnrichmentSettings`, `SetEnrichmentSettings`, `GetApiSettings`, `SetApiSettings` |
 | `JobsService` | `WatchProgress` (server stream), `ReprocessJob`, `WatchReprocess` (server stream) |
 | `RecordsService` | `GetRecord`, `ListRecords` |
 | `GraphService` | `GetNode`, `Neighbours`, `CompanyDocuments`, `ListMerges`, `MergeCompanies`, `UndoMerge`, `SplitCompany`, `DismissPair`, `ListDismissals`, `ListProposals`, `AcceptProposal`, `RejectProposal` |
@@ -108,6 +110,15 @@ The comments in the `.proto` files are the reference for every field. In short:
   `INVALID_ARGUMENT`. It is read for every `Summarize` call, so it applies to the next one;
   calls in flight keep running.
 
+### API settings
+
+- **GetApiSettings** returns the server's per-call limits, defaults filled in:
+  `max_calls_in_flight` (default 256) and `deadline_seconds` (default 60).
+- **SetApiSettings** changes them; an unset field keeps its value, and a refused request
+  changes nothing. `max_calls_in_flight` is 1 to 65536, `deadline_seconds` 1 to 3600; anything
+  else is `INVALID_ARGUMENT`. They apply to the next call, without a restart; a call already
+  running keeps the deadline it started with. What they do is in [Limits](#limits).
+
 ### Enrichment settings
 
 Company enrichment's runtime settings (ADR 0002 section 7). The enrichment job reads them on
@@ -146,8 +157,11 @@ every pass and the icon route on every lookup, so a change needs no restart.
 
 **WatchProgress** streams one `KIND_SNAPSHOT` update per source, then an update whenever a
 source changes: `KIND_COUNTERS`, `KIND_STATE_CHANGED` (with `previous_state`) or `KIND_REMOVED`.
-It ends when the client cancels or the server shuts down. `source_ids` narrows it; empty watches
-every source, including ones added later.
+It ends when the client cancels or the server shuts down, or when its connection reaches its
+maximum age (at most 35 minutes, see [Limits](#limits)). `source_ids` narrows it; empty
+watches every source, including ones added later. A client watches again when the stream
+ends with an error (for example a transport error when the connection closed): the first message of the new
+stream is a full snapshot, so nothing is lost. `WatchReprocess` behaves the same way.
 
 A watch of every source (empty `source_ids`) also carries the instance's enrichment job: a
 `KIND_ENRICHMENT` update with the first snapshot and whenever its counters change, with
@@ -287,11 +301,48 @@ source's `max_object_bytes`; a file larger than ingest analyzes (512 MiB) is
 | `INVALID_ARGUMENT` | a field is wrong. Every problem is reported at once: the message lists `field: reason` pairs, and a `google.rpc.BadRequest` detail carries the same field paths (`credentials.access_key_id`, `llm_policy.kinds[2]`, ...). |
 | `NOT_FOUND` | the source, record, node or provider does not exist |
 | `ALREADY_EXISTS` | the source exists on this instance, or another instance has claimed it (named in the message) |
-| `UNAVAILABLE` | the shared Postgres is not connected (yet), or a call to it failed; retry. `ReprocessJob` and `Summarize` on an instance without ingest; `Summarize` of an object that cannot be read |
+| `UNAVAILABLE` | the shared Postgres is not connected (yet), or a call to it failed; retry. `ReprocessJob` and `Summarize` on an instance without ingest; `Summarize` of an object that cannot be read. The server is overloaded: more calls are in flight than `max_calls_in_flight` (the message says `overloaded`; nothing ran, retry with backoff). |
+| `DEADLINE_EXCEEDED` | the call ran longer than the server's deadline (`deadline_seconds`, default 60 s), or than the client's own deadline |
+| `CANCELLED` | the client's `grpc-timeout` ran out on the server side (the client usually reports its own `DEADLINE_EXCEEDED` first) |
 | `FAILED_PRECONDITION` | the shared database was migrated by a newer doewood. A merge of a dismissed pair or of a merged-away company; an undo that later merges depend on (named in the message), of an entry already undone, or of a split that dismissed its pair; a dismissal of two companies merged now. `Summarize` without a configured AI provider (or with one missing its key or base URL), of a source whose LLM policy is off, of a file without text, or of a file larger than ingest analyzes |
 | `RESOURCE_EXHAUSTED` | `Summarize` while as many calls as `summarize_max_concurrent` allows are reading or analyzing a file; retry later |
 | `OUT_OF_RANGE` | a message larger than the limit |
 | `INTERNAL` | anything else; the details are in the server log, not in the message |
+
+## Limits
+
+The server protects itself from one client and from overload. What a client sees, and what
+to do:
+
+| limit | value | what the client sees |
+|---|---|---|
+| Streams (calls) at the same time on one HTTP/2 connection | 256 (fixed) | the next call waits in the client until one ends (HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS`); open another connection, or a channel per 256 watches |
+| HTTP/2 keepalive | PING after 30 s without traffic, closed if no answer within 20 s (fixed) | nothing; a dead or vanished peer's connection, streams and tasks are freed |
+| TCP keepalive | probes after 60 s idle (fixed) | nothing; half-open connections behind a NAT or load balancer are found |
+| Connection age | GOAWAY at 30 min, closed 5 min later (fixed) | new calls go to a new connection (which the load balancer may send to another replica); calls already running get the 5 minutes to finish; an open stream still running then ends with a transport error (the connection is closed): watch again |
+| Calls in flight, per instance | `max_calls_in_flight`, default 256 (runtime setting) | `UNAVAILABLE`, at once, with `overloaded` in the message; retry with backoff (another replica may answer) |
+| Server deadline | `deadline_seconds`, default 60 s (runtime setting) | `DEADLINE_EXCEEDED`; a shorter client `grpc-timeout` wins |
+
+- **Streams** (`WatchProgress`, `WatchReprocess`, reflection, the health `Watch`) count
+  against the in-flight cap and the deadline only while they are set up: until the server
+  has answered with the stream. An open stream is never shed or cut by the deadline; the
+  streams per connection bound how many one connection holds.
+- **`Summarize`** counts against the in-flight cap but has no server deadline: its analysis
+  and provider call are bounded on their own and can take minutes, and its analyses have
+  their own cap (`summarize_max_concurrent`, `RESOURCE_EXHAUSTED` beyond it). Give it a
+  client deadline if you need one.
+- **Health checks** (`grpc.health.v1.Health`) are never shed nor given the deadline, so a
+  probe answers under load.
+- **gRPC-Web** calls get the same limits and errors (the status in the response headers). The
+  icon route `GET /icons/{domain}` is outside them: it has its own (16 lookups in flight, then
+  `503`, see [Company icons](#company-icons)), and so do the ops endpoints (another port).
+- The connection limits are fixed when the listener starts (they are not bootstrap variables;
+  see [configuration.md](configuration.md#api-limits)). The two per-call limits are set with
+  `SetApiSettings` and apply to the next call.
+- **Retries:** `UNAVAILABLE` is safe to retry for every call (a shed call did not run). Use
+  exponential backoff with jitter (for example 100 ms doubling to 10 s), and a client
+  deadline on every unary call. gRPC clients reconnect on GOAWAY by themselves.
+- **Load balancing** across replicas: see [deploy.md](deploy.md#load-balancing).
 
 ## Examples with grpcurl
 

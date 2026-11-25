@@ -53,6 +53,11 @@ service ConfigService {
   // Changes them, all or nothing; an unset field keeps its value. The enrichment job reads
   // them on every pass and the favicon proxy on every lookup: no restart.
   rpc SetEnrichmentSettings(SetEnrichmentSettingsRequest) returns (EnrichmentSettings);
+  // The API server's limits (docs/api.md, "Limits"), with the defaults filled in.
+  rpc GetApiSettings(GetApiSettingsRequest) returns (ApiSettings);
+  // Changes them, all or nothing; an unset field keeps its value. Applies to the next call,
+  // without a restart. Calls already running keep the deadline they started with.
+  rpc SetApiSettings(SetApiSettingsRequest) returns (ApiSettings);
 }
 
 // How bucket URLs are built.
@@ -314,6 +319,29 @@ message SetIngestSettingsRequest {
   // 1 to 16; anything else is INVALID_ARGUMENT. Unset keeps the stored value. Applies to the
   // next `Summarize` call; calls in flight keep running.
   optional uint32 summarize_max_concurrent = 2;
+}
+
+// The API server's runtime limits. The connection limits (streams per connection, keepalive,
+// connection age) are fixed, see docs/api.md.
+message ApiSettings {
+  // Calls the server runs at the same time; a call beyond it is refused at once with
+  // UNAVAILABLE. A stream counts while it is set up, not while it is open; health
+  // checks never count. 1 to 65536, default 256.
+  uint32 max_calls_in_flight = 1;
+  // The server's deadline for a call, in seconds: a call still running after it ends with
+  // DEADLINE_EXCEEDED (a shorter client `grpc-timeout` wins). For a stream it bounds the
+  // start only, not the open stream. `Summarize` has no server deadline (its analysis and
+  // provider have their own). 1 to 3600, default 60.
+  uint32 deadline_seconds = 2;
+}
+
+message GetApiSettingsRequest {}
+
+message SetApiSettingsRequest {
+  // 1 to 65536; anything else is INVALID_ARGUMENT. Unset keeps the stored value.
+  optional uint32 max_calls_in_flight = 1;
+  // 1 to 3600; anything else is INVALID_ARGUMENT. Unset keeps the stored value.
+  optional uint32 deadline_seconds = 2;
 }
 
 // Company enrichment's settings. Secrets are never returned, only whether one is set.
