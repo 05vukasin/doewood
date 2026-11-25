@@ -1,5 +1,7 @@
+use std::num::NonZeroUsize;
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use doewood_core::MasterKey;
@@ -35,16 +37,116 @@ const JOURNAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
 /// Prepared statements kept per connection.
 pub(crate) const STATEMENT_CACHE: usize = 128;
 
+/// Read-only connections of an on-disk store when none are asked for: at most this many, and
+/// at most one per CPU.
+pub const DEFAULT_READERS: usize = 2;
+
+/// Most read-only connections a store opens.
+pub const MAX_READERS: usize = 16;
+
 /// Reserved secret that proves the master key is the one the store was created with.
 const KEY_CHECK: &str = "_doewood.key_check";
 const KEY_CHECK_VALUE: &[u8] = b"doewood key check v1";
 
-/// The instance-local store. Cheap to share behind an `Arc`; every call takes the single
-/// connection's lock, so there is exactly one writer.
+/// The instance-local store. Cheap to share behind an `Arc`.
+///
+/// Every write goes through the one read-write connection behind a mutex, so there is exactly
+/// one writer. An on-disk store also opens a few read-only connections ([`DEFAULT_READERS`]):
+/// the pure reads the API and the progress snapshot make run there, in WAL mode next to the
+/// writer, so they no longer wait for ingest's writes. A read sees what was committed when it
+/// started; each read call is one transaction on one connection. An in-memory store has no
+/// readers: its reads use the writer, as before.
 pub struct Store {
     conn: Mutex<Connection>,
+    readers: Readers,
     cipher: Cipher,
 }
+
+/// The read-only connections: idle ones wait in `idle`, a read takes one and gives it back.
+#[derive(Default)]
+pub(crate) struct Readers {
+    idle: Mutex<Vec<Connection>>,
+    returned: Condvar,
+    count: usize,
+}
+
+/// The connection a read runs on: a read-only one, or the writer when the store has none.
+pub(crate) enum ReadConn<'a> {
+    Writer(MutexGuard<'a, Connection>),
+    Reader {
+        readers: &'a Readers,
+        conn: Option<Connection>,
+    },
+}
+
+impl Deref for ReadConn<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        match self {
+            Self::Writer(conn) => conn,
+            Self::Reader { conn, .. } => conn.as_ref().expect("held until dropped"),
+        }
+    }
+}
+
+impl DerefMut for ReadConn<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        match self {
+            Self::Writer(conn) => conn,
+            Self::Reader { conn, .. } => conn.as_mut().expect("held until dropped"),
+        }
+    }
+}
+
+impl Drop for ReadConn<'_> {
+    fn drop(&mut self) {
+        // A read that panicked or failed to commit leaves its transaction open: end it, or the
+        // connection's next read would fail to begin.
+        if !self.is_autocommit() {
+            let _ = self.execute_batch("ROLLBACK");
+        }
+        if let Self::Reader { readers, conn } = self
+            && let Some(conn) = conn.take()
+        {
+            lock(&readers.idle).push(conn);
+            readers.returned.notify_one();
+        }
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    // A panic while holding the lock leaves SQLite consistent (statements are atomic).
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Runs `f` in one read transaction on `conn`, so every statement it runs sees the same
+/// committed state. `map` turns SQLite's errors into the caller's.
+pub(crate) fn read_tx<T, E>(
+    conn: &mut Connection,
+    map: impl Fn(rusqlite::Error) -> E,
+    f: impl FnOnce(&mut Connection) -> Result<T, E>,
+) -> Result<T, E> {
+    fn step(conn: &Connection, sql: &str) -> rusqlite::Result<()> {
+        conn.prepare_cached(sql)
+            .and_then(|mut cached| cached.execute([]))
+            .map(drop)
+    }
+    step(conn, "BEGIN").map_err(&map)?;
+    let out = f(conn);
+    // A read changed nothing, so COMMIT and ROLLBACK are the same; a failed one is rolled
+    // back when the connection is given back.
+    let end = step(conn, "COMMIT");
+    match (out, end) {
+        (Ok(v), Ok(())) => Ok(v),
+        (Err(e), _) => Err(e),
+        (Ok(_), Err(e)) => Err(map(e)),
+    }
+}
+
+/// A consistent read of the store: every call through it sees the same committed state
+/// ([`Store::snapshot`]).
+pub struct Snapshot<'a>(pub(crate) &'a Connection);
 
 impl std::fmt::Debug for Store {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -54,15 +156,38 @@ impl std::fmt::Debug for Store {
 
 impl Store {
     /// Opens (creating if needed) the store at `path`, applies the pragmas, migrates the schema
-    /// and checks the master key.
+    /// and checks the master key; then opens the read-only connections: [`DEFAULT_READERS`],
+    /// at most one per CPU.
     pub fn open(path: &Path, key: &MasterKey) -> Result<Self, StoreError> {
+        let cpus = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+        Self::open_with_readers(path, key, DEFAULT_READERS.min(cpus))
+    }
+
+    /// [`Store::open`] with `readers` read-only connections (at most [`MAX_READERS`]); 0 runs
+    /// every read on the writer.
+    pub fn open_with_readers(
+        path: &Path,
+        key: &MasterKey,
+        readers: usize,
+    ) -> Result<Self, StoreError> {
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        Self::init(conn, key)
+        // The writer migrates and checks the key first: the readers open the finished schema.
+        let mut store = Self::init(conn, key)?;
+        let count = readers.min(MAX_READERS);
+        let idle = (0..count)
+            .map(|_| open_reader(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        store.readers = Readers {
+            idle: Mutex::new(idle),
+            returned: Condvar::new(),
+            count,
+        };
+        Ok(store)
     }
 
     /// An in-memory store, for tests.
@@ -88,15 +213,63 @@ impl Store {
         conn.execute_batch("PRAGMA optimize = 0x10002;")?;
         let store = Self {
             conn: Mutex::new(conn),
+            readers: Readers::default(),
             cipher: Cipher::new(key),
         };
         store.check_key()?;
         Ok(store)
     }
 
+    /// The writer. Every write, and every read that must see the caller's own uncommitted
+    /// writes, runs here.
     pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
-        // A panic while holding the lock leaves SQLite consistent (statements are atomic).
-        self.conn.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.conn)
+    }
+
+    /// How many read-only connections the store has (0: reads use the writer).
+    pub fn readers(&self) -> usize {
+        self.readers.count
+    }
+
+    /// A connection for a read: an idle reader (waiting for one when all are busy), or the
+    /// writer when the store has none. Never the writer while it has readers, so reads do not
+    /// wait for writes, and a flood of reads cannot hold up a write.
+    pub(crate) fn reader(&self) -> ReadConn<'_> {
+        if self.readers.count == 0 {
+            return ReadConn::Writer(self.conn());
+        }
+        let mut idle = lock(&self.readers.idle);
+        loop {
+            if let Some(conn) = idle.pop() {
+                return ReadConn::Reader {
+                    readers: &self.readers,
+                    conn: Some(conn),
+                };
+            }
+            idle = self
+                .readers
+                .returned
+                .wait(idle)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// Runs the read `f` in one transaction on a reader ([`Store::reader`]).
+    pub(crate) fn read<T, E>(
+        &self,
+        map: impl Fn(rusqlite::Error) -> E,
+        f: impl FnOnce(&mut Connection) -> Result<T, E>,
+    ) -> Result<T, E> {
+        read_tx(&mut self.reader(), map, f)
+    }
+
+    /// Runs `f` on one consistent read of the store, on a reader: what several calls read
+    /// together (every source's progress, say) comes from the same committed state.
+    pub fn snapshot<T>(
+        &self,
+        f: impl FnOnce(&Snapshot<'_>) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        self.read(StoreError::from, |conn| f(&Snapshot(conn)))
     }
 
     fn check_key(&self) -> Result<(), StoreError> {
@@ -130,14 +303,12 @@ impl Store {
 
     /// Reads a runtime setting.
     pub fn setting(&self, key: &str) -> Result<Option<serde_json::Value>, StoreError> {
-        let text: Option<String> = self
-            .conn()
-            .query_row(
-                "SELECT value_json FROM settings WHERE key = ?1",
-                [key],
-                |r| r.get(0),
-            )
-            .optional()?;
+        let text: Option<String> = self.read(StoreError::from, |conn| {
+            Ok(conn
+                .prepare_cached("SELECT value_json FROM settings WHERE key = ?1")?
+                .query_row([key], |r| r.get(0))
+                .optional()?)
+        })?;
         text.map(|t| serde_json::from_str(&t).map_err(|_| StoreError::BadSetting(key.to_owned())))
             .transpose()
     }
@@ -175,23 +346,26 @@ impl Store {
     /// Whether a secret with this name is stored.
     pub fn secret_exists(&self, name: &str) -> Result<bool, StoreError> {
         validate_secret_name(name)?;
-        Ok(self
-            .conn()
-            .query_row("SELECT 1 FROM secrets WHERE name = ?1", [name], |_| Ok(()))
-            .optional()?
-            .is_some())
+        self.read(StoreError::from, |conn| {
+            Ok(conn
+                .prepare_cached("SELECT 1 FROM secrets WHERE name = ?1")?
+                .query_row([name], |_| Ok(()))
+                .optional()?
+                .is_some())
+        })
     }
 
     /// The names of the stored secrets, sorted. Names only, never values.
     pub fn secret_names(&self) -> Result<Vec<String>, StoreError> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT name FROM secrets WHERE name NOT LIKE '\\_%' ESCAPE '\\' ORDER BY name",
-        )?;
-        let names = stmt
-            .query_map([], |r| r.get(0))?
-            .collect::<Result<Vec<String>, _>>()?;
-        Ok(names)
+        self.read(StoreError::from, |conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT name FROM secrets WHERE name NOT LIKE '\\_%' ESCAPE '\\' ORDER BY name",
+            )?;
+            let names = stmt
+                .query_map([], |r| r.get(0))?
+                .collect::<Result<Vec<String>, _>>()?;
+            Ok(names)
+        })
     }
 
     /// Decrypts a secret. Crate-internal: the connectors (S3 credentials, AI provider keys)
@@ -215,15 +389,16 @@ impl Store {
         Ok(())
     }
 
+    /// Reads and opens a sealed secret, on a reader: the cipher is the store's, whichever
+    /// connection read the row. (At open, before the readers exist, the key check reads on the
+    /// writer.)
     fn read_sealed(&self, name: &str) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
-        let row: Option<(Vec<u8>, Vec<u8>)> = self
-            .conn()
-            .query_row(
-                "SELECT nonce, ciphertext FROM secrets WHERE name = ?1",
-                [name],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
+        let row: Option<(Vec<u8>, Vec<u8>)> = self.read(StoreError::from, |conn| {
+            Ok(conn
+                .prepare_cached("SELECT nonce, ciphertext FROM secrets WHERE name = ?1")?
+                .query_row([name], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?)
+        })?;
         row.map(|(nonce, ct)| self.cipher.open(name, &nonce, &ct))
             .transpose()
     }
@@ -235,8 +410,16 @@ impl Store {
         Ok(())
     }
 
-    /// Checkpoints the WAL into the main file and closes the connection.
+    /// Closes the readers, then checkpoints the WAL into the main file and closes the writer.
     pub fn close(self) -> Result<(), StoreError> {
+        let readers = self
+            .readers
+            .idle
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner);
+        for reader in readers {
+            reader.close().map_err(|(_, e)| StoreError::Sqlite(e))?;
+        }
         let conn = self
             .conn
             .into_inner()
@@ -249,6 +432,19 @@ impl Store {
     pub(crate) fn raw(&self) -> MutexGuard<'_, Connection> {
         self.conn()
     }
+}
+
+/// A read-only connection to the store at `path`, with the writer's statement cache and busy
+/// timeout. `SQLITE_OPEN_READ_ONLY` and `query_only` both refuse writes.
+fn open_reader(path: &Path) -> Result<Connection, StoreError> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    conn.pragma_update(None, "query_only", true)?;
+    conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
+    Ok(conn)
 }
 
 /// Secret names: 1 to 128 ASCII letters, digits, `.`, `_`, `-` or `/`; a leading `_` is
@@ -565,5 +761,240 @@ mod tests {
             Err(StoreError::WrongMasterKey)
         ));
         Store::open(&path, &key(1)).unwrap().close().unwrap();
+    }
+
+    fn on_disk(readers: usize) -> (tempfile::TempDir, Store) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            Store::open_with_readers(&tmp.path().join(STORE_FILE), &key(1), readers).unwrap();
+        (tmp, store)
+    }
+
+    #[test]
+    fn readers_are_for_on_disk_stores_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join(STORE_FILE), &key(1)).unwrap();
+        let cpus = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+        assert_eq!(store.readers(), DEFAULT_READERS.min(cpus));
+        store.close().unwrap();
+        assert_eq!(Store::open_in_memory(&key(1)).unwrap().readers(), 0);
+        assert_eq!(on_disk(0).1.readers(), 0);
+        assert_eq!(on_disk(MAX_READERS + 5).1.readers(), MAX_READERS);
+        // With no readers, reads use the writer.
+        let (_tmp, store) = on_disk(0);
+        store.set_setting("k", &serde_json::json!(1)).unwrap();
+        assert_eq!(store.setting("k").unwrap(), Some(serde_json::json!(1)));
+    }
+
+    #[test]
+    fn readers_refuse_writes() {
+        let (_tmp, store) = on_disk(2);
+        let reader = store.reader();
+        assert!(matches!(&reader, ReadConn::Reader { .. }));
+        let query_only: bool = reader
+            .pragma_query_value(None, "query_only", |r| r.get(0))
+            .unwrap();
+        assert!(query_only);
+        let err = reader
+            .execute(
+                "INSERT INTO settings (key, value_json, updated_at) VALUES ('x', '1', 0)",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err.sqlite_error_code(), Some(rusqlite::ErrorCode::ReadOnly)),
+            "{err}"
+        );
+        drop(reader);
+        assert_eq!(store.setting("x").unwrap(), None);
+    }
+
+    #[test]
+    fn readers_see_committed_writes_and_do_not_wait_for_the_writer() {
+        let (_tmp, store) = on_disk(2);
+        store.set_setting("a", &serde_json::json!("one")).unwrap();
+        assert_eq!(store.setting("a").unwrap(), Some(serde_json::json!("one")));
+        // A long write transaction holds the writer.
+        let writer = store.conn();
+        writer
+            .execute_batch(
+                "BEGIN IMMEDIATE; UPDATE settings SET value_json = '\"two\"' WHERE key = 'a';",
+            )
+            .unwrap();
+        // Reads on other threads go on at once and see the last committed state.
+        std::thread::scope(|s| {
+            let reads: Vec<_> = (0..4)
+                .map(|_| {
+                    s.spawn(|| {
+                        let t = std::time::Instant::now();
+                        let v = store.setting("a").unwrap();
+                        (v, t.elapsed())
+                    })
+                })
+                .collect();
+            for r in reads {
+                let (v, took) = r.join().unwrap();
+                assert_eq!(v, Some(serde_json::json!("one")));
+                assert!(took < Duration::from_secs(2), "a read waited {took:?}");
+            }
+        });
+        writer.execute_batch("COMMIT").unwrap();
+        drop(writer);
+        assert_eq!(store.setting("a").unwrap(), Some(serde_json::json!("two")));
+    }
+
+    #[test]
+    fn a_snapshot_reads_one_committed_state() {
+        let (_tmp, store) = on_disk(2);
+        store.set_setting("n", &serde_json::json!(1)).unwrap();
+        let (before, after) = store
+            .read(StoreError::from, |conn| {
+                let get = |conn: &Connection| -> rusqlite::Result<String> {
+                    conn.query_row("SELECT value_json FROM settings WHERE key = 'n'", [], |r| {
+                        r.get(0)
+                    })
+                };
+                let before = get(conn)?;
+                // A write commits on the writer meanwhile.
+                store.set_setting("n", &serde_json::json!(2))?;
+                Ok((before, get(conn)?))
+            })
+            .unwrap();
+        assert_eq!((before.as_str(), after.as_str()), ("1", "1"));
+        assert_eq!(store.setting("n").unwrap(), Some(serde_json::json!(2)));
+    }
+
+    #[test]
+    fn a_failed_or_panicking_read_gives_its_reader_back_clean() {
+        let (_tmp, store) = on_disk(2);
+        for _ in 0..3 {
+            let out: Result<(), StoreError> = store.read(StoreError::from, |_| {
+                Err(StoreError::BadSetting("x".into()))
+            });
+            assert!(out.is_err());
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _: Result<(), StoreError> = store.read(StoreError::from, |_| panic!("boom"));
+            }));
+            assert!(panicked.is_err());
+        }
+        // Every reader is idle, outside a transaction, and serves reads.
+        let idle = lock(&store.readers.idle);
+        assert_eq!(idle.len(), 2);
+        assert!(idle.iter().all(Connection::is_autocommit));
+        drop(idle);
+        store.set_setting("k", &serde_json::json!(true)).unwrap();
+        for _ in 0..4 {
+            assert_eq!(store.setting("k").unwrap(), Some(serde_json::json!(true)));
+        }
+    }
+
+    #[test]
+    fn a_read_waits_for_a_free_reader_not_for_the_writer() {
+        let (_tmp, store) = on_disk(1);
+        let held = store.reader();
+        std::thread::scope(|s| {
+            let read = s.spawn(|| store.setting("k").unwrap());
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!read.is_finished(), "the only reader is taken");
+            drop(held);
+            assert_eq!(read.join().unwrap(), None);
+        });
+    }
+
+    #[test]
+    fn secrets_open_on_readers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(STORE_FILE);
+        let store = Store::open_with_readers(&path, &key(1), 2).unwrap();
+        store.set_secret("s3/main", b"very-secret-value").unwrap();
+        assert!(matches!(store.reader(), ReadConn::Reader { .. }));
+        assert!(store.secret_exists("s3/main").unwrap());
+        assert_eq!(store.secret_names().unwrap(), ["s3/main"]);
+        assert_eq!(
+            store.reveal("s3/main").unwrap().unwrap().as_slice(),
+            b"very-secret-value"
+        );
+        store.close().unwrap();
+        // The key check still runs (on the writer, before the readers open).
+        assert!(matches!(
+            Store::open_with_readers(&path, &key(2), 2),
+            Err(StoreError::WrongMasterKey)
+        ));
+        let store = Store::open_with_readers(&path, &key(1), 2).unwrap();
+        assert_eq!(
+            store.reveal("s3/main").unwrap().unwrap().as_slice(),
+            b"very-secret-value"
+        );
+        store.close().unwrap();
+    }
+
+    /// What each reader adds to the process's memory once its page cache is full: a store of
+    /// about 40 MiB is read in full on every connection at once, then the resident set is
+    /// compared with the same reads on the writer alone.
+    /// `cargo test -p doewood-store --lib -- --ignored --nocapture reader_memory`
+    /// (`DOEWOOD_BENCH_READERS` sets the readers, default 2).
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn reader_memory() {
+        fn rss_kib() -> u64 {
+            let statm = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+            let pages: u64 = statm
+                .split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            pages * 4
+        }
+        let n: usize = std::env::var("DOEWOOD_BENCH_READERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(STORE_FILE);
+        {
+            let store = Store::open_with_readers(&path, &key(1), 0).unwrap();
+            let mut conn = store.conn();
+            let tx = conn.transaction().unwrap();
+            let body = "x".repeat(4000);
+            for i in 0..10_000 {
+                tx.execute(
+                    "INSERT INTO settings (key, value_json, updated_at) VALUES (?1, ?2, 0)",
+                    params![format!("k{i:06}"), serde_json::json!(body).to_string()],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+            drop(conn);
+            store.close().unwrap();
+        }
+        let scan = |conn: &Connection| {
+            let mut stmt = conn
+                .prepare_cached("SELECT sum(length(value_json)) FROM settings")
+                .unwrap();
+            let _: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
+        };
+        let store = Store::open_with_readers(&path, &key(1), n).unwrap();
+        let base = rss_kib();
+        scan(&store.conn());
+        let writer = rss_kib();
+        // Every reader at once, so each fills its own cache.
+        let held: Vec<ReadConn<'_>> = (0..n).map(|_| store.reader()).collect();
+        for conn in &held {
+            scan(conn);
+        }
+        let all = rss_kib();
+        drop(held);
+        #[allow(clippy::cast_precision_loss)]
+        let per = if n == 0 {
+            0.0
+        } else {
+            (all.saturating_sub(writer)) as f64 / n as f64 / 1024.0
+        };
+        println!(
+            "reader_memory: {n} readers; RSS after open {base} KiB, writer warm {writer} KiB \
+             (+{} KiB), all warm {all} KiB: {per:.2} MiB per reader",
+            writer.saturating_sub(base)
+        );
+        store.close().unwrap();
     }
 }

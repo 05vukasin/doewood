@@ -8,6 +8,7 @@
 use doewood_core::SourceId;
 use rusqlite::{OptionalExtension as _, params};
 
+use super::Snapshot;
 use super::{Store, now};
 use crate::StoreError;
 
@@ -416,24 +417,7 @@ impl Store {
 
     /// A source's scan checkpoint; `None` before its first pass.
     pub fn scan_checkpoint(&self, source: SourceId) -> Result<Option<ScanCheckpoint>, StoreError> {
-        Ok(self
-            .conn()
-            .prepare_cached(
-                "SELECT pass, in_progress, start_after, pass_started_at, last_completed_at \
-                 FROM scan_checkpoints WHERE source_id = ?1",
-            )
-            .and_then(|mut cached| {
-                cached.query_row([source.to_string()], |r| {
-                    Ok(ScanCheckpoint {
-                        pass: u64::try_from(r.get::<_, i64>(0)?).unwrap_or(0),
-                        in_progress: r.get(1)?,
-                        start_after: r.get(2)?,
-                        pass_started_at: r.get(3)?,
-                        last_completed_at: r.get(4)?,
-                    })
-                })
-            })
-            .optional()?)
+        self.snapshot(|s| s.scan_checkpoint(source))
     }
 
     /// Saves a source's scan checkpoint.
@@ -482,6 +466,30 @@ fn write_checkpoint(
         now
     ])?;
     Ok(())
+}
+
+impl Snapshot<'_> {
+    /// A source's scan checkpoint; `None` before its first pass.
+    pub fn scan_checkpoint(&self, source: SourceId) -> Result<Option<ScanCheckpoint>, StoreError> {
+        Ok(self
+            .0
+            .prepare_cached(
+                "SELECT pass, in_progress, start_after, pass_started_at, last_completed_at \
+                 FROM scan_checkpoints WHERE source_id = ?1",
+            )
+            .and_then(|mut cached| {
+                cached.query_row([source.to_string()], |r| {
+                    Ok(ScanCheckpoint {
+                        pass: u64::try_from(r.get::<_, i64>(0)?).unwrap_or(0),
+                        in_progress: r.get(1)?,
+                        start_after: r.get(2)?,
+                        pass_started_at: r.get(3)?,
+                        last_completed_at: r.get(4)?,
+                    })
+                })
+            })
+            .optional()?)
+    }
 }
 
 #[cfg(test)]

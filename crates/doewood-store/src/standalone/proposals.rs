@@ -194,12 +194,12 @@ impl ProposalStore for Standalone {
     }
 
     async fn proposal(&self, id: Uuid) -> Result<Option<Proposal>> {
-        self.run(move |c| by_id(c, &id.to_string())).await
+        self.read(move |c| by_id(c, &id.to_string())).await
     }
 
     async fn list_proposals(&self, q: &ProposalQuery) -> Result<Vec<Proposal>> {
         let q = *q;
-        self.run(move |c| {
+        self.read(move |c| {
             let mut stmt = c
                 .prepare_cached(&format!(
                     "SELECT {COLUMNS} FROM company_proposals \

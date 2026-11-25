@@ -576,13 +576,12 @@ impl MergeStore for Standalone {
     }
 
     async fn merge_entry(&self, id: Uuid) -> Result<Option<MergeEntry>> {
-        self.run(move |c| in_tx(c, |tx| ready(tx.entry(id)))).await
+        self.read(move |c| ready(Tx(c).entry(id))).await
     }
 
     async fn list_merges(&self, query: &MergeQuery) -> Result<Vec<MergeEntry>> {
         let q = *query;
-        self.run(move |c| in_tx(c, |tx| ready(tx.entries(&q))))
-            .await
+        self.read(move |c| ready(Tx(c).entries(&q))).await
     }
 
     async fn dismiss_pair(&self, req: &DismissRequest) -> Result<Dismissal> {
@@ -592,13 +591,12 @@ impl MergeStore for Standalone {
     }
 
     async fn dismissal(&self, a: Uuid, b: Uuid) -> Result<Option<Dismissal>> {
-        self.run(move |c| in_tx(c, |tx| ready(merge::find_dismissal(tx, a, b))))
+        self.read(move |c| ready(merge::find_dismissal(&mut Tx(c), a, b)))
             .await
     }
 
     async fn list_dismissals(&self, query: &DismissalQuery) -> Result<Vec<Dismissal>> {
         let q = *query;
-        self.run(move |c| in_tx(c, |tx| ready(tx.dismissals(&q))))
-            .await
+        self.read(move |c| ready(Tx(c).dismissals(&q))).await
     }
 }

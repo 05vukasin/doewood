@@ -9,6 +9,7 @@ use doewood_core::SourceId;
 use rusqlite::{OptionalExtension as _, Row, params};
 use zeroize::Zeroizing;
 
+use super::Snapshot;
 use super::sqs::{self, SqsInlet};
 use super::{Store, now};
 use crate::StoreError;
@@ -657,25 +658,14 @@ impl Store {
 
     /// All sources, oldest first.
     pub fn sources(&self) -> Result<Vec<Source>, StoreError> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare_cached(&format!(
-            "SELECT {SOURCE_COLUMNS} FROM sources ORDER BY created_at, id"
-        ))?;
-        let rows = stmt
-            .query_map([], Source::from_row)?
-            .collect::<Result<Vec<_>, _>>()?;
-        rows.into_iter().collect()
+        // `Snapshot::sources` itself is not general enough over the snapshot's lifetime.
+        #[allow(clippy::redundant_closure_for_method_calls)]
+        self.snapshot(|s| s.sources())
     }
 
     /// One source.
     pub fn source(&self, id: SourceId) -> Result<Option<Source>, StoreError> {
-        self.conn()
-            .prepare_cached(&format!(
-                "SELECT {SOURCE_COLUMNS} FROM sources WHERE id = ?1"
-            ))
-            .and_then(|mut cached| cached.query_row([id.to_string()], Source::from_row))
-            .optional()?
-            .transpose()
+        self.snapshot(|s| s.source(id))
     }
 
     /// Sets a source's state. `reason` is kept for [`SourceState::Error`] and cleared otherwise.
@@ -771,16 +761,7 @@ impl Store {
         bucket: &str,
         prefix: &str,
     ) -> Result<Option<Source>, StoreError> {
-        self.conn()
-            .prepare_cached(&format!(
-                "SELECT {SOURCE_COLUMNS} FROM sources \
-                     WHERE endpoint = ?1 AND bucket = ?2 AND prefix = ?3"
-            ))
-            .and_then(|mut cached| {
-                cached.query_row(params![endpoint, bucket, prefix], Source::from_row)
-            })
-            .optional()?
-            .transpose()
+        self.snapshot(|s| s.source_by_key(endpoint, bucket, prefix))
     }
 
     /// Applies a patch to a source's options and returns the source as it is now.
@@ -866,25 +847,7 @@ impl Store {
 
     /// How many of a source's objects are in each ingest status.
     pub fn object_counts(&self, id: SourceId) -> Result<ObjectCounts, StoreError> {
-        let conn = self.conn();
-        let mut stmt =
-            conn.prepare_cached("SELECT status, n FROM object_counts WHERE source_id = ?1")?;
-        let mut counts = ObjectCounts::default();
-        let rows = stmt.query_map([id.to_string()], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-        })?;
-        for row in rows {
-            let (status, n) = row?;
-            let n = u64::try_from(n).unwrap_or(0);
-            match status.as_str() {
-                "pending" => counts.pending = n,
-                "done" => counts.done = n,
-                "failed" => counts.failed = n,
-                "skipped" => counts.skipped = n,
-                _ => counts.deleted = n,
-            }
-        }
-        Ok(counts)
+        self.snapshot(|s| s.object_counts(id))
     }
 
     /// Decrypts a source's credentials: the S3 connector's access path to the secret store.
@@ -903,6 +866,73 @@ impl Store {
             .read_sealed(&name)?
             .ok_or_else(|| StoreError::InvalidSource(format!("secret {name:?} is missing")))?;
         S3Credentials::decode(&name, &plain).map(Some)
+    }
+}
+
+impl Snapshot<'_> {
+    /// All sources, oldest first.
+    pub fn sources(&self) -> Result<Vec<Source>, StoreError> {
+        let conn = self.0;
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {SOURCE_COLUMNS} FROM sources ORDER BY created_at, id"
+        ))?;
+        let rows = stmt
+            .query_map([], Source::from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().collect()
+    }
+
+    /// One source.
+    pub fn source(&self, id: SourceId) -> Result<Option<Source>, StoreError> {
+        self.0
+            .prepare_cached(&format!(
+                "SELECT {SOURCE_COLUMNS} FROM sources WHERE id = ?1"
+            ))
+            .and_then(|mut cached| cached.query_row([id.to_string()], Source::from_row))
+            .optional()?
+            .transpose()
+    }
+
+    /// The source with this endpoint, bucket and prefix (compared exactly as stored).
+    pub fn source_by_key(
+        &self,
+        endpoint: &str,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Option<Source>, StoreError> {
+        self.0
+            .prepare_cached(&format!(
+                "SELECT {SOURCE_COLUMNS} FROM sources \
+                     WHERE endpoint = ?1 AND bucket = ?2 AND prefix = ?3"
+            ))
+            .and_then(|mut cached| {
+                cached.query_row(params![endpoint, bucket, prefix], Source::from_row)
+            })
+            .optional()?
+            .transpose()
+    }
+
+    /// How many of a source's objects are in each ingest status.
+    pub fn object_counts(&self, id: SourceId) -> Result<ObjectCounts, StoreError> {
+        let conn = self.0;
+        let mut stmt =
+            conn.prepare_cached("SELECT status, n FROM object_counts WHERE source_id = ?1")?;
+        let mut counts = ObjectCounts::default();
+        let rows = stmt.query_map([id.to_string()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (status, n) = row?;
+            let n = u64::try_from(n).unwrap_or(0);
+            match status.as_str() {
+                "pending" => counts.pending = n,
+                "done" => counts.done = n,
+                "failed" => counts.failed = n,
+                "skipped" => counts.skipped = n,
+                _ => counts.deleted = n,
+            }
+        }
+        Ok(counts)
     }
 }
 

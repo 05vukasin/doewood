@@ -284,7 +284,12 @@ async fn open_store(config: &BootstrapConfig) -> Result<Store, String> {
         let store = Store::open(&path, &key)
             .map_err(|e| format!("cannot open the store {}: {e}", path.display()))?;
         let version = store.schema_version().map_err(|e| e.to_string())?;
-        info!(path = %path.display(), schema = version, "store open");
+        info!(
+            path = %path.display(),
+            schema = version,
+            readers = store.readers(),
+            "store open"
+        );
         Ok(store)
     })
     .await

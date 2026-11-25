@@ -10,6 +10,7 @@ use std::str::FromStr;
 use doewood_core::SourceId;
 use rusqlite::params;
 
+use super::Snapshot;
 use super::objects::truncate;
 use super::{Store, now};
 use crate::StoreError;
@@ -238,52 +239,12 @@ impl Store {
 
     /// How many of a source's jobs are in each status, and its latest failure.
     pub fn llm_counts(&self, source: SourceId) -> Result<LlmCounts, StoreError> {
-        use rusqlite::OptionalExtension as _;
-        let conn = self.conn();
-        let mut counts = LlmCounts::default();
-        {
-            let mut stmt =
-                conn.prepare_cached("SELECT status, n FROM llm_job_counts WHERE source_id = ?1")?;
-            let rows = stmt.query_map([source.to_string()], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-            })?;
-            for row in rows {
-                let (status, n) = row?;
-                let n = u64::try_from(n).unwrap_or(0);
-                match status.parse()? {
-                    LlmJobStatus::Pending => counts.pending = n,
-                    LlmJobStatus::Done => counts.done = n,
-                    LlmJobStatus::Failed => counts.failed = n,
-                    LlmJobStatus::Skipped => counts.skipped = n,
-                }
-            }
-        }
-        counts.last_error = conn
-            .prepare_cached(
-                "SELECT last_error FROM llm_jobs WHERE source_id = ?1 AND status = 'failed' \
-                 AND last_error IS NOT NULL ORDER BY updated_at DESC LIMIT 1",
-            )?
-            .query_row([source.to_string()], |r| r.get(0))
-            .optional()?;
-        Ok(counts)
+        self.snapshot(|s| s.llm_counts(source))
     }
 
     /// What a source spent on UTC day `day` ([`utc_day`]).
     pub fn llm_usage(&self, source: SourceId, day: i64) -> Result<LlmUsage, StoreError> {
-        use rusqlite::OptionalExtension as _;
-        let row: Option<(i64, i64)> = self
-            .conn()
-            .prepare_cached("SELECT tokens, calls FROM llm_usage WHERE source_id = ?1 AND day = ?2")
-            .and_then(|mut cached| {
-                cached.query_row(params![source.to_string(), day], |r| {
-                    Ok((r.get(0)?, r.get(1)?))
-                })
-            })
-            .optional()?;
-        Ok(row.map_or_else(LlmUsage::default, |(t, c)| LlmUsage {
-            tokens: u64::try_from(t).unwrap_or(0),
-            calls: u64::try_from(c).unwrap_or(0),
-        }))
+        self.snapshot(|s| s.llm_usage(source, day))
     }
 
     /// Adds one call and its tokens to a source's spend on UTC day `day`; returns the day's
@@ -317,6 +278,58 @@ impl Store {
             tokens: u64::try_from(t).unwrap_or(0),
             calls: u64::try_from(c).unwrap_or(0),
         })
+    }
+}
+
+impl Snapshot<'_> {
+    /// How many of a source's jobs are in each status, and its latest failure.
+    pub fn llm_counts(&self, source: SourceId) -> Result<LlmCounts, StoreError> {
+        use rusqlite::OptionalExtension as _;
+        let conn = self.0;
+        let mut counts = LlmCounts::default();
+        {
+            let mut stmt =
+                conn.prepare_cached("SELECT status, n FROM llm_job_counts WHERE source_id = ?1")?;
+            let rows = stmt.query_map([source.to_string()], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (status, n) = row?;
+                let n = u64::try_from(n).unwrap_or(0);
+                match status.parse()? {
+                    LlmJobStatus::Pending => counts.pending = n,
+                    LlmJobStatus::Done => counts.done = n,
+                    LlmJobStatus::Failed => counts.failed = n,
+                    LlmJobStatus::Skipped => counts.skipped = n,
+                }
+            }
+        }
+        counts.last_error = conn
+            .prepare_cached(
+                "SELECT last_error FROM llm_jobs WHERE source_id = ?1 AND status = 'failed' \
+                 AND last_error IS NOT NULL ORDER BY updated_at DESC LIMIT 1",
+            )?
+            .query_row([source.to_string()], |r| r.get(0))
+            .optional()?;
+        Ok(counts)
+    }
+
+    /// What a source spent on UTC day `day` ([`utc_day`]).
+    pub fn llm_usage(&self, source: SourceId, day: i64) -> Result<LlmUsage, StoreError> {
+        use rusqlite::OptionalExtension as _;
+        let row: Option<(i64, i64)> = self
+            .0
+            .prepare_cached("SELECT tokens, calls FROM llm_usage WHERE source_id = ?1 AND day = ?2")
+            .and_then(|mut cached| {
+                cached.query_row(params![source.to_string(), day], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+            })
+            .optional()?;
+        Ok(row.map_or_else(LlmUsage::default, |(t, c)| LlmUsage {
+            tokens: u64::try_from(t).unwrap_or(0),
+            calls: u64::try_from(c).unwrap_or(0),
+        }))
     }
 }
 
