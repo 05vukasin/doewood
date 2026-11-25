@@ -85,6 +85,9 @@ pub struct Clients {
     pub favicons: Option<Arc<FaviconResolver>>,
     /// Ask the public favicon fallback service.
     pub favicon_fallback: bool,
+    /// EDGAR's daily index feed is on: new filings make a company due, so EDGAR's own
+    /// refresh is the 30 days of the other registries instead of a day.
+    pub edgar_fed: bool,
     /// Where websites are reached.
     pub origin: SiteOrigin,
 }
@@ -153,6 +156,7 @@ impl ClientSet {
         {
             let mut c = c.clone();
             c.favicon_fallback = settings.favicon.fallback;
+            c.edgar_fed = settings.feeds.edgar && settings.edgar;
             return (c, Vec::new());
         }
         let mut warnings = Vec::new();
@@ -207,6 +211,7 @@ impl ClientSet {
             web,
             favicons,
             favicon_fallback: settings.favicon.fallback,
+            edgar_fed: settings.feeds.edgar && settings.edgar,
             origin: self.templates.origin,
         };
         self.current = Some((built, clients.clone()));

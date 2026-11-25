@@ -5,10 +5,11 @@
 
 use std::sync::Arc;
 
-use doewood_api::{EnrichmentCounts, Progress};
+use doewood_api::{EnrichmentCounts, FeedCounts, Progress};
 use doewood_core::BootstrapConfig;
 use doewood_ingest::{
-    Enrichment, EnrichmentOptions, EnrichmentParts, EnrichmentStats, Templates, WebClientFactory,
+    Enrichment, EnrichmentOptions, EnrichmentParts, EnrichmentStats, FeedTemplates, Templates,
+    WebClientFactory,
 };
 use doewood_model::Backend;
 use doewood_registry::favicon::{GuardOptions, GuardedClient, PublicOnly, SystemDns};
@@ -40,6 +41,17 @@ fn counts(s: EnrichmentStats) -> EnrichmentCounts {
         passes: s.passes,
         last_pass_completed_at: s.last_pass_completed_at,
         running: s.running,
+        feeds: s.feeds.map(|f| FeedCounts {
+            feed: f.feed,
+            enabled: f.enabled,
+            leader: f.leader,
+            runs: f.runs,
+            records: f.records,
+            companies_due: f.companies_due,
+            failures: f.failures,
+            last_run_at: f.last_run_at,
+            position: f.position,
+        }),
     }
 }
 
@@ -58,6 +70,7 @@ pub fn start(
         backend,
         settings: EnrichmentParts::store_settings(Arc::clone(store)),
         templates: Templates::default(),
+        feed_templates: FeedTemplates::default(),
         web: production_web(),
         options: EnrichmentOptions::default(),
         on_change: Arc::new(move |s| progress.set_enrichment(counts(s))),
