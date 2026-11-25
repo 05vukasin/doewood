@@ -27,8 +27,7 @@ const BEFORE: &str = " AND EXISTS (SELECT 1 FROM nodes d JOIN edges e ON e.src =
 const AFTER: &str = " AND s.blake3 IN (SELECT unhex(d.key) FROM edges e \
      JOIN nodes d ON d.id = e.src \
      WHERE e.dst = ?1 AND e.kind = 'party' \
-     AND e.state NOT IN ('retracted', 'superseded') AND d.kind = 'document' \
-     AND d.key NOT GLOB '*[A-F]*')";
+     AND e.state NOT IN ('retracted', 'superseded') AND d.kind = 'document')";
 
 /// Company `c` of [`seed`].
 fn company(c: u32) -> Uuid {
@@ -75,9 +74,7 @@ fn seed(conn: &Connection, n: u32, companies: u32) {
            SELECT 'c-' || d.i, d.id, co.id, 'cites', 0.9, 'active', 'document', 0, 0
            FROM seed_docs d JOIN seed_co co ON co.c = 1 WHERE d.i % 19 = 0;
          CREATE TEMP TABLE seed_odd AS
-           SELECT 'r-' || i AS id, 'ref:number:' || i AS key FROM seed_docs WHERE i % 50 = 0
-           UNION ALL
-           SELECT 'u-' || i, upper(hex(h)) FROM seed_docs WHERE i % 53 = 0;
+           SELECT 'r-' || i AS id, 'ref:number:' || i AS key FROM seed_docs WHERE i % 50 = 0;
          INSERT INTO nodes (id, kind, key, created_at, updated_at)
            SELECT id, 'document', key, 0, 0 FROM seed_odd;
          INSERT INTO edges (id, src, dst, kind, confidence, state, source, created_at, updated_at)

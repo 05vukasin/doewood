@@ -1289,14 +1289,13 @@ impl SearchStore for Standalone {
             if let Some(company) = q.company {
                 // Driven by the company's party edges (edges_by_dst), each document's hash
                 // looked up by primary key, rather than a check per indexed document (issue
-                // #111). Only lowercase hex keys matched `lower(hex(...))`; unhex gives NULL
-                // for the others (such as `ref:` placeholders).
+                // #111). A document key is its hash in lowercase hex or a `ref:` placeholder
+                // (`validate_node`); unhex gives NULL for the placeholders.
                 sql_text.push_str(
                     " AND s.blake3 IN (SELECT unhex(d.key) FROM edges e \
                      JOIN nodes d ON d.id = e.src \
                      WHERE e.dst = ? AND e.kind = 'party' \
-                     AND e.state NOT IN ('retracted', 'superseded') AND d.kind = 'document' \
-                     AND d.key NOT GLOB '*[A-F]*')",
+                     AND e.state NOT IN ('retracted', 'superseded') AND d.kind = 'document')",
                 );
                 args.push(Sql::Text(company.to_string()));
             }

@@ -63,6 +63,15 @@ pub(crate) const LIST_RECORDS: &str = "SELECT r.blake3, r.record, r.versions, ex
      AND ($4::bytea IS NULL OR l.blake3 > $4)) \
      ORDER BY r.blake3 LIMIT $5";
 
+/// Whether company `$1` has fewer `party` edges than a quarter of the indexed documents (at
+/// least 1000), reading at most that many index entries. Search by such a company starts from
+/// its edges and looks each document up; for a bigger one, checking the indexed documents in
+/// rank order until the page is full is faster (issue #111, docs/api.md).
+pub(crate) const FEW_PARTIES: &str = "WITH lim AS (SELECT greatest(1000, \
+     (SELECT reltuples::bigint FROM pg_class WHERE oid = 'search_index'::regclass) / 4) AS n) \
+     SELECT (SELECT count(*) FROM (SELECT 1 FROM edges WHERE dst = $1 AND kind = 'party' \
+     LIMIT (SELECT n FROM lim)) x) < (SELECT n FROM lim)";
+
 /// The rows of the first batch [`LIST_RECORDS`] reads from its portal.
 const LIST_RECORDS_BATCH: usize = 32;
 
@@ -1088,19 +1097,36 @@ impl SearchStore for PgStore {
                  FROM search_index s WHERE s.tsv @@ plainto_tsquery('simple', {p})"
             )
         };
+        let c = client(&self.pool).await?;
         if let Some(company) = q.company {
+            let few = c
+                .one(FEW_PARTIES, &[&company])
+                .await?
+                .try_get(0)
+                .map_err(pg)?;
             let p = args.push(company);
-            // Driven by the company's party edges (edges_by_dst), each document's hash looked
-            // up by primary key, rather than a check per indexed document (issue #111). Only
-            // lowercase hex keys are hashes (the others, such as `ref:` placeholders, never
-            // matched `encode`), and decode would fail on them.
-            let _ = write!(
-                sql,
-                " AND s.blake3 IN (SELECT decode(CASE WHEN d.key ~ '^[0-9a-f]{{64}}$' \
-                 THEN d.key END, 'hex') FROM edges e JOIN nodes d ON d.id = e.src \
-                 WHERE e.dst = {p} AND e.kind = 'party' \
-                 AND e.state NOT IN ('retracted', 'superseded') AND d.kind = 'document')"
-            );
+            let _ = if few {
+                // Driven by the company's party edges (edges_by_dst), each document's hash
+                // looked up by primary key (issue #111). A document key is its hash in
+                // lowercase hex or a `ref:` placeholder (`validate_node`); decode would fail on
+                // the placeholders.
+                write!(
+                    sql,
+                    " AND s.blake3 IN (SELECT CASE WHEN starts_with(d.key, 'ref:') THEN NULL \
+                     ELSE decode(d.key, 'hex') END FROM edges e JOIN nodes d ON d.id = e.src \
+                     WHERE e.dst = {p} AND e.kind = 'party' \
+                     AND e.state NOT IN ('retracted', 'superseded') AND d.kind = 'document')"
+                )
+            } else {
+                // A check per indexed document, in rank order, which stops at the page.
+                write!(
+                    sql,
+                    " AND EXISTS (SELECT 1 FROM nodes d JOIN edges e ON e.src = d.id \
+                     WHERE d.kind = 'document' AND d.key = encode(s.blake3, 'hex') \
+                     AND e.kind = 'party' AND e.dst = {p} \
+                     AND e.state NOT IN ('retracted', 'superseded'))"
+                )
+            };
         }
         let mut filter = |cond: &str, value: Box<dyn ToSql + Sync + Send>| {
             args.0.push(value);
@@ -1143,7 +1169,6 @@ impl SearchStore for PgStore {
             " ORDER BY score DESC, s.doc_date DESC NULLS LAST, s.blake3 \
              LIMIT {limit} OFFSET {offset}"
         );
-        let c = client(&self.pool).await?;
         // Not cached: up to 256 shapes (one per combination of filters), user-driven and rare
         // next to the ingest statements, and a generic plan could not use the source prefix.
         let rows = c.query(&sql, &args.refs()).await.map_err(pg)?;

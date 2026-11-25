@@ -1,7 +1,8 @@
 //! Search with a company filter on generated data (issue #111): the query driven by the
 //! company's party edges returns what the correlated `EXISTS` before it returned, for every
-//! combination of words, filters and pages, and an ignored test shows both plans and times
-//! (docs/api.md, "Search by company").
+//! combination of words, filters and pages, `PgStore::search` returns the same with either
+//! strategy, and an ignored test shows both plans and times (docs/api.md, "Search by
+//! company").
 
 use std::fmt::Write as _;
 use std::time::Instant;
@@ -12,6 +13,7 @@ use tokio_postgres::types::ToSql;
 use uuid::Uuid;
 
 use super::{Scratch, test_url};
+use crate::backend::FEW_PARTIES;
 
 /// The company filter before issue #111, kept as the reference.
 const BEFORE: &str = " AND EXISTS (SELECT 1 FROM nodes d JOIN edges e ON e.src = d.id \
@@ -19,9 +21,10 @@ const BEFORE: &str = " AND EXISTS (SELECT 1 FROM nodes d JOIN edges e ON e.src =
      AND e.kind = 'party' AND e.dst = $1 \
      AND e.state NOT IN ('retracted', 'superseded'))";
 
-/// The company filter after issue #111, as `PgStore::search` writes it.
-const AFTER: &str = " AND s.blake3 IN (SELECT decode(CASE WHEN d.key ~ '^[0-9a-f]{64}$' \
-     THEN d.key END, 'hex') FROM edges e JOIN nodes d ON d.id = e.src \
+/// The company filter after issue #111, as `PgStore::search` writes it for a company with few
+/// documents ([`FEW_PARTIES`]); for the others it keeps [`BEFORE`].
+const AFTER: &str = " AND s.blake3 IN (SELECT CASE WHEN starts_with(d.key, 'ref:') THEN NULL \
+     ELSE decode(d.key, 'hex') END FROM edges e JOIN nodes d ON d.id = e.src \
      WHERE e.dst = $1 AND e.kind = 'party' \
      AND e.state NOT IN ('retracted', 'superseded') AND d.kind = 'document')";
 
@@ -34,8 +37,7 @@ const AFTER: &str = " AND s.blake3 IN (SELECT decode(CASE WHEN d.key ~ '^[0-9a-f
 ///   (every 11th), superseded (13th), proposed (4th) or active; every 9th has a second, manual
 ///   edge to it. Every even document is also a party of company 0. Every 19th has a `cites`
 ///   edge to company 1, which is not a party.
-/// - Odd document nodes, all parties of company 1: a `ref:` placeholder per 50 documents, the
-///   uppercase-hex key of every 53rd hash, and company 2 itself.
+/// - Odd parties of company 1: a `ref:` placeholder document per 50 documents, and company 2.
 fn seed(n: u32, companies: u32) -> String {
     format!(
         "INSERT INTO records (blake3, record, versions)
@@ -74,10 +76,7 @@ fn seed(n: u32, companies: u32) -> String {
            FROM seed_docs d JOIN seed_co co ON co.c = 1 WHERE d.i % 19 = 0;
          CREATE TEMP TABLE seed_odd AS
            SELECT gen_random_uuid() AS id, 'ref:number:' || i AS key
-           FROM generate_series(1, {n}) i WHERE i % 50 = 0
-           UNION ALL
-           SELECT gen_random_uuid(), upper(encode(sha256(int4send(i)), 'hex'))
-           FROM generate_series(1, {n}) i WHERE i % 53 = 0;
+           FROM generate_series(1, {n}) i WHERE i % 50 = 0;
          INSERT INTO nodes (id, kind, key) SELECT id, 'document', key FROM seed_odd;
          INSERT INTO edges (id, src, dst, kind, confidence, state, source)
            SELECT gen_random_uuid(), o.id, co.id, 'party', 0.9, 'active', 'document'
@@ -162,6 +161,12 @@ async fn search_by_company_matches_the_query_before() {
     let store = db.store().await;
     let c = db.client().await;
     c.batch_execute(&seed(3000, 40)).await.unwrap();
+    // Both strategies are covered: company 0 (1500 documents) is checked per indexed document,
+    // the others are driven from their edges.
+    for (co, few) in [(company(0), false), (company(1), true), (company(7), true)] {
+        let got: bool = c.query_one(FEW_PARTIES, &[&co]).await.unwrap().get(0);
+        assert_eq!(got, few, "{co}");
+    }
     let from = Date::from_calendar_date(2022, Month::January, 1).unwrap();
     let missing = Uuid::from_u128(7);
     let mut total = 0;
@@ -190,7 +195,7 @@ async fn search_by_company_matches_the_query_before() {
         }
     }
     assert!(total > 3_000, "{total}");
-    // Company 1's odd parties (placeholders, an uppercase key, a company) find nothing more
+    // Company 1's odd parties (placeholders, a company) find nothing more
     // than its documents, and company 2 is not a document of company 1.
     let q = SearchQuery {
         company: Some(company(1)),
@@ -228,7 +233,7 @@ async fn search_by_company_timings() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(50_000);
     let db = Scratch::new(&url).await;
-    drop(db.store().await);
+    let store = db.store().await;
     let c = db.client().await;
     c.batch_execute(&seed(n, n / 10)).await.unwrap();
     let cases = [
@@ -264,6 +269,21 @@ async fn search_by_company_timings() {
             .await;
             println!("{name}, {label}: {ms:.2} ms");
         }
+        let few: bool = c
+            .query_one(FEW_PARTIES, &[&q.company])
+            .await
+            .unwrap()
+            .get(0);
+        let ms = median_ms(9, async || {
+            store.search(q).await.unwrap();
+        })
+        .await;
+        let way = if few {
+            "from the edges"
+        } else {
+            "per document"
+        };
+        println!("{name}, PgStore::search ({way}): {ms:.2} ms");
     }
     db.drop_schema().await;
 }
