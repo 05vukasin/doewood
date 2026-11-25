@@ -184,6 +184,11 @@ the kind can skip it.
 | `summarized`, `llm_failed` | documents the LLM queue summarized, and those whose summary failed (`llm_last_error` on the source's progress has the latest error) |
 | `llm_tokens_today` | tokens the source's summaries spent on the current UTC day (what its daily budget is checked against) |
 
+A spreadsheet of more than 1,600,000 cells counts as `failed` (its status says `sheet.read@1:
+file refused: the workbook has more than 1,600,000 cells ...`), and a file over 16 MiB may stay
+`pending` a little longer while bigger files hold ingest's memory budget; see
+[ingest.md](ingest.md#memory).
+
 ### Records, graph and search
 
 - **GetRecord** takes a BLAKE3 in hex; the record's JSON is in `body_json`, exactly as stored.

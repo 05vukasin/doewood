@@ -116,6 +116,18 @@ impl Harness {
         file_timeout: Option<Duration>,
         on_change: Arc<dyn Fn(SourceId) + Send + Sync>,
     ) -> Self {
+        Self::start_tuned(store, backend, jobs, retry, file_timeout, on_change, |_| {})
+    }
+
+    fn start_tuned(
+        store: Arc<Store>,
+        backend: Arc<dyn Backend>,
+        jobs: usize,
+        retry: Duration,
+        file_timeout: Option<Duration>,
+        on_change: Arc<dyn Fn(SourceId) + Send + Sync>,
+        tune: impl FnOnce(&mut IngestConfig),
+    ) -> Self {
         let source = store
             .add_source(&NewSource::new(ENDPOINT, BUCKET), None)
             .unwrap();
@@ -124,6 +136,7 @@ impl Harness {
         config.retry_base = retry;
         config.sweep_interval = Duration::from_millis(200);
         config.reprocess_poll = Duration::from_millis(20);
+        tune(&mut config);
         let (_tx, backend_rx) = watch::channel(Some(Arc::clone(&backend)));
         let ingest = Ingest::new(IngestParts {
             store: Arc::clone(&store),
@@ -1270,6 +1283,115 @@ async fn timed_out_spreadsheets() {
         total,
         mib(base),
         mib(peak.load(Ordering::Relaxed)),
+        mib(rss_kib()),
+        c.done,
+        c.failed,
+    );
+    h.stop().await;
+}
+
+/// Peak RSS while a few big spreadsheets go through at once, with the normal file timeout:
+/// `cargo test -p doewood-ingest --test pipeline -- --ignored --nocapture big_spreadsheets`.
+/// `DOEWOOD_BENCH_ROWS` rows (default 100,000) of `DOEWOOD_BENCH_COLS` cells (default 26, at
+/// most 26), every other one text with `DOEWOOD_BENCH_TEXT=1`; `DOEWOOD_BENCH_FILES` files
+/// (default 3) on `DOEWOOD_BENCH_JOBS` workers (default 3), under a memory budget of
+/// `DOEWOOD_BENCH_BUDGET_MIB` (default: from the workers and memory).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "a measurement, not a check"]
+async fn big_spreadsheets() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    fn rss_kib() -> u64 {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        status
+            .lines()
+            .find(|l| l.starts_with("VmRSS:"))
+            .and_then(|l| l.split_whitespace().nth(1)?.parse().ok())
+            .unwrap_or(0)
+    }
+    fn env(var: &str, default: usize) -> usize {
+        std::env::var(var)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+
+    let rows = env("DOEWOOD_BENCH_ROWS", 100_000);
+    let cols = env("DOEWOOD_BENCH_COLS", 26).min(26);
+    let n = env("DOEWOOD_BENCH_FILES", 3);
+    let jobs = env("DOEWOOD_BENCH_JOBS", 3);
+    let text = env("DOEWOOD_BENCH_TEXT", 0) == 1;
+    let files: Vec<(String, Vec<u8>)> = (0..n as u64)
+        .map(|i| {
+            let data = common::big_xlsx_with(rows, cols, 7000 + i, text);
+            (format!("big/{i}.xlsx"), data)
+        })
+        .collect();
+    let size: usize = files.iter().map(|(_, d)| d.len()).sum();
+    let store = Arc::new(Store::open_in_memory(&MasterKey::from_bytes([11; 32])).unwrap());
+    let backend: Arc<dyn Backend> = Arc::new(Standalone::new(Arc::clone(&store)));
+    let budget = env("DOEWOOD_BENCH_BUDGET_MIB", 0) as u64;
+    let h = Harness::start_tuned(
+        Arc::clone(&store),
+        backend,
+        jobs,
+        Duration::from_millis(10),
+        None,
+        Arc::new(|_| {}),
+        |c| {
+            if budget > 0 {
+                c.memory_budget = budget << 20;
+            }
+        },
+    );
+    let budget = h.ingest.config().memory_budget >> 20;
+    let base = rss_kib();
+    let (peak, stop) = (
+        Arc::new(AtomicU64::new(base)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let sampler = {
+        let (peak, stop) = (Arc::clone(&peak), Arc::clone(&stop));
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                peak.fetch_max(rss_kib(), Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+    };
+    let started = std::time::Instant::now();
+    let batch: Vec<(&str, Vec<u8>, bool)> = files
+        .iter()
+        .map(|(k, d)| (k.as_str(), d.clone(), true))
+        .collect();
+    h.put(&batch).await;
+    drop(batch);
+    h.settle().await;
+    let secs = started.elapsed().as_secs_f64();
+    stop.store(true, Ordering::Relaxed);
+    sampler.join().unwrap();
+    let c = store.object_counts(h.source).unwrap();
+    let errors: Vec<String> = (0..n)
+        .map(|i| {
+            let s = h.status(&format!("big/{i}.xlsx"));
+            format!("{} {:?}", s.status, s.last_error)
+        })
+        .collect();
+    #[allow(clippy::cast_precision_loss)]
+    let (mib, total) = (
+        |kib: u64| kib as f64 / 1024.0,
+        size as f64 / f64::from(1 << 20),
+    );
+    let peak = peak.load(Ordering::Relaxed);
+    #[allow(clippy::cast_precision_loss)]
+    let per_cell = (peak.saturating_sub(base) * 1024) as f64 / (n * rows * cols) as f64;
+    println!(
+        "big_spreadsheets: {n} x {rows} x {cols} cells (text {text}, {total:.1} MiB in all), \
+         {jobs} workers, budget {budget} MiB, {secs:.2}s; RSS before {:.0} MiB, peak {:.0} MiB (+{:.0} MiB, \
+         {per_cell:.0} B a cell), after {:.0} MiB; done {} failed {}; {errors:?}",
+        mib(base),
+        mib(peak),
+        mib(peak.saturating_sub(base)),
         mib(rss_kib()),
         c.done,
         c.failed,

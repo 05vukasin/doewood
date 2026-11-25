@@ -22,7 +22,8 @@ pending sweep (objects_seen)┘                                         (cap)   
   (1024 events), and the scanners wait in turn.
 - **Workers:** `DOEWOOD_INGEST_JOBS`, else one per CPU, at most what half the available memory
   holds at 512 MiB a worker (a cgroup v2 limit counts), at most 32. Every analysis runs on a
-  blocking thread; the quail engine is shared.
+  blocking thread; the quail engine is shared. Big files also wait for the
+  [memory budget](#memory).
 - **Shutdown:** each worker finishes the file in hand; the rest stays pending for the next start.
 
 ## Fetch
@@ -65,8 +66,8 @@ object over the cap fails without a retry.
   and its normalizer (`NormalizeOptions.deadline`) get the same instant. A spreadsheet takes at
   most the file timeout, not quail's plus hedgehog's. A read past it fails the file
   (`sheet.read@1: file refused: reading took longer than the time limit`); tables past it are
-  a problem of a partial record. The other hedgehog limits (cells, decompressed bytes) are its
-  defaults. The fetch is not under it: the
+  a problem of a partial record. The cell cap is in [Memory](#memory); decompressed bytes keep
+  hedgehog's limit (2 GiB, read in chunks, not held). The fetch is not under it: the
   S3 read timeout bounds a stalled transfer, and a large object takes as long as it takes.
 - **The watchdog.** A step that does not stop on time (a native call that never checks) is
   backed up by a watchdog of the file's time cap (the timeout, or more with OCR) plus 1 minute
@@ -79,6 +80,40 @@ object over the cap fails without a retry.
   end before it takes another file. So stuck analyses hold at most two files per worker instead
   of piling up, and a step that never returns costs one worker at most two files' memory.
   `Stats::overruns` counts them.
+
+## Memory
+
+A worker is planned at 512 MiB (`WORKER_BYTES`): the file, the engine's working set and the
+extracted text. Two bounds keep one file, and several big files at once, inside that plan, so
+none of them can abort the instance with an out-of-memory error.
+
+- **The memory budget** (`DOEWOOD_INGEST_BUDGET_MIB`, else half the workers' plan: workers x
+  512 MiB, at most half the available memory, halved; at least 256 MiB. 1 GiB with 4 workers,
+  768 MiB under the chart's 4 GiB limit with 3). A file over 16 MiB (`SMALL_FILE_BYTES`) is
+  charged its listed size (from the scan or the event) before it is fetched, and keeps that
+  share until its analysis really ends: through retries, and for an analysis the watchdog gave
+  up on, until it returns. A file bigger than the whole budget takes all of it, so it runs
+  with no other big file (it is still refused by the source's size cap, before its body is
+  read, and quail still gives a file over `max_bytes` its identity only).
+- **Fairness.** Files up to 16 MiB are not charged and never wait (at most 16 MiB a worker
+  beside the budget). A big file that does not fit is put aside in a list of its own and its
+  worker takes the next job, so small files keep flowing on every worker. The list is first in,
+  first out: a big file is not overtaken by a later big file, even a smaller one, so none
+  waits forever. Each worker takes a waiting big file first once its share is free. Only when
+  more big files wait than there are workers do the workers stop taking new jobs and wait for
+  the budget (the queue then waits too, as for a full queue).
+- **The cell cap.** hedgehog reads at most 1,600,000 cells (and shared strings) per workbook
+  (`sheet::MAX_CELLS`): `WORKER_BYTES / CELL_BYTES`, rounded down to 100,000, with
+  `CELL_BYTES` = 320, the peak per cell measured with `big_spreadsheets` (200 to 300 bytes for
+  numbers and text, the file included), rounded up. A bigger workbook fails without a retry,
+  like any other refused file: `sheet.read@1: file refused: the workbook has more than
+  1,600,000 cells (limit 1,600,000)`; its record keeps quail's identity facts. Before, the
+  limit was hedgehog's default of 10 million cells (about 2.5 to 3 GiB).
+- **quail's limits** stay its defaults: 256 MiB decompressed and 64 MiB of text per file, 40
+  million pixels a rendered page, which already fit a worker. OCR has its own budget (quail's
+  OCR permits, about 1 GiB an engine; see [deploy.md](deploy.md#sizing)).
+- **Not covered:** `Summarize` reads and analyzes files beside ingest, under its own limit
+  (`summarize_max_concurrent`), not under this budget.
 
 ## Records and step versions
 
@@ -244,8 +279,10 @@ are there for enrichment, and no document merges on a fuzzy match yet.
   deletes and reprocessing. `throughput` (ignored) measures files per second.
 - Unit tests in `pipeline.rs` stall an analysis past the watchdog: the file fails, the worker
   goes on, the stalled analysis keeps its bytes counted until it returns and then frees them, a
-  worker leaves at most one behind, and each file is hashed once. `tests/sheet.rs`: hedgehog's
-  read past the deadline fails the workbook.
+  worker leaves at most one behind, and each file is hashed once. Others hold a big file past
+  the watchdog: a second big file waits for the budget until that analysis ends, small files
+  flow meanwhile, and a file bigger than the budget takes all of it. `tests/sheet.rs`:
+  hedgehog's read past the deadline, or over the cell cap, fails the workbook.
 - `tests/minio_postgres.rs`: an S3 put in MinIO to a record in Postgres, with both
   `DOEWOOD_TEST_S3_ENDPOINT` and `DOEWOOD_TEST_POSTGRES_URL` set (CI's `ingest-e2e` job).
 

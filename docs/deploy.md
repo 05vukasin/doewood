@@ -191,6 +191,33 @@ What the numbers say:
 - **MinIO** used 600 to 1300 MiB, most of it page cache; its anonymous memory was 250 to 490
   MiB.
 
+### Big spreadsheets at once (issue #67)
+
+`big_spreadsheets` in `crates/doewood-ingest/tests/pipeline.rs`: generated XLSX (stored, not
+deflated) of 26 columns, numbers or every other column text, all put at once, 3 workers, the
+normal file timeout, peak RSS of the test process sampled every 10 ms. In process, test
+profile, the server above, single runs. "Peak" is above the RSS before the run (which holds
+the test's own copies of the files).
+
+| files | before (hedgehog's 10 M cells, no budget) | after (1.6 M cells, budget) |
+|---|---|---|
+| 1 x 2.6 M cells, numbers (80 MiB) | +605 MiB, `done` | +287 MiB, `failed` (over the cell cap) |
+| 1 x 2.6 M cells, half text (120 MiB) | +736 MiB, `done` | +386 MiB, `failed` |
+| 3 x 2.6 M cells, numbers (241 MiB) | +1701 MiB, `done` | +775 MiB, `failed` |
+| 3 x 2.6 M cells, half text (360 MiB) | +2210 MiB, `done` | +1044 MiB, `failed` |
+| 3 x 5.2 M cells, numbers (492 MiB) | +3004 MiB, `done` | +1204 MiB, `failed` |
+| 3 x 1.56 M cells, numbers (143 MiB), budget 4 GiB / 768 MiB (the default for 3 workers) / 64 MiB | +989 / +976 / +551 MiB, all `done` | |
+| 3 x 1.56 M cells, half text (214 MiB), budget 4 GiB / 64 MiB | +1294 / +729 MiB, all `done` (4.2 s / 7.8 s) | |
+
+- The peak per cell was 200 to 300 bytes (file included) before the cap; that is
+  `CELL_BYTES` (320, rounded up), and the cap is what 512 MiB holds at that rate (1.6 M).
+  A refused workbook still costs its file and the cells read up to the cap.
+- Under the cap the default budget does not serialize these files (71 MiB each, 3 fit in
+  768 MiB): the budget bounds the bytes of files in flight, the cell cap the workbook's
+  working set. A small budget runs big files one at a time (64 MiB: 40 % lower peak, twice
+  the wall time).
+- glibc keeps some of the freed memory (RSS after the runs: 0.5 to 1.2 GiB above the start).
+
 ### Requests and limits
 
 Per doewood instance (one pod):
@@ -203,7 +230,10 @@ Per doewood instance (one pod):
 - The chart's defaults (500m, 1 GiB, limit 4 GiB) fit both, so they are unchanged: the request
   covers the OCR engine with one worker, the limit covers 4 workers with OCR plus a large
   spreadsheet in flight. With a lower limit the default worker count drops (half the room under
-  the limit, 512 MiB a worker).
+  the limit, 512 MiB a worker), and so does the memory budget (half the workers' plan: 768 MiB
+  with 3 workers under 4 GiB). Files over 16 MiB beyond the budget wait; a workbook over
+  1,600,000 cells fails (see [ingest.md](ingest.md#memory)). Set `DOEWOOD_INGEST_BUDGET_MIB`
+  lower if big PDFs or DOCX files come several at a time on a small limit.
 - OCR throughput follows the CPU: with a 500m request an OCR-heavy pod gets only what the node
   has spare. Plan about 1500 scanned pages an hour per instance on 4 cores, and more instances
   (each with its own sources) rather than more workers to go faster. A second OCR engine needs a

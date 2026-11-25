@@ -30,7 +30,10 @@ pub async fn build(
     backend: watch::Receiver<Option<Arc<dyn Backend>>>,
     progress: &Arc<Progress>,
 ) -> Option<(Ingest, Summaries)> {
-    let ingest_config = IngestConfig::new(config.ingest_jobs, &config.ocr_models);
+    let mut ingest_config = IngestConfig::new(config.ingest_jobs, &config.ocr_models);
+    if let Some(bytes) = config.ingest_budget_bytes {
+        ingest_config.memory_budget = bytes;
+    }
     let analyzer_config = ingest_config.analyzer.clone();
     // Checking the OCR models reads (and hashes) them: off the async threads.
     let analyzer = tokio::task::spawn_blocking(move || Analyzer::new(&analyzer_config)).await;
@@ -45,7 +48,12 @@ pub async fn build(
             return None;
         }
     };
-    info!(jobs = ingest_config.jobs, ocr = ?analyzer.ocr(), "ingest configured");
+    info!(
+        jobs = ingest_config.jobs,
+        memory_budget_mib = ingest_config.memory_budget >> 20,
+        ocr = ?analyzer.ocr(),
+        "ingest configured"
+    );
     let fetch: Arc<dyn Fetch> = Arc::new(S3Fetch::new(Arc::clone(store), ClientOptions::default()));
     let summaries = {
         let progress = Arc::clone(progress);
