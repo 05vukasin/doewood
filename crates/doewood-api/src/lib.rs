@@ -58,7 +58,7 @@ pub use icons::{
     CACHE_HIT, CACHE_MISS, CSP, ICON_CONTENT_TYPES, ICONS_PATH, IconAnswer, Icons,
     respond as icon_response,
 };
-pub use progress::{EnrichmentCounts, EventCounts, Progress};
+pub use progress::{EnrichmentCounts, EventCounts, FeedCounts, Progress};
 pub use reprocess::{ReprocessPhase, ReprocessView, Reprocessor};
 pub use state::{ApiOptions, ApiParts, ApiState};
 pub use summarize::{BoxFuture, OnDemand, OnDemandError, OnDemandInput, OnDemandResult};

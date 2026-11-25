@@ -65,6 +65,11 @@ impl Pool {
 }
 
 impl Snapshot {
+    /// `DatumPreseka`, as given.
+    pub fn as_of(&self) -> Option<&str> {
+        self.as_of.as_deref()
+    }
+
     /// How many companies it holds.
     pub fn len(&self) -> usize {
         self.entries.len()

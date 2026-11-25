@@ -340,6 +340,7 @@ fn job(backend: &Arc<dyn Backend>, store: &Arc<Store>, mock: &Mock, instance: &s
         backend: rx,
         settings: EnrichmentParts::store_settings(Arc::clone(store)),
         templates: templates(mock),
+        feed_templates: doewood_ingest::FeedTemplates::default(),
         web: web(mock.port),
         options: EnrichmentOptions {
             concurrency: 2,
