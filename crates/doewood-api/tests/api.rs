@@ -2197,6 +2197,293 @@ async fn merges_undo_split_and_dismissals() {
     }
 }
 
+/// Enrichment proposals through `GraphService` (issue #52): list with filters and pages,
+/// accept a merge (through the merge log, so UndoMerge undoes it), accept a registry record,
+/// reject with a dismissal that blocks the merge and the proposal, a dismissed pair refused,
+/// and the validation errors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn proposals_list_accept_and_reject() {
+    use doewood_model::{ProposalReason, ProposalRequest};
+
+    for shared in Shared::all().await {
+        let name = shared.name;
+        let a = Instance::start("inst-a", Some(shared.backend.clone())).await;
+        let mut graph = GraphServiceClient::new(a.channel().await);
+        let be = &shared.backend;
+        let company = |key: &'static str| async move {
+            be.upsert_node(NodeKind::Company, key, &json!({"name": key}))
+                .await
+                .unwrap()
+        };
+        let (p, q, r, w) = (
+            company("prop-p").await,
+            company("prop-q").await,
+            company("prop-r").await,
+            company("prop-w").await,
+        );
+        let doc = be
+            .upsert_node(NodeKind::Document, &hash(91).to_hex(), &json!({}))
+            .await
+            .unwrap();
+        be.upsert_edge(&Edge::new(doc, q, EdgeKind::Party, EdgeSource::Document))
+            .await
+            .unwrap();
+        let evidence = json!([{"source": "name_ladder", "step": "form_blind"}]);
+        let pair = |x: uuid::Uuid, y: uuid::Uuid| {
+            ProposalRequest::merge(
+                x,
+                y,
+                json!({"why": "the gate's review band"}),
+                evidence.clone(),
+                0.8,
+                ProposalReason::ReviewBand,
+            )
+        };
+        let pq = be.propose(&pair(p, q)).await.unwrap().unwrap();
+        let rec = be
+            .propose(&ProposalRequest::registry_record(
+                r,
+                "apr",
+                "companies/11111111",
+                json!({"registry": "apr", "record": "companies/11111111", "name": "Prop R d.o.o."}),
+                json!([{"source": "fuzzy_name"}]),
+                0.7,
+                ProposalReason::ReviewBand,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let rw = be.propose(&pair(r, w)).await.unwrap().unwrap();
+
+        // Validation.
+        invalid(
+            &graph
+                .list_proposals(pb::ListProposalsRequest {
+                    state: 99,
+                    kind: 99,
+                    company_id: "nope".into(),
+                    page_size: 5000,
+                    page_token: "x".into(),
+                })
+                .await
+                .unwrap_err(),
+            &["state", "kind", "company_id", "page_size", "page_token"],
+        );
+        invalid(
+            &graph
+                .accept_proposal(pb::AcceptProposalRequest {
+                    proposal_id: "x".into(),
+                    survivor_id: "bad".into(),
+                    note: "n".repeat(3000),
+                })
+                .await
+                .unwrap_err(),
+            &["proposal_id", "survivor_id", "note"],
+        );
+        invalid(
+            &graph
+                .reject_proposal(pb::RejectProposalRequest::default())
+                .await
+                .unwrap_err(),
+            &["proposal_id"],
+        );
+        let err = graph
+            .accept_proposal(pb::AcceptProposalRequest {
+                proposal_id: uuid::Uuid::now_v7().to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::NotFound, "{name}: {err:?}");
+
+        // Listing: newest first, filters, pages.
+        let lister = graph.clone();
+        let list = |req: pb::ListProposalsRequest| {
+            let mut g = lister.clone();
+            async move { g.list_proposals(req).await.unwrap().into_inner() }
+        };
+        let all = list(pb::ListProposalsRequest::default()).await;
+        let ids: Vec<_> = all.proposals.iter().map(|x| x.id.clone()).collect();
+        assert_eq!(
+            ids,
+            [rw.id.to_string(), rec.id.to_string(), pq.id.to_string()],
+            "{name}"
+        );
+        let got = &all.proposals[1];
+        assert_eq!(got.kind, pb::ProposalKind::RegistryRecord as i32);
+        assert_eq!(got.candidate, "apr:companies/11111111");
+        assert_eq!(got.state, pb::ProposalState::Open as i32);
+        assert_eq!(got.reason, pb::ProposalReason::ReviewBand as i32);
+        assert!(
+            got.detail_json.contains("Prop R d.o.o."),
+            "{}",
+            got.detail_json
+        );
+        assert!((got.probability - 0.7).abs() < 1e-6);
+        assert_eq!((got.resolved_at, got.resolved_by.clone()), (0, None));
+        let merges = list(pb::ListProposalsRequest {
+            kind: pb::ProposalKind::Merge as i32,
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(merges.proposals.len(), 2, "{name}");
+        let of_q = list(pb::ListProposalsRequest {
+            company_id: q.to_string(),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(of_q.proposals.len(), 1, "{name}: q is a merge candidate");
+        assert_eq!(of_q.proposals[0].evidence_json, evidence.to_string());
+        let first = list(pb::ListProposalsRequest {
+            page_size: 2,
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(first.proposals.len(), 2);
+        assert!(!first.next_page_token.is_empty());
+        let second = list(pb::ListProposalsRequest {
+            page_size: 2,
+            page_token: first.next_page_token,
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(second.proposals.len(), 1);
+        assert_eq!(second.proposals[0].id, pq.id.to_string());
+        assert!(second.next_page_token.is_empty());
+
+        // Accept a merge: logged as a person's, with the proposal's evidence; undone.
+        let done = graph
+            .accept_proposal(pb::AcceptProposalRequest {
+                proposal_id: pq.id.to_string(),
+                survivor_id: String::new(),
+                note: "same company".into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let m = done.merge.expect("merged");
+        assert_eq!(
+            (m.survivor_id.as_str(), m.absorbed_id.as_str()),
+            (q.to_string().as_str(), p.to_string().as_str()),
+            "{name}: the one with more documents survives"
+        );
+        assert_eq!(
+            m.actor.clone().unwrap().kind,
+            pb::MergeActorKind::Manual as i32
+        );
+        assert_eq!(m.evidence_json, evidence.to_string());
+        let accepted = done.proposal.expect("proposal");
+        assert_eq!(accepted.state, pb::ProposalState::Accepted as i32);
+        assert_eq!(accepted.merge_id, m.id);
+        assert_eq!(accepted.note, "same company");
+        assert_eq!(accepted.resolved_by.unwrap().instance_id, "inst-a");
+        assert!(accepted.resolved_at > 0);
+        let err = graph
+            .accept_proposal(pb::AcceptProposalRequest {
+                proposal_id: pq.id.to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition, "{name}: {err:?}");
+        let undone = graph
+            .undo_merge(pb::UndoMergeRequest {
+                merge_id: m.id.clone(),
+                cascade: false,
+                dismiss: false,
+                reason: String::new(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(undone.undone_ids, [m.id.clone()], "{name}");
+        let accepted_only = list(pb::ListProposalsRequest {
+            state: pb::ProposalState::Accepted as i32,
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(accepted_only.proposals.len(), 1);
+
+        // Accept a registry record: its identifier joins the company.
+        let done = graph
+            .accept_proposal(pb::AcceptProposalRequest {
+                proposal_id: rec.id.to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(done.alias, "id:rs_mb:11111111", "{name}");
+        assert_eq!(done.merge, None);
+        let held = be
+            .alias(NodeKind::Company, "id:rs_mb:11111111")
+            .await
+            .unwrap()
+            .expect("claimed");
+        assert_eq!(held.node, Some(r), "{name}");
+
+        // Reject with a dismissal: the pair is dismissed, never merged nor proposed again.
+        let out = graph
+            .reject_proposal(pb::RejectProposalRequest {
+                proposal_id: rw.id.to_string(),
+                dismiss: true,
+                note: "different companies".into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let rejected = out.proposal.unwrap();
+        assert_eq!(rejected.state, pb::ProposalState::Rejected as i32);
+        assert!(rejected.dismissed);
+        let d = out.dismissal.expect("dismissal");
+        assert_eq!(d.reason, "different companies");
+        let err = graph
+            .merge_companies(pb::MergeCompaniesRequest {
+                survivor_id: r.to_string(),
+                absorbed_id: w.to_string(),
+                evidence_json: String::new(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition, "{name}: {err:?}");
+        assert_eq!(be.propose(&pair(w, r)).await.unwrap(), None, "{name}");
+
+        // A proposal whose pair was dismissed after it opened cannot be accepted.
+        let pw = be.propose(&pair(p, w)).await.unwrap().unwrap();
+        graph
+            .dismiss_pair(pb::DismissPairRequest {
+                company_a_id: p.to_string(),
+                company_b_id: w.to_string(),
+                reason: String::new(),
+            })
+            .await
+            .unwrap();
+        let err = graph
+            .accept_proposal(pb::AcceptProposalRequest {
+                proposal_id: pw.id.to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition, "{name}: {err:?}");
+        assert!(err.message().contains("dismissed"), "{}", err.message());
+        // A plain rejection records no dismissal.
+        let out = graph
+            .reject_proposal(pb::RejectProposalRequest {
+                proposal_id: pw.id.to_string(),
+                dismiss: false,
+                note: String::new(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(out.dismissal, None);
+        assert!(!out.proposal.unwrap().dismissed);
+        a.stop().await;
+        shared.drop_schema().await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn health_and_reflection() {
     use tonic_reflection::pb::v1::ServerReflectionRequest;

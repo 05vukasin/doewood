@@ -1,5 +1,5 @@
-//! `GraphService`: nodes, neighbours and a company's documents, and the merge log (in
-//! `merges`).
+//! `GraphService`: nodes, neighbours and a company's documents, the merge log (in
+//! `merges`) and enrichment proposals (in `proposals`).
 
 use doewood_model::{NODE_KEY_MAX_LEN, NeighbourQuery, NodeKind};
 use tonic::{Request, Response, Status};
@@ -218,6 +218,33 @@ impl GraphService for Api {
     ) -> Result<Response<pb::ListDismissalsResponse>, Status> {
         Ok(Response::new(
             self.list_dismissals_rpc(request.get_ref()).await?,
+        ))
+    }
+
+    async fn list_proposals(
+        &self,
+        request: Request<pb::ListProposalsRequest>,
+    ) -> Result<Response<pb::ListProposalsResponse>, Status> {
+        Ok(Response::new(
+            self.list_proposals_rpc(request.get_ref()).await?,
+        ))
+    }
+
+    async fn accept_proposal(
+        &self,
+        request: Request<pb::AcceptProposalRequest>,
+    ) -> Result<Response<pb::AcceptProposalResponse>, Status> {
+        Ok(Response::new(
+            self.accept_proposal_rpc(request.get_ref()).await?,
+        ))
+    }
+
+    async fn reject_proposal(
+        &self,
+        request: Request<pb::RejectProposalRequest>,
+    ) -> Result<Response<pb::RejectProposalResponse>, Status> {
+        Ok(Response::new(
+            self.reject_proposal_rpc(request.get_ref()).await?,
         ))
     }
 }

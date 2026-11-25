@@ -32,7 +32,7 @@ const ENTRY_COLUMNS: &str = "id, seq, op, at, actor, instance, survivor_id, abso
 
 const DISMISSAL_COLUMNS: &str = "seq, company_a, company_b, at, actor, instance, reason, merge_id";
 
-fn actor(kind: &str, instance: &str) -> Result<MergeActor> {
+pub(super) fn actor(kind: &str, instance: &str) -> Result<MergeActor> {
     Ok(MergeActor {
         kind: parse(kind)?,
         instance: InstanceId::new(instance)

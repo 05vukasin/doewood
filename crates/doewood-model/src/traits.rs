@@ -14,9 +14,10 @@ use uuid::Uuid;
 use crate::{
     Blake3, CacheRow, DismissRequest, Dismissal, DismissalQuery, DueCompany, Edge, Enrichment,
     IconRow, Located, LocationEnded, MergeEntry, MergeQuery, MergeRequest, Neighbour,
-    NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PropsPatch, PutOutcome,
-    Record, Result, SearchDoc, SearchHit, SearchQuery, Sketch, SourceClaim, SourceKey,
-    SplitRequest, StepVersions, UndoOutcome, UndoRequest,
+    NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation, OwnedAlias, Proposal, ProposalQuery,
+    ProposalRequest, PropsPatch, PutOutcome, Record, ResolveRequest, Result, SearchDoc, SearchHit,
+    SearchQuery, Sketch, SourceClaim, SourceKey, SplitRequest, StepVersions, UndoOutcome,
+    UndoRequest,
 };
 
 /// quail and hedgehog records, keyed by BLAKE3.
@@ -155,6 +156,28 @@ pub trait MergeStore: Send + Sync {
     async fn list_dismissals(&self, query: &DismissalQuery) -> Result<Vec<Dismissal>>;
 }
 
+/// Enrichment proposals (ADR 0002 section 1.6, issue #52): what the decision gate leaves to
+/// a person. See [`crate::proposal`] for the rules.
+#[async_trait]
+pub trait ProposalStore: Send + Sync {
+    /// Records a proposal: a new open one, or the open one of the same kind, company and
+    /// candidate updated (evidence, probability, reason, detail, `updated_at`). `None` when it
+    /// is never to be opened: the same proposal was rejected as dismissed, or (a merge) the
+    /// pair is dismissed ([`MergeStore::dismissal`]). Fails with [`crate::Error::NotFound`]
+    /// when the company (or a merge's other company) does not exist.
+    async fn propose(&self, req: &ProposalRequest) -> Result<Option<Proposal>>;
+
+    /// A proposal by id.
+    async fn proposal(&self, id: Uuid) -> Result<Option<Proposal>>;
+
+    /// A page of proposals, newest first.
+    async fn list_proposals(&self, query: &ProposalQuery) -> Result<Vec<Proposal>>;
+
+    /// Accepts or rejects an open proposal. Fails with [`crate::Error::NotFound`] when there
+    /// is none, and with [`crate::Error::Precondition`] when it is not open any more.
+    async fn resolve_proposal(&self, req: &ResolveRequest) -> Result<Proposal>;
+}
+
 /// The `MinHash` LSH band index behind `similar_to` edges: candidates come from a lookup by
 /// band key, never from a scan of every document.
 #[async_trait]
@@ -276,6 +299,7 @@ pub trait Backend:
     + CacheStore
     + FreshnessStore
     + MergeStore
+    + ProposalStore
 {
     /// `postgres` or `sqlite`.
     fn name(&self) -> &'static str;

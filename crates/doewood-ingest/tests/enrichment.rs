@@ -28,7 +28,8 @@ use doewood_enrich::{CompanyName, IdKind, Identifier};
 use doewood_ingest::{Enrichment, EnrichmentOptions, EnrichmentParts, Templates, WebClientFactory};
 use doewood_model::{
     Backend, Blake3, Direction, DismissRequest, Edge, EdgeKind, EdgeSource, EdgeState, MergeActor,
-    MergeActorKind, MergeQuery, NeighbourQuery, NodeKind, StepVersions, StoredEdge,
+    MergeActorKind, MergeQuery, NeighbourQuery, NodeKind, ProposalKind, ProposalQuery,
+    ProposalReason, ProposalState, StepVersions, StoredEdge,
 };
 use doewood_registry::favicon::{
     AddressPolicy, DnsResolver, GuardOptions, GuardedClient, SiteOrigin,
@@ -993,7 +994,7 @@ async fn the_gate_merges_proposes_and_honours_dismissals() {
         );
         assert_eq!(owner(b, &format!("id:rs_mb:{mb_y}")).await, Some(x));
 
-        // U and V were dismissed: never merged, a proposal says why.
+        // U and V were dismissed: never merged, and never proposed (issue #52).
         assert!(
             b.list_merges(&MergeQuery {
                 company: Some(u),
@@ -1004,12 +1005,18 @@ async fn the_gate_merges_proposes_and_honours_dismissals() {
             .is_empty(),
             "{name}"
         );
-        let pu = props(b, u).await;
-        assert_eq!(
-            pu["merge_proposals"][0]["reason"], "dismissed",
-            "{name} {pu}"
-        );
-        assert_eq!(pu["merge_proposals"][0]["company"], v.to_string());
+        let of = |c: Uuid| {
+            let b = Arc::clone(b);
+            async move {
+                b.list_proposals(&ProposalQuery {
+                    company: Some(c),
+                    ..ProposalQuery::default()
+                })
+                .await
+                .unwrap()
+            }
+        };
+        assert!(of(u).await.is_empty(), "{name}");
         assert_eq!(owner(b, &format!("id:rs_mb:{mb_v}")).await, Some(v));
 
         // Name search: an exact APR name is adopted (its MB joins the company) ...
@@ -1018,26 +1025,64 @@ async fn the_gate_merges_proposes_and_honours_dismissals() {
             Some(g),
             "{name}"
         );
-        // ... the review band is a proposal, not a match ...
-        let pr = props(b, r).await;
+        // ... the review band is a proposal in the table, not a match ...
         assert_eq!(owner(b, &format!("id:rs_mb:{mb_r}")).await, None, "{name}");
+        let pr = of(r).await;
+        assert_eq!(pr.len(), 1, "{name} {pr:?}");
+        assert_eq!(pr[0].kind, ProposalKind::RegistryRecord);
+        assert_eq!(pr[0].state, ProposalState::Open);
+        assert_eq!(pr[0].reason, ProposalReason::ReviewBand);
         assert_eq!(
-            pr["registry_proposals"][0]["registry"], "apr",
-            "{name} {pr}"
+            pr[0].registry_record(),
+            Some(("apr", format!("companies/{mb_r}").as_str()))
         );
-        assert_eq!(pr["registry_proposals"][0]["reason"], "uncertain");
+        assert_eq!(pr[0].detail["name"], "Beta Fiktiv Plus d.o.o.");
+        assert!(pr[0].probability >= 0.5 && pr[0].probability < 0.9);
+        assert_eq!(pr[0].evidence[0]["registry"], "apr", "{}", pr[0].evidence);
+        // ... no props lists any more ...
+        for c in [x, u, r, g] {
+            let p = props(b, c).await;
+            assert!(p.get("merge_proposals").is_none(), "{name} {p}");
+            assert!(p.get("registry_proposals").is_none(), "{name} {p}");
+        }
         // ... and nothing else is nothing.
-        let pz = props(b, z).await;
-        assert!(
-            pz["registry_proposals"].as_array().unwrap().is_empty(),
-            "{name}"
-        );
+        assert!(of(z).await.is_empty(), "{name}");
         assert!(b.enrichment(z).await.unwrap().is_some());
         assert!(
-            job.stats().merged >= 1 && job.stats().proposed >= 2,
+            job.stats().merged >= 1 && job.stats().proposed >= 1,
             "{:?}",
             job.stats()
         );
+
+        // A person accepts the record: its MB joins the company, APR is due now, and the
+        // next pass looks the company up by it and writes the record's facts.
+        let person = MergeActor {
+            kind: MergeActorKind::Manual,
+            instance: InstanceId::new("person").unwrap(),
+        };
+        let done = doewood_model::proposal::accept(b.as_ref(), pr[0].id, &person, None, "")
+            .await
+            .unwrap();
+        assert_eq!(done.alias, Some(format!("id:rs_mb:{mb_r}")));
+        assert_eq!(
+            owner(b, &format!("id:rs_mb:{mb_r}")).await,
+            Some(r),
+            "{name}"
+        );
+        pass(&job, b).await;
+        let pr = props(b, r).await;
+        assert_eq!(pr["registry"]["apr"]["found"], true, "{name} {pr}");
+        assert_eq!(pr["registry"]["apr"]["mb"], mb_r.as_str(), "{name} {pr}");
+        assert_eq!(pr["legal_name"], "Beta Fiktiv Plus d.o.o.", "{name} {pr}");
+        let open = b
+            .list_proposals(&ProposalQuery {
+                company: Some(r),
+                state: Some(ProposalState::Open),
+                ..ProposalQuery::default()
+            })
+            .await
+            .unwrap();
+        assert!(open.is_empty(), "{name} {open:?}");
     }
     backends.drop_schema().await;
 }

@@ -14,6 +14,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0005_llm.sql"),
     include_str!("migrations/0006_enrichment.sql"),
     include_str!("migrations/0007_merges.sql"),
+    include_str!("migrations/0008_proposals.sql"),
 ];
 
 /// The schema version this binary writes.
@@ -27,6 +28,12 @@ pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 /// inside a transaction). Each migration checks them before it commits; the caller turns them
 /// back on.
 pub(crate) fn migrate(conn: &mut Connection) -> Result<i64, StoreError> {
+    migrate_to(conn, SCHEMA_VERSION)
+}
+
+/// Brings the schema up to `target` (at most [`SCHEMA_VERSION`]): [`migrate`], or a test's
+/// older schema to migrate data from.
+pub(crate) fn migrate_to(conn: &mut Connection, target: i64) -> Result<i64, StoreError> {
     conn.pragma_update(None, "foreign_keys", false)?;
     let current: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     if current > SCHEMA_VERSION {
@@ -38,6 +45,7 @@ pub(crate) fn migrate(conn: &mut Connection) -> Result<i64, StoreError> {
     for (version, sql) in (1_i64..)
         .zip(MIGRATIONS)
         .skip(usize::try_from(current).unwrap_or(0))
+        .take_while(|(v, _)| *v <= target)
     {
         let tx = conn.transaction()?;
         tx.execute_batch(sql)?;
@@ -55,5 +63,5 @@ pub(crate) fn migrate(conn: &mut Connection) -> Result<i64, StoreError> {
         tx.pragma_update(None, "user_version", version)?;
         tx.commit()?;
     }
-    Ok(SCHEMA_VERSION)
+    Ok(target.min(SCHEMA_VERSION))
 }

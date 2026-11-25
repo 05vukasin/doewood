@@ -299,6 +299,7 @@ mod tests {
                 "company_enrichment",
                 "company_leases",
                 "company_merges",
+                "company_proposals",
                 "company_registry_due",
                 "edges",
                 "favicons",

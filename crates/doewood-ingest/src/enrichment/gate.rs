@@ -5,14 +5,16 @@
 //!   form missing on one side the legal-form-blind 0.85, else the fuzzy score with the
 //!   jurisdiction veto; different jurisdictions are never the same company). The noisy-OR of
 //!   the evidence goes through the gate: a record at 0.90 or more is adopted (its identifiers
-//!   join the company), one in the review band is a proposal, below 0.50 nothing.
+//!   join the company), one in the review band is a registry record proposal, below 0.50
+//!   nothing.
 //! - **Other companies** ([`run`]): a company that owns an identifier the registry gave for
 //!   this one (found by this company's own identifier) is a registry identifier hit (0.95); a
 //!   company that owns a key of the registry's legal or former names is a name-ladder hit. A
 //!   company with a different national registry number (MB, PIB, OIB, Companies House number,
 //!   CIK) or in another jurisdiction is never a candidate. Fused, gated: a merge at 0.90 or
 //!   more through the merge log (actor `enrichment`, with the evidence), never for a dismissed
-//!   pair; the review band and conflicts become proposals on the company.
+//!   pair (a dismissed pair is never a candidate); the review band and conflicts become
+//!   proposals (`ProposalStore::propose`, issue #52).
 //! - Identifiers adopted from a name match never count as registry identifier hits: a company
 //!   that owns one is a proposal, not a merge.
 
@@ -24,7 +26,10 @@ use std::collections::BTreeMap;
 use doewood_enrich::fusion::{Candidate, Decision, Evidence, ReviewReason, Source, decide, fuse};
 use doewood_enrich::fuzzy::{self, FuzzyVerdict};
 use doewood_enrich::{CompanyName, IdKind, LadderStep};
-use doewood_model::{Error, MergeActor, MergeActorKind, MergeRequest, NodeKind, Result};
+use doewood_model::{
+    Error, MergeActor, MergeActorKind, MergeRequest, NodeKind, ProposalReason, ProposalRequest,
+    Result,
+};
 use doewood_registry::Registry;
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
@@ -81,6 +86,7 @@ pub(crate) fn pick(
     let name = s.name.as_ref()?;
     let mut seen = Vec::new();
     let mut scored = Vec::new();
+    let mut evidence = Vec::new();
     for (i, c) in candidates.iter().enumerate() {
         if seen.contains(&c.record) {
             continue;
@@ -91,6 +97,7 @@ pub(crate) fn pick(
         };
         if let Some(e) = name_evidence(name, s.country.as_deref(), &other, c.country.as_deref()) {
             scored.push(Candidate::new(i, &[e]));
+            evidence.push((i, e));
         }
     }
     match decide(&scored) {
@@ -108,13 +115,33 @@ pub(crate) fn pick(
                 .filter(|c| c.probability >= doewood_enrich::fusion::NEW_BELOW)
             {
                 let cand = &candidates[c.id];
-                f.proposals.push(json!({
-                    "registry": registry.as_str(),
-                    "record": cand.record,
-                    "name": cand.name,
-                    "probability": c.probability,
-                    "reason": reason_name(reason),
-                }));
+                let ev: Vec<Value> = evidence
+                    .iter()
+                    .filter(|(i, _)| *i == c.id)
+                    .map(|(_, e)| {
+                        json!({
+                            "source": e.source.as_str(),
+                            "reliability": e.reliability,
+                            "registry": registry.as_str(),
+                            "record": cand.record,
+                            "name": cand.name,
+                        })
+                    })
+                    .collect();
+                f.proposals.push(ProposalRequest::registry_record(
+                    s.id(),
+                    registry.as_str(),
+                    &cand.record,
+                    json!({
+                        "registry": registry.as_str(),
+                        "record": cand.record,
+                        "name": cand.name,
+                        "country": cand.country,
+                    }),
+                    Value::Array(ev),
+                    unit(c.probability),
+                    proposal_reason(reason),
+                ));
             }
             None
         }
@@ -122,11 +149,17 @@ pub(crate) fn pick(
     }
 }
 
-fn reason_name(r: ReviewReason) -> &'static str {
+fn proposal_reason(r: ReviewReason) -> ProposalReason {
     match r {
-        ReviewReason::Uncertain => "uncertain",
-        ReviewReason::Conflict => "conflict",
+        ReviewReason::Uncertain => ProposalReason::ReviewBand,
+        ReviewReason::Conflict => ProposalReason::Conflict,
     }
+}
+
+/// A probability as stored (0 to 1, `f32`).
+#[allow(clippy::cast_possible_truncation)]
+fn unit(p: f64) -> f32 {
+    p.clamp(0.0, 1.0) as f32
 }
 
 /// What the gate did with other companies.
@@ -134,10 +167,8 @@ fn reason_name(r: ReviewReason) -> &'static str {
 pub(crate) struct Gated {
     /// Merges done.
     pub merged: u64,
-    /// Proposals recorded.
-    pub proposed: u64,
-    /// The proposals, for the company's props.
-    pub proposals: Vec<Value>,
+    /// The merge proposals, for the proposals table.
+    pub proposals: Vec<ProposalRequest>,
 }
 
 /// Whether two companies carry different national registry numbers of one kind: then they
@@ -189,14 +220,18 @@ pub(crate) async fn run(job: &Job<'_>, s: &mut Subject, f: &Findings) -> Result<
             continue;
         }
         if let Some(p) = found.by_name {
-            out.proposals.push(json!({
-                "company": owner.to_string(),
-                "probability": p,
-                "reason": "owns an identifier of a name match",
-                "alias": found.alias,
-                "evidence": [found.evidence],
-            }));
-            out.proposed += 1;
+            if b.dismissal(me, owner).await?.is_some() {
+                debug!(company = %me, other = %owner, "a dismissed pair is never proposed");
+                continue;
+            }
+            out.proposals.push(ProposalRequest::merge(
+                me,
+                owner,
+                json!({"why": "owns an identifier of a name match", "alias": found.alias}),
+                json!([{"source": "name_match_identifier", "alias": found.alias, "probability": p, "record": found.evidence}]),
+                unit(p),
+                ProposalReason::ReviewBand,
+            ));
             continue;
         }
         evidence.entry(owner).or_default().push((
@@ -247,6 +282,12 @@ pub(crate) async fn run(job: &Job<'_>, s: &mut Subject, f: &Findings) -> Result<
         {
             continue;
         }
+        // A dismissed pair is never the same company, whatever the evidence (ADR 0002
+        // section 1.8): not merged, not proposed, and no conflict for the others.
+        if b.dismissal(me, *owner).await?.is_some() {
+            debug!(company = %me, other = %owner, "a dismissed pair is never merged or proposed");
+            continue;
+        }
         let list: Vec<Evidence> = ev.iter().map(|(e, _)| *e).collect();
         candidates.push(Candidate {
             id: *owner,
@@ -267,19 +308,7 @@ pub(crate) async fn run(job: &Job<'_>, s: &mut Subject, f: &Findings) -> Result<
                 .iter()
                 .find(|c| c.id == other)
                 .map_or(0.0, |c| c.probability);
-            if let Some(d) = b.dismissal(me, other).await? {
-                debug!(company = %me, other = %other, "a dismissed pair is never merged");
-                out.proposals.push(json!({
-                    "company": other.to_string(),
-                    "probability": p,
-                    "reason": "dismissed",
-                    "dismissal": d.seq,
-                    "evidence": json_of(&other),
-                }));
-                out.proposed += 1;
-            } else if !job.lease_other(other).await? {
-                debug!(company = %me, other = %other, "the other company is leased elsewhere; merged later");
-            } else {
+            if job.lease_other(other).await? {
                 let mine = b.company_documents(me).await?.len();
                 let theirs = b.company_documents(other).await?.len();
                 let (survivor, absorbed) = if theirs > mine {
@@ -287,8 +316,7 @@ pub(crate) async fn run(job: &Job<'_>, s: &mut Subject, f: &Findings) -> Result<
                 } else {
                     (me, other)
                 };
-                #[allow(clippy::cast_possible_truncation)]
-                let p32 = p as f32;
+                let p32 = unit(p);
                 let req = MergeRequest {
                     survivor,
                     absorbed,
@@ -320,6 +348,8 @@ pub(crate) async fn run(job: &Job<'_>, s: &mut Subject, f: &Findings) -> Result<
                     }
                     Err(e) => return Err(e),
                 }
+            } else {
+                debug!(company = %me, other = %other, "the other company is leased elsewhere; merged later");
             }
         }
         Decision::Review(reason) => {
@@ -327,13 +357,14 @@ pub(crate) async fn run(job: &Job<'_>, s: &mut Subject, f: &Findings) -> Result<
                 .iter()
                 .filter(|c| c.probability >= doewood_enrich::fusion::NEW_BELOW)
             {
-                out.proposals.push(json!({
-                    "company": c.id.to_string(),
-                    "probability": c.probability,
-                    "reason": reason_name(reason),
-                    "evidence": json_of(&c.id),
-                }));
-                out.proposed += 1;
+                out.proposals.push(ProposalRequest::merge(
+                    me,
+                    c.id,
+                    json!({"why": "the gate's review band"}),
+                    json_of(&c.id),
+                    unit(c.probability),
+                    proposal_reason(reason),
+                ));
             }
         }
         Decision::New => {}

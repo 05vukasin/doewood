@@ -20,6 +20,7 @@ mod backend;
 mod enrichment;
 mod merges;
 mod migrate;
+mod proposals;
 #[cfg(test)]
 mod tests;
 mod tls;
