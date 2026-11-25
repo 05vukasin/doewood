@@ -29,7 +29,7 @@ const ENTRY_COLUMNS: &str = "id, seq, op, extract(epoch FROM at)::bigint, actor,
 const DISMISSAL_COLUMNS: &str = "seq, company_a, company_b, extract(epoch FROM at)::bigint, \
      actor, instance, reason, merge_id";
 
-fn actor(kind: &str, instance: &str) -> Result<MergeActor> {
+pub(crate) fn actor(kind: &str, instance: &str) -> Result<MergeActor> {
     Ok(MergeActor {
         kind: parse(kind)?,
         instance: InstanceId::new(instance).map_err(|e| bad("instance", e))?,

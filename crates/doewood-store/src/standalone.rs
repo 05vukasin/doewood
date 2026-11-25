@@ -29,6 +29,7 @@ use crate::store::now;
 
 mod enrichment;
 mod merges;
+mod proposals;
 
 /// The SQLite backend. Cheap to clone: every clone shares the one store.
 #[derive(Clone, Debug)]

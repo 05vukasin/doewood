@@ -27,14 +27,14 @@ fn actor_kind(k: MergeActorKind) -> pb::MergeActorKind {
     }
 }
 
-fn actor(a: &MergeActor) -> pb::MergeActor {
+pub(crate) fn actor(a: &MergeActor) -> pb::MergeActor {
     pb::MergeActor {
         kind: actor_kind(a.kind) as i32,
         instance_id: a.instance.as_str().to_owned(),
     }
 }
 
-fn entry(e: &MergeEntry) -> pb::MergeEntry {
+pub(crate) fn entry(e: &MergeEntry) -> pb::MergeEntry {
     pb::MergeEntry {
         id: e.id.to_string(),
         seq: e.seq,
@@ -55,7 +55,7 @@ fn entry(e: &MergeEntry) -> pb::MergeEntry {
     }
 }
 
-fn dismissal(d: &Dismissal) -> pb::Dismissal {
+pub(crate) fn dismissal(d: &Dismissal) -> pb::Dismissal {
     pb::Dismissal {
         company_a_id: d.a.to_string(),
         company_b_id: d.b.to_string(),
@@ -68,7 +68,7 @@ fn dismissal(d: &Dismissal) -> pb::Dismissal {
 }
 
 /// An optional company filter.
-fn company_filter(v: &mut Violations, field: &str, value: &str) -> Option<Uuid> {
+pub(crate) fn company_filter(v: &mut Violations, field: &str, value: &str) -> Option<Uuid> {
     if value.is_empty() {
         None
     } else {
@@ -77,7 +77,7 @@ fn company_filter(v: &mut Violations, field: &str, value: &str) -> Option<Uuid> 
 }
 
 /// A page size and the token of the previous page (the last `seq` it held).
-fn page(v: &mut Violations, size: u32, token: &str) -> (u32, Option<i64>) {
+pub(crate) fn page(v: &mut Violations, size: u32, token: &str) -> (u32, Option<i64>) {
     if size > MERGES_MAX_LIMIT {
         v.add("page_size", format!("at most {MERGES_MAX_LIMIT}"));
     }
@@ -93,7 +93,7 @@ fn page(v: &mut Violations, size: u32, token: &str) -> (u32, Option<i64>) {
     (merges_limit(size), before)
 }
 
-fn reason(v: &mut Violations, field: &str, value: &str) {
+pub(crate) fn reason(v: &mut Violations, field: &str, value: &str) {
     if value.len() > REASON_MAX_LEN || value.contains('\0') {
         v.add(
             field,
@@ -130,7 +130,7 @@ fn uuids(v: &mut Violations, field: &str, values: &[String]) -> Vec<Uuid> {
 }
 
 /// The token of the next page: the last `seq`, when the page is full.
-fn next_token(len: usize, limit: u32, last: Option<i64>) -> String {
+pub(crate) fn next_token(len: usize, limit: u32, last: Option<i64>) -> String {
     match last {
         Some(seq) if len == limit as usize => seq.to_string(),
         _ => String::new(),
@@ -138,7 +138,7 @@ fn next_token(len: usize, limit: u32, last: Option<i64>) -> String {
 }
 
 impl Api {
-    fn manual(&self) -> MergeActor {
+    pub(crate) fn manual(&self) -> MergeActor {
         MergeActor {
             kind: MergeActorKind::Manual,
             instance: self.state.instance().clone(),

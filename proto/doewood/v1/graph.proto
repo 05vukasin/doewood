@@ -31,6 +31,22 @@ service GraphService {
   rpc DismissPair(DismissPairRequest) returns (Dismissal);
   // Dismissed pairs, newest first.
   rpc ListDismissals(ListDismissalsRequest) returns (ListDismissalsResponse);
+
+  // Enrichment proposals (ADR 0002 section 1.6): what the decision gate leaves to a person,
+  // a registry record to adopt or a company to merge with. Newest first, filtered by state,
+  // kind and company.
+  rpc ListProposals(ListProposalsRequest) returns (ListProposalsResponse);
+  // Accepts an open proposal. A merge goes through the merge log (actor manual, the
+  // proposal's evidence), so UndoMerge undoes it; a registry record's identifier joins the
+  // company and the next enrichment pass fetches the record by it. NOT_FOUND for an unknown
+  // proposal; FAILED_PRECONDITION when it is not open, the pair is dismissed, or the
+  // record's identifier belongs to another company.
+  rpc AcceptProposal(AcceptProposalRequest) returns (AcceptProposalResponse);
+  // Rejects an open proposal. With `dismiss` the rejection is permanent: the proposal is
+  // never opened again, and a merge proposal's pair is dismissed (DismissPair), so it never
+  // merges either. FAILED_PRECONDITION when it is not open, or (dismiss) the two are one
+  // company now.
+  rpc RejectProposal(RejectProposalRequest) returns (RejectProposalResponse);
 }
 
 enum NodeKind {
@@ -301,4 +317,108 @@ message ListDismissalsRequest {
 message ListDismissalsResponse {
   repeated Dismissal dismissals = 1;
   string next_page_token = 2;
+}
+
+enum ProposalKind {
+  PROPOSAL_KIND_UNSPECIFIED = 0;
+  // A registry record a name search found, for the company to adopt.
+  PROPOSAL_KIND_REGISTRY_RECORD = 1;
+  // Another company that may be the same, to merge with.
+  PROPOSAL_KIND_MERGE = 2;
+}
+
+enum ProposalReason {
+  PROPOSAL_REASON_UNSPECIFIED = 0;
+  // The fused probability is in the review band (0.50 to 0.90).
+  PROPOSAL_REASON_REVIEW_BAND = 1;
+  // Two conflicting high-precision hits.
+  PROPOSAL_REASON_CONFLICT = 2;
+  // The evidence said merge but the pair is dismissed (moved from props by schema 5).
+  PROPOSAL_REASON_DISMISSED = 3;
+}
+
+enum ProposalState {
+  PROPOSAL_STATE_UNSPECIFIED = 0;
+  PROPOSAL_STATE_OPEN = 1;
+  PROPOSAL_STATE_ACCEPTED = 2;
+  PROPOSAL_STATE_REJECTED = 3;
+}
+
+message Proposal {
+  string id = 1;
+  // Its place in the list: later proposals have larger numbers.
+  int64 seq = 2;
+  ProposalKind kind = 3;
+  // The company. For a merge, the smaller id of the pair.
+  string company_id = 4;
+  // A registry record as `<registry>:<record>` (`apr:companies/12345678`), or a merge's other
+  // company id.
+  string candidate = 5;
+  // What a person needs to decide (a record's registry, id and name), as a JSON object.
+  string detail_json = 6;
+  // Why, as a JSON array.
+  string evidence_json = 7;
+  // The fused (noisy-OR) probability, 0 to 1.
+  float probability = 8;
+  ProposalReason reason = 9;
+  ProposalState state = 10;
+  // Unix seconds: first proposed, last proposed.
+  int64 created_at = 11;
+  int64 updated_at = 12;
+  // Set once accepted or rejected: Unix seconds (0 while open) and by whom (absent for the
+  // dismissed pairs schema 5 moved out of props).
+  int64 resolved_at = 13;
+  MergeActor resolved_by = 14;
+  // A permanent rejection.
+  bool dismissed = 15;
+  // The merge an accepted merge proposal made.
+  string merge_id = 16;
+  string note = 17;
+}
+
+message ListProposalsRequest {
+  // Unspecified for every state.
+  ProposalState state = 1;
+  // Unspecified for every kind.
+  ProposalKind kind = 2;
+  // Only proposals about this company (its own, and merge proposals naming it); empty for
+  // all.
+  string company_id = 3;
+  // 0 means 50; at most 1000.
+  uint32 page_size = 4;
+  // `next_page_token` of the previous page; empty for the first.
+  string page_token = 5;
+}
+
+message ListProposalsResponse {
+  repeated Proposal proposals = 1;
+  string next_page_token = 2;
+}
+
+message AcceptProposalRequest {
+  string proposal_id = 1;
+  // A merge's surviving company, one of the two; empty for the one with more documents.
+  string survivor_id = 2;
+  string note = 3;
+}
+
+message AcceptProposalResponse {
+  Proposal proposal = 1;
+  // The merge made (undo it with UndoMerge), for a merge proposal.
+  MergeEntry merge = 2;
+  // The identifier alias the company adopted, for a registry record.
+  string alias = 3;
+}
+
+message RejectProposalRequest {
+  string proposal_id = 1;
+  // Permanent: never proposed again, and a merge proposal's pair is dismissed.
+  bool dismiss = 2;
+  string note = 3;
+}
+
+message RejectProposalResponse {
+  Proposal proposal = 1;
+  // The dismissal recorded, for a merge proposal rejected with `dismiss`.
+  Dismissal dismissal = 2;
 }

@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use doewood_core::InstanceId;
 use doewood_enrich::{CompanyName, IdKind, Identifier};
-use doewood_model::{Backend, DueCompany, EdgeKind, EdgeState, Result};
+use doewood_model::{Backend, DueCompany, EdgeKind, EdgeState, ProposalRequest, Result};
 use doewood_registry::apr::Company as AprCompany;
 use doewood_registry::companies_house::{CompanyNumber, PscKind, Status as ChStatus};
 use doewood_registry::edgar::Cik;
@@ -132,7 +132,7 @@ pub(crate) struct Findings {
     /// Official websites (Wikidata), as host names.
     pub websites: Vec<String>,
     /// Name-search candidates in the review band, for a person.
-    pub proposals: Vec<Value>,
+    pub proposals: Vec<ProposalRequest>,
     /// The warnings.
     pub warnings: Vec<Warning>,
     /// Each registry asked, and whether every request to it answered.
@@ -392,8 +392,9 @@ impl<'a> Job<'a> {
         self.renew(subject.id()).await;
         let gated = gate::run(self, &mut subject, &f).await?;
         out.merged = gated.merged;
-        out.proposed = gated.proposed + f.proposals.len() as u64;
-        out.edges = super::write::write(self, &subject, &f, &gated).await?;
+        let written = super::write::write(self, &subject, &f, &gated).await?;
+        out.edges = written.edges;
+        out.proposed = written.proposed;
         out.website = super::website::run(self, &subject, &f).await?;
         b.record_enrichment(subject.id(), &f.schedule(self.retry))
             .await?;

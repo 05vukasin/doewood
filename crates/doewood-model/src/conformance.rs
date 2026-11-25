@@ -18,7 +18,8 @@ use crate::{
     Backend, Blake3, CACHE_KEY_MAX_LEN, CACHE_MAX_BODY, CacheRow, Direction, DismissRequest,
     DismissalQuery, DueCompany, DueReason, Edge, EdgeKind, EdgeSource, EdgeState, Error, IconRow,
     MergeActor, MergeActorKind, MergeOp, MergeQuery, MergeRequest, NeighbourQuery, Node, NodeKind,
-    ObjectLocation, OwnedAlias, PropsPatch, PutOutcome, SearchDoc, SearchQuery, SourceKey,
+    ObjectLocation, OwnedAlias, ProposalKind, ProposalQuery, ProposalReason, ProposalRequest,
+    ProposalState, PropsPatch, PutOutcome, ResolveRequest, SearchDoc, SearchQuery, SourceKey,
     SplitRequest, StepVersions, StoredEdge, StoredIcon, UndoRequest, merged_into,
 };
 
@@ -43,6 +44,8 @@ pub async fn run<B: Backend + ?Sized>(a: &B, b: &B) {
     caches(a, b).await;
     freshness(a, b).await;
     merges(a).await;
+    proposals(a, b).await;
+    decisions(a).await;
     live_edges(a, b).await;
     a.ping().await.expect("ping");
 }
@@ -1891,6 +1894,399 @@ pub async fn merges<B: Backend + ?Sized>(s: &B) {
         s.undo_merge(&undo_req(sp2.id, false, false)).await,
         "dismissed",
     );
+}
+
+fn resolve_req(id: Uuid, state: ProposalState, dismissed: bool) -> ResolveRequest {
+    ResolveRequest {
+        id,
+        state,
+        actor: actor(MergeActorKind::Manual),
+        dismissed,
+        merge: None,
+        note: "checked".to_owned(),
+    }
+}
+
+/// Enrichment proposals (issue #52): dedup of open proposals, filters and pages, resolution
+/// once, dismissed rejections and dismissed pairs never opened again.
+///
+/// # Panics
+///
+/// When the backend misbehaves.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+pub async fn proposals<B: Backend + ?Sized>(s: &B, other: &B) {
+    let company = |key: &'static str| async move {
+        s.upsert_node(NodeKind::Company, key, &json!({"name": key}))
+            .await
+            .unwrap()
+    };
+    let (x, y, z) = (
+        company("p-x").await,
+        company("p-y").await,
+        company("p-z").await,
+    );
+    let merge = |p: f32, reason: ProposalReason| {
+        ProposalRequest::merge(
+            y,
+            x,
+            json!({"why": "name"}),
+            json!([{"source": "name_ladder", "step": "normalized"}]),
+            p,
+            reason,
+        )
+    };
+    let record = ProposalRequest::registry_record(
+        x,
+        "apr",
+        "companies/12345678",
+        json!({"name": "P-X d.o.o."}),
+        json!([{"source": "fuzzy_name", "registry": "apr"}]),
+        0.75,
+        ProposalReason::ReviewBand,
+    );
+    // New, then the same again: one open proposal, updated.
+    let first = s
+        .propose(&merge(0.6, ProposalReason::ReviewBand))
+        .await
+        .unwrap()
+        .expect("opened");
+    assert_eq!(first.kind, ProposalKind::Merge);
+    assert_eq!(first.company, x.min(y));
+    assert_eq!(first.candidate, x.max(y).to_string());
+    assert_eq!(first.candidate_company(), Some(x.max(y)));
+    assert_eq!(first.state, ProposalState::Open);
+    assert_eq!(first.resolution, None);
+    assert!(first.created_at > 1_700_000_000);
+    let again = other
+        .propose(&merge(0.7, ProposalReason::Conflict))
+        .await
+        .unwrap()
+        .expect("updated");
+    assert_eq!((again.id, again.seq), (first.id, first.seq), "deduplicated");
+    assert!((again.probability - 0.7).abs() < 1e-6);
+    assert_eq!(again.reason, ProposalReason::Conflict);
+    assert_eq!(again.created_at, first.created_at);
+    assert_eq!(s.proposal(first.id).await.unwrap(), Some(again.clone()));
+    let rec = s.propose(&record).await.unwrap().expect("opened");
+    assert_eq!(rec.registry_record(), Some(("apr", "companies/12345678")));
+    assert_eq!(rec.detail, json!({"name": "P-X d.o.o."}));
+    assert!(rec.seq > again.seq);
+    // Filters and pages, newest first.
+    let list = |q: ProposalQuery| async move { s.list_proposals(&q).await.unwrap() };
+    let ids = |v: Vec<crate::Proposal>| v.into_iter().map(|p| p.id).collect::<Vec<_>>();
+    assert_eq!(
+        ids(list(ProposalQuery::default()).await),
+        [rec.id, first.id]
+    );
+    let merges_only = ProposalQuery {
+        kind: Some(ProposalKind::Merge),
+        ..ProposalQuery::default()
+    };
+    assert_eq!(ids(list(merges_only).await), [first.id]);
+    for (c, want) in [
+        (x, vec![rec.id, first.id]),
+        (y, vec![first.id]),
+        (z, vec![]),
+    ] {
+        let q = ProposalQuery {
+            company: Some(c),
+            ..ProposalQuery::default()
+        };
+        assert_eq!(
+            ids(list(q).await),
+            want,
+            "company filter, either side of a merge"
+        );
+    }
+    let accepted = ProposalQuery {
+        state: Some(ProposalState::Accepted),
+        ..ProposalQuery::default()
+    };
+    assert!(list(accepted).await.is_empty());
+    let page = list(ProposalQuery {
+        limit: 1,
+        ..ProposalQuery::default()
+    })
+    .await;
+    assert_eq!(ids(page.clone()), [rec.id]);
+    let next = ProposalQuery {
+        limit: 1,
+        before: Some(page[0].seq),
+        ..ProposalQuery::default()
+    };
+    assert_eq!(ids(list(next).await), [first.id]);
+    // Resolved once.
+    let mut req = resolve_req(first.id, ProposalState::Accepted, false);
+    req.merge = Some(Uuid::now_v7());
+    let done = s.resolve_proposal(&req).await.unwrap();
+    assert_eq!(done.state, ProposalState::Accepted);
+    let r = done.resolution.clone().expect("resolved");
+    assert_eq!(r.actor, Some(actor(MergeActorKind::Manual)));
+    assert_eq!(
+        (r.merge, r.note.as_str(), r.dismissed),
+        (req.merge, "checked", false)
+    );
+    assert!(r.at >= done.created_at);
+    precondition(other.resolve_proposal(&req).await, "accepted");
+    assert!(matches!(
+        s.resolve_proposal(&resolve_req(Uuid::now_v7(), ProposalState::Rejected, false))
+            .await,
+        Err(Error::NotFound(_))
+    ));
+    assert!(matches!(
+        s.resolve_proposal(&resolve_req(rec.id, ProposalState::Open, false))
+            .await,
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        s.resolve_proposal(&resolve_req(rec.id, ProposalState::Accepted, true))
+            .await,
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(ids(list(accepted).await), [first.id]);
+    // A resolved proposal is history: proposing the pair again opens a new one.
+    let reopened = s
+        .propose(&merge(0.65, ProposalReason::ReviewBand))
+        .await
+        .unwrap()
+        .expect("opened");
+    assert_ne!(reopened.id, first.id);
+    // A plain rejection: proposed again later, it opens again.
+    s.resolve_proposal(&resolve_req(reopened.id, ProposalState::Rejected, false))
+        .await
+        .unwrap();
+    let third = s
+        .propose(&merge(0.66, ProposalReason::ReviewBand))
+        .await
+        .unwrap()
+        .expect("opened again");
+    assert_ne!(third.id, reopened.id);
+    // A dismissed rejection is never opened again.
+    let rejected = s
+        .resolve_proposal(&resolve_req(rec.id, ProposalState::Rejected, true))
+        .await
+        .unwrap();
+    assert_eq!(rejected.state, ProposalState::Rejected);
+    assert!(rejected.resolution.expect("resolved").dismissed);
+    assert_eq!(other.propose(&record).await.unwrap(), None);
+    // Nor is a merge proposal for a dismissed pair.
+    s.dismiss_pair(&DismissRequest {
+        a: z,
+        b: x,
+        actor: actor(MergeActorKind::Manual),
+        reason: "different".to_owned(),
+    })
+    .await
+    .unwrap();
+    let dismissed =
+        ProposalRequest::merge(x, z, json!({}), json!([]), 0.95, ProposalReason::Dismissed);
+    assert_eq!(s.propose(&dismissed).await.unwrap(), None);
+    // Unknown companies and bad requests.
+    let ghost = ProposalRequest::merge(
+        x,
+        Uuid::now_v7(),
+        json!({}),
+        json!([]),
+        0.6,
+        ProposalReason::ReviewBand,
+    );
+    assert!(matches!(s.propose(&ghost).await, Err(Error::NotFound(_))));
+    let mut ghost = record.clone();
+    ghost.company = Uuid::now_v7();
+    assert!(matches!(s.propose(&ghost).await, Err(Error::NotFound(_))));
+    let mut bad = record;
+    bad.probability = 2.0;
+    assert!(matches!(s.propose(&bad).await, Err(Error::Invalid(_))));
+}
+
+/// A person's decisions on proposals (`proposal::accept` and `proposal::reject`): an
+/// accepted merge goes through the merge log and is undone; an accepted record adopts its
+/// identifier and makes its registry due; a dismissed rejection blocks the merge and the
+/// proposal; accepting a dismissed pair fails.
+///
+/// # Panics
+///
+/// When the backend misbehaves.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+pub async fn decisions<B: Backend + ?Sized>(s: &B) {
+    use crate::proposal::{accept, reject};
+    let company = |key: &'static str| async move {
+        s.upsert_node(NodeKind::Company, key, &json!({"name": key}))
+            .await
+            .unwrap()
+    };
+    let person = actor(MergeActorKind::Manual);
+    let (a, b, c) = (
+        company("d-a").await,
+        company("d-b").await,
+        company("d-c").await,
+    );
+    let doc = s
+        .upsert_node(NodeKind::Document, &"d".repeat(64), &json!({}))
+        .await
+        .unwrap();
+    s.upsert_edge(&Edge::new(doc, b, EdgeKind::Party, EdgeSource::Document))
+        .await
+        .unwrap();
+    let evidence = json!([{"source": "name_ladder", "step": "form_blind"}]);
+    let pair = |x: Uuid, y: Uuid| {
+        ProposalRequest::merge(
+            x,
+            y,
+            json!({}),
+            evidence.clone(),
+            0.85,
+            ProposalReason::ReviewBand,
+        )
+    };
+    // Accept a merge: the one with more documents survives; the log has the evidence.
+    let p = s.propose(&pair(a, b)).await.unwrap().expect("opened");
+    let done = accept(s, p.id, &person, None, "same").await.unwrap();
+    let entry = done.merge.expect("merged");
+    assert_eq!((entry.survivor, entry.absorbed), (b, a));
+    assert_eq!(entry.actor, person);
+    assert_eq!(entry.evidence, evidence);
+    assert!((entry.probability - 0.85).abs() < 1e-6);
+    assert_eq!(done.proposal.state, ProposalState::Accepted);
+    let r = done.proposal.resolution.expect("resolved");
+    assert_eq!((r.merge, r.note.as_str()), (Some(entry.id), "same"));
+    precondition(accept(s, p.id, &person, None, "").await, "accepted");
+    // ... and undo it.
+    let undone = s
+        .undo_merge(&UndoRequest {
+            merge: entry.id,
+            actor: person.clone(),
+            cascade: false,
+            dismiss: false,
+            reason: String::new(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(undone.undone, [entry.id]);
+    assert_eq!(merged_into(&s.node(a).await.unwrap().unwrap()), None);
+    // A chosen survivor; one that is neither company is refused.
+    let p = s.propose(&pair(a, b)).await.unwrap().expect("opened");
+    assert!(matches!(
+        accept(s, p.id, &person, Some(c), "").await,
+        Err(Error::Invalid(_))
+    ));
+    let done = accept(s, p.id, &person, Some(a), "").await.unwrap();
+    let entry = done.merge.expect("merged");
+    assert_eq!((entry.survivor, entry.absorbed), (a, b));
+    // A pair that is one company already is accepted without a merge.
+    let p = s.propose(&pair(a, b)).await.unwrap().expect("opened");
+    let done = accept(s, p.id, &person, None, "").await.unwrap();
+    assert_eq!(done.merge, None);
+    assert_eq!(
+        done.proposal.resolution.expect("resolved").note,
+        "already one company"
+    );
+    // Rejected as dismissed: the pair is dismissed, never merged, never proposed again.
+    let p = s.propose(&pair(a, c)).await.unwrap().expect("opened");
+    let (rejected, d) = reject(s, p.id, &person, true, "different companies")
+        .await
+        .unwrap();
+    assert_eq!(rejected.state, ProposalState::Rejected);
+    assert!(rejected.resolution.expect("resolved").dismissed);
+    let d = d.expect("dismissed");
+    assert_eq!((d.a, d.b), (a.min(c), a.max(c)));
+    assert_eq!(d.reason, "different companies");
+    assert!(s.dismissal(a, c).await.unwrap().is_some());
+    precondition(
+        s.merge_companies(&merge_req(a, c, MergeActorKind::Enrichment))
+            .await,
+        "dismissed",
+    );
+    assert_eq!(s.propose(&pair(c, a)).await.unwrap(), None);
+    // A plain rejection records no dismissal.
+    let e = company("d-e").await;
+    let p = s.propose(&pair(c, e)).await.unwrap().expect("opened");
+    let (_, d) = reject(s, p.id, &person, false, "").await.unwrap();
+    assert_eq!(d, None);
+    assert!(s.dismissal(c, e).await.unwrap().is_none());
+    // A proposal opened before its pair was dismissed cannot be accepted.
+    let p = s.propose(&pair(c, e)).await.unwrap().expect("opened");
+    s.dismiss_pair(&DismissRequest {
+        a: c,
+        b: e,
+        actor: person.clone(),
+        reason: String::new(),
+    })
+    .await
+    .unwrap();
+    precondition(accept(s, p.id, &person, None, "").await, "dismissed");
+    assert_eq!(
+        s.proposal(p.id).await.unwrap().expect("kept").state,
+        ProposalState::Open
+    );
+    // Accept a registry record: its identifier joins the company, its registry is due now.
+    let record = |company: Uuid, record: &str| {
+        ProposalRequest::registry_record(
+            company,
+            "apr",
+            record,
+            json!({"name": "D-C d.o.o."}),
+            json!([]),
+            0.7,
+            ProposalReason::ReviewBand,
+        )
+    };
+    let p = s
+        .propose(&record(c, "companies/87654321"))
+        .await
+        .unwrap()
+        .expect("opened");
+    let done = accept(s, p.id, &person, None, "").await.unwrap();
+    assert_eq!(done.alias.as_deref(), Some("id:rs_mb:87654321"));
+    let held = s
+        .alias(NodeKind::Company, "id:rs_mb:87654321")
+        .await
+        .unwrap()
+        .expect("claimed");
+    assert_eq!(held.node, Some(c));
+    assert_eq!(held.props["proposal"], p.id.to_string());
+    assert_eq!(
+        s.node(c).await.unwrap().unwrap().props["ids"]["rs_mb"],
+        json!(["87654321"])
+    );
+    let fresh = s.enrichment(c).await.unwrap().expect("recorded");
+    assert!(
+        fresh.next_due["apr"] <= fresh.enriched_at,
+        "due now: {fresh:?}"
+    );
+    // A record whose identifier another company owns is refused; one with no identifier too.
+    let p = s
+        .propose(&record(e, "companies/87654321"))
+        .await
+        .unwrap()
+        .expect("opened");
+    precondition(
+        accept(s, p.id, &person, None, "").await,
+        "belongs to company",
+    );
+    let p = s
+        .propose(&ProposalRequest::registry_record(
+            e,
+            "wikidata",
+            "Q1",
+            json!({}),
+            json!([]),
+            0.6,
+            ProposalReason::ReviewBand,
+        ))
+        .await
+        .unwrap()
+        .expect("opened");
+    precondition(accept(s, p.id, &person, None, "").await, "no identifier");
+    // Unknown proposals.
+    assert!(matches!(
+        accept(s, Uuid::now_v7(), &person, None, "").await,
+        Err(Error::NotFound(_))
+    ));
+    assert!(matches!(
+        reject(s, Uuid::now_v7(), &person, false, "").await,
+        Err(Error::NotFound(_))
+    ));
 }
 
 /// Edges onto live companies (issue #48): a writer resolved an alias to a company, then a

@@ -28,6 +28,7 @@ mod icons;
 mod jobs;
 mod merges;
 mod progress;
+mod proposals;
 mod records;
 mod reprocess;
 mod search;

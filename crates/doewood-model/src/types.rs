@@ -371,6 +371,40 @@ text_enum!(
     }
 );
 
+text_enum!(
+    /// What an enrichment proposal proposes (ADR 0002 section 1.6, issue #52).
+    ProposalKind, "proposal kind" {
+        /// A registry record a name search found, for the company to adopt.
+        RegistryRecord = "registry_record",
+        /// Another company that may be the same, to merge.
+        Merge = "merge",
+    }
+);
+
+text_enum!(
+    /// Why the gate left a decision to a person.
+    ProposalReason, "proposal reason" {
+        /// The fused probability is in the review band (0.50 to 0.90).
+        ReviewBand = "review_band",
+        /// Two conflicting high-precision hits.
+        Conflict = "conflict",
+        /// The evidence said merge, but the pair is dismissed (kept from props, schema 5).
+        Dismissed = "dismissed",
+    }
+);
+
+text_enum!(
+    /// Where a proposal stands.
+    ProposalState, "proposal state" {
+        /// Waiting for a person.
+        Open = "open",
+        /// Accepted: merged, or the record adopted.
+        Accepted = "accepted",
+        /// Rejected.
+        Rejected = "rejected",
+    }
+);
+
 impl EdgeState {
     /// Whether neighbour queries return the edge by default: everything but retracted and
     /// superseded.
