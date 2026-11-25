@@ -264,13 +264,7 @@ impl Analyzer {
         deadline: Option<Instant>,
     ) -> (Json, StepVersions, Outcome) {
         let name = key.rsplit('/').next().unwrap_or(key);
-        let out = sheet::analyze_with(
-            bytes,
-            name,
-            format.as_str(),
-            deadline,
-            self.sheet_max_cells,
-        );
+        let out = sheet::analyze_with(bytes, name, format.as_str(), deadline, self.sheet_max_cells);
         record.facts.extend(out.facts);
         record.steps.extend(out.steps);
         let mut problems = out.problems;
