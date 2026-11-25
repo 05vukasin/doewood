@@ -130,7 +130,11 @@ same; the API is in [api.md](api.md#merges-undo-split-and-dismissals).
   names both); edges between the two stay as they are. Props are folded: missing keys are
   added, lists (`names`, `ids.<kind>`) get what they lack, the survivor's values win. The
   absorbed node stays, with `{"merged_into": <survivor>, "merge": <entry>}`, so its id still
-  resolves; ingest follows `merged_into` and never attaches to it.
+  resolves; ingest follows `merged_into` and never attaches to it. The `party` edge write
+  resolves `merged_into` again in the same transaction (`upsert_live_edge`; on Postgres under
+  share locks that wait for a merge in flight), so a merge another instance commits between the
+  match and the write sends the edge to the survivor (issue #48). Such redirects are counted in
+  the ingest stats (`redirected`) and logged at debug.
 - **Undo** puts back what the payload lists: the aliases still owned by the survivor, the edges
   still at the survivor, the superseded edges' states, the absorbed node's props, and it takes
   out of the survivor's props exactly what the merge added (values written since stay).

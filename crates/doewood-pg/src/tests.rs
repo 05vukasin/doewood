@@ -163,13 +163,16 @@ async fn migrations_are_idempotent_and_versioned() {
         versions,
         (1..=i32::try_from(crate::SCHEMA_VERSION).unwrap()).collect::<Vec<_>>()
     );
+    // Catalog reads by this schema's own relations only (issue #58): a view such as
+    // `pg_indexes` or `information_schema.columns` calls functions on every relation's oid
+    // before it filters by schema, and those fail on a relation another test drops at the
+    // same moment ("could not open relation with OID").
     let embedding: bool = db
         .admin
         .query_one(
-            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
-             WHERE table_schema = $1 AND table_name = 'search_index' \
-             AND column_name = 'embedding')",
-            &[&db.schema],
+            "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass($1) \
+             AND attname = 'embedding' AND NOT attisdropped)",
+            &[&format!("{}.search_index", db.schema)],
         )
         .await
         .unwrap()
@@ -186,17 +189,19 @@ async fn migrations_are_idempotent_and_versioned() {
         .get(0);
     assert_eq!(first.has_vector(), available, "pgvector used iff available");
     // A tsvector column with a GIN index.
-    let gin: bool = db
+    let def: Option<String> = db
         .admin
         .query_one(
-            "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = $1 \
-             AND indexname = 'search_tsv' AND indexdef LIKE '%USING gin (tsv)%')",
-            &[&db.schema],
+            "SELECT pg_get_indexdef(to_regclass($1))",
+            &[&format!("{}.search_tsv", db.schema)],
         )
         .await
         .unwrap()
         .get(0);
-    assert!(gin);
+    let gin = def
+        .as_deref()
+        .is_some_and(|d| d.contains("USING gin (tsv)"));
+    assert!(gin, "{def:?}");
     db.drop_schema().await;
 }
 
@@ -324,6 +329,108 @@ async fn concurrent_merges_of_one_pair_have_one_winner() {
     assert!(matches!(lost, Err(Error::Precondition(_))), "{lost:?}");
     let log = stores[1].list_merges(&MergeQuery::default()).await.unwrap();
     assert_eq!(log.len(), 1);
+    db.drop_schema().await;
+}
+
+/// Issue #48: one instance merges companies while another writes party edges to the
+/// absorbed one, which it matched before the merge, both at once, many rounds. No edge is
+/// left on a husk: each lands on the survivor, by the write's own resolution or by the merge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn party_edges_never_land_on_a_husk_under_concurrent_merges() {
+    use doewood_model::{
+        Edge, EdgeKind, EdgeSource, GraphStore, MergeActor, MergeActorKind, MergeRequest,
+        MergeStore, NodeKind,
+    };
+    use serde_json::json;
+
+    const ROUNDS: usize = 150;
+    const DOCS: usize = 4;
+    let Some(url) = test_url() else { return };
+    let db = Scratch::new(&url).await;
+    let (merger, writer) = (db.store().await, db.store().await);
+    let mut redirected = 0;
+    for round in 0..ROUNDS {
+        let survivor = merger
+            .upsert_node(NodeKind::Company, &format!("s{round}"), &json!({}))
+            .await
+            .unwrap();
+        let absorbed = merger
+            .upsert_node(NodeKind::Company, &format!("a{round}"), &json!({}))
+            .await
+            .unwrap();
+        let mut docs = Vec::new();
+        for d in 0..DOCS {
+            docs.push(
+                merger
+                    .upsert_node(NodeKind::Document, &format!("ref:d{round}-{d}"), &json!({}))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let merge = {
+            let (s, barrier) = (merger.clone(), std::sync::Arc::clone(&barrier));
+            tokio::spawn(async move {
+                barrier.wait().await;
+                // Staggered, so some rounds write first and some merge first.
+                let lag = u64::try_from(round % 6).unwrap() * 400;
+                tokio::time::sleep(Duration::from_micros(lag)).await;
+                s.merge_companies(&MergeRequest {
+                    survivor,
+                    absorbed,
+                    actor: MergeActor {
+                        kind: MergeActorKind::Enrichment,
+                        instance: InstanceId::new("inst-a").unwrap(),
+                    },
+                    evidence: json!([]),
+                    confidence: 1.0,
+                    probability: 0.99,
+                })
+                .await
+                .unwrap();
+            })
+        };
+        let write = {
+            let s = writer.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                let mut redirected = 0;
+                for doc in docs {
+                    // Matched before the merge: the edge is meant for `absorbed`.
+                    let e = Edge::new(doc, absorbed, EdgeKind::Party, EdgeSource::Document);
+                    let w = s.upsert_live_edge(&e).await.unwrap();
+                    assert!(w.dst == absorbed || w.dst == survivor, "{w:?}");
+                    redirected += usize::from(w.redirects > 0);
+                }
+                redirected
+            })
+        };
+        merge.await.unwrap();
+        redirected += write.await.unwrap();
+    }
+    let c = db.client().await;
+    let count = |sql: &'static str| {
+        let c = &c;
+        async move { c.query_one(sql, &[]).await.unwrap().get::<_, i64>(0) }
+    };
+    let on_husks = count(
+        "SELECT count(*) FROM edges e JOIN nodes n ON n.id = e.dst \
+         WHERE e.kind = 'party' AND n.props ? 'merged_into'",
+    )
+    .await;
+    let on_survivors = count(
+        "SELECT count(*) FROM edges e JOIN nodes n ON n.id = e.dst \
+         WHERE e.kind = 'party' AND e.state NOT IN ('retracted', 'superseded') \
+         AND n.key LIKE 's%' AND NOT n.props ? 'merged_into'",
+    )
+    .await;
+    eprintln!(
+        "{ROUNDS} rounds: {redirected} of {} edges redirected by the write itself, \
+         the rest moved by the merge",
+        ROUNDS * DOCS
+    );
+    assert_eq!(on_husks, 0, "party edges left on husks");
+    assert_eq!(on_survivors, i64::try_from(ROUNDS * DOCS).unwrap());
     db.drop_schema().await;
 }
 

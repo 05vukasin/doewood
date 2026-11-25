@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::{
     Blake3, CacheRow, DismissRequest, Dismissal, DismissalQuery, DueCompany, Edge, Enrichment,
-    IconRow, Located, LocationEnded, MergeEntry, MergeQuery, MergeRequest, Neighbour,
+    IconRow, LiveEdge, Located, LocationEnded, MergeEntry, MergeQuery, MergeRequest, Neighbour,
     NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation, OwnedAlias, Proposal, ProposalQuery,
     ProposalRequest, PropsPatch, PutOutcome, Record, ResolveRequest, Result, SearchDoc, SearchHit,
     SearchQuery, Sketch, SourceClaim, SourceKey, SplitRequest, StepVersions, UndoOutcome,
@@ -73,6 +73,16 @@ pub trait GraphStore: Send + Sync {
     /// Inserts the edge, or updates the edge with the same `(src, dst, kind, source,
     /// valid_from)`. Returns its id. Both nodes must exist.
     async fn upsert_edge(&self, edge: &Edge) -> Result<Uuid>;
+
+    /// [`GraphStore::upsert_edge`] onto live companies (issue #48): an end that is a
+    /// merged-away company (a husk with `merged_into`, ADR 0002 section 1.8) is replaced by
+    /// the company it was merged into, following chains of at most
+    /// [`crate::MERGE_CHAIN_MAX`] hops. The ends are checked and the edge written atomically,
+    /// ordered after any merge of those companies, so a merge that commits between a
+    /// writer's alias lookup and this write never leaves the edge on the husk: the edge
+    /// either lands on the survivor, or is written first and moved by the merge. A longer
+    /// chain fails with [`crate::Error::Precondition`].
+    async fn upsert_live_edge(&self, edge: &Edge) -> Result<LiveEdge>;
 
     /// The edges at a node and the nodes at their other ends, ordered by edge kind, then
     /// `valid_from` (undated first), then edge id.
