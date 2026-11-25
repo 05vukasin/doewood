@@ -101,6 +101,19 @@ The record is the quail record JSON, keyed by BLAKE3, with step versions: one pe
 - **Search:** title (`ref.title`, else the card's, the file's own, the file name), body (the
   summary card, the extractive summary, keywords, sheet text), kind, date and amount.
 
+## Company props
+
+Ingest and the enrichment job write the same company nodes, each only its own keys (ingest:
+`name`, `key`, `legal_form`, `jurisdiction`, `names`, `quail_keys`, `ids.<kind>`,
+`matches`; the document's `format`, `title`, `kind` and `numbers`). A writer never reads,
+changes and writes back the whole props: it sends a `PropsPatch` (set, set if missing, remove,
+add to a capped set, push to a capped list replacing the same entry) to
+`GraphStore::update_props`, which applies it to the props as stored, with the node row locked,
+in one transaction (Postgres `SELECT ... FOR UPDATE`, SQLite `BEGIN IMMEDIATE`). Nodes that
+more than one writer may create are created with `ensure_node` (empty props, never replacing
+an existing node's) and then patched. The conformance suite runs two writers patching one node
+at the same time through two handles and checks that every write survives (issue #51).
+
 ## Merges, undo and dismissals
 
 Every merge and split is reversible (ADR 0002 section 1.8, ADR 0001 section 7). The rules are

@@ -100,6 +100,44 @@ async fn conformance() {
     db.drop_schema().await;
 }
 
+/// Issue #51: two instances (two pools, so two connections) patch different keys of one
+/// company from two tasks on two threads, many rounds, and both add to one shared list.
+/// Every write survives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn props_patches_race_on_two_connections() {
+    use doewood_model::{GraphStore, NodeKind, PropsPatch};
+    use serde_json::json;
+
+    const ROUNDS: usize = 100;
+    let Some(url) = test_url() else { return };
+    let db = Scratch::new(&url).await;
+    let (a, b) = (db.store().await, db.store().await);
+    let id = a.ensure_node(NodeKind::Company, "raced").await.unwrap();
+    let writer = |s: PgStore, who: &'static str| {
+        tokio::spawn(async move {
+            for i in 0..ROUNDS {
+                let patch = PropsPatch::new()
+                    .set(&[&format!("{who}{i}")], json!(i))
+                    .add_to_set(&["log"], json!(format!("{who}{i}")), 10 * ROUNDS)
+                    .set_if_absent(&["name"], json!(who));
+                s.update_props(id, &patch).await.unwrap().unwrap();
+            }
+        })
+    };
+    let (x, y) = (writer(a.clone(), "a"), writer(b.clone(), "b"));
+    x.await.unwrap();
+    y.await.unwrap();
+    let props = a.node(id).await.unwrap().unwrap().props;
+    for who in ["a", "b"] {
+        for i in 0..ROUNDS {
+            assert_eq!(props[format!("{who}{i}")], json!(i), "{who}{i} kept");
+        }
+    }
+    assert_eq!(props["log"].as_array().unwrap().len(), 2 * ROUNDS);
+    assert!(props["name"] == json!("a") || props["name"] == json!("b"));
+    db.drop_schema().await;
+}
+
 #[tokio::test]
 async fn migrations_are_idempotent_and_versioned() {
     let Some(url) = test_url() else { return };

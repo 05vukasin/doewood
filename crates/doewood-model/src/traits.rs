@@ -14,9 +14,9 @@ use uuid::Uuid;
 use crate::{
     Blake3, CacheRow, DismissRequest, Dismissal, DismissalQuery, DueCompany, Edge, Enrichment,
     IconRow, Located, LocationEnded, MergeEntry, MergeQuery, MergeRequest, Neighbour,
-    NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PutOutcome, Record,
-    Result, SearchDoc, SearchHit, SearchQuery, Sketch, SourceClaim, SourceKey, SplitRequest,
-    StepVersions, UndoOutcome, UndoRequest,
+    NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PropsPatch, PutOutcome,
+    Record, Result, SearchDoc, SearchHit, SearchQuery, Sketch, SourceClaim, SourceKey,
+    SplitRequest, StepVersions, UndoOutcome, UndoRequest,
 };
 
 /// quail and hedgehog records, keyed by BLAKE3.
@@ -51,6 +51,17 @@ pub trait GraphStore: Send + Sync {
     /// Inserts the node, or replaces the props of the node with this kind and key. Returns
     /// its id, which never changes once assigned.
     async fn upsert_node(&self, kind: NodeKind, key: &str, props: &Value) -> Result<Uuid>;
+
+    /// Inserts the node with empty props if it is missing, and leaves an existing one as it
+    /// is. Returns its id. Writers that share a node create it with this, then
+    /// [`GraphStore::update_props`], so a create never replaces what another wrote.
+    async fn ensure_node(&self, kind: NodeKind, key: &str) -> Result<Uuid>;
+
+    /// Applies `patch` to the node's props atomically: in one transaction, with the node
+    /// locked, on the props as stored. Keys the patch does not name stay as they are, so two
+    /// writers changing different keys never lose each other's writes (issue #51). Returns
+    /// the node as written, `None` when there is no node `id`.
+    async fn update_props(&self, id: Uuid, patch: &PropsPatch) -> Result<Option<Node>>;
 
     /// A node by id.
     async fn node(&self, id: Uuid) -> Result<Option<Node>>;

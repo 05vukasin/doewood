@@ -9,8 +9,8 @@ use doewood_core::InstanceId;
 use doewood_model::{
     Backend, Blake3, ClaimStore, Direction, Edge, EdgeKind, EdgeSource, Error, GraphStore, Located,
     LocationEnded, Neighbour, NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation,
-    OwnedAlias, PutOutcome, Record, RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit,
-    SearchQuery, SearchStore, Sketch, SketchStore, SourceClaim, SourceKey, StepVersions,
+    OwnedAlias, PropsPatch, PutOutcome, Record, RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc,
+    SearchHit, SearchQuery, SearchStore, Sketch, SketchStore, SourceClaim, SourceKey, StepVersions,
     StoredEdge, band_to_i64, records_limit, sketch_limit, validate_alias, validate_node,
     validate_sketch, versions_from_json, versions_to_json,
 };
@@ -316,6 +316,47 @@ impl GraphStore for PgStore {
     async fn upsert_node(&self, kind: NodeKind, key: &str, props: &Value) -> Result<Uuid> {
         validate_node(kind, key, props)?;
         upsert_node(&**client(&self.pool).await?, kind, key, props).await
+    }
+
+    async fn ensure_node(&self, kind: NodeKind, key: &str) -> Result<Uuid> {
+        validate_node(kind, key, &Value::Object(serde_json::Map::new()))?;
+        ensure_node(&**client(&self.pool).await?, kind, key).await
+    }
+
+    async fn update_props(&self, id: Uuid, patch: &PropsPatch) -> Result<Option<Node>> {
+        patch.validate()?;
+        let mut c = client(&self.pool).await?;
+        let tx = c.transaction().await.map_err(pg)?;
+        // The row lock orders this after any other writer of the node (another patch, an
+        // upsert, a merge) and lets it read what that writer committed.
+        let Some(row) = tx
+            .query_opt(
+                &format!("SELECT {NODE_COLUMNS} FROM nodes n WHERE n.id = $1 FOR UPDATE"),
+                &[&id],
+            )
+            .await
+            .map_err(pg)?
+        else {
+            return Ok(None);
+        };
+        let mut node = node_at(&row, 0)?;
+        let before = std::mem::take(&mut node.props);
+        let mut props = match &before {
+            Value::Object(m) => m.clone(),
+            _ => serde_json::Map::new(),
+        };
+        patch.apply(&mut props);
+        node.props = Value::Object(props);
+        if node.props != before {
+            tx.execute(
+                "UPDATE nodes SET props = $2, updated_at = now() WHERE id = $1",
+                &[&id, &node.props],
+            )
+            .await
+            .map_err(pg)?;
+        }
+        tx.commit().await.map_err(pg)?;
+        Ok(Some(node))
     }
 
     async fn node(&self, id: Uuid) -> Result<Option<Node>> {
