@@ -91,8 +91,8 @@ impl Pool {
     /// An instance read takes any free connection, except the last one while the API holds
     /// none and waits for one.
     fn instance_may_take(&self) -> bool {
-        !self.idle.is_empty()
-            && !(self.idle.len() == 1 && self.api_held == 0 && self.api_waiting > 0)
+        let starved_api = self.api_held == 0 && self.api_waiting > 0;
+        self.idle.len() > usize::from(starved_api)
     }
 
     /// An API read takes a free connection no instance read is waiting for; or any while it
@@ -104,6 +104,10 @@ impl Pool {
 
 fn lock(m: &Mutex<Pool>) -> MutexGuard<'_, Pool> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn wait<'a>(cv: &Condvar, pool: MutexGuard<'a, Pool>) -> MutexGuard<'a, Pool> {
+    cv.wait(pool).unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Readers {
@@ -131,14 +135,14 @@ impl Readers {
             Caller::Instance => {
                 while !pool.instance_may_take() {
                     pool.instance_waiting += 1;
-                    pool = self.wait(&self.instance, pool);
+                    pool = wait(&self.instance, pool);
                     pool.instance_waiting -= 1;
                 }
             }
             Caller::Api => {
                 while !pool.api_may_take() {
                     pool.api_waiting += 1;
-                    pool = self.wait(&self.api, pool);
+                    pool = wait(&self.api, pool);
                     pool.api_waiting -= 1;
                 }
                 pool.api_held += 1;
@@ -160,9 +164,6 @@ impl Readers {
         self.wake(&pool);
     }
 
-    fn wait<'a>(&self, cv: &Condvar, pool: MutexGuard<'a, Pool>) -> MutexGuard<'a, Pool> {
-        cv.wait(pool).unwrap_or_else(PoisonError::into_inner)
-    }
 
     /// Wakes a waiting read of each kind that may take a free connection now.
     fn wake(&self, pool: &Pool) {
