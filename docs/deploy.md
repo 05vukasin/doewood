@@ -51,7 +51,10 @@ pushes nothing; publishing the image to a registry is not set up yet.
 The chart in `charts/doewood` runs a `StatefulSet` (pods start in parallel; each gets its own
 `PersistentVolumeClaim` from `volumeClaimTemplates`), a headless Service naming each pod, and a
 Service for the gRPC (7443) and ops (7444) ports. The liveness probe is `/healthz`, the readiness
-probe `/readyz`. `DOEWOOD_INSTANCE_ID` is the pod name.
+probe `/readyz`. `DOEWOOD_INSTANCE_ID` is the pod name. Parallel starts against a new, empty
+database are safe: one pod migrates the shared schema (and creates pgvector), the others
+wait for it and stay not ready until then (see the Migrations bullet in
+[configuration.md](configuration.md#the-shared-postgres)).
 
 Secrets come only from existing `Secret`s, never from values:
 

@@ -9,8 +9,10 @@
 //!   verified when TLS is used.
 //! - **A pool** (`deadpool-postgres`) with bounded waits, so a dead database fails calls quickly
 //!   instead of hanging them.
-//! - **Migrations** are embedded and applied on connect under an advisory lock, so instances
-//!   starting together migrate once. Versions are kept in `doewood_schema`.
+//! - **Migrations** are embedded and applied on connect, together with the pgvector setup, in
+//!   one transaction under an advisory lock ([`MIGRATION_LOCK`]), so instances starting
+//!   together migrate once: the others wait (at most 5 minutes) and find the schema migrated.
+//!   Versions are kept in `doewood_schema`.
 //! - **pgvector** is optional: when the extension is available it is created and
 //!   `search_index.embedding` is added; otherwise this is logged and skipped, never fatal.
 
@@ -29,7 +31,7 @@ use doewood_core::PostgresUrl;
 use doewood_model::{Error, Result};
 use tracing::info;
 
-pub use migrate::SCHEMA_VERSION;
+pub use migrate::{MIGRATION_LOCK, SCHEMA_VERSION};
 
 /// Connections in the pool.
 const POOL_SIZE: usize = 16;
@@ -90,8 +92,7 @@ impl PgStore {
             .build()
             .map_err(|e| Error::Invalid(format!("connection pool: {e}")))?;
         let mut client = backend::client(&pool).await?;
-        let version = migrate::migrate(&mut client).await?;
-        let vector = migrate::ensure_vector(&mut client).await?;
+        let (version, vector) = migrate::migrate(&mut client).await?;
         info!(
             schema = version,
             pgvector = vector,
