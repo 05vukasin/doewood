@@ -24,6 +24,7 @@ use quail_engine::Engine;
 use serde_json::Value as Json;
 use tracing::info;
 
+use crate::cpus::CpuSlots;
 use crate::route::{Route, route};
 use crate::sheet;
 
@@ -52,6 +53,10 @@ pub struct AnalyzerConfig {
     pub sheet_max_cells: u64,
     /// File workers that share the engine (sizes the OCR permits).
     pub workers: usize,
+    /// CPU slots shared by the analyses ([`CpuSlots`]): each holds one, and a spreadsheet's
+    /// normalizer borrows the free ones. `IngestConfig::new`: the CPUs, at most the workers.
+    /// 1 (the default): every normalizer runs on one thread.
+    pub cpus: usize,
     /// Where the OCR models are.
     pub ocr_models: PathBuf,
 }
@@ -63,6 +68,7 @@ impl Default for AnalyzerConfig {
             max_bytes: Limits::default().max_bytes,
             sheet_max_cells: sheet::MIN_AUTO_CELLS,
             workers: 1,
+            cpus: 1,
             ocr_models: PathBuf::from("ocr-models"),
         }
     }
@@ -117,6 +123,7 @@ pub struct Analyzer {
     ocr: OcrState,
     limits: Limits,
     sheet_max_cells: u64,
+    cpus: std::sync::Arc<CpuSlots>,
 }
 
 impl std::fmt::Debug for Analyzer {
@@ -170,12 +177,18 @@ impl Analyzer {
             ocr,
             limits,
             sheet_max_cells: config.sheet_max_cells,
+            cpus: CpuSlots::new(config.cpus),
         })
     }
 
     /// Whether OCR runs.
     pub fn ocr(&self) -> &OcrState {
         &self.ocr
+    }
+
+    /// The CPU slots the analyses share.
+    pub fn cpus(&self) -> &std::sync::Arc<CpuSlots> {
+        &self.cpus
     }
 
     /// The per-file limits, OCR's extension included.
@@ -216,7 +229,11 @@ impl Analyzer {
     /// clock here too (it stops between steps and inside the steps that check), and hedgehog's
     /// read and its normalizer get the same instant, so a spreadsheet takes at most the file
     /// timeout, not quail's plus hedgehog's.
+    ///
+    /// The analysis holds one of the instance's CPU slots until it returns; a spreadsheet's
+    /// normalizer borrows the free ones for its call.
     pub fn analyze_hashed(&self, bytes: Vec<u8>, blake3: Blake3, key: &str) -> Analysis {
+        let _slot = self.cpus.enter();
         let deadline = Instant::now().checked_add(self.limits.timeout);
         let sniff = quail_engine::detect(&bytes);
         let route = route(sniff, &bytes, key);
@@ -266,7 +283,14 @@ impl Analyzer {
         deadline: Option<Instant>,
     ) -> (Json, StepVersions, Outcome) {
         let name = key.rsplit('/').next().unwrap_or(key);
-        let out = sheet::analyze_with(bytes, name, format.as_str(), deadline, self.sheet_max_cells);
+        let out = sheet::analyze_on(
+            bytes,
+            name,
+            format.as_str(),
+            deadline,
+            self.sheet_max_cells,
+            Some(&self.cpus),
+        );
         record.facts.extend(out.facts);
         record.steps.extend(out.steps);
         let mut problems = out.problems;

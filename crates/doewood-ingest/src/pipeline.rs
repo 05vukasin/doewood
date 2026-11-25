@@ -127,6 +127,7 @@ impl IngestConfig {
             analyzer: AnalyzerConfig {
                 sheet_max_cells: plan_cells(jobs, memory),
                 workers: jobs,
+                cpus: crate::cpus::available().min(jobs),
                 ocr_models: ocr_models.to_owned(),
                 ..AnalyzerConfig::default()
             },
@@ -137,8 +138,7 @@ impl IngestConfig {
 /// Workers for this machine: one per CPU, at most what half the available memory holds at
 /// [`WORKER_BYTES`] each, between 1 and [`MAX_AUTO_JOBS`].
 pub fn default_jobs() -> usize {
-    let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    plan_jobs(cpus, available_memory())
+    plan_jobs(crate::cpus::available(), available_memory())
 }
 
 /// [`default_jobs`] for `cpus` and `memory` bytes available (`None`: unknown).
@@ -661,6 +661,7 @@ impl Ingest {
             queue = c.queue,
             memory_budget_mib = c.memory_budget >> 20,
             sheet_max_cells = c.analyzer.sheet_max_cells,
+            cpu_slots = self.inner.analyzer.cpus().total(),
             ocr = ?self.inner.analyzer.ocr(),
             "ingest started"
         );

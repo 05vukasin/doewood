@@ -7,12 +7,15 @@
 //! known panics on hostile files, and a panic must end only that file.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 use std::time::Instant;
 
 use hh_core::normalize::Options as NormalizeOptions;
 use hh_core::reader::ReadOptions;
 use hh_core::{Value as Cell, Workbook};
 use quail_core::{AnalyzerId, Fact, FactKey, Value};
+
+use crate::cpus::{CpuSlots, MAX_SHEET_THREADS};
 
 /// The step that reads the workbook. Its version follows doewood's conversion; hedgehog's own
 /// revision is in [`HEDGEHOG_REV`].
@@ -100,6 +103,8 @@ pub struct SheetOutcome {
     pub problems: Vec<String>,
     /// The workbook could not be read at all.
     pub failed: Option<String>,
+    /// The threads hedgehog's normalizer ran with (0: it did not run).
+    pub threads: usize,
 }
 
 /// Reads and analyzes a workbook, stopping at `deadline` (the file's): hedgehog's read checks
@@ -113,13 +118,28 @@ pub fn analyze(bytes: &[u8], name: &str, format: &str, deadline: Option<Instant>
 /// [`analyze`] with another cell cap: a workbook of more than `max_cells` cells (or shared
 /// strings) fails like any other refused file, with its identity facts kept
 /// (`sheet.read@1: file refused: the workbook has more than ... cells (limit ...); ...`, which
-/// says how to raise the cap).
+/// says how to raise the cap). The normalizer runs on one thread.
 pub fn analyze_with(
     bytes: &[u8],
     name: &str,
     format: &str,
     deadline: Option<Instant>,
     max_cells: u64,
+) -> SheetOutcome {
+    analyze_on(bytes, name, format, deadline, max_cells, None)
+}
+
+/// [`analyze_with`], with the normalizer borrowing the free slots of `cpus` (at most
+/// [`MAX_SHEET_THREADS`] threads in all) for the length of its call. The caller holds its own
+/// slot ([`CpuSlots::enter`]). The output does not depend on the threads (hedgehog's
+/// determinism guarantee).
+pub fn analyze_on(
+    bytes: &[u8],
+    name: &str,
+    format: &str,
+    deadline: Option<Instant>,
+    max_cells: u64,
+    cpus: Option<&Arc<CpuSlots>>,
 ) -> SheetOutcome {
     let mut out = SheetOutcome::default();
     // Decompressed bytes keep hedgehog's limit (2 GiB): parts are read in chunks, not held.
@@ -190,18 +210,30 @@ pub fn analyze_with(
     if !text.is_empty() {
         out.facts.push(fact(keys::TEXT, Value::text(text)));
     }
-    tables(&wb, deadline, &mut out);
+    tables(&wb, deadline, cpus, &mut out);
     out
 }
 
-/// The tables, through hedgehog's normalizer (rules plus its learned row model).
-fn tables(wb: &Workbook, deadline: Option<Instant>, out: &mut SheetOutcome) {
+/// The tables, through hedgehog's normalizer (rules plus its learned row model), on the
+/// caller's thread plus what `cpus` lends; the loan is returned when this returns (a panic
+/// included).
+fn tables(
+    wb: &Workbook,
+    deadline: Option<Instant>,
+    cpus: Option<&Arc<CpuSlots>>,
+    out: &mut SheetOutcome,
+) {
+    let lent = cpus.map(|c| c.lend(MAX_SHEET_THREADS - 1));
+    let threads = lent.as_ref().map_or(1, crate::cpus::Lent::threads);
+    out.threads = threads;
     let opts = NormalizeOptions {
         deadline,
-        threads: Some(1),
+        threads: Some(threads),
         ..NormalizeOptions::default()
     };
-    let norm = match guarded(|| hh_core::try_normalize_workbook(wb, &opts)) {
+    let norm = guarded(|| hh_core::try_normalize_workbook(wb, &opts));
+    drop(lent);
+    let norm = match norm {
         Ok(Ok(n)) => n,
         Ok(Err(e)) => {
             out.problems.push(format!("{TABLES_ID}: {e}"));

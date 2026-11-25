@@ -23,7 +23,8 @@ pending sweep (objects_seen)┘                                         (cap)   
 - **Workers:** `DOEWOOD_INGEST_JOBS`, else one per CPU, at most what half the available memory
   holds at 512 MiB a worker (a cgroup v2 limit counts), at most 32. Every analysis runs on a
   blocking thread; the quail engine is shared. Big files also wait for the
-  [memory budget](#memory).
+  [memory budget](#memory). A spreadsheet may borrow idle workers' CPUs
+  ([Memory](#memory), Threads).
 - **Shutdown:** each worker finishes the file in hand; the rest stays pending for the next start.
 
 ## Fetch
@@ -135,9 +136,41 @@ more), so none of them can abort the instance with an out-of-memory error.
   ingest worker)`. The cap in use is logged at start (`sheet_max_cells` in `ingest started`).
   Raise it only with the memory for it: about 320 bytes a cell for each worker that may read
   such a workbook at once.
-- **One thread per analysis.** Each worker's hedgehog normalizer runs with `threads: Some(1)`,
-  and since hedgehog `fac6eba` every inner fan-out honours it, so a worker's analysis really is
-  single-threaded: the workers, not hedgehog, decide how many CPUs ingest uses.
+- **Threads: one per analysis, more for a spreadsheet when the instance is idle** (issue
+  #101). The instance has CPU slots: its CPUs (`available_parallelism`, which follows a cgroup
+  CPU quota), at most the workers. Each running analysis holds one slot until it returns (an
+  analysis the watchdog gave up on too). When a spreadsheet's hedgehog normalizer starts, it
+  borrows the slots nobody holds, so it runs with `threads: Some(1 + free slots)`, at most 4
+  threads in all (`MAX_SHEET_THREADS`; hedgehog's row model streams on at most 4). It gives
+  them back when the call returns, fails or panics. Since hedgehog `fac6eba` every inner
+  fan-out honours `threads`, so under load each analysis is single-threaded and the workers
+  decide how many CPUs ingest uses.
+  - A loan only takes slots that are free at that moment, so lending never takes the count
+    over the CPUs. An analysis that starts while slots are lent does not wait: it runs beside
+    them, one thread, until that normalize returns, and the next normalize borrows nothing.
+  - The output does not depend on the threads (hedgehog's determinism guarantee; checked by
+    `lent_threads_give_the_same_tables` in `tests/sheet.rs`).
+  - Memory: the lent threads did not raise the peak measurably (below). A lent slot is an idle
+    worker's, so its 512 MiB plan is not in use meanwhile; with fewer workers than CPUs
+    (a memory-sized instance) only the workers' slots are lent.
+
+  `lent_threads_measure` in `tests/sheet.rs` (generated XLSX, 38,462 rows x 26 cells, every
+  other one text: 1,000,012 cells; read and tables; 4 vCPU server, test profile; RSS is the
+  peak above the start):
+
+  | | slots | threads per workbook | wall | peak RSS |
+  |---|---|---|---|---|
+  | 1 workbook, before | 1 | 1 | 1.91 s | +210 MiB |
+  | 1 workbook, after | 4 | 4 | 1.33 s | +201 MiB |
+  | 4 workbooks at once, before | 1 | 1 each | 2.59 s | +696 MiB |
+  | 4 workbooks at once, after | 4 | 1 each | 2.53 s | +667 MiB |
+
+  The read (calamine) stays on one thread; only the tables step is lent threads. With numbers
+  only, one workbook took 0.76 s before and 0.60 s after.
+
+  ```
+  DOEWOOD_BENCH_TEXT=1 DOEWOOD_BENCH_FILES=1 cargo test -p doewood-ingest --test sheet -- --ignored --nocapture lent_threads_measure
+  ```
 - **quail's limits** stay its defaults: 256 MiB decompressed and 64 MiB of text per file, 40
   million pixels a rendered page, which already fit a worker. OCR has its own budget (quail's
   OCR permits, about 1 GiB an engine; see [deploy.md](deploy.md#sizing)).
