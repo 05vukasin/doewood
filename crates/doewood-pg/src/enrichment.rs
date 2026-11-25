@@ -259,7 +259,7 @@ impl FreshnessStore for PgStore {
     ) -> Result<Vec<DueCompany>> {
         let c = client(&self.pool).await?;
         let rows = c
-            .rows(
+            .rows_uncached(
                 &format!(
                     "SELECT n.id, c.docs, f.documents, \
                      ARRAY(SELECT r.registry FROM company_registry_due r \

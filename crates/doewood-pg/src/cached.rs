@@ -12,6 +12,11 @@
 //!   `tokio-postgres` client, so no statement is cached against an older schema.
 //! - Only fixed SQL texts (or texts with a small, bounded number of shapes) go through here:
 //!   each text keeps one prepared statement per connection for the connection's life.
+//! - **Catch-all queries stay uncached** ([`Cached::rows_uncached`]): a query whose plan
+//!   depends on its parameters, such as `($4::bytea IS NULL OR r.blake3 > $4)` or a
+//!   `starts_with` prefix. After five runs of a cached statement Postgres may switch to a
+//!   generic plan, which cannot use those bounds: for `LIST_RECORDS` it drops the prefix range
+//!   (issue #27) and the page bound (issue #13) and reads the whole bucket on every page.
 
 use async_trait::async_trait;
 use deadpool_postgres::GenericClient;
@@ -32,6 +37,9 @@ pub(crate) trait Cached {
     async fn rows(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Row>>;
     /// The number of rows changed.
     async fn exec(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64>;
+    /// All rows, from a statement prepared for this run only, so Postgres plans it with the
+    /// actual parameters (one more round trip). For catch-all queries.
+    async fn rows_uncached(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Row>>;
 }
 
 #[async_trait]
@@ -54,5 +62,9 @@ impl<C: GenericClient> Cached for C {
     async fn exec(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64> {
         let st = self.prepare_cached(sql).await.map_err(pg)?;
         self.execute(&st, params).await.map_err(pg)
+    }
+
+    async fn rows_uncached(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Row>> {
+        self.query(sql, params).await.map_err(pg)
     }
 }

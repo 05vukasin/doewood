@@ -295,7 +295,7 @@ impl MergeTx for Tx<'_> {
     async fn entries(&mut self, q: &MergeQuery) -> Result<Vec<MergeEntry>> {
         let rows = self
             .0
-            .rows(
+            .rows_uncached(
                 &format!(
                     "SELECT {ENTRY_COLUMNS} FROM company_merges \
                      WHERE ($1::uuid IS NULL OR survivor_id = $1 OR absorbed_id = $1) \
@@ -397,7 +397,7 @@ impl MergeTx for Tx<'_> {
     async fn dismissals(&mut self, q: &DismissalQuery) -> Result<Vec<Dismissal>> {
         let rows = self
             .0
-            .rows(
+            .rows_uncached(
                 &format!(
                     "SELECT {DISMISSAL_COLUMNS} FROM company_dismissals \
                      WHERE ($1::uuid IS NULL OR company_a = $1 OR company_b = $1) \

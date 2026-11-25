@@ -32,6 +32,7 @@ use crate::cached::Cached;
 /// reads every row before `after` and walking all pages is quadratic (issue #13, docs/api.md).
 /// The prefix is matched in the "C" collation, so a selective prefix becomes a range scan of
 /// `locations_by_key_c` (issue #27); `starts_with` gives the same answer in any collation.
+/// Never cached: a generic plan would lose both bounds (see `cached.rs`).
 pub(crate) const LIST_RECORDS: &str = "SELECT r.blake3, r.record, r.versions, extract(epoch FROM r.updated_at)::bigint \
      FROM records r WHERE ($4::bytea IS NULL OR r.blake3 > $4) \
      AND EXISTS (SELECT 1 FROM locations l WHERE l.blake3 = r.blake3 \
@@ -419,7 +420,7 @@ impl RecordStore for PgStore {
         let c = client(&self.pool).await?;
         let after = after.map(|h| h.as_bytes().to_vec());
         let rows = c
-            .rows(
+            .rows_uncached(
                 LIST_RECORDS,
                 &[
                     &source.endpoint(),
@@ -988,8 +989,8 @@ impl SearchStore for PgStore {
              LIMIT {limit} OFFSET {offset}"
         );
         let c = client(&self.pool).await?;
-        // Not cached: up to 256 shapes (one per combination of filters), each user-driven and
-        // rare next to the ingest statements.
+        // Not cached: up to 256 shapes (one per combination of filters), user-driven and rare
+        // next to the ingest statements, and a generic plan could not use the source prefix.
         let rows = c.query(&sql, &args.refs()).await.map_err(pg)?;
         rows.iter()
             .map(|r| {

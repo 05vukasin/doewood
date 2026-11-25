@@ -137,7 +137,7 @@ impl ProposalStore for PgStore {
     async fn list_proposals(&self, q: &ProposalQuery) -> Result<Vec<Proposal>> {
         let c = client(&self.pool).await?;
         let rows = c
-            .rows(
+            .rows_uncached(
                 &format!(
                     "SELECT {COLUMNS} FROM company_proposals \
                      WHERE ($1::text IS NULL OR state = $1) \
