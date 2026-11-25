@@ -84,8 +84,9 @@ object over the cap fails without a retry.
 ## Memory
 
 A worker is planned at 512 MiB (`WORKER_BYTES`): the file, the engine's working set and the
-extracted text. Two bounds keep one file, and several big files at once, inside that plan, so
-none of them can abort the instance with an out-of-memory error.
+extracted text. Two bounds keep one file, and several big files at once, inside that plan
+(or, for spreadsheets, inside each worker's share of half the available memory when that is
+more), so none of them can abort the instance with an out-of-memory error.
 
 - **The memory budget** (`DOEWOOD_INGEST_BUDGET_MIB`, else half the workers' plan: workers x
   512 MiB, at most half the available memory, halved; at least 256 MiB. 1 GiB with 4 workers,
@@ -102,13 +103,41 @@ none of them can abort the instance with an out-of-memory error.
   waits forever. Each worker takes a waiting big file first once its share is free. Only when
   more big files wait than there are workers do the workers stop taking new jobs and wait for
   the budget (the queue then waits too, as for a full queue).
-- **The cell cap.** hedgehog reads at most 1,600,000 cells (and shared strings) per workbook
-  (`sheet::MAX_CELLS`): `WORKER_BYTES / CELL_BYTES`, rounded down to 100,000, with
-  `CELL_BYTES` = 320, the peak per cell measured with `big_spreadsheets` (200 to 300 bytes for
-  numbers and text, the file included), rounded up. A bigger workbook fails without a retry,
-  like any other refused file: `sheet.read@1: file refused: the workbook has more than
-  1,600,000 cells (limit 1,600,000)`; its record keeps quail's identity facts. Before, the
-  limit was hedgehog's default of 10 million cells (about 2.5 to 3 GiB).
+- **The cell cap** (`DOEWOOD_INGEST_MAX_CELLS`, else from the memory per worker). hedgehog
+  reads at most this many cells (and shared strings) per workbook. The default is what one
+  worker's share of the memory holds at `CELL_BYTES` = 320 bytes a cell (the peak per cell
+  measured with `big_spreadsheets`, 200 to 300 bytes for numbers and text, the file included,
+  rounded up), rounded down to 100,000:
+
+  ```text
+  per worker = available memory (a cgroup limit counts) / 2 / workers   (512 MiB if unknown)
+  cell cap   = per worker / 320, rounded down to 100,000, from 1,600,000 to 10,000,000
+  ```
+
+  The floor, 1,600,000, is what a 512 MiB worker plan (`WORKER_BYTES`) holds; the ceiling,
+  10,000,000, is hedgehog's own default (about 2.5 to 3 GiB), which only
+  `DOEWOOD_INGEST_MAX_CELLS` goes above. The inputs are the same as the budget's: the
+  workers (`DOEWOOD_INGEST_JOBS`, else from the CPUs and memory) and the available memory,
+  read once at start; `DOEWOOD_INGEST_BUDGET_MIB` does not change the cap. For example:
+
+  | memory available | workers | per worker | cell cap |
+  |---|---|---|---|
+  | unknown (not Linux) | any | 512 MiB | 1,600,000 |
+  | 4 GiB limit (about 3.9 GiB free) | 3 | 666 MiB | 2,100,000 |
+  | 8 GiB | 4 | 1 GiB | 3,300,000 |
+  | 16 GiB | 4 | 2 GiB | 6,700,000 |
+  | 2 GiB | 4 | 256 MiB | 1,600,000 (the floor) |
+  | 128 GiB | 2 | 32 GiB | 10,000,000 (the ceiling) |
+
+  A bigger workbook fails without a retry, like any other refused file, and its record keeps
+  quail's identity facts: `sheet.read@1: file refused: the workbook has more than 1,600,000
+  cells (limit 1,600,000); DOEWOOD_INGEST_MAX_CELLS raises the cap (it follows the memory per
+  ingest worker)`. The cap in use is logged at start (`sheet_max_cells` in `ingest started`).
+  Raise it only with the memory for it: about 320 bytes a cell for each worker that may read
+  such a workbook at once.
+- **One thread per analysis.** Each worker's hedgehog normalizer runs with `threads: Some(1)`,
+  and since hedgehog `fac6eba` every inner fan-out honours it, so a worker's analysis really is
+  single-threaded: the workers, not hedgehog, decide how many CPUs ingest uses.
 - **quail's limits** stay its defaults: 256 MiB decompressed and 64 MiB of text per file, 40
   million pixels a rendered page, which already fit a worker. OCR has its own budget (quail's
   OCR permits, about 1 GiB an engine; see [deploy.md](deploy.md#sizing)).

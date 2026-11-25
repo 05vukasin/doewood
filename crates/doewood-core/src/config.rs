@@ -33,6 +33,8 @@ pub mod vars {
     /// Ingest memory budget in MiB (bytes of big files in flight); defaults from the workers
     /// and memory.
     pub const INGEST_BUDGET_MIB: &str = "DOEWOOD_INGEST_BUDGET_MIB";
+    /// Most cells read from one spreadsheet; defaults from the memory per worker.
+    pub const INGEST_MAX_CELLS: &str = "DOEWOOD_INGEST_MAX_CELLS";
     /// Directory of the OCR model files; defaults to `<data>/ocr-models`.
     pub const OCR_MODELS: &str = "DOEWOOD_OCR_MODELS";
 
@@ -44,7 +46,7 @@ pub mod vars {
     )];
 
     /// Every bootstrap variable, in the order they are reported.
-    pub const ALL: [&str; 10] = [
+    pub const ALL: [&str; 11] = [
         DATA_DIR,
         LISTEN,
         OPS_LISTEN,
@@ -54,6 +56,7 @@ pub mod vars {
         API_MAX_MESSAGE_MIB,
         INGEST_JOBS,
         INGEST_BUDGET_MIB,
+        INGEST_MAX_CELLS,
         OCR_MODELS,
     ];
 }
@@ -78,6 +81,11 @@ pub const MAX_INGEST_JOBS: usize = 256;
 pub const MIN_INGEST_BUDGET_MIB: u64 = 16;
 /// Largest accepted `DOEWOOD_INGEST_BUDGET_MIB` (1 TiB).
 pub const MAX_INGEST_BUDGET_MIB: u64 = 1 << 20;
+/// Smallest accepted `DOEWOOD_INGEST_MAX_CELLS`.
+pub const MIN_INGEST_MAX_CELLS: u64 = 10_000;
+/// Largest accepted `DOEWOOD_INGEST_MAX_CELLS` (about 30 GiB of working set at 320 bytes a
+/// cell).
+pub const MAX_INGEST_MAX_CELLS: u64 = 100_000_000;
 /// Default of `DOEWOOD_OCR_MODELS`, inside the data directory.
 pub const OCR_MODELS_DIR: &str = "ocr-models";
 
@@ -235,6 +243,7 @@ struct Origins {
     api_max_message: Origin,
     ingest_jobs: Origin,
     ingest_budget: Origin,
+    ingest_max_cells: Origin,
     ocr_models: Origin,
 }
 
@@ -259,6 +268,9 @@ pub struct BootstrapConfig {
     pub ingest_jobs: Option<usize>,
     /// Ingest memory budget in bytes; `None` lets ingest size it from the workers and memory.
     pub ingest_budget_bytes: Option<u64>,
+    /// Most cells read from one spreadsheet; `None` lets ingest size it from the memory per
+    /// worker.
+    pub ingest_max_cells: Option<u64>,
     /// Directory of the OCR model files.
     pub ocr_models: PathBuf,
     origins: Origins,
@@ -307,6 +319,8 @@ impl BootstrapConfig {
         let (ingest_jobs, ingest_jobs_origin) = parse_jobs(get(vars::INGEST_JOBS), &mut w);
         let (ingest_budget_mib, ingest_budget_origin) =
             parse_budget(get(vars::INGEST_BUDGET_MIB), &mut w);
+        let (ingest_max_cells, ingest_max_cells_origin) =
+            parse_max_cells(get(vars::INGEST_MAX_CELLS), &mut w);
         let (ocr_models, ocr_models_origin) = match get(vars::OCR_MODELS) {
             Some(v) => (PathBuf::from(v), Origin::Env),
             None => (data_dir.join(OCR_MODELS_DIR), Origin::Default),
@@ -330,6 +344,7 @@ impl BootstrapConfig {
                     .saturating_mul(1024 * 1024),
                 ingest_jobs,
                 ingest_budget_bytes: ingest_budget_mib.map(|m| m << 20),
+                ingest_max_cells,
                 ocr_models,
                 origins: Origins {
                     data_dir: data_dir_origin,
@@ -341,6 +356,7 @@ impl BootstrapConfig {
                     api_max_message: api_max_message_origin,
                     ingest_jobs: ingest_jobs_origin,
                     ingest_budget: ingest_budget_origin,
+                    ingest_max_cells: ingest_max_cells_origin,
                     ocr_models: ocr_models_origin,
                 },
             },
@@ -428,6 +444,13 @@ impl BootstrapConfig {
                     |b| format!("{} MiB", b >> 20),
                 ),
                 origin: o.ingest_budget,
+            },
+            Entry {
+                var: vars::INGEST_MAX_CELLS,
+                value: self
+                    .ingest_max_cells
+                    .map_or_else(|| "auto (memory per worker)".to_owned(), |n| n.to_string()),
+                origin: o.ingest_max_cells,
             },
             Entry {
                 var: vars::OCR_MODELS,
@@ -598,21 +621,50 @@ fn parse_jobs(value: Option<OsString>, w: &mut Vec<ConfigWarning>) -> (Option<us
 }
 
 fn parse_budget(value: Option<OsString>, w: &mut Vec<ConfigWarning>) -> (Option<u64>, Origin) {
+    parse_range(
+        value,
+        w,
+        vars::INGEST_BUDGET_MIB,
+        MIN_INGEST_BUDGET_MIB..=MAX_INGEST_BUDGET_MIB,
+        "MiB",
+        "the workers and memory",
+    )
+}
+
+fn parse_max_cells(value: Option<OsString>, w: &mut Vec<ConfigWarning>) -> (Option<u64>, Origin) {
+    parse_range(
+        value,
+        w,
+        vars::INGEST_MAX_CELLS,
+        MIN_INGEST_MAX_CELLS..=MAX_INGEST_MAX_CELLS,
+        "cells",
+        "the memory per worker",
+    )
+}
+
+/// A whole number in `range`, else a warning and `None` (ingest then sizes it from `auto`).
+fn parse_range(
+    value: Option<OsString>,
+    w: &mut Vec<ConfigWarning>,
+    var: &'static str,
+    range: std::ops::RangeInclusive<u64>,
+    unit: &str,
+    auto: &str,
+) -> (Option<u64>, Origin) {
     let Some(v) = value else {
         return (None, Origin::Default);
     };
     match v.to_str().map(|s| s.trim().parse::<u64>()) {
-        Some(Ok(n)) if (MIN_INGEST_BUDGET_MIB..=MAX_INGEST_BUDGET_MIB).contains(&n) => {
-            (Some(n), Origin::Env)
-        }
+        Some(Ok(n)) if range.contains(&n) => (Some(n), Origin::Env),
         _ => {
             let shown = v.to_string_lossy();
+            let (min, max) = (range.start(), range.end());
             warn(
                 w,
-                vars::INGEST_BUDGET_MIB,
+                var,
                 format!(
-                    "{shown:?} is not a whole number of MiB from {MIN_INGEST_BUDGET_MIB} to \
-                     {MAX_INGEST_BUDGET_MIB}; sizing from the workers and memory"
+                    "{shown:?} is not a whole number of {unit} from {min} to {max}; sizing from \
+                     {auto}"
                 ),
             );
             (None, Origin::Fallback)
@@ -652,11 +704,13 @@ mod tests {
         assert!(warnings.is_empty());
         assert_eq!(config.ingest_jobs, None);
         assert_eq!(config.ingest_budget_bytes, None);
+        assert_eq!(config.ingest_max_cells, None);
         assert_eq!(config.ocr_models, PathBuf::from("/d/ocr-models"));
         let Loaded { config, warnings } = load(
             &[
                 ("DOEWOOD_INGEST_JOBS", "6"),
                 ("DOEWOOD_INGEST_BUDGET_MIB", "768"),
+                ("DOEWOOD_INGEST_MAX_CELLS", "5000000"),
                 ("DOEWOOD_OCR_MODELS", "/models"),
             ],
             Some("h"),
@@ -664,20 +718,28 @@ mod tests {
         assert!(warnings.is_empty());
         assert_eq!(config.ingest_jobs, Some(6));
         assert_eq!(config.ingest_budget_bytes, Some(768 << 20));
+        assert_eq!(config.ingest_max_cells, Some(5_000_000));
         assert_eq!(config.ocr_models, PathBuf::from("/models"));
         let Loaded { config, warnings } = load(
             &[
                 ("DOEWOOD_INGEST_JOBS", "0"),
                 ("DOEWOOD_INGEST_BUDGET_MIB", "8"),
+                ("DOEWOOD_INGEST_MAX_CELLS", "200000000"),
             ],
             Some("h"),
         );
         assert_eq!(
             warnings.iter().map(|w| w.var).collect::<Vec<_>>(),
-            ["DOEWOOD_INGEST_JOBS", "DOEWOOD_INGEST_BUDGET_MIB"]
+            [
+                "DOEWOOD_INGEST_JOBS",
+                "DOEWOOD_INGEST_BUDGET_MIB",
+                "DOEWOOD_INGEST_MAX_CELLS"
+            ]
         );
+        assert!(warnings[2].message.contains("from 10000 to 100000000"));
         assert_eq!(config.ingest_jobs, None);
         assert_eq!(config.ingest_budget_bytes, None);
+        assert_eq!(config.ingest_max_cells, None);
         assert_eq!(config.entries().len(), vars::ALL.len());
     }
 
@@ -736,6 +798,7 @@ mod tests {
                 ("DOEWOOD_API_MAX_MESSAGE_MIB", "8"),
                 ("DOEWOOD_INGEST_JOBS", "3"),
                 ("DOEWOOD_INGEST_BUDGET_MIB", "1024"),
+                ("DOEWOOD_INGEST_MAX_CELLS", "4000000"),
                 ("DOEWOOD_OCR_MODELS", "/opt/ocr"),
             ],
             Some("ignored"),
@@ -815,6 +878,7 @@ mod tests {
                 Origin::Fallback,
                 Origin::Fallback,
                 Origin::Fallback,
+                Origin::Default,
                 Origin::Default,
                 Origin::Default,
                 Origin::Default,

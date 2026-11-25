@@ -107,13 +107,14 @@ pub struct IngestConfig {
 
 impl IngestConfig {
     /// The configuration for an instance: `jobs` from `DOEWOOD_INGEST_JOBS` (`None`: from the
-    /// CPUs and memory), the memory budget from the jobs and memory, and the OCR models
-    /// directory. Tuning values such as the `similar_to` threshold are runtime settings, read
-    /// from the store for every file.
+    /// CPUs and memory), the memory budget and the spreadsheet cell cap from the jobs and
+    /// memory, and the OCR models directory. Tuning values such as the `similar_to` threshold
+    /// are runtime settings, read from the store for every file.
     pub fn new(jobs: Option<usize>, ocr_models: &Path) -> Self {
         let jobs = jobs.unwrap_or_else(default_jobs).max(1);
+        let memory = available_memory();
         Self {
-            memory_budget: plan_budget(jobs, available_memory()),
+            memory_budget: plan_budget(jobs, memory),
             small_file: SMALL_FILE_BYTES,
             jobs,
             queue: jobs * 2,
@@ -124,6 +125,7 @@ impl IngestConfig {
             watchdog_grace: Duration::from_mins(1),
             similarity: SimilarityConfig::default(),
             analyzer: AnalyzerConfig {
+                sheet_max_cells: plan_cells(jobs, memory),
                 workers: jobs,
                 ocr_models: ocr_models.to_owned(),
                 ..AnalyzerConfig::default()
@@ -155,6 +157,16 @@ pub fn plan_budget(jobs: usize, memory: Option<u64>) -> u64 {
     let plan = (jobs.max(1) as u64).saturating_mul(WORKER_BYTES);
     let plan = memory.map_or(plan, |m| plan.min(m / MEMORY_SHARE));
     (plan / 2).max(MIN_BUDGET)
+}
+
+/// The default spreadsheet cell cap for `jobs` workers and `memory` bytes available (`None`:
+/// unknown): what each worker's share of half the available memory holds
+/// ([`sheet::cells_for`](crate::sheet::cells_for): 320 bytes a cell, rounded down to 100,000),
+/// at least 1,600,000 (one [`WORKER_BYTES`] plan, also when the memory is unknown) and at most
+/// hedgehog's 10,000,000.
+pub fn plan_cells(jobs: usize, memory: Option<u64>) -> u64 {
+    let worker = memory.map_or(WORKER_BYTES, |m| m / MEMORY_SHARE / jobs.max(1) as u64);
+    crate::sheet::cells_for(worker)
 }
 
 /// `MemAvailable`, lowered to the room under a cgroup v2 limit. `None` off Linux.
@@ -1699,6 +1711,30 @@ mod tests {
         assert_eq!(plan_budget(1, Some(GIB)), MIN_BUDGET);
         assert_eq!(plan_budget(0, Some(100 << 20)), MIN_BUDGET);
         assert!(IngestConfig::new(Some(2), Path::new("/x")).memory_budget >= MIN_BUDGET);
+    }
+
+    #[test]
+    fn cell_cap_follows_jobs_and_memory() {
+        const GIB: u64 = 1 << 30;
+        // One worker's plan (512 MiB) when the memory is unknown, whatever the jobs.
+        assert_eq!(plan_cells(4, None), 1_600_000);
+        assert_eq!(plan_cells(1, None), 1_600_000);
+        // 1 GiB a worker (half of 8 GiB over 4), 2 GiB a worker (half of 16 GiB over 4).
+        assert_eq!(plan_cells(4, Some(8 * GIB)), 3_300_000);
+        assert_eq!(plan_cells(4, Some(16 * GIB)), 6_700_000);
+        // Twice the workers, half the cells each.
+        assert_eq!(plan_cells(8, Some(16 * GIB)), 3_300_000);
+        // The chart's 4 GiB limit with 3 workers.
+        assert_eq!(plan_cells(3, Some(4 * GIB - (100 << 20))), 2_100_000);
+        // Floor and ceiling.
+        assert_eq!(plan_cells(4, Some(GIB)), crate::sheet::MIN_AUTO_CELLS);
+        assert_eq!(plan_cells(0, Some(100 << 20)), crate::sheet::MIN_AUTO_CELLS);
+        assert_eq!(plan_cells(2, Some(128 * GIB)), 10_000_000);
+        assert_eq!(crate::sheet::MAX_AUTO_CELLS, 10_000_000);
+        let cells = IngestConfig::new(Some(2), Path::new("/x"))
+            .analyzer
+            .sheet_max_cells;
+        assert!((1_600_000..=10_000_000).contains(&cells), "{cells}");
     }
 
     #[test]

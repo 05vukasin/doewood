@@ -58,13 +58,14 @@ see [registries.md](registries.md#configuring-the-registries).
 | `DOEWOOD_API_MAX_MESSAGE_MIB` | `64` | Largest gRPC message the API decodes or encodes, in MiB (1 to 1024). Leaves room for a file sent to `Summarize`. |
 | `DOEWOOD_INGEST_JOBS` | from the CPUs and memory | Files ingest analyzes at the same time (1 to 256). The default is one per CPU, at most what half the available memory holds at 512 MiB each (a cgroup limit counts), at most 32. See [ingest.md](ingest.md). |
 | `DOEWOOD_INGEST_BUDGET_MIB` | from the workers and memory | Ingest's memory budget, in MiB (16 to 1048576): the listed sizes of the files over 16 MiB held at once, from their fetch to the end of their analysis. The default is half the workers' plan (workers x 512 MiB, at most half the available memory), at least 256 MiB: 1 GiB with 4 workers, 768 MiB under a 4 GiB limit with 3. A bigger file waits; one bigger than the budget runs with no other big file. See [ingest.md](ingest.md#memory). |
+| `DOEWOOD_INGEST_MAX_CELLS` | from the workers and memory | Most cells (and shared strings) read from one spreadsheet (10000 to 100000000); a bigger workbook fails. The default is what each worker's share of half the available memory holds at 320 bytes a cell, rounded down to 100,000, from 1,600,000 to 10,000,000 (hedgehog's own default): 1,600,000 for a 512 MiB worker, 6,700,000 for a 2 GiB one. Above 10,000,000 only when set here. See [ingest.md](ingest.md#memory). |
 | `DOEWOOD_OCR_MODELS` | `<data>/ocr-models` | Directory of quail's OCR model files (`quail models fetch` downloads them). Missing models are a `WARN` at start, never an error: scanned pages are then flagged `needs_ocr`. |
 
 `RUST_LOG` sets the log filter (default `info`), for example `RUST_LOG=doewood=debug,info`.
 
 ### Why the ingest variables stay bootstrap values
 
-Tuning values that change what ingest writes are runtime settings. Three ingest variables
+Tuning values that change what ingest writes are runtime settings. Four ingest variables
 are not, because the API cannot set them:
 
 - `DOEWOOD_INGEST_JOBS` sizes the process: the worker pool and the engine's threads are built
@@ -73,12 +74,15 @@ are not, because the API cannot set them:
 - `DOEWOOD_INGEST_BUDGET_MIB` sizes the process the same way: it is the share of the
   container's memory limit that files in flight may take, set once at start next to the
   workers. It changes when ingest runs a file, never what it writes.
+- `DOEWOOD_INGEST_MAX_CELLS` sizes the process too: it is how much of a worker's share of the
+  memory limit one workbook may take, so it belongs with that limit and the workers in the
+  deployment, and is read once at start like them. Unlike the budget it can change an
+  outcome (a workbook over it fails instead of being read), which is why its default follows
+  the memory the deployment gives each worker rather than being fixed.
 - `DOEWOOD_OCR_MODELS` is part of the image layout: a path to model files that the image (or a
   volume mounted into it) provides. It is fixed by how the container is built, not by an
   operator at run time, and the analyzer checks the models once at start.
 
-The spreadsheet cell cap (1,600,000 cells a workbook, from the 512 MiB a worker is planned for)
-is fixed, not a setting; see [ingest.md](ingest.md#memory).
 
 `DOEWOOD_SIMILAR_MIN_JACCARD`, read by earlier versions, is the runtime setting
 `similar_min_jaccard` now. If it is still set, doewood ignores it and logs a `WARN` at start

@@ -428,7 +428,7 @@ async fn scenario(store: Arc<Store>, shared: &Shared) {
     ] {
         assert!(keys.contains(&k), "{name}: {k} in {keys:?}");
     }
-    assert_eq!(xl.versions["hedgehog"], "c418c2b");
+    assert_eq!(xl.versions["hedgehog"], "fac6eba");
     assert_eq!(xl.versions["doewood.ingest"], "1");
     let blob_rec = b.get_record(&h.hash("in/blob.bin")).await.unwrap().unwrap();
     assert_eq!(blob_rec.body["format"], "unknown", "{name}");
