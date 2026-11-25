@@ -197,7 +197,9 @@ mod tests {
                     })
                 })
                 .collect();
-            let lent_some = handles.into_iter().any(|h| h.join().unwrap());
+            // Join them all (`any` alone would stop at the first that lent).
+            let lent: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            let lent_some = lent.contains(&true);
             let peak = peak.load(Ordering::SeqCst);
             assert!(
                 peak <= total,
