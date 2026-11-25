@@ -11,7 +11,8 @@ use uuid::Uuid;
 
 use super::{Scratch, test_url};
 use crate::PgStore;
-use crate::backend::SKETCH_CANDIDATES;
+use crate::backend::{SKETCH_CANDIDATES, client};
+use crate::cached::Cached;
 
 /// The candidate query before issue #74, kept as the reference the current one must match.
 const BEFORE: &str = "SELECT b.blake3, s.signature, count(DISTINCT b.band) AS shared \
@@ -154,7 +155,9 @@ async fn unchanged_writes_write_nothing() {
     s.put_record(&h, &serde_json::json!({}), &Default::default())
         .await
         .unwrap();
-    s.put_sketch(&h, &[1, 2, 3], &[5, 6, u64::MAX]).await.unwrap();
+    s.put_sketch(&h, &[1, 2, 3], &[5, 6, u64::MAX])
+        .await
+        .unwrap();
     let doc = SearchDoc {
         blake3: h,
         title: "Invoice".to_owned(),
@@ -177,7 +180,9 @@ async fn unchanged_writes_write_nothing() {
     };
     let before = versions().await;
     assert_eq!(before.len(), 5);
-    s.put_sketch(&h, &[1, 2, 3], &[u64::MAX, 6, 5, 5]).await.unwrap();
+    s.put_sketch(&h, &[1, 2, 3], &[u64::MAX, 6, 5, 5])
+        .await
+        .unwrap();
     s.index_document(&doc).await.unwrap();
     assert_eq!(versions().await, before);
     // A change is written.
@@ -221,7 +226,13 @@ async fn median_ms<F: AsyncFnMut()>(runs: usize, mut f: F) -> f64 {
 /// first 50, one full record each.
 async fn email_domains_before(s: &PgStore, company: Uuid) -> Vec<(Blake3, String)> {
     let mut out = Vec::new();
-    for doc in s.company_documents(company).await.unwrap().into_iter().take(50) {
+    for doc in s
+        .company_documents(company)
+        .await
+        .unwrap()
+        .into_iter()
+        .take(50)
+    {
         let hash: Blake3 = doc.key.parse().unwrap();
         let record = s.get_record(&hash).await.unwrap().unwrap();
         for fact in record.body["facts"].as_array().unwrap() {
@@ -244,10 +255,7 @@ async fn email_domains_after(s: &PgStore, company: Uuid) -> Vec<(Blake3, String)
         .iter()
         .map(|d| d.key.parse().unwrap())
         .collect();
-    let mut out = s
-        .fact_texts(&hashes, "signal.email_domain")
-        .await
-        .unwrap();
+    let mut out = s.fact_texts(&hashes, "signal.email_domain").await.unwrap();
     out.sort();
     out
 }
@@ -336,11 +344,14 @@ async fn read_path_timings() {
     for doc in &search {
         s.index_document(doc).await.unwrap();
     }
+    // The writes before issue #74, run as the store ran them: a pooled connection, cached
+    // statements.
     let put_before = async |h: &Blake3, sig: &[u8], bands: &[u64]| {
         let bands: Vec<i64> = bands.iter().map(|b| band_to_i64(*b)).collect();
         let key = h.as_bytes().as_slice();
-        c.batch_execute("BEGIN").await.unwrap();
-        c.execute(
+        let mut c = client(&s.pool).await.unwrap();
+        let tx = c.transaction().await.unwrap();
+        tx.exec(
             "INSERT INTO sketches (blake3, signature) VALUES ($1, $2) \
              ON CONFLICT (blake3) DO UPDATE SET signature = EXCLUDED.signature, \
              updated_at = now()",
@@ -348,36 +359,39 @@ async fn read_path_timings() {
         )
         .await
         .unwrap();
-        c.execute("DELETE FROM sketch_bands WHERE blake3 = $1", &[&key])
+        tx.exec("DELETE FROM sketch_bands WHERE blake3 = $1", &[&key])
             .await
             .unwrap();
-        c.execute(
+        tx.exec(
             "INSERT INTO sketch_bands (band, blake3) \
              SELECT DISTINCT b, $2::bytea FROM unnest($1::bigint[]) AS b",
             &[&bands, &key],
         )
         .await
         .unwrap();
-        c.batch_execute("COMMIT").await.unwrap();
+        tx.commit().await.unwrap();
     };
     let index_before = async |d: &SearchDoc| {
-        c.execute(
-            "INSERT INTO search_index (blake3, title, body, kind, doc_date, amount) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
-             ON CONFLICT (blake3) DO UPDATE SET title = EXCLUDED.title, body = EXCLUDED.body, \
-             kind = EXCLUDED.kind, doc_date = EXCLUDED.doc_date, amount = EXCLUDED.amount, \
-             indexed_at = now()",
-            &[
-                &d.blake3.as_bytes().as_slice(),
-                &d.title,
-                &d.body,
-                &d.kind,
-                &d.date,
-                &d.amount,
-            ],
-        )
-        .await
-        .unwrap();
+        client(&s.pool)
+            .await
+            .unwrap()
+            .exec(
+                "INSERT INTO search_index (blake3, title, body, kind, doc_date, amount) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT (blake3) DO UPDATE SET title = EXCLUDED.title, \
+                 body = EXCLUDED.body, kind = EXCLUDED.kind, doc_date = EXCLUDED.doc_date, \
+                 amount = EXCLUDED.amount, indexed_at = now()",
+                &[
+                    &d.blake3.as_bytes().as_slice(),
+                    &d.title,
+                    &d.body,
+                    &d.kind,
+                    &d.date,
+                    &d.amount,
+                ],
+            )
+            .await
+            .unwrap();
     };
     let wal = async || -> i64 {
         c.query_one("SELECT (pg_current_wal_lsn() - '0/0')::bigint", &[])
@@ -448,10 +462,13 @@ async fn read_path_timings() {
     // #75: the merge gate's counts and the email domains, for the owner (on every document)
     // and a typical company.
     let company = async |key: &str| -> Uuid {
-        c.query_one("SELECT id FROM nodes WHERE kind = 'company' AND key = $1", &[&key])
-            .await
-            .unwrap()
-            .get(0)
+        c.query_one(
+            "SELECT id FROM nodes WHERE kind = 'company' AND key = $1",
+            &[&key],
+        )
+        .await
+        .unwrap()
+        .get(0)
     };
     for key in ["co-1", "co-2"] {
         let id = company(key).await;
@@ -465,18 +482,14 @@ async fn read_path_timings() {
             let _ = s.company_document_count(id).await.unwrap();
         })
         .await;
-        println!(
-            "gate count, {docs:>6} documents       before {before:>8.2}  after {after:>8.2}"
-        );
+        println!("gate count, {docs:>6} documents       before {before:>8.2}  after {after:>8.2}");
         assert_eq!(
             email_domains_before(&s, id).await,
             email_domains_after(&s, id).await
         );
         let before = median_ms(9, async || drop(email_domains_before(&s, id).await)).await;
         let after = median_ms(9, async || drop(email_domains_after(&s, id).await)).await;
-        println!(
-            "email domains, {docs:>6} documents    before {before:>8.2}  after {after:>8.2}"
-        );
+        println!("email domains, {docs:>6} documents    before {before:>8.2}  after {after:>8.2}");
     }
     db.drop_schema().await;
 }

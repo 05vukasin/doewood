@@ -164,7 +164,10 @@ fn candidates(
     exclude: &Blake3,
     limit: i64,
 ) -> Vec<(Vec<u8>, Vec<u8>, i64)> {
-    let mut args: Vec<Sql> = bands.iter().map(|b| Sql::Integer(band_to_i64(*b))).collect();
+    let mut args: Vec<Sql> = bands
+        .iter()
+        .map(|b| Sql::Integer(band_to_i64(*b)))
+        .collect();
     args.push(Sql::Blob(exclude.as_bytes().to_vec()));
     args.push(Sql::Integer(limit));
     let mut stmt = conn.prepare_cached(sql).unwrap();
@@ -222,7 +225,9 @@ async fn unchanged_writes_write_nothing() {
     s.put_record(&h, &json!({}), &Default::default())
         .await
         .unwrap();
-    s.put_sketch(&h, &[1, 2, 3], &[5, 6, u64::MAX]).await.unwrap();
+    s.put_sketch(&h, &[1, 2, 3], &[5, 6, u64::MAX])
+        .await
+        .unwrap();
     let doc = SearchDoc {
         blake3: h,
         title: "Invoice".to_owned(),
@@ -235,9 +240,7 @@ async fn unchanged_writes_write_nothing() {
     // Times in the past: a write would set them to now.
     store
         .conn()
-        .execute_batch(
-            "UPDATE sketches SET updated_at = 1; UPDATE search_index SET indexed_at = 1",
-        )
+        .execute_batch("UPDATE sketches SET updated_at = 1; UPDATE search_index SET indexed_at = 1")
         .unwrap();
     let times = || -> (i64, i64) {
         store
@@ -259,7 +262,9 @@ async fn unchanged_writes_write_nothing() {
             .collect::<rusqlite::Result<_>>()
             .unwrap()
     };
-    s.put_sketch(&h, &[1, 2, 3], &[u64::MAX, 6, 5, 5]).await.unwrap();
+    s.put_sketch(&h, &[1, 2, 3], &[u64::MAX, 6, 5, 5])
+        .await
+        .unwrap();
     s.index_document(&doc).await.unwrap();
     assert_eq!(times(), (1, 1));
     assert_eq!(bands(), [-1, 5, 6]);
@@ -291,7 +296,13 @@ async fn median_ms<F: AsyncFnMut()>(runs: usize, mut f: F) -> f64 {
 /// The email domains as `website.rs` read them before issue #75.
 async fn email_domains_before(s: &Standalone, company: Uuid) -> Vec<(Blake3, String)> {
     let mut out = Vec::new();
-    for doc in s.company_documents(company).await.unwrap().into_iter().take(50) {
+    for doc in s
+        .company_documents(company)
+        .await
+        .unwrap()
+        .into_iter()
+        .take(50)
+    {
         let hash: Blake3 = doc.key.parse().unwrap();
         let record = s.get_record(&hash).await.unwrap().unwrap();
         for fact in record.body["facts"].as_array().unwrap() {
@@ -314,10 +325,7 @@ async fn email_domains_after(s: &Standalone, company: Uuid) -> Vec<(Blake3, Stri
         .iter()
         .map(|d| d.key.parse().unwrap())
         .collect();
-    let mut out = s
-        .fact_texts(&hashes, "signal.email_domain")
-        .await
-        .unwrap();
+    let mut out = s.fact_texts(&hashes, "signal.email_domain").await.unwrap();
     out.sort();
     out
 }
@@ -386,33 +394,42 @@ async fn read_path_timings() {
             .flat_map(|k| mix(template(i) * 64 + k).to_be_bytes())
             .collect()
     };
-    let put_before = |i: u64| {
-        let mut conn = store.conn();
-        let tx = conn.transaction().unwrap();
-        let key = doc_hash(i);
-        let key = key.as_bytes().as_slice();
-        tx.execute(
-            "INSERT INTO sketches (blake3, signature, updated_at) VALUES (?1, ?2, ?3) \
-             ON CONFLICT (blake3) DO UPDATE SET signature = excluded.signature, \
-             updated_at = excluded.updated_at",
-            params![key, sig(i), now()],
-        )
-        .unwrap();
-        tx.execute("DELETE FROM sketch_bands WHERE blake3 = ?1", [key])
-            .unwrap();
-        for b in bands(i) {
+    // The writes before issue #74, run as the store ran them: on its blocking pool.
+    let put_before = async |i: u64| {
+        let (sig, bands) = (sig(i), bands(i));
+        s.run(move |conn| {
+            let tx = conn.transaction().unwrap();
+            let key = doc_hash(i);
+            let key = key.as_bytes().as_slice();
             tx.execute(
-                "INSERT INTO sketch_bands (band, blake3) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
-                params![band_to_i64(b), key],
+                "INSERT INTO sketches (blake3, signature, updated_at) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT (blake3) DO UPDATE SET signature = excluded.signature, \
+                 updated_at = excluded.updated_at",
+                params![key, sig, now()],
             )
             .unwrap();
-        }
-        tx.commit().unwrap();
+            tx.execute("DELETE FROM sketch_bands WHERE blake3 = ?1", [key])
+                .unwrap();
+            {
+                let mut insert = tx
+                    .prepare_cached(
+                        "INSERT INTO sketch_bands (band, blake3) VALUES (?1, ?2) \
+                         ON CONFLICT DO NOTHING",
+                    )
+                    .unwrap();
+                for b in bands {
+                    insert.execute(params![band_to_i64(b), key]).unwrap();
+                }
+            }
+            tx.commit().unwrap();
+            Ok(())
+        })
+        .await
+        .unwrap();
     };
-    let index_before = |d: &SearchDoc| {
-        store
-            .conn()
-            .execute(
+    let index_before = async |d: SearchDoc| {
+        s.run(move |conn| {
+            conn.execute(
                 "INSERT INTO search_index (blake3, title, body, kind, doc_date, amount, \
                  indexed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
                  ON CONFLICT (blake3) DO UPDATE SET title = excluded.title, \
@@ -429,17 +446,30 @@ async fn read_path_timings() {
                 ],
             )
             .unwrap();
+            Ok(())
+        })
+        .await
+        .unwrap();
     };
-    let before = median_ms(3, async || docs.iter().for_each(|&i| put_before(i))).await;
+    let before = median_ms(3, async || {
+        for &i in &docs {
+            put_before(i).await;
+        }
+    })
+    .await;
     let after = median_ms(3, async || {
         for &i in &docs {
-            s.put_sketch(&doc_hash(i), &sig(i), &bands(i)).await.unwrap();
+            s.put_sketch(&doc_hash(i), &sig(i), &bands(i))
+                .await
+                .unwrap();
         }
     })
     .await;
     println!("put_sketch x200 unchanged          before {before:>8.2}  after {after:>8.2}");
     let before = median_ms(3, async || {
-        docs.iter().for_each(|&i| index_before(&search(i)));
+        for &i in &docs {
+            index_before(search(i)).await;
+        }
     })
     .await;
     let after = median_ms(3, async || {
@@ -474,17 +504,13 @@ async fn read_path_timings() {
             let _ = s.company_document_count(id).await.unwrap();
         })
         .await;
-        println!(
-            "gate count, {docs:>6} documents       before {before:>8.2}  after {after:>8.2}"
-        );
+        println!("gate count, {docs:>6} documents       before {before:>8.2}  after {after:>8.2}");
         assert_eq!(
             email_domains_before(&s, id).await,
             email_domains_after(&s, id).await
         );
         let before = median_ms(9, async || drop(email_domains_before(&s, id).await)).await;
         let after = median_ms(9, async || drop(email_domains_after(&s, id).await)).await;
-        println!(
-            "email domains, {docs:>6} documents    before {before:>8.2}  after {after:>8.2}"
-        );
+        println!("email domains, {docs:>6} documents    before {before:>8.2}  after {after:>8.2}");
     }
 }

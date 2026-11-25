@@ -15,8 +15,8 @@ use doewood_model::{
     NodeKind, ObjectLocation, OwnedAlias, PropsPatch, PutOutcome, Record, RecordStore, Result,
     SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore, Sketch, SketchStore,
     SourceClaim, SourceKey, StepVersions, StoredEdge, band_to_i64, merged_into, records_limit,
-    sketch_limit, validate_alias, validate_hashes, validate_node, validate_sketch, versions_from_json,
-    versions_to_json,
+    sketch_limit, validate_alias, validate_hashes, validate_node, validate_sketch,
+    versions_from_json, versions_to_json,
 };
 use rusqlite::types::Value as Sql;
 use rusqlite::{
@@ -485,7 +485,10 @@ impl RecordStore for Standalone {
                 .map_err(sql)?;
             rows.map(|row| {
                 let (h, versions) = row.map_err(sql)?;
-                Ok((Blake3::from_slice(&h)?, versions_from_json(&json(&versions)?)?))
+                Ok((
+                    Blake3::from_slice(&h)?,
+                    versions_from_json(&json(&versions)?)?,
+                ))
             })
             .collect()
         })

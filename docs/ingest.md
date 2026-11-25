@@ -269,6 +269,58 @@ DOEWOOD_BENCH_FILES=2000 cargo test -p doewood-ingest --test pipeline -- --ignor
 Server: Linux 7.0.0-30, rustc 1.97.1, commit `ba0b963`. Throughput grows less than linearly
 with workers here (2 to 4 workers: 1.4x).
 
+## Read paths
+
+Issues #74 and #75: the store reads and writes only what a caller needs. Results are the same
+as before; each backend has a test that compares the new candidate query with the old one on
+4,000 generated documents (`sketch_candidates_match_the_query_before`), and the conformance
+suite covers the new methods.
+
+- **`similar_to` candidates** count the shared bands on `sketch_bands` alone, order and limit
+  them, and only then read the survivors' signatures. Before, every matching band row was
+  joined to its signature first.
+- **Unchanged writes** write nothing: `put_sketch` updates the signature only when it differs
+  and deletes or inserts only the bands that changed; `index_document` leaves a row with the
+  same title, body, kind, date and amount as it is (no new `tsvector` and GIN entries on
+  Postgres, no FTS5 rewrite on SQLite). `sketches.updated_at` and `search_index.indexed_at`
+  no longer move on such writes (nothing reads them).
+- **Reprocess** reads the step versions of a page of 500 files in one query
+  (`RecordStore::record_versions`), not one full record per file.
+- **The merge gate** (and accepting a merge proposal without a survivor) compares document
+  counts (`GraphStore::company_document_count`) instead of loading every document node.
+- **Email domains** read the first 50 documents (`GraphStore::company_documents_first`) and only
+  their `signal.email_domain` values (`RecordStore::fact_texts`), not 50 full records.
+
+Ignored test `read_path_timings` in `doewood-pg` and `doewood-store` (release build; median of 9
+runs, ms; writes: 200 calls, median of 3 runs). 50,000 generated documents (records of about
+4 KB with 20 facts, 32 bands each; 2,000 near-identical, the rest in 48 templates), 5,000
+companies; company 1 is a party of every document, the others of about 10.
+`DOEWOOD_BENCH_DOCS` and `DOEWOOD_BENCH_COMPANIES` set the sizes. Postgres 17 in Docker on the
+same machine, after `VACUUM ANALYZE`; SQLite on disk.
+
+```
+DOEWOOD_TEST_POSTGRES_URL=postgres://... cargo test --release -p doewood-pg -p doewood-store \
+    read_path_timings -- --ignored --nocapture
+```
+
+| path | Postgres before | after | SQLite before | after |
+|---|---|---|---|---|
+| `sketch_candidates`, one of 2,000 near-identical | 105 | 10.0 | 146 | 15.7 |
+| `sketch_candidates`, a template of ~1,000 | 79 | 5.7 | 88 | 6.4 |
+| `put_sketch` x200, unchanged | 498 | 428 | 78 | 33 |
+| `index_document` x200, unchanged | 267 | 229 | 61 | 23 |
+| reprocess, one page of 500 | 104 | 1.9 | 55 | 18 |
+| gate count, 50,000 documents | 154 | 69 | 332 | 103 |
+| gate count, 10 documents | 0.25 | 0.22 | 0.17 | 0.12 |
+| email domains, 50,000 documents | 170 | 83 | 301 | 5.4 |
+| email domains, 10 documents | 2.7 | 0.6 | 1.9 | 0.8 |
+
+On Postgres the unchanged writes are bound by round trips; what they save is WAL and dead
+rows: 800 unchanged `put_sketch` calls wrote 59 MB of WAL before and 76 KB after. The gate
+count and the email domains of a company with 50,000 documents still walk its `party` edges
+(the count must, and the first 50 by key need every key); a stored count would need a schema
+change.
+
 ## Timed-out spreadsheets
 
 `timed_out_spreadsheets` in `tests/pipeline.rs`: three generated XLSX of 200,000 rows x 26
