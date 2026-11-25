@@ -945,9 +945,12 @@ async fn similarity_uses_the_stored_threshold() {
 /// Files per second through the whole pipeline (fetch from memory, analyze, SQLite records,
 /// graph and search) on a generated mix of PDF, DOCX, TXT and XLSX, every file distinct.
 /// `cargo test -p doewood-ingest --test pipeline -- --ignored --nocapture throughput`
-/// (`DOEWOOD_BENCH_FILES` sets the count, default 400).
+/// (`DOEWOOD_BENCH_FILES` sets the count, default 400). `DOEWOOD_BENCH_READERS=n` puts the
+/// store in a file with `n` read-only connections (0: on disk, every read on the writer) and
+/// times a `ListRecords` page every millisecond while ingest runs.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "a measurement, not a check"]
+#[allow(clippy::too_many_lines)]
 async fn throughput() {
     let n: usize = std::env::var("DOEWOOD_BENCH_FILES")
         .ok()
@@ -957,8 +960,19 @@ async fn throughput() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    let readers: Option<usize> = std::env::var("DOEWOOD_BENCH_READERS")
+        .ok()
+        .and_then(|v| v.parse().ok());
     let jobs = doewood_ingest::default_jobs();
-    let store = Arc::new(Store::open_in_memory(&MasterKey::from_bytes([8; 32])).unwrap());
+    let dir = std::env::temp_dir().join(format!("doewood-throughput-{}", std::process::id()));
+    let key = MasterKey::from_bytes([8; 32]);
+    let store = Arc::new(match readers {
+        None => Store::open_in_memory(&key).unwrap(),
+        Some(n) => {
+            std::fs::create_dir_all(&dir).unwrap();
+            Store::open_with_readers(&dir.join(doewood_store::STORE_FILE), &key, n).unwrap()
+        }
+    });
     let backend: Arc<dyn Backend> = Arc::new(Standalone::new(Arc::clone(&store)));
     let progress = Arc::new(doewood_api::Progress::new());
     let h = {
@@ -974,6 +988,7 @@ async fn throughput() {
     };
     let api = bench::Api::start(&store, &backend, &progress, watchers).await;
     let probe = bench::Probe::start(&store);
+    let reads = readers.map(|_| bench::ReadProbe::start(api.addr, h.source));
     let cpu = bench::cpu_seconds();
     let mut files = Vec::with_capacity(n);
     let mut bytes = 0usize;
@@ -1034,6 +1049,10 @@ async fn throughput() {
     let secs = started.elapsed().as_secs_f64();
     let cpu = bench::cpu_seconds() - cpu;
     let wait = probe.stop();
+    let reads = match reads {
+        Some(r) => r.stop().await,
+        None => "-".into(),
+    };
     let messages = api.stop().await;
     let c = store.object_counts(h.source).unwrap();
     #[allow(clippy::cast_precision_loss)]
@@ -1041,11 +1060,16 @@ async fn throughput() {
     println!(
         "throughput: {n} files ({mib:.1} MiB) with {jobs} workers in {secs:.2}s = {rate:.0} \
          files/s (done {}, skipped {}, failed {}); {watchers} progress watchers \
-         ({messages} messages); CPU {cpu:.2}s; store lock wait {wait}",
-        c.done, c.skipped, c.failed
+         ({messages} messages); CPU {cpu:.2}s; store lock wait {wait}; readers {}: \
+         ListRecords {reads}",
+        c.done,
+        c.skipped,
+        c.failed,
+        readers.map_or_else(|| "in memory".to_owned(), |n| n.to_string()),
     );
     assert_eq!(c.done, n as u64);
     h.stop().await;
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The `throughput` measurement's helpers: `WatchProgress` streams on a real API server, and
@@ -1056,6 +1080,7 @@ mod bench {
     use std::time::{Duration, Instant};
 
     use doewood_api::pb::jobs_service_client::JobsServiceClient;
+    use doewood_api::pb::records_service_client::RecordsServiceClient;
     use doewood_api::{ApiOptions, ApiParts, ApiState, Progress, pb};
     use doewood_core::InstanceId;
     use doewood_model::Backend;
@@ -1064,6 +1089,7 @@ mod bench {
 
     /// An API server with `watchers` open `WatchProgress` streams of every source.
     pub struct Api {
+        pub addr: std::net::SocketAddr,
         shutdown: watch::Sender<bool>,
         server: tokio::task::JoinHandle<Result<(), doewood_api::ServeError>>,
         readers: Vec<tokio::task::JoinHandle<()>>,
@@ -1118,6 +1144,7 @@ mod bench {
                 }));
             }
             Self {
+                addr,
                 shutdown,
                 server,
                 readers,
@@ -1164,22 +1191,71 @@ mod bench {
         /// Mean, 99th percentile and maximum.
         pub fn stop(self) -> String {
             self.stop.store(true, Ordering::Relaxed);
-            let mut w = self.thread.join().unwrap();
-            w.sort();
-            if w.is_empty() {
-                return "-".into();
-            }
-            let total: Duration = w.iter().sum();
-            let mean = total / u32::try_from(w.len()).unwrap();
-            let p99 = w[w.len() * 99 / 100];
-            format!(
-                "mean {:.0} us, p99 {:.0} us, max {:.1} ms ({} probes)",
-                mean.as_secs_f64() * 1e6,
-                p99.as_secs_f64() * 1e6,
-                w[w.len() - 1].as_secs_f64() * 1e3,
-                w.len()
-            )
+            stats(self.thread.join().unwrap())
         }
+    }
+
+    /// Times a `ListRecords` page of 100 of a source every millisecond, through the API.
+    pub struct ReadProbe {
+        stop: Arc<AtomicBool>,
+        task: tokio::task::JoinHandle<Vec<Duration>>,
+    }
+
+    impl ReadProbe {
+        pub fn start(addr: std::net::SocketAddr, source: doewood_core::SourceId) -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let task = {
+                let stop = Arc::clone(&stop);
+                tokio::spawn(async move {
+                    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+                        .unwrap()
+                        .connect()
+                        .await
+                        .unwrap();
+                    let mut client = RecordsServiceClient::new(channel);
+                    let mut waits = Vec::new();
+                    while !stop.load(Ordering::Relaxed) {
+                        let t = Instant::now();
+                        client
+                            .list_records(pb::ListRecordsRequest {
+                                source_id: source.to_string(),
+                                page_size: 100,
+                                page_token: String::new(),
+                            })
+                            .await
+                            .unwrap();
+                        waits.push(t.elapsed());
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    waits
+                })
+            };
+            Self { stop, task }
+        }
+
+        /// Mean, 99th percentile and maximum.
+        pub async fn stop(self) -> String {
+            self.stop.store(true, Ordering::Relaxed);
+            stats(self.task.await.unwrap())
+        }
+    }
+
+    /// Mean, 99th percentile and maximum of `w`.
+    fn stats(mut w: Vec<Duration>) -> String {
+        w.sort();
+        if w.is_empty() {
+            return "-".into();
+        }
+        let total: Duration = w.iter().sum();
+        let mean = total / u32::try_from(w.len()).unwrap();
+        let p99 = w[w.len() * 99 / 100];
+        format!(
+            "mean {:.0} us, p99 {:.0} us, max {:.1} ms ({} probes)",
+            mean.as_secs_f64() * 1e6,
+            p99.as_secs_f64() * 1e6,
+            w[w.len() - 1].as_secs_f64() * 1e3,
+            w.len()
+        )
     }
 
     /// User and system CPU time of this process (Linux), in seconds; 0 elsewhere.

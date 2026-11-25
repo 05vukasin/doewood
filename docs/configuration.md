@@ -161,13 +161,37 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
 
 `doewood.sqlite` runs in WAL mode with `synchronous = NORMAL`, and a `journal_size_limit` of
 64 MiB: after a large transaction the `-wal` file shrinks back to that at the next checkpoint.
-Its one connection keeps up to 128 prepared statements. At open it runs
+Its writer connection keeps up to 128 prepared statements. At open it runs
 `PRAGMA optimize = 0x10002`, and the hourly cache purge task runs `PRAGMA optimize`, so the
 planner statistics follow tables that grow from empty to millions of rows. Schema 10 (issues
 #72 and #73) keeps per-source status counters of `objects_seen` and `llm_jobs`
 (`object_counts`, `llm_job_counts`, updated by triggers in the same transaction), adds an
 index for a source's newest failed summary, and drops `objects_seen_by_status`, which held the
 same entries as `objects_seen_pending`.
+
+**Read-only connections (issue #83).** Every write goes through the one writer connection,
+behind a mutex: there is exactly one writer (ADR 0001). Next to it, an on-disk store opens
+**2 read-only connections** (fewer on a 1-CPU machine; fixed, not a setting), opened with
+`SQLITE_OPEN_READ_ONLY` and `query_only = ON`, with the writer's 128-statement cache and 5 s
+busy timeout. In WAL mode they read next to the writer, so these reads no longer wait for
+ingest's write transactions:
+
+- standalone: records (`GetRecord`, `ListRecords`, versions, facts), the graph (nodes, aliases,
+  neighbours, a company's documents), search, similar documents (sketch candidates), source
+  claims, proposals, the merge log and dismissals, the registry and icon caches, enrichment
+  state and due companies, feed state and company aliases;
+- the instance store: sources, the `WatchProgress` snapshot (every source's counters,
+  checkpoint and LLM spend, read in one transaction), runtime settings and AI providers,
+  whether a secret is set, and opening a secret for a connector (decrypted with the same
+  master key; the key check at open runs on the writer before the readers open).
+
+Each read call is one transaction on one connection: it sees what was committed when it
+started, never a write still in progress. Every write commits before it returns, so a read made
+after a write returned sees it (a call that writes and then reads, such as `AddSource`, still
+gets what it wrote). Writes, and everything ingest and the scanners read to decide their next
+write (object status, pending objects, the LLM queue), stay on the writer. When both readers
+are busy a read waits for one, never for the writer. An in-memory store (tests) has no
+readers; its reads use the writer, as before.
 - **pgvector** is used when the server has it: doewood creates the extension (this needs a role
   allowed to) and adds `search_index.embedding`. Without it, this is logged once and search runs
   on full text only.

@@ -358,18 +358,21 @@ impl Snapshots {
     /// Every source's progress, from the store and [`Progress`].
     async fn compute(&self) -> Result<BTreeMap<SourceId, SourceProgress>, Status> {
         let store = Arc::clone(&self.store);
+        // One read transaction on a reader: every source's counters come from the same
+        // committed state, and the snapshot does not wait for ingest's writes.
         let rows = tokio::task::spawn_blocking(move || -> Result<_, StoreError> {
-            store
-                .sources()?
-                .into_iter()
-                .map(|s| {
-                    let counts = store.object_counts(s.id)?;
-                    let checkpoint = store.scan_checkpoint(s.id)?.unwrap_or_default();
-                    let llm = store.llm_counts(s.id)?;
-                    let spent = store.llm_usage(s.id, doewood_store::utc_day(unix_now()))?;
-                    Ok((s, counts, checkpoint, (llm, spent)))
-                })
-                .collect::<Result<Vec<(Source, _, _, _)>, _>>()
+            store.snapshot(|snap| {
+                snap.sources()?
+                    .into_iter()
+                    .map(|s| {
+                        let counts = snap.object_counts(s.id)?;
+                        let checkpoint = snap.scan_checkpoint(s.id)?.unwrap_or_default();
+                        let llm = snap.llm_counts(s.id)?;
+                        let spent = snap.llm_usage(s.id, doewood_store::utc_day(unix_now()))?;
+                        Ok((s, counts, checkpoint, (llm, spent)))
+                    })
+                    .collect::<Result<Vec<(Source, _, _, _)>, _>>()
+            })
         })
         .await
         .map_err(|e| crate::error::join(&e))?
