@@ -39,7 +39,7 @@ the route usually answers from the cache.
    icon's bytes and format (or the miss), the lookup date and the expiry. With a shared
    Postgres every instance uses the same table, so an icon is fetched once; standalone it is
    the instance's SQLite file. While the shared store is not connected yet, icons are cached
-   in memory (up to 10,000 domains; the oldest go first). Expired rows are never served and are
+   in memory (up to 10,000 domains and 16 MiB; the oldest go first, expired ones are dropped). Expired rows are never served and are
    purged every hour. Anything that finds no usable icon is a miss, including a site that does
    not answer or that the guard refuses. At most 16 lookups fetch at the same time; more
    answer `503`.

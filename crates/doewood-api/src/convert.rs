@@ -128,6 +128,16 @@ pub(crate) fn api_settings(s: doewood_store::ApiSettings) -> pb::ApiSettings {
     }
 }
 
+/// [`record`], moving the body instead of copying it.
+pub(crate) fn into_record(r: Record) -> pb::Record {
+    pb::Record {
+        blake3: r.blake3.to_hex(),
+        body_json: String::from(Box::<str>::from(r.body)),
+        versions: r.versions.into_iter().collect(),
+        updated_at: r.updated_at,
+    }
+}
+
 pub(crate) fn record(r: &Record) -> pb::Record {
     pb::Record {
         blake3: r.blake3.to_hex(),

@@ -196,7 +196,7 @@ async fn s3_put_to_postgres_record() {
         async move {
             let deadline = tokio::time::Instant::now() + Duration::from_mins(2);
             loop {
-                let got = pg.list_records(&key, None, 0).await.unwrap();
+                let got = pg.list_records(&key, None, 0, usize::MAX).await.unwrap();
                 if got.len() == n {
                     return got;
                 }

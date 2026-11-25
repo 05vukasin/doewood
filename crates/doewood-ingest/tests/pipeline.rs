@@ -685,7 +685,10 @@ async fn scenario(store: Arc<Store>, shared: &Shared) {
     assert_eq!(hits.len(), 3, "{name}");
     let src = SourceKey::new(ENDPOINT, BUCKET, "in/copy/").unwrap();
     assert_eq!(
-        b.list_records(&src, None, 0).await.unwrap().len(),
+        b.list_records(&src, None, 0, usize::MAX)
+            .await
+            .unwrap()
+            .len(),
         1,
         "{name}"
     );
@@ -702,7 +705,10 @@ async fn scenario(store: Arc<Store>, shared: &Shared) {
         .expect("ended");
     assert!(ended.edge.edge.valid_to.is_some(), "{name}");
     assert!(
-        b.list_records(&src, None, 0).await.unwrap().is_empty(),
+        b.list_records(&src, None, 0, usize::MAX)
+            .await
+            .unwrap()
+            .is_empty(),
         "{name}"
     );
     assert!(

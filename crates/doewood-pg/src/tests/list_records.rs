@@ -134,7 +134,12 @@ async fn list_records_matches_the_query_before_issue_13() {
             let mut after: Option<Blake3> = None;
             for p in &now {
                 let got = store
-                    .list_records(&key, after.as_ref(), u32::try_from(limit).unwrap())
+                    .list_records(
+                        &key,
+                        after.as_ref(),
+                        u32::try_from(limit).unwrap(),
+                        usize::MAX,
+                    )
                     .await
                     .unwrap();
                 let got: Vec<(Vec<u8>, serde_json::Value)> = got

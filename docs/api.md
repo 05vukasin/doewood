@@ -194,7 +194,13 @@ refused: the workbook has more than 1,600,000 cells ...`, and how to raise the c
 
 - **GetRecord** takes a BLAKE3 in hex; the record's JSON is in `body_json`, exactly as stored.
 - **ListRecords** pages through the records of a source's files, ordered by hash: pass
-  `next_page_token` back as `page_token` until it comes back empty.
+  `next_page_token` back as `page_token` until it comes back empty. A page holds up to
+  `page_size` records (default 50, at most 1000) and also ends with the record that brings
+  its bodies to 3 MiB (issue #111), so a page can hold fewer records than asked for and still
+  have a next one; it always holds at least one record when any is left. With records up to
+  about 1 MiB a page stays under the 4 MiB message size that gRPC clients accept by default.
+  A page that ends exactly at the end of the source may still give a token; the next page is
+  then empty. See [ListRecords page budget](#listrecords-page-budget).
 - **GetNode** finds a node by id or by kind and key; **Neighbours** follows its edges with the
   filters of the model's `NeighbourQuery` (direction, edge kinds, neighbour kind, a day the edge
   must hold on, inactive edges); **CompanyDocuments** lists the documents with a live `party`

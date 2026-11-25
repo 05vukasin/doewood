@@ -12,8 +12,8 @@ use doewood_model::{
     LiveEdge, Located, LocationEnded, MERGE_CHAIN_MAX, Neighbour, NeighbourQuery, Node, NodeAlias,
     NodeKind, ObjectLocation, OwnedAlias, PropsPatch, PutOutcome, Record, RecordStore, Result,
     SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore, Sketch, SketchStore,
-    SourceClaim, SourceKey, StepVersions, StoredEdge, band_to_i64, merged_into, records_limit,
-    sketch_limit, validate_alias, validate_hashes, validate_node, validate_sketch,
+    SourceClaim, SourceKey, StepVersions, StoredEdge, band_to_i64, merged_into, record_page_bytes,
+    records_limit, sketch_limit, validate_alias, validate_hashes, validate_node, validate_sketch,
     versions_from_json, versions_to_json,
 };
 use serde_json::Value;
@@ -62,6 +62,9 @@ pub(crate) const LIST_RECORDS: &str = "SELECT r.blake3, r.record, r.versions, ex
      AND l.endpoint = $1 AND l.bucket = $2 AND starts_with(l.object_key COLLATE \"C\", $3) \
      AND ($4::bytea IS NULL OR l.blake3 > $4)) \
      ORDER BY r.blake3 LIMIT $5";
+
+/// The rows of the first batch [`LIST_RECORDS`] reads from its portal.
+const LIST_RECORDS_BATCH: usize = 32;
 
 /// Claim attempts when the owner releases between our insert and our read.
 const CLAIM_ATTEMPTS: usize = 3;
@@ -490,31 +493,66 @@ impl RecordStore for PgStore {
         source: &SourceKey,
         after: Option<&Blake3>,
         limit: u32,
+        max_bytes: usize,
     ) -> Result<Vec<Record>> {
-        let c = client(&self.pool).await?;
+        let limit = records_limit(limit) as usize;
+        let mut c = client(&self.pool).await?;
         let after = after.map(|h| h.as_bytes().to_vec());
-        let rows = c
-            .rows_uncached(
-                LIST_RECORDS,
+        // Read through a portal a few rows at a time, so that a page stops at the byte budget
+        // without the server sending, or this process holding, the rest (issue #111). Never
+        // cached (see `LIST_RECORDS`): a fresh statement gets a custom plan.
+        let tx = c
+            .build_transaction()
+            .read_only(true)
+            .start()
+            .await
+            .map_err(pg)?;
+        let st = tx.prepare(LIST_RECORDS).await.map_err(pg)?;
+        let portal = tx
+            .bind(
+                &st,
                 &[
                     &source.endpoint(),
                     &source.bucket(),
                     &source.prefix(),
                     &after,
-                    &i64::from(records_limit(limit)),
+                    &i64::try_from(limit).unwrap_or(i64::MAX),
                 ],
             )
-            .await?;
-        rows.iter()
-            .map(|r| {
-                Ok(Record {
+            .await
+            .map_err(pg)?;
+        let (mut page, mut bytes) = (Vec::new(), 0usize);
+        // The first batch; later ones are sized from the mean record so far to about what
+        // still fits.
+        let mut batch = LIST_RECORDS_BATCH.min(limit);
+        'page: loop {
+            let rows = tx
+                .query_portal(&portal, i32::try_from(batch).unwrap_or(i32::MAX))
+                .await
+                .map_err(pg)?;
+            let done = rows.len() < batch;
+            for r in &rows {
+                let record = Record {
                     blake3: Blake3::from_slice(r.try_get::<_, &[u8]>(0).map_err(pg)?)?,
                     body: record_text(&r.try_get(1).map_err(pg)?)?,
                     versions: versions_from_json(&r.try_get::<_, Value>(2).map_err(pg)?)?,
                     updated_at: r.try_get(3).map_err(pg)?,
-                })
-            })
-            .collect()
+                };
+                bytes += record_page_bytes(&record);
+                page.push(record);
+                if bytes >= max_bytes {
+                    break 'page;
+                }
+            }
+            if done || page.len() >= limit {
+                break;
+            }
+            let mean = (bytes / page.len()).max(1);
+            batch = ((max_bytes - bytes) / mean + 1).clamp(1, limit - page.len());
+        }
+        drop(portal);
+        tx.commit().await.map_err(pg)?;
+        Ok(page)
     }
 }
 
@@ -1052,12 +1090,16 @@ impl SearchStore for PgStore {
         };
         if let Some(company) = q.company {
             let p = args.push(company);
+            // Driven by the company's party edges (edges_by_dst), each document's hash looked
+            // up by primary key, rather than a check per indexed document (issue #111). Only
+            // lowercase hex keys are hashes (the others, such as `ref:` placeholders, never
+            // matched `encode`), and decode would fail on them.
             let _ = write!(
                 sql,
-                " AND EXISTS (SELECT 1 FROM nodes d JOIN edges e ON e.src = d.id \
-                 WHERE d.kind = 'document' AND d.key = encode(s.blake3, 'hex') \
-                 AND e.kind = 'party' AND e.dst = {p} \
-                 AND e.state NOT IN ('retracted', 'superseded'))"
+                " AND s.blake3 IN (SELECT decode(CASE WHEN d.key ~ '^[0-9a-f]{{64}}$' \
+                 THEN d.key END, 'hex') FROM edges e JOIN nodes d ON d.id = e.src \
+                 WHERE e.dst = {p} AND e.kind = 'party' \
+                 AND e.state NOT IN ('retracted', 'superseded') AND d.kind = 'document')"
             );
         }
         let mut filter = |cond: &str, value: Box<dyn ToSql + Sync + Send>| {

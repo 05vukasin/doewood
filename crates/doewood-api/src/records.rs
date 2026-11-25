@@ -1,6 +1,6 @@
 //! `RecordsService`: records by hash, and by source a page at a time.
 
-use doewood_model::{SourceKey, records_limit};
+use doewood_model::{RECORDS_PAGE_BYTES, SourceKey, records_limit, records_page_full};
 use tonic::{Request, Response, Status};
 
 use crate::pb::records_service_server::RecordsService;
@@ -60,11 +60,12 @@ impl RecordsService for Api {
         let records = self
             .state
             .backend()?
-            .list_records(&key, after.as_ref(), limit)
+            .list_records(&key, after.as_ref(), limit, RECORDS_PAGE_BYTES)
             .await
             .map_err(error::model)?;
-        // A full page may have a next one; the token is the last hash (opaque to clients).
-        let next_page_token = if records.len() == limit as usize {
+        // A page that ended at its size or byte budget may have a next one; the token is the
+        // last hash (opaque to clients).
+        let next_page_token = if records_page_full(&records, limit, RECORDS_PAGE_BYTES) {
             records
                 .last()
                 .map(|r| r.blake3.to_hex())
@@ -73,7 +74,7 @@ impl RecordsService for Api {
             String::new()
         };
         Ok(Response::new(ListRecordsResponse {
-            records: records.iter().map(convert::record).collect(),
+            records: records.into_iter().map(convert::into_record).collect(),
             next_page_token,
         }))
     }
