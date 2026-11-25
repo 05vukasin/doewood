@@ -26,7 +26,7 @@ use doewood_registry::gleif::{
 };
 use doewood_registry::wikidata::{Period, QId, Relation, WikidataItem};
 use doewood_registry::{Registry, Warning, WarningKind};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use time::{Date, OffsetDateTime};
 use tracing::warn;
 use uuid::Uuid;
@@ -1266,12 +1266,4 @@ fn majority(natures: &[String]) -> bool {
             || n.contains("75-to-100-percent")
             || n.starts_with("right-to-appoint-and-remove-directors")
     })
-}
-
-/// Props of a company, as a map.
-pub(crate) fn props_map(v: &Value) -> Map<String, Value> {
-    match v {
-        Value::Object(o) => o.clone(),
-        _ => Map::new(),
-    }
 }

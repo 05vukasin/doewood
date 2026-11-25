@@ -413,23 +413,26 @@ async fn postgres() -> Option<(Arc<dyn Backend>, tokio_postgres::Client, String)
         .batch_execute(&format!("CREATE SCHEMA {schema}"))
         .await
         .unwrap();
+    // pgvector in `public`, shared by every test schema, created under the store's own lock
+    // (as doewood-pg's tests do). Left to the store, it would land in the first test schema
+    // to connect and go when that schema is dropped, under the feet of the other tests.
+    admin
+        .batch_execute(&format!(
+            "BEGIN; SELECT pg_advisory_xact_lock({}); \
+             DO $$ BEGIN \
+                 IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'vector') \
+                 THEN CREATE EXTENSION IF NOT EXISTS vector SCHEMA public; END IF; \
+             END $$; COMMIT",
+            doewood_pg::MIGRATION_LOCK
+        ))
+        .await
+        .unwrap();
     let sep = if url.contains('?') { '&' } else { '?' };
     let scoped = format!("{url}{sep}options=-c%20search_path%3D{schema}");
     let url = doewood_core::PostgresUrl::parse(&scoped).unwrap();
-    // Tests run in parallel, each migrating its own schema: the first `CREATE EXTENSION` of
-    // the database can race; a second try finds it.
-    let mut tries = 0;
-    let pg = loop {
-        match doewood_pg::PgStore::connect(&url).await {
-            Ok(pg) => break pg,
-            Err(e) if tries < 5 => {
-                tries += 1;
-                eprintln!("connect {schema}: {e}; trying again");
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-            Err(e) => panic!("connect {schema}: {e}"),
-        }
-    };
+    let pg = doewood_pg::PgStore::connect(&url)
+        .await
+        .unwrap_or_else(|e| panic!("connect {schema}: {e}"));
     Some((Arc::new(pg), admin, schema))
 }
 

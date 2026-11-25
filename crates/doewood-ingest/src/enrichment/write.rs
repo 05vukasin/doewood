@@ -22,15 +22,15 @@ use std::collections::BTreeSet;
 
 use doewood_enrich::{CompanyName, LadderStep};
 use doewood_model::{
-    Backend, Direction, Edge, EdgeKind, EdgeSource, EdgeState, NeighbourQuery, NodeKind, Result,
-    merged_into,
+    Backend, Direction, Edge, EdgeKind, EdgeSource, EdgeState, NeighbourQuery, NodeKind,
+    PropsPatch, Result, merged_into,
 };
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use time::Date;
 use tracing::debug;
 use uuid::Uuid;
 
-use super::company::{Findings, Job, Other, Planned, props_map};
+use super::company::{Findings, Job, Other, Planned};
 use super::gate::Gated;
 use super::subject::{Subject, ch_alias, qid_alias};
 
@@ -193,16 +193,28 @@ async fn create_or_find(
         return Ok(Some(live_id(b, n.id).await?));
     }
     let parsed = name.and_then(CompanyName::parse);
-    let mut props = json!({"origin": "registry", "ids": ids});
+    // Created empty, then only missing keys filled: a company ingest created with this key
+    // at the same moment keeps what it wrote.
+    let id = b.ensure_node(NodeKind::Company, &alias).await?;
+    let mut patch = PropsPatch::new()
+        .set_if_absent(&["origin"], json!("registry"))
+        .set_if_absent(&["ids"], json!({}));
+    for (kind, values) in ids.as_object().into_iter().flatten() {
+        for v in values.as_array().into_iter().flatten() {
+            patch = patch.add_to_set(&["ids", kind], v.clone(), MAX_LIST);
+        }
+    }
     if let Some(n) = name {
-        props["name"] = json!(n);
-        props["legal_name"] = json!(n);
+        patch = patch
+            .set_if_absent(&["name"], json!(n))
+            .set_if_absent(&["legal_name"], json!(n));
     }
     if let Some(p) = &parsed {
-        props["key"] = json!(p.key);
-        props["legal_form"] = json!(p.legal_form);
+        patch = patch
+            .set_if_absent(&["key"], json!(p.key))
+            .set_if_absent(&["legal_form"], json!(p.legal_form));
     }
-    let id = b.upsert_node(NodeKind::Company, &alias, &props).await?;
+    b.update_props(id, &patch).await?;
     let evidence = json!({"step": "registry", "confidence": 0.95});
     b.claim_alias(NodeKind::Company, &alias, id, &evidence)
         .await?;
@@ -300,14 +312,8 @@ fn supersede(e: &Edge, until: Date) -> Edge {
     e
 }
 
-fn push_bounded(list: &mut Vec<Value>, v: Value, same: impl Fn(&Value) -> bool) {
-    list.retain(|x| !same(x));
-    list.push(v);
-    while list.len() > MAX_LIST {
-        list.remove(0);
-    }
-}
-
+/// The company's props from the findings, as one atomic patch of the keys the job keeps
+/// (issue #51): ingest's keys, and what it writes at the same moment, stay.
 async fn update_props(
     b: &dyn Backend,
     me: Uuid,
@@ -315,79 +321,54 @@ async fn update_props(
     g: &Gated,
     owned: &BTreeSet<String>,
 ) -> Result<()> {
-    let Some(node) = b.node(me).await? else {
-        return Ok(());
-    };
-    let mut props = props_map(&node.props);
-    let mut registry = props.get("registry").map(props_map).unwrap_or_default();
-    for (name, facts) in &f.facts {
-        registry.insert((*name).to_owned(), facts.clone());
+    // Every list and map the job keeps is there, empty if need be.
+    let mut patch = PropsPatch::new();
+    for key in ["registry", "ids", "registry_ids"] {
+        patch = patch.set_if_absent(&[key], json!({}));
     }
-    props.insert("registry".into(), Value::Object(registry));
-    let mut ids = props.get("ids").map(props_map).unwrap_or_default();
-    let mut registry_ids = props.get("registry_ids").map(props_map).unwrap_or_default();
+    for key in ["former_names", "merge_proposals", "registry_proposals"] {
+        patch = patch.set_if_absent(&[key], json!([]));
+    }
+    for (name, facts) in &f.facts {
+        patch = patch.set(&["registry", name], facts.clone());
+    }
     for alias in owned {
         if let Some(rest) = alias.strip_prefix("id:")
             && let Some((kind, value)) = rest.split_once(':')
         {
-            let list = ids
-                .entry(kind.to_owned())
-                .or_insert_with(|| Value::Array(Vec::new()));
-            if let Value::Array(l) = list
-                && l.len() < MAX_LIST
-                && !l.iter().any(|v| v.as_str() == Some(value))
-            {
-                l.push(Value::String(value.to_owned()));
-            }
+            patch = patch.add_to_set(&["ids", kind], json!(value), MAX_LIST);
         } else if let Some(rest) = alias.strip_prefix("reg:")
             && let Some((kind, value)) = rest.split_once(':')
         {
-            registry_ids.insert(kind.to_owned(), Value::String(value.to_owned()));
+            patch = patch.set(&["registry_ids", kind], json!(value));
         }
     }
-    props.insert("ids".into(), Value::Object(ids));
-    props.insert("registry_ids".into(), Value::Object(registry_ids));
     if let Some(name) = f.names.first() {
-        props.insert("legal_name".into(), Value::String(name.clone()));
-        if props.get("name").is_none_or(Value::is_null) {
-            props.insert("name".into(), Value::String(name.clone()));
-        }
+        patch = patch
+            .set(&["legal_name"], json!(name))
+            .set_if_absent(&["name"], json!(name));
     }
-    let mut former = list_of(&props, "former_names");
     for n in &f.former {
         let v = json!({"name": n.name, "until": n.until.map(|d| d.to_string()), "evidence": n.evidence});
-        push_bounded(&mut former, v, |x| x["name"] == json!(n.name));
+        patch = patch.push_capped(&["former_names"], v, &["name"], MAX_LIST);
     }
-    props.insert("former_names".into(), Value::Array(former));
     let at = super::unix_now();
-    let mut merges = list_of(&props, "merge_proposals");
     for p in &g.proposals {
         let mut p = p.clone();
         p["at"] = json!(at);
-        let company = p["company"].clone();
-        push_bounded(&mut merges, p, |x| x["company"] == company);
+        patch = patch.push_capped(&["merge_proposals"], p, &["company"], MAX_LIST);
     }
-    props.insert("merge_proposals".into(), Value::Array(merges));
-    let mut records = list_of(&props, "registry_proposals");
     for p in &f.proposals {
         let mut p = p.clone();
         p["at"] = json!(at);
-        let (r, rec) = (p["registry"].clone(), p["record"].clone());
-        push_bounded(&mut records, p, |x| {
-            x["registry"] == r && x["record"] == rec
-        });
+        patch = patch.push_capped(
+            &["registry_proposals"],
+            p,
+            &["registry", "record"],
+            MAX_LIST,
+        );
     }
-    props.insert("registry_proposals".into(), Value::Array(records));
-    props.insert("enriched_at".into(), json!(at));
-    b.upsert_node(NodeKind::Company, &node.key, &Value::Object(props))
-        .await?;
+    patch = patch.set(&["enriched_at"], json!(at));
+    b.update_props(me, &patch).await?;
     Ok(())
-}
-
-fn list_of(props: &Map<String, Value>, key: &str) -> Vec<Value> {
-    props
-        .get(key)
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
 }
