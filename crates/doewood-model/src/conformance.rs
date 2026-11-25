@@ -135,10 +135,10 @@ async fn record_versions<B: Backend + ?Sized>(s: &B) {
 /// the full bodies finds: only string values of matching facts in a `facts` array.
 async fn fact_texts<B: Backend + ?Sized>(s: &B) {
     let key = "signal.email_domain";
-    let (a, b, c, d, missing) = (hash(5), hash(6), hash(7), hash(8), hash(9));
+    let (many, one, flat, blob, missing) = (hash(5), hash(6), hash(7), hash(8), hash(9));
     let fact = |k: &str, v: serde_json::Value| json!({"key": k, "value": v, "conf": 0.9});
     s.put_record(
-        &a,
+        &many,
         &json!({"facts": [
             fact(key, json!({"t": "text", "v": "Acme.example"})),
             fact(key, json!({"t": "text", "v": "acme.example"})),
@@ -154,7 +154,7 @@ async fn fact_texts<B: Backend + ?Sized>(s: &B) {
     .await
     .unwrap();
     s.put_record(
-        &b,
+        &one,
         &json!({"facts": [fact(key, json!({"t": "text", "v": " b.example "}))]}),
         &versions("1"),
     )
@@ -162,33 +162,36 @@ async fn fact_texts<B: Backend + ?Sized>(s: &B) {
     .unwrap();
     // `facts` that is not an array has no facts.
     s.put_record(
-        &c,
+        &flat,
         &json!({"facts": fact(key, json!({"v": "c.example"}))}),
         &versions("1"),
     )
     .await
     .unwrap();
-    s.put_record(&d, &json!({"kind": "blob"}), &versions("1"))
+    s.put_record(&blob, &json!({"kind": "blob"}), &versions("1"))
         .await
         .unwrap();
-    let mut got = s.fact_texts(&[a, b, c, d, missing], key).await.unwrap();
+    let mut got = s
+        .fact_texts(&[many, one, flat, blob, missing], key)
+        .await
+        .unwrap();
     got.sort();
     assert_eq!(
         got,
         [
-            (a, "Acme.example".to_owned()),
-            (a, "acme.example".to_owned()),
-            (b, " b.example ".to_owned()),
+            (many, "Acme.example".to_owned()),
+            (many, "acme.example".to_owned()),
+            (one, " b.example ".to_owned()),
         ]
     );
     assert_eq!(
-        s.fact_texts(&[a], "signal.phone").await.unwrap(),
-        [(a, "+381".to_owned())]
+        s.fact_texts(&[many], "signal.phone").await.unwrap(),
+        [(many, "+381".to_owned())]
     );
     assert!(s.fact_texts(&[], key).await.unwrap().is_empty());
-    assert!(s.fact_texts(&[a], "signal").await.unwrap().is_empty());
+    assert!(s.fact_texts(&[many], "signal").await.unwrap().is_empty());
     assert!(matches!(
-        s.fact_texts(&vec![a; crate::RECORDS_MAX_LIMIT as usize + 1], key)
+        s.fact_texts(&vec![many; crate::RECORDS_MAX_LIMIT as usize + 1], key)
             .await,
         Err(Error::Invalid(_))
     ));

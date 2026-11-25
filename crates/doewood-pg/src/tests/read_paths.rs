@@ -152,9 +152,13 @@ async fn unchanged_writes_write_nothing() {
     let s = db.store().await;
     let c = db.client().await;
     let h = Blake3([7; 32]);
-    s.put_record(&h, &serde_json::json!({}), &Default::default())
-        .await
-        .unwrap();
+    s.put_record(
+        &h,
+        &serde_json::json!({}),
+        &doewood_model::StepVersions::new(),
+    )
+    .await
+    .unwrap();
     s.put_sketch(&h, &[1, 2, 3], &[5, 6, u64::MAX])
         .await
         .unwrap();

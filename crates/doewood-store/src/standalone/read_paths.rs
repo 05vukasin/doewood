@@ -222,7 +222,7 @@ async fn unchanged_writes_write_nothing() {
     let store = Arc::new(Store::open_in_memory(&MasterKey::from_bytes([1; 32])).unwrap());
     let s = Standalone::new(Arc::clone(&store));
     let h = Blake3([7; 32]);
-    s.put_record(&h, &json!({}), &Default::default())
+    s.put_record(&h, &json!({}), &doewood_model::StepVersions::new())
         .await
         .unwrap();
     s.put_sketch(&h, &[1, 2, 3], &[5, 6, u64::MAX])
