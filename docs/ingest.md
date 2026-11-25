@@ -158,12 +158,12 @@ more), so none of them can abort the instance with an out-of-memory error.
   other one text: 1,000,012 cells; read and tables; 4 vCPU server, test profile; RSS is the
   peak above the start):
 
-  | | slots | threads per workbook | wall | peak RSS |
+  | | slots | threads per workbook | wall, run 1 / 2 | peak RSS, run 1 / 2 |
   |---|---|---|---|---|
-  | 1 workbook, before | 1 | 1 | 1.91 s | +210 MiB |
-  | 1 workbook, after | 4 | 4 | 1.33 s | +201 MiB |
-  | 4 workbooks at once, before | 1 | 1 each | 2.59 s | +696 MiB |
-  | 4 workbooks at once, after | 4 | 1 each | 2.53 s | +667 MiB |
+  | 1 workbook, before | 1 | 1 | 1.91 / 1.90 s | +210 / +209 MiB |
+  | 1 workbook, after | 4 | 4 | 1.33 / 1.30 s | +201 / +203 MiB |
+  | 4 workbooks at once, before | 1 | 1 each | 2.59 / 2.51 s | +696 / +717 MiB |
+  | 4 workbooks at once, after | 4 | 1 each | 2.53 / 2.46 s | +667 / +666 MiB |
 
   The read (calamine) stays on one thread; only the tables step is lent threads. With numbers
   only, one workbook took 0.76 s before and 0.60 s after.
