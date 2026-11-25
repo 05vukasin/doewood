@@ -114,14 +114,21 @@ every pass and the icon route on every lookup, so a change needs no restart.
   (`gleif_enabled`, `vies_enabled`, `wikidata_enabled`, `edgar_enabled`, `apr_enabled`,
   `companies_house_enabled`, all default `true`), `edgar_contact` (default empty: the generic
   User-Agent), `favicon_fallback` (default `false`) and `favicon_egress_proxy` (default
-  empty: direct). Secrets come back only as `companies_house_api_key_set`,
-  `opencorporates_api_key_set` and `apr_extra_roots_set`. `companies_house_active` is
-  `companies_house_enabled` and a key set: Companies House is asked only then.
+  empty: direct), and the registry delta feed switches (`gleif_feed_enabled`,
+  `edgar_feed_enabled`, `apr_feed_enabled`, default `true`; `companies_house_feed_enabled`,
+  default `false`). Secrets come back only as `companies_house_api_key_set`,
+  `companies_house_stream_key_set`, `opencorporates_api_key_set` and `apr_extra_roots_set`.
+  `companies_house_active` is `companies_house_enabled` and a key set: Companies House is
+  asked only then. `companies_house_feed_active` is `companies_house_feed_enabled`, a
+  streaming key set and `companies_house_active`: the stream is read only then. A feed runs
+  only while its registry is switched on too (see [enrichment.md](enrichment.md#delta-feeds)).
 - **SetEnrichmentSettings** changes them, all or nothing; an unset field keeps its value. The
   write-only fields work as `SetAiProvider`'s `api_key`: empty keeps the stored value, the
   `clear_` field deletes it, and both at once is `INVALID_ARGUMENT`.
-  - `companies_house_api_key`, `opencorporates_api_key`: 8 to 256 printable ASCII characters,
-    without spaces or `:` (surrounding white space is trimmed).
+  - `companies_house_api_key`, `companies_house_stream_key`, `opencorporates_api_key`: 8 to
+    256 printable ASCII characters, without spaces or `:` (surrounding white space is
+    trimmed). The streaming key is a key of its own: Companies House issues streaming keys
+    apart from REST keys.
   - `apr_extra_roots_pem`: a PEM bundle of at most 64 KiB whose certificates parse.
   - `edgar_contact`: at most 200 printable ASCII characters; empty goes back to the generic
     User-Agent.
@@ -142,9 +149,11 @@ every source, including ones added later.
 A watch of every source (empty `source_ids`) also carries the instance's enrichment job: a
 `KIND_ENRICHMENT` update with the first snapshot and whenever its counters change, with
 `enrichment` set (and no `progress`): `enriched`, `merged`, `proposed`, `failed`,
-`registry_warnings`, `edges`, `redirected`, `websites`, `passes`, `last_pass_completed_at` and
-`running`, counted since the instance started (see [enrichment.md](enrichment.md#progress)). A client
-that does not know the kind can skip it.
+`registry_warnings`, `edges`, `redirected`, `websites`, `passes`, `last_pass_completed_at`,
+`running`, and `feeds` (one `FeedProgress` per delta feed: `feed`, `enabled`, `leader`,
+`runs`, `records`, `companies_due`, `failures`, `last_run_at`, `position`), counted since the
+instance started (see [enrichment.md](enrichment.md#progress)). A client that does not know
+the kind can skip it.
 
 | counter | meaning |
 |---|---|
