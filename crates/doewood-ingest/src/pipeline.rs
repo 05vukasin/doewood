@@ -418,6 +418,29 @@ pub struct Stats {
     pub redirected: u64,
     /// Analyses the watchdog gave up on (their files failed; each ran on until it returned).
     pub overruns: u64,
+    /// Where the workers' time went, summed over files (issue #69).
+    pub time: StageTimes,
+}
+
+/// Time the ingest workers spent per stage, summed over all files and attempts. The stages
+/// run one after another per file, so with `jobs` workers their sum is at most `jobs` times
+/// the wall time; the rest is waiting for work.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StageTimes {
+    /// Instance-store calls: the status check, the source and settings, the final status.
+    pub store: Duration,
+    /// Fetching the object.
+    pub fetch: Duration,
+    /// Hashing and analyzing (quail, hedgehog, OCR) on blocking threads.
+    pub analyze: Duration,
+    /// Reading and writing the record in the shared store.
+    pub record: Duration,
+    /// Writing the graph and search (the company lock's wait and hold included).
+    pub graph: Duration,
+    /// Of `graph`: waiting for the instance's company-resolution lock.
+    pub company_lock_wait: Duration,
+    /// Of `graph`: holding it.
+    pub company_lock_hold: Duration,
 }
 
 /// Analyses running on blocking threads, and the bytes of their files.
@@ -716,6 +739,7 @@ impl Ingest {
             redirected = s.redirected,
             mib = s.bytes / (1 << 20),
             secs = self.inner.started.elapsed().as_secs(),
+            time = ?s.time,
             "ingest dispatcher stopped"
         );
     }
@@ -908,7 +932,10 @@ impl Ingest {
     ) {
         // Already through (a duplicate event, a stale sweep page): nothing to do.
         let (k, e) = (key.to_owned(), etag.map(str::to_owned));
-        if let Ok(Some(st)) = self.db(move |s| s.ingest_status(source, &k)).await
+        let t = Instant::now();
+        let status = self.db(move |s| s.ingest_status(source, &k)).await;
+        lock(&self.inner.stats).time.store += t.elapsed();
+        if let Ok(Some(st)) = status
             && st.etag == e
             && st.status != "pending"
         {
@@ -955,10 +982,12 @@ impl Ingest {
                 warn!(source = %source, key, attempts, error = %error, "ingest failed");
             }
             let (k, e) = (key.to_owned(), etag.map(str::to_owned));
-            if let Err(err) = self
+            let t = Instant::now();
+            let finished = self
                 .db(move |s| s.finish_object(source, &k, e.as_deref(), &outcome))
-                .await
-            {
+                .await;
+            lock(&self.inner.stats).time.store += t.elapsed();
+            if let Err(err) = finished {
                 warn!(source = %source, key, error = %err, "cannot record the ingest status");
             }
             return;
@@ -975,14 +1004,17 @@ impl Ingest {
         overruns: &mut Overruns,
     ) -> Result<Option<IngestOutcome>, IngestError> {
         // The runtime settings are read per file, so a change applies without a restart.
+        let t = Instant::now();
         let (source, settings) = self
             .db(move |s| Ok((s.source(id)?, s.ingest_settings()?)))
             .await?;
+        let mut t = self.stage(t, |s| &mut s.store);
         let Some(source) = source else {
             return Ok(None);
         };
         let bytes = self.inner.fetch.fetch(&source, key).await?;
         lock(&self.inner.stats).bytes += bytes.len() as u64;
+        t = self.stage(t, |s| &mut s.fetch);
         let location = ObjectLocation {
             endpoint: source.endpoint.clone(),
             bucket: source.bucket.clone(),
@@ -990,11 +1022,13 @@ impl Ingest {
         };
         let name = key.rsplit('/').next().unwrap_or(key).to_owned();
         let (bytes, blake3) = hash(bytes).await?;
+        t = self.stage(t, |s| &mut s.analyze);
         // Content already stored with the current step versions: reuse its record.
         let stored = backend
             .get_record(&blake3)
             .await?
             .filter(|r| !self.inner.analyzer.is_stale(&r.versions));
+        t = self.stage(t, |s| &mut s.record);
         let (body, outcome) = if let Some(r) = stored {
             let outcome = stored_outcome(&r.body);
             (r.body, outcome)
@@ -1003,7 +1037,9 @@ impl Ingest {
                 .analyze(bytes, blake3, key, charge.cloned(), overruns)
                 .await?;
             lock(&self.inner.stats).analyzed += 1;
+            t = self.stage(t, |s| &mut s.analyze);
             backend.put_record(&a.blake3, &a.body, &a.versions).await?;
+            t = self.stage(t, |s| &mut s.record);
             (a.body, a.outcome)
         };
         let facts = DocFacts::from_record(&body);
@@ -1017,9 +1053,12 @@ impl Ingest {
                 settings.similar_min_jaccard,
             )
             .await?;
-        if stats.redirects > 0 {
-            lock(&self.inner.stats).redirected +=
-                u64::try_from(stats.redirects).unwrap_or(u64::MAX);
+        self.stage(t, |s| &mut s.graph);
+        {
+            let mut s = lock(&self.inner.stats);
+            s.time.company_lock_wait += stats.company_lock_wait;
+            s.time.company_lock_hold += stats.company_lock_hold;
+            s.redirected += u64::try_from(stats.redirects).unwrap_or(u64::MAX);
         }
         debug!(
             source = %id,
@@ -1162,6 +1201,17 @@ impl Ingest {
                 _ = shutdown.wait_for(|s| *s) => return None,
             }
         }
+    }
+
+    /// Adds the time since `since` to one stage of [`Stats::time`]; returns now.
+    fn stage(
+        &self,
+        since: Instant,
+        field: impl FnOnce(&mut StageTimes) -> &mut Duration,
+    ) -> Instant {
+        let now = Instant::now();
+        *field(&mut lock(&self.inner.stats).time) += now - since;
+        now
     }
 
     /// The graph writer of this backend (one per backend, so company matching is serialized).

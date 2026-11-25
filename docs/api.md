@@ -386,6 +386,15 @@ The API's metrics are on the ops port's `/metrics` (Prometheus text format), nex
 - Cost: a few atomic operations and one small allocation per call.
 - Alerts worth setting: see [deploy.md](deploy.md#metrics-and-alerts).
 
+## Capacity
+
+Measured with `tests/api_load.rs` (issue #80) on 4 vCPU, a realistic mix of reads, streams
+included: one instance serves about 4,500 calls/s on SQLite, reached at 10 clients (the
+store's 2 read-only connections), and about 6,000 calls/s on Postgres, reached at about 100
+clients (the pool of 16 connections). Beyond `max_calls_in_flight` the server sheds and the
+calls it takes keep their latency. An idle connection costs about 13.5 KiB. Numbers, method and
+caveats: [deploy.md](deploy.md#api-under-many-clients-issue-80).
+
 ## Examples with grpcurl
 
 Reflection is on, so `grpcurl` needs no `.proto` files. `-plaintext`: the API speaks
@@ -665,5 +674,6 @@ page took 471 ms before and 69 ms after, with the same results.
 the happy paths, validation errors, two instances sharing one backend (the claim conflict),
 secrets never coming back (SQS inlet credentials included), the progress stream, a gRPC-Web
 request over HTTP/1.1, health, reflection and the message limit. `tests/icons.rs` checks the icon route's answers and
-headers with a fake resolver. With `DOEWOOD_TEST_POSTGRES_URL` set, the claim, records,
+headers with a fake resolver. `tests/api_load.rs` (ignored) is the load benchmark (see
+[Capacity](#capacity)). With `DOEWOOD_TEST_POSTGRES_URL` set, the claim, records,
 graph, merge-log and search tests also run against Postgres.
