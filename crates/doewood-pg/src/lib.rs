@@ -16,6 +16,7 @@
 
 mod backend;
 mod enrichment;
+mod merges;
 mod migrate;
 #[cfg(test)]
 mod tests;

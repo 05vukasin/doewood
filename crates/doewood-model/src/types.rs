@@ -349,6 +349,28 @@ text_enum!(
     }
 );
 
+text_enum!(
+    /// Who merged or split companies (ADR 0002 section 1.8).
+    MergeActorKind, "merge actor" {
+        /// Ingest's company matching.
+        Ingest = "ingest",
+        /// The enrichment job (registries).
+        Enrichment = "enrichment",
+        /// A person, through the API.
+        Manual = "manual",
+    }
+);
+
+text_enum!(
+    /// What a merge log entry did.
+    MergeOp, "merge operation" {
+        /// One company absorbed another.
+        Merge = "merge",
+        /// One company was split in two.
+        Split = "split",
+    }
+);
+
 impl EdgeState {
     /// Whether neighbour queries return the edge by default: everything but retracted and
     /// superseded.

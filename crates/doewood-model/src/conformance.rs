@@ -13,9 +13,11 @@ use time::{Date, Month};
 use uuid::Uuid;
 
 use crate::{
-    Backend, Blake3, CACHE_KEY_MAX_LEN, CACHE_MAX_BODY, CacheRow, Direction, DueCompany, DueReason,
-    Edge, EdgeKind, EdgeSource, EdgeState, Error, IconRow, NeighbourQuery, NodeKind,
-    ObjectLocation, PutOutcome, SearchDoc, SearchQuery, SourceKey, StepVersions, StoredIcon,
+    Backend, Blake3, CACHE_KEY_MAX_LEN, CACHE_MAX_BODY, CacheRow, Direction, DismissRequest,
+    DismissalQuery, DueCompany, DueReason, Edge, EdgeKind, EdgeSource, EdgeState, Error, IconRow,
+    MergeActor, MergeActorKind, MergeOp, MergeQuery, MergeRequest, NeighbourQuery, Node, NodeKind,
+    ObjectLocation, OwnedAlias, PutOutcome, SearchDoc, SearchQuery, SourceKey, SplitRequest,
+    StepVersions, StoredEdge, StoredIcon, UndoRequest, merged_into,
 };
 
 /// Runs every check.
@@ -37,6 +39,7 @@ pub async fn run<B: Backend + ?Sized>(a: &B, b: &B) {
     search(a).await;
     caches(a, b).await;
     freshness(a, b).await;
+    merges(a).await;
     a.ping().await.expect("ping");
 }
 
@@ -1249,4 +1252,487 @@ pub async fn freshness<B: Backend + ?Sized>(a: &B, b: &B) {
         Err(Error::Invalid(_))
     ));
     assert_eq!(a.enrichment(doc).await.unwrap(), None);
+}
+
+/// The graph state around some nodes: the nodes, every edge at them (any state), and the
+/// aliases they own. What an undo must restore exactly.
+type Snapshot = (Vec<Option<Node>>, Vec<StoredEdge>, Vec<Vec<OwnedAlias>>);
+
+async fn snapshot<B: Backend + ?Sized>(s: &B, nodes: &[Uuid]) -> Snapshot {
+    let mut out_nodes = Vec::new();
+    let mut edges = std::collections::BTreeMap::new();
+    let mut aliases = Vec::new();
+    let all = NeighbourQuery {
+        include_inactive: true,
+        ..NeighbourQuery::default()
+    };
+    for n in nodes {
+        out_nodes.push(s.node(*n).await.unwrap());
+        for nb in s.neighbours(*n, &all).await.unwrap() {
+            edges.insert(nb.edge.id, nb.edge);
+        }
+        aliases.push(s.aliases_of(*n).await.unwrap());
+    }
+    (out_nodes, edges.into_values().collect(), aliases)
+}
+
+fn actor(kind: MergeActorKind) -> MergeActor {
+    MergeActor {
+        kind,
+        instance: instance("inst-a"),
+    }
+}
+
+fn merge_req(survivor: Uuid, absorbed: Uuid, kind: MergeActorKind) -> MergeRequest {
+    MergeRequest {
+        survivor,
+        absorbed,
+        actor: actor(kind),
+        evidence: json!([{"source": "registry_id", "alias": "id:rs_pib:100000001"}]),
+        confidence: 0.9,
+        probability: 0.995,
+    }
+}
+
+fn undo_req(merge: Uuid, cascade: bool, dismiss: bool) -> UndoRequest {
+    UndoRequest {
+        merge,
+        actor: actor(MergeActorKind::Manual),
+        cascade,
+        dismiss,
+        reason: "not the same company".to_owned(),
+    }
+}
+
+fn precondition<T: std::fmt::Debug>(r: crate::Result<T>, says: &str) {
+    match r {
+        Err(Error::Precondition(m)) => assert!(m.contains(says), "{m:?} lacks {says:?}"),
+        other => panic!("expected a precondition failure ({says}), got {other:?}"),
+    }
+}
+
+/// Merges, the log, undo (exact), later merges, cascade, split and its undo, dismissals.
+///
+/// # Panics
+///
+/// When the backend misbehaves.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+pub async fn merges<B: Backend + ?Sized>(s: &B) {
+    let company = |key: &'static str, props: serde_json::Value| async move {
+        s.upsert_node(NodeKind::Company, key, &props).await.unwrap()
+    };
+    let survivor = company("m-survivor", json!({"name": "ACME", "names": ["ACME"]})).await;
+    let absorbed = company(
+        "m-absorbed",
+        json!({"name": "Acme d.o.o.", "names": ["Acme d.o.o."], "legal_form": "doo",
+               "ids": {"rs_pib": ["100000001"]}}),
+    )
+    .await;
+    let parent = company("m-parent", json!({"name": "Holding"})).await;
+    let doc = |n: u8| async move {
+        s.upsert_node(NodeKind::Document, &hash(n).to_hex(), &json!({}))
+            .await
+            .unwrap()
+    };
+    let (d1, d2, d3) = (doc(201).await, doc(202).await, doc(203).await);
+    let party = |d: Uuid, c: Uuid, role: &str| {
+        Edge::new(d, c, EdgeKind::Party, EdgeSource::Document)
+            .with_props(json!({"role": role}))
+            .with_confidence(0.8)
+    };
+    s.upsert_edge(&party(d1, absorbed, "buyer")).await.unwrap();
+    s.upsert_edge(&party(d2, survivor, "supplier"))
+        .await
+        .unwrap();
+    // The same document at both: after the merge this one is superseded, not moved.
+    let twin = s.upsert_edge(&party(d2, absorbed, "buyer")).await.unwrap();
+    s.upsert_edge(&party(d3, absorbed, "buyer").with_state(EdgeState::Retracted))
+        .await
+        .unwrap();
+    s.upsert_edge(
+        &Edge::new(parent, absorbed, EdgeKind::ParentOf, EdgeSource::Registry)
+            .valid(Some(day(2020, 1, 1)), None)
+            .with_evidence(json!([{"registry": "apr", "record": "1"}])),
+    )
+    .await
+    .unwrap();
+    // Between the two: stays where it is.
+    let between = s
+        .upsert_edge(&Edge::new(
+            absorbed,
+            survivor,
+            EdgeKind::TradingNameOf,
+            EdgeSource::Document,
+        ))
+        .await
+        .unwrap();
+    for (alias, node) in [
+        ("id:rs_pib:100000001", absorbed),
+        ("name:acme|doo", absorbed),
+        ("id:lei:5493001KJTIIGC8Y1R12", survivor),
+    ] {
+        s.claim_alias(NodeKind::Company, alias, node, &json!({"step": "test"}))
+            .await
+            .unwrap();
+    }
+    let nodes = [survivor, absorbed, parent, d1, d2, d3];
+    let before = snapshot(s, &nodes).await;
+
+    // Bad requests.
+    let r = s
+        .merge_companies(&merge_req(survivor, survivor, MergeActorKind::Manual))
+        .await;
+    assert!(matches!(r, Err(Error::Invalid(_))), "{r:?}");
+    let r = s
+        .merge_companies(&merge_req(survivor, d1, MergeActorKind::Manual))
+        .await;
+    assert!(matches!(r, Err(Error::Invalid(_))), "{r:?}");
+    let r = s
+        .merge_companies(&merge_req(survivor, Uuid::now_v7(), MergeActorKind::Manual))
+        .await;
+    assert!(matches!(r, Err(Error::NotFound(_))), "{r:?}");
+
+    // Merge: logged, aliases and edges moved, the absorbed node a husk.
+    let m = s
+        .merge_companies(&merge_req(survivor, absorbed, MergeActorKind::Ingest))
+        .await
+        .unwrap();
+    assert_eq!(m.op, MergeOp::Merge);
+    assert_eq!((m.survivor, m.absorbed), (survivor, absorbed));
+    assert_eq!(m.actor, actor(MergeActorKind::Ingest));
+    assert!((m.probability - 0.995).abs() < 1e-6 && (m.confidence - 0.9).abs() < 1e-6);
+    assert_eq!(m.evidence[0]["source"], "registry_id");
+    assert!(m.undone.is_none() && m.at > 1_700_000_000);
+    assert_eq!(s.merge_entry(m.id).await.unwrap().as_ref(), Some(&m));
+    let listed = s
+        .list_merges(&MergeQuery {
+            company: Some(absorbed),
+            ..MergeQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(listed, std::slice::from_ref(&m));
+    assert_eq!(
+        s.alias(NodeKind::Company, "id:rs_pib:100000001")
+            .await
+            .unwrap()
+            .unwrap()
+            .node,
+        Some(survivor)
+    );
+    assert!(s.aliases_of(absorbed).await.unwrap().is_empty());
+    assert_eq!(s.aliases_of(survivor).await.unwrap().len(), 3);
+    let docs: Vec<Uuid> = s
+        .company_documents(survivor)
+        .await
+        .unwrap()
+        .iter()
+        .map(|n| n.id)
+        .collect();
+    assert_eq!(docs.len(), 2);
+    assert!(docs.contains(&d1) && docs.contains(&d2));
+    assert!(s.company_documents(absorbed).await.unwrap().is_empty());
+    let husk = s.node(absorbed).await.unwrap().unwrap();
+    assert_eq!(merged_into(&husk), Some(survivor));
+    let folded = s.node(survivor).await.unwrap().unwrap().props;
+    assert_eq!(folded["names"], json!(["ACME", "Acme d.o.o."]));
+    assert_eq!(folded["ids"]["rs_pib"], json!(["100000001"]));
+    assert_eq!(folded["legal_form"], "doo");
+    assert_eq!(folded["name"], "ACME");
+    let at_absorbed = s
+        .neighbours(
+            absorbed,
+            &NeighbourQuery {
+                include_inactive: true,
+                ..NeighbourQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+    let ids: BTreeSet<Uuid> = at_absorbed.iter().map(|n| n.edge.id).collect();
+    assert_eq!(ids, BTreeSet::from([twin, between]));
+    assert!(
+        at_absorbed
+            .iter()
+            .any(|n| n.edge.id == twin && n.edge.edge.state == EdgeState::Superseded)
+    );
+    precondition(
+        s.merge_companies(&merge_req(survivor, absorbed, MergeActorKind::Manual))
+            .await,
+        "merged into",
+    );
+
+    // Undo restores the graph exactly.
+    let out = s.undo_merge(&undo_req(m.id, false, false)).await.unwrap();
+    assert_eq!(out.undone, [m.id]);
+    assert!(out.skipped.is_empty(), "{:?}", out.skipped);
+    assert!(out.dismissal.is_none());
+    assert_eq!(snapshot(s, &nodes).await, before);
+    let undone = s.merge_entry(m.id).await.unwrap().unwrap();
+    assert_eq!(
+        undone.undone.map(|u| u.actor),
+        Some(actor(MergeActorKind::Manual))
+    );
+    precondition(
+        s.undo_merge(&undo_req(m.id, false, false)).await,
+        "already undone",
+    );
+    let r = s.undo_merge(&undo_req(Uuid::now_v7(), false, false)).await;
+    assert!(matches!(r, Err(Error::NotFound(_))), "{r:?}");
+
+    // A later merge involving the same companies: refused, or cascaded newest first.
+    let top = company("m-top", json!({"name": "Top"})).await;
+    let mut nodes2 = nodes.to_vec();
+    nodes2.push(top);
+    let before2 = snapshot(s, &nodes2).await;
+    let m1 = s
+        .merge_companies(&merge_req(survivor, absorbed, MergeActorKind::Enrichment))
+        .await
+        .unwrap();
+    let m2 = s
+        .merge_companies(&merge_req(top, survivor, MergeActorKind::Manual))
+        .await
+        .unwrap();
+    assert!(m2.seq > m1.seq);
+    assert_eq!(
+        s.alias(NodeKind::Company, "name:acme|doo")
+            .await
+            .unwrap()
+            .unwrap()
+            .node,
+        Some(top)
+    );
+    precondition(
+        s.undo_merge(&undo_req(m1.id, false, false)).await,
+        &m2.id.to_string(),
+    );
+    // The refusal changed nothing.
+    assert!(
+        s.merge_entry(m2.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .undone
+            .is_none()
+    );
+    let out = s.undo_merge(&undo_req(m1.id, true, false)).await.unwrap();
+    assert_eq!(out.undone, [m2.id, m1.id]);
+    assert_eq!(snapshot(s, &nodes2).await, before2);
+    // Newest first, with paging.
+    let page = s
+        .list_merges(&MergeQuery {
+            company: Some(survivor),
+            before: None,
+            limit: 2,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        page.iter().map(|e| e.id).collect::<Vec<_>>(),
+        [m2.id, m1.id]
+    );
+    assert!(page.iter().all(|e| e.undone.is_some()));
+    let rest = s
+        .list_merges(&MergeQuery {
+            company: Some(survivor),
+            before: Some(page[1].seq),
+            limit: 2,
+        })
+        .await
+        .unwrap();
+    assert_eq!(rest.iter().map(|e| e.id).collect::<Vec<_>>(), [m.id]);
+
+    // Split: a new company takes an alias and a document; its undo restores the company.
+    let before_split = snapshot(s, &nodes).await;
+    let r = s
+        .split_company(&SplitRequest {
+            company: survivor,
+            key: None,
+            props: json!({}),
+            aliases: vec!["name:acme|doo".to_owned()],
+            documents: vec![],
+            edges: vec![],
+            actor: actor(MergeActorKind::Manual),
+            evidence: json!([]),
+            dismiss: false,
+        })
+        .await;
+    assert!(
+        matches!(r, Err(Error::Invalid(_))),
+        "not survivor's alias: {r:?}"
+    );
+    let r = s
+        .split_company(&SplitRequest {
+            company: survivor,
+            key: None,
+            props: json!({}),
+            aliases: vec![],
+            documents: vec![d1],
+            edges: vec![],
+            actor: actor(MergeActorKind::Manual),
+            evidence: json!([]),
+            dismiss: false,
+        })
+        .await;
+    assert!(matches!(r, Err(Error::Invalid(_))), "no party edge: {r:?}");
+    assert_eq!(
+        snapshot(s, &nodes).await,
+        before_split,
+        "a refused split is a no-op"
+    );
+    let sp = s
+        .split_company(&SplitRequest {
+            company: survivor,
+            key: Some("m-split-off".to_owned()),
+            props: json!({"name": "ACME Trading"}),
+            aliases: vec!["id:lei:5493001KJTIIGC8Y1R12".to_owned()],
+            documents: vec![d2],
+            edges: vec![],
+            actor: actor(MergeActorKind::Manual),
+            evidence: json!([{"note": "two companies share a name"}]),
+            dismiss: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(sp.op, MergeOp::Split);
+    let new = sp.absorbed;
+    let node = s.node(new).await.unwrap().unwrap();
+    assert_eq!(node.key, "m-split-off");
+    assert_eq!(node.props["name"], "ACME Trading");
+    assert_eq!(node.props["split_from"], survivor.to_string());
+    assert_eq!(
+        s.company_documents(new)
+            .await
+            .unwrap()
+            .iter()
+            .map(|n| n.id)
+            .collect::<Vec<_>>(),
+        [d2]
+    );
+    assert!(s.company_documents(survivor).await.unwrap().is_empty());
+    assert_eq!(
+        s.alias(NodeKind::Company, "id:lei:5493001KJTIIGC8Y1R12")
+            .await
+            .unwrap()
+            .unwrap()
+            .node,
+        Some(new)
+    );
+    let out = s.undo_merge(&undo_req(sp.id, false, false)).await.unwrap();
+    assert_eq!(out.undone, [sp.id]);
+    assert_eq!(snapshot(s, &nodes).await, before_split);
+    assert!(
+        s.node(new).await.unwrap().is_none(),
+        "the empty split-off is gone"
+    );
+
+    // Dismissals: both directions, permanent, and they block merges between the groups.
+    let (p, q, r) = (
+        company("m-p", json!({})).await,
+        company("m-q", json!({})).await,
+        company("m-r", json!({})).await,
+    );
+    let dis = |a: Uuid, b: Uuid| DismissRequest {
+        a,
+        b,
+        actor: actor(MergeActorKind::Manual),
+        reason: "different companies".to_owned(),
+    };
+    let d = s.dismiss_pair(&dis(q, p)).await.unwrap();
+    assert_eq!((d.a, d.b), (p.min(q), p.max(q)));
+    assert_eq!(d.reason, "different companies");
+    assert_eq!(
+        s.dismiss_pair(&dis(p, q)).await.unwrap(),
+        d,
+        "first one kept"
+    );
+    assert_eq!(s.dismissal(p, q).await.unwrap().as_ref(), Some(&d));
+    assert_eq!(s.dismissal(q, p).await.unwrap().as_ref(), Some(&d));
+    assert_eq!(s.dismissal(p, r).await.unwrap(), None);
+    precondition(
+        s.merge_companies(&merge_req(p, q, MergeActorKind::Ingest))
+            .await,
+        "dismissed",
+    );
+    precondition(
+        s.merge_companies(&merge_req(q, p, MergeActorKind::Enrichment))
+            .await,
+        "dismissed",
+    );
+    // Through a group: q merged into r keeps p away from r.
+    let qr = s
+        .merge_companies(&merge_req(r, q, MergeActorKind::Manual))
+        .await
+        .unwrap();
+    assert_eq!(s.dismissal(p, r).await.unwrap().as_ref(), Some(&d));
+    precondition(
+        s.merge_companies(&merge_req(r, p, MergeActorKind::Ingest))
+            .await,
+        "dismissed",
+    );
+    precondition(s.dismiss_pair(&dis(q, r)).await, "merged now");
+    let r_self = s.dismiss_pair(&dis(p, p)).await;
+    assert!(matches!(r_self, Err(Error::Invalid(_))), "{r_self:?}");
+    // Undo with dismiss: the pair never merges again.
+    let out = s.undo_merge(&undo_req(qr.id, false, true)).await.unwrap();
+    let rd = out.dismissal.expect("dismissal recorded");
+    assert_eq!(rd.merge, Some(qr.id));
+    assert_eq!((rd.a, rd.b), (q.min(r), q.max(r)));
+    precondition(
+        s.merge_companies(&merge_req(r, q, MergeActorKind::Ingest))
+            .await,
+        "dismissed",
+    );
+    let listed = s
+        .list_dismissals(&DismissalQuery {
+            company: Some(q),
+            ..DismissalQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(listed, [rd.clone(), d.clone()], "newest first");
+    let page = s
+        .list_dismissals(&DismissalQuery {
+            company: Some(q),
+            before: Some(rd.seq),
+            limit: 1,
+        })
+        .await
+        .unwrap();
+    assert_eq!(page, [d]);
+    // A split that dismisses: its undo is refused, the dismissal is permanent.
+    let lone = s
+        .upsert_node(NodeKind::Company, "m-lone", &json!({}))
+        .await
+        .unwrap();
+    s.claim_alias(NodeKind::Company, "m-lone-alias", lone, &json!({}))
+        .await
+        .unwrap();
+    let sp2 = s
+        .split_company(&SplitRequest {
+            company: lone,
+            key: None,
+            props: json!({}),
+            aliases: vec!["m-lone-alias".to_owned()],
+            documents: vec![],
+            edges: vec![],
+            actor: actor(MergeActorKind::Manual),
+            evidence: json!([]),
+            dismiss: true,
+        })
+        .await
+        .unwrap();
+    assert!(s.dismissal(lone, sp2.absorbed).await.unwrap().is_some());
+    assert!(
+        s.node(sp2.absorbed)
+            .await
+            .unwrap()
+            .unwrap()
+            .key
+            .starts_with("split:")
+    );
+    precondition(
+        s.undo_merge(&undo_req(sp2.id, false, false)).await,
+        "dismissed",
+    );
 }

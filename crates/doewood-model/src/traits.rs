@@ -12,9 +12,11 @@ use time::Date;
 use uuid::Uuid;
 
 use crate::{
-    Blake3, CacheRow, DueCompany, Edge, Enrichment, IconRow, Located, LocationEnded, Neighbour,
-    NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation, PutOutcome, Record, Result,
-    SearchDoc, SearchHit, SearchQuery, Sketch, SourceClaim, SourceKey, StepVersions,
+    Blake3, CacheRow, DismissRequest, Dismissal, DismissalQuery, DueCompany, Edge, Enrichment,
+    IconRow, Located, LocationEnded, MergeEntry, MergeQuery, MergeRequest, Neighbour,
+    NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PutOutcome, Record,
+    Result, SearchDoc, SearchHit, SearchQuery, Sketch, SourceClaim, SourceKey, SplitRequest,
+    StepVersions, UndoOutcome, UndoRequest,
 };
 
 /// quail and hedgehog records, keyed by BLAKE3.
@@ -100,6 +102,46 @@ pub trait GraphStore: Send + Sync {
     /// Blocks an alias: it resolves to no node from now on (a key that turned out to belong
     /// to more than one), with `props` saying why.
     async fn block_alias(&self, kind: NodeKind, alias: &str, props: &Value) -> Result<()>;
+
+    /// The aliases `node` owns, ordered by kind, then alias.
+    async fn aliases_of(&self, node: Uuid) -> Result<Vec<OwnedAlias>>;
+}
+
+/// Reversible company merges (ADR 0002 section 1.8): the merge log, undo and split, and
+/// permanent dismissals. Each write is one transaction; see [`crate::merge`] for the rules.
+#[async_trait]
+pub trait MergeStore: Send + Sync {
+    /// Merges `absorbed` into `survivor` and logs it, atomically. Fails with
+    /// [`crate::Error::Precondition`] when either company was merged away already or the
+    /// pair (or a company merged into either) is dismissed.
+    async fn merge_companies(&self, req: &MergeRequest) -> Result<MergeEntry>;
+
+    /// Splits a company in two and logs it, atomically. The entry's `absorbed` is the new
+    /// company.
+    async fn split_company(&self, req: &SplitRequest) -> Result<MergeEntry>;
+
+    /// Undoes a merge or split from its undo payload. Later live entries involving the same
+    /// companies make it fail with [`crate::Error::Precondition`] listing them, unless
+    /// `cascade` is set: then they are undone first, newest first.
+    async fn undo_merge(&self, req: &UndoRequest) -> Result<UndoOutcome>;
+
+    /// A log entry.
+    async fn merge_entry(&self, id: Uuid) -> Result<Option<MergeEntry>>;
+
+    /// A page of the log, newest first.
+    async fn list_merges(&self, query: &MergeQuery) -> Result<Vec<MergeEntry>>;
+
+    /// Records a permanent "not the same" pair (both directions). Dismissing a pair again
+    /// returns the first dismissal. Two companies merged now are refused: undo the merge with
+    /// `dismiss` instead.
+    async fn dismiss_pair(&self, req: &DismissRequest) -> Result<Dismissal>;
+
+    /// The dismissal that keeps `a` and `b` apart, if any: between them, or between companies
+    /// merged into them. The enrichment gate asks this before every merge.
+    async fn dismissal(&self, a: Uuid, b: Uuid) -> Result<Option<Dismissal>>;
+
+    /// A page of dismissals, newest first.
+    async fn list_dismissals(&self, query: &DismissalQuery) -> Result<Vec<Dismissal>>;
 }
 
 /// The `MinHash` LSH band index behind `similar_to` edges: candidates come from a lookup by
@@ -215,7 +257,14 @@ pub trait FreshnessStore: Send + Sync {
 /// A complete backend: everything the service needs from its store.
 #[async_trait]
 pub trait Backend:
-    RecordStore + GraphStore + ClaimStore + SearchStore + SketchStore + CacheStore + FreshnessStore
+    RecordStore
+    + GraphStore
+    + ClaimStore
+    + SearchStore
+    + SketchStore
+    + CacheStore
+    + FreshnessStore
+    + MergeStore
 {
     /// `postgres` or `sqlite`.
     fn name(&self) -> &'static str;

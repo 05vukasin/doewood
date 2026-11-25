@@ -23,6 +23,10 @@ pub enum Error {
     /// Something the operation refers to does not exist (an edge to an unknown node, ...).
     #[error("not found: {0}")]
     NotFound(String),
+    /// The store's state does not allow the operation: a dismissed pair, a merge that later
+    /// merges depend on, an entry already undone. The message says what to do instead.
+    #[error("{0}")]
+    Precondition(String),
     /// The backend cannot be reached right now; the operation may succeed later.
     #[error("store unavailable: {0}")]
     Unavailable(String),

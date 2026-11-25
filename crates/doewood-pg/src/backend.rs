@@ -9,10 +9,10 @@ use doewood_core::InstanceId;
 use doewood_model::{
     Backend, Blake3, ClaimStore, Direction, Edge, EdgeKind, EdgeSource, Error, GraphStore, Located,
     LocationEnded, Neighbour, NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation,
-    PutOutcome, Record, RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery,
-    SearchStore, Sketch, SketchStore, SourceClaim, SourceKey, StepVersions, StoredEdge,
-    band_to_i64, records_limit, sketch_limit, validate_alias, validate_node, validate_sketch,
-    versions_from_json, versions_to_json,
+    OwnedAlias, PutOutcome, Record, RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit,
+    SearchQuery, SearchStore, Sketch, SketchStore, SourceClaim, SourceKey, StepVersions,
+    StoredEdge, band_to_i64, records_limit, sketch_limit, validate_alias, validate_node,
+    validate_sketch, versions_from_json, versions_to_json,
 };
 use serde_json::Value;
 use time::Date;
@@ -78,7 +78,7 @@ pub(crate) fn bad(what: &str, e: impl std::fmt::Display) -> Error {
     }
 }
 
-fn parse<T: std::str::FromStr<Err = Error>>(text: &str) -> Result<T> {
+pub(crate) fn parse<T: std::str::FromStr<Err = Error>>(text: &str) -> Result<T> {
     text.parse().map_err(|e: Error| bad("value", e))
 }
 
@@ -101,9 +101,9 @@ impl Args {
     }
 }
 
-const NODE_COLUMNS: &str = "n.id, n.kind, n.key, n.props";
+pub(crate) const NODE_COLUMNS: &str = "n.id, n.kind, n.key, n.props";
 
-fn node_at(row: &Row, at: usize) -> Result<Node> {
+pub(crate) fn node_at(row: &Row, at: usize) -> Result<Node> {
     Ok(Node {
         id: row.try_get(at).map_err(pg)?,
         kind: parse(row.try_get::<_, &str>(at + 1).map_err(pg)?)?,
@@ -112,10 +112,10 @@ fn node_at(row: &Row, at: usize) -> Result<Node> {
     })
 }
 
-const EDGE_COLUMNS: &str = "e.id, e.src, e.dst, e.kind, e.props, e.evidence, e.confidence, \
+pub(crate) const EDGE_COLUMNS: &str = "e.id, e.src, e.dst, e.kind, e.props, e.evidence, e.confidence, \
      e.state, e.valid_from, e.valid_to, e.source";
 
-fn edge_at(row: &Row) -> Result<StoredEdge> {
+pub(crate) fn edge_at(row: &Row) -> Result<StoredEdge> {
     let get_text = |i| row.try_get::<_, &str>(i).map_err(pg);
     Ok(StoredEdge {
         id: row.try_get(0).map_err(pg)?,
@@ -546,6 +546,10 @@ impl GraphStore for PgStore {
         .await
         .map_err(pg)?;
         Ok(())
+    }
+
+    async fn aliases_of(&self, node: Uuid) -> Result<Vec<OwnedAlias>> {
+        crate::merges::aliases_of(&**client(&self.pool).await?, node).await
     }
 }
 
