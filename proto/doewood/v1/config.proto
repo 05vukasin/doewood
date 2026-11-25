@@ -29,6 +29,12 @@ service ConfigService {
   // Sets which documents of a source get an LLM summary. Applies to documents queued from now
   // on, and to waiting ones: a queued document the new policy does not ask for is skipped.
   rpc SetLlmPolicy(SetLlmPolicyRequest) returns (Source);
+  // Sets a source's SQS event inlet: the queue S3 sends the bucket's event notifications to,
+  // directly or through SNS. The inlet polls while the source is scanned, next to its scanner
+  // (the periodic scan still runs). A change applies at once, without a restart.
+  rpc SetSqsInlet(SetSqsInletRequest) returns (Source);
+  // Removes a source's SQS inlet and its credentials. Removing a source removes its inlet.
+  rpc RemoveSqsInlet(RemoveSqsInletRequest) returns (Source);
   // Adds or replaces an AI provider. The LLM queue uses the default provider. For bedrock the
   // base URL is required, `https://bedrock-runtime.<region>.amazonaws.com`: the region is read
   // from it.
@@ -147,6 +153,62 @@ message Source {
   // Unix seconds.
   int64 created_at = 15;
   int64 updated_at = 16;
+  // Its SQS event inlet; unset when it has none.
+  SqsInlet sqs_inlet = 17;
+}
+
+// A source's SQS event inlet.
+message SqsInlet {
+  string queue_url = 1;
+  // The signing region in use.
+  string region = 2;
+  // Whether it polls (while the source is scanned).
+  bool enabled = 3;
+  // Whether the inlet has credentials of its own; without, it signs with the source's. The
+  // credentials themselves are never returned.
+  bool credentials_set = 4;
+  // Whether its task runs now on this instance.
+  bool running = 5;
+  // Counters since the inlet last started on this instance.
+  // Messages received from the queue.
+  uint64 messages_received = 6;
+  // Messages deleted from it: handed off, ignored, test events and malformed ones.
+  uint64 messages_deleted = 7;
+  // Discovery events sent (`new`, `changed`, `deleted`).
+  uint64 events_emitted = 8;
+  // Notification records ignored: another bucket, outside the prefix, already seen.
+  uint64 records_ignored = 9;
+  // `s3:TestEvent` messages.
+  uint64 test_events = 10;
+  // Messages that were not S3 event notifications (deleted after a warning).
+  uint64 malformed_messages = 11;
+  // Failed queue requests and hand-offs.
+  uint64 errors = 12;
+  // The last failure; empty when none. Never carries a credential.
+  string last_error = 13;
+  // When it happened, Unix seconds; 0 when none.
+  int64 last_error_at = 14;
+}
+
+message SetSqsInletRequest {
+  string source_id = 1;
+  // The queue URL as SQS shows it: `https://sqs.<region>.amazonaws.com/<account>/<queue>`
+  // (`http(s)://host[:port]/<account>/<queue>` for an SQS-compatible server), without
+  // credentials, query or fragment.
+  string queue_url = 2;
+  // Signing region; empty means the region of an AWS queue URL, else `us-east-1`.
+  string region = 3;
+  // Store the inlet without polling (off).
+  bool disabled = 4;
+  // WRITE-ONLY. Credentials for the queue only, sealed with the master key. Unset keeps the
+  // stored ones; with none stored the inlet signs with the source's credentials.
+  S3Credentials credentials = 5;
+  // Deletes the inlet's own credentials: it then signs with the source's.
+  bool clear_credentials = 6;
+}
+
+message RemoveSqsInletRequest {
+  string source_id = 1;
 }
 
 message UpdateSourceRequest {

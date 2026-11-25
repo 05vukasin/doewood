@@ -151,10 +151,6 @@ impl ApiState {
         }
     }
 
-    pub(crate) fn running(&self, id: SourceId) -> bool {
-        self.discovery().is_some_and(|d| d.is_running(id))
-    }
-
     /// Runs a store call on a blocking thread.
     pub(crate) async fn db<T: Send + 'static>(
         &self,
@@ -175,6 +171,14 @@ impl ApiState {
     }
 
     pub(crate) fn source_pb(&self, s: &Source) -> pb::Source {
-        convert::source(s, self.instance(), self.running(s.id))
+        let running = self
+            .discovery()
+            .map(|d| convert::Running {
+                scanner: d.is_running(s.id),
+                inlet: d.is_inlet_running(s.id),
+                inlet_stats: d.inlet_stats(s.id),
+            })
+            .unwrap_or_default();
+        convert::source(s, self.instance(), running)
     }
 }
