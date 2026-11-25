@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 
 use doewood_enrich::{CompanyName, normalize};
-use doewood_model::{Backend, Blake3, NodeKind, Result};
+use doewood_model::{Backend, Blake3, NodeKind, PropsPatch, Result};
 use doewood_registry::favicon::{
     Domain, Fallback, GuardedClient, MAX_PAGE_BYTES, Oversize, SiteOrigin,
 };
@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use tracing::{debug, info};
 use url::Url;
 
-use super::company::{Findings, Job, props_map};
+use super::company::{Findings, Job};
 use super::subject::{Subject, domain_alias};
 use super::write::live_id;
 
@@ -130,24 +130,23 @@ pub(crate) async fn run(job: &Job<'_>, s: &Subject, f: &Findings) -> Result<bool
             }
             None => Value::Null,
         };
-        let Some(node) = b.node(me).await? else {
+        // Only the job's two keys, atomically (issue #51).
+        let patch = PropsPatch::new()
+            .set(
+                &["website"],
+                json!({
+                    "domain": domain,
+                    "url": format!("https://{domain}/"),
+                    "source": source,
+                    "matched": matched,
+                    "page": page.as_str(),
+                    "verified_at": super::unix_now(),
+                }),
+            )
+            .set(&["icon"], icon);
+        if b.update_props(me, &patch).await?.is_none() {
             return Ok(false);
-        };
-        let mut props = props_map(&node.props);
-        props.insert(
-            "website".into(),
-            json!({
-                "domain": domain,
-                "url": format!("https://{domain}/"),
-                "source": source,
-                "matched": matched,
-                "page": page.as_str(),
-                "verified_at": super::unix_now(),
-            }),
-        );
-        props.insert("icon".into(), icon);
-        b.upsert_node(NodeKind::Company, &node.key, &Value::Object(props))
-            .await?;
+        }
         info!(company = %me, %domain, source, matched, "website verified");
         return Ok(true);
     }

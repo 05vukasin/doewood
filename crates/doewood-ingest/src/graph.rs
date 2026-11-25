@@ -27,9 +27,9 @@ use std::sync::Arc;
 
 use doewood_model::{
     Backend, Blake3, Direction, Edge, EdgeKind, EdgeSource, EdgeState, NeighbourQuery, NodeKind,
-    ObjectLocation, PENDING_REF_PREFIX, Result, SearchDoc, merged_into,
+    ObjectLocation, PENDING_REF_PREFIX, PropsPatch, Result, SearchDoc, merged_into,
 };
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -140,17 +140,13 @@ impl GraphWriter {
         let hex = blake3.to_hex();
         let doc = b.upsert_location(blake3, location).await?.document;
         let title = facts.title.clone().unwrap_or_else(|| name.to_owned());
-        b.upsert_node(
-            NodeKind::Document,
-            &hex,
-            &json!({
-                "format": facts.format,
-                "title": title,
-                "kind": facts.kind,
-                "numbers": facts.numbers,
-            }),
-        )
-        .await?;
+        // Only this document's own keys: whatever else is on the node stays.
+        let patch = PropsPatch::new()
+            .set(&["format"], json!(facts.format))
+            .set(&["title"], json!(title))
+            .set(&["kind"], json!(facts.kind))
+            .set(&["numbers"], json!(facts.numbers));
+        b.update_props(doc, &patch).await?;
         let mut stats = WriteStats::default();
         self.numbers(doc, &hex, facts, &mut stats).await?;
         self.parties(doc, &hex, facts, &mut stats).await?;
@@ -521,13 +517,9 @@ impl GraphWriter {
                 false,
             ));
         }
-        let id = b
-            .upsert_node(
-                NodeKind::Company,
-                &key,
-                &json!({"name": name.original, "key": name.key, "legal_form": name.legal_form}),
-            )
-            .await?;
+        // Created empty: a company another writer created with the same key at the same
+        // moment keeps its props. `update_company` fills in the name.
+        let id = b.ensure_node(NodeKind::Company, &key).await?;
         Ok((
             Match {
                 company: id,
@@ -617,7 +609,9 @@ impl GraphWriter {
         Ok(())
     }
 
-    /// Merges what this party says into the company's props.
+    /// Merges what this party says into the company's props, as one atomic patch of the
+    /// keys ingest keeps (issue #51): the enrichment job's keys, and what another document
+    /// wrote at the same moment, stay.
     async fn update_company(
         &self,
         m: &Match,
@@ -625,58 +619,22 @@ impl GraphWriter {
         p: &Party,
         hex: &str,
     ) -> Result<()> {
-        let b = &self.backend;
-        let Some(node) = b.node(m.company).await? else {
-            return Ok(());
-        };
-        let mut props = match node.props {
-            Value::Object(o) => o,
-            _ => Map::new(),
-        };
-        push_unique(
-            &mut props,
-            "names",
-            Value::String(name.original.clone()),
-            MAX_NAMES,
-        );
-        if props.get("name").is_none_or(Value::is_null) {
-            props.insert("name".into(), Value::String(name.original.clone()));
-        }
-        if props.get("legal_form").is_none_or(Value::is_null)
-            && let Some(f) = name.legal_form
-        {
-            props.insert("legal_form".into(), Value::String(f.to_owned()));
-        }
-        if props.get("key").is_none_or(Value::is_null) {
-            props.insert("key".into(), Value::String(name.key.clone()));
+        let mut patch = PropsPatch::new()
+            .add_to_set(&["names"], json!(name.original), MAX_NAMES)
+            .set_if_absent(&["name"], json!(name.original))
+            .set_if_absent(&["key"], json!(name.key));
+        if let Some(f) = name.legal_form {
+            patch = patch.set_if_absent(&["legal_form"], json!(f));
         }
         if let Some(j) = &p.jurisdiction {
-            props.insert("jurisdiction".into(), Value::String(j.clone()));
+            patch = patch.set(&["jurisdiction"], json!(j));
         }
-        push_unique(
-            &mut props,
-            "quail_keys",
-            Value::String(p.quail_key.clone()),
-            MAX_NAMES,
-        );
+        patch = patch.add_to_set(&["quail_keys"], json!(p.quail_key), MAX_NAMES);
         for id in &p.ids {
             if m.conflicts.contains(&id.alias()) {
                 continue;
             }
-            let ids = props
-                .entry("ids")
-                .or_insert_with(|| Value::Object(Map::new()));
-            if let Value::Object(ids) = ids {
-                let list = ids
-                    .entry(id.kind.as_str())
-                    .or_insert_with(|| Value::Array(Vec::new()));
-                if let Value::Array(l) = list
-                    && l.len() < MAX_IDS
-                    && !l.iter().any(|v| v.as_str() == Some(id.value.as_str()))
-                {
-                    l.push(Value::String(id.value.clone()));
-                }
-            }
+            patch = patch.add_to_set(&["ids", id.kind.as_str()], json!(id.value), MAX_IDS);
         }
         let entry = json!({
             "step": m.step.map_or("created", LadderStep::as_str),
@@ -685,31 +643,9 @@ impl GraphWriter {
             "document": hex,
             "conflicts": m.conflicts,
         });
-        let matches = props
-            .entry("matches")
-            .or_insert_with(|| Value::Array(Vec::new()));
-        if let Value::Array(l) = matches {
-            l.retain(|n| n["document"] != entry["document"]);
-            l.push(entry);
-            if l.len() > MAX_MATCHES {
-                l.remove(0);
-            }
-        }
-        b.upsert_node(NodeKind::Company, &node.key, &Value::Object(props))
-            .await?;
+        patch = patch.push_capped(&["matches"], entry, &["document"], MAX_MATCHES);
+        self.backend.update_props(m.company, &patch).await?;
         Ok(())
-    }
-}
-
-fn push_unique(props: &mut Map<String, Value>, field: &str, v: Value, max: usize) {
-    let list = props
-        .entry(field)
-        .or_insert_with(|| Value::Array(Vec::new()));
-    if let Value::Array(l) = list
-        && l.len() < max
-        && !l.contains(&v)
-    {
-        l.push(v);
     }
 }
 
@@ -718,6 +654,6 @@ async fn document_node(b: &dyn Backend, blake3: &Blake3) -> Result<Uuid> {
     let hex = blake3.to_hex();
     match b.node_by_key(NodeKind::Document, &hex).await? {
         Some(n) => Ok(n.id),
-        None => b.upsert_node(NodeKind::Document, &hex, &json!({})).await,
+        None => b.ensure_node(NodeKind::Document, &hex).await,
     }
 }

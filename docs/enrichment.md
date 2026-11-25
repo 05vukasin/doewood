@@ -98,7 +98,9 @@ the two, or recorded a proposal). Former names become learned aliases (`name:<ke
 **Props** of the company: `registry.<name>` (each registry's facts and fetch date: status,
 legal form, registered name, events), `ids` and `registry_ids`, `legal_name`, `former_names`,
 `merge_proposals`, `registry_proposals` (at most 20 each), `website`, `icon` and
-`enriched_at`. The document name (`name`) is kept.
+`enriched_at`. The document name (`name`) is kept. The job writes only these keys, as one
+atomic patch (`GraphStore::update_props`, see [ingest.md](ingest.md#company-props)), so what
+ingest writes to the same company at the same moment is never lost.
 
 **Edges** (ADR 0002 section 3), each with `source = registry`, the registry and record id
 (and fetch date) as evidence, `valid_from` / `valid_to`, a confidence and a state:
@@ -198,9 +200,6 @@ due, and what it did), `companies merged` (survivor, absorbed, merge entry, prob
 
 ## Limits and assumptions
 
-- **Props are read and written whole.** The job re-reads a company right before it writes its
-  props, but a write by ingest in the same moment can be lost; the next pass writes the
-  registry facts again.
 - **No delta feeds yet.** GLEIF's daily files, Companies House streaming and EDGAR's RSS are
   not read; the schedule above stands in (EDGAR daily).
 - **APR's open data** has no PIB, no dates of status changes, no mergers and no deleted

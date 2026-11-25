@@ -11,13 +11,15 @@ use doewood_core::InstanceId;
 use doewood_model::{
     Backend, Blake3, ClaimStore, Direction, Edge, EdgeKind, EdgeSource, Error, GraphStore, Located,
     LocationEnded, Neighbour, NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation,
-    OwnedAlias, PutOutcome, Record, RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit,
-    SearchQuery, SearchStore, Sketch, SketchStore, SourceClaim, SourceKey, StepVersions,
+    OwnedAlias, PropsPatch, PutOutcome, Record, RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc,
+    SearchHit, SearchQuery, SearchStore, Sketch, SketchStore, SourceClaim, SourceKey, StepVersions,
     StoredEdge, band_to_i64, records_limit, sketch_limit, validate_alias, validate_node,
     validate_sketch, versions_from_json, versions_to_json,
 };
 use rusqlite::types::Value as Sql;
-use rusqlite::{Connection, OptionalExtension as _, Row, params, params_from_iter};
+use rusqlite::{
+    Connection, OptionalExtension as _, Row, TransactionBehavior, params, params_from_iter,
+};
 use serde_json::Value;
 use time::Date;
 use uuid::Uuid;
@@ -395,6 +397,52 @@ impl GraphStore for Standalone {
         let (key, props) = (key.to_owned(), props.clone());
         self.run(move |conn| upsert_node(conn, kind, &key, &props))
             .await
+    }
+
+    async fn ensure_node(&self, kind: NodeKind, key: &str) -> Result<Uuid> {
+        validate_node(kind, key, &Value::Object(serde_json::Map::new()))?;
+        let key = key.to_owned();
+        self.run(move |conn| ensure_node(conn, kind, &key)).await
+    }
+
+    async fn update_props(&self, id: Uuid, patch: &PropsPatch) -> Result<Option<Node>> {
+        patch.validate()?;
+        let patch = patch.clone();
+        self.run(move |conn| {
+            // The write lock from the start: the read and the write are one step.
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql)?;
+            let Some(row) = tx
+                .query_row(
+                    &format!("SELECT {NODE_COLUMNS} FROM nodes n WHERE n.id = ?1"),
+                    [id.to_string()],
+                    |r| node_at(r, 0),
+                )
+                .optional()
+                .map_err(sql)?
+            else {
+                return Ok(None);
+            };
+            let mut node = node_from(row)?;
+            let before = std::mem::take(&mut node.props);
+            let mut props = match &before {
+                Value::Object(m) => m.clone(),
+                _ => serde_json::Map::new(),
+            };
+            patch.apply(&mut props);
+            node.props = Value::Object(props);
+            if node.props != before {
+                tx.execute(
+                    "UPDATE nodes SET props_json = ?2, updated_at = ?3 WHERE id = ?1",
+                    params![id.to_string(), node.props.to_string(), now()],
+                )
+                .map_err(sql)?;
+            }
+            tx.commit().map_err(sql)?;
+            Ok(Some(node))
+        })
+        .await
     }
 
     async fn node(&self, id: Uuid) -> Result<Option<Node>> {

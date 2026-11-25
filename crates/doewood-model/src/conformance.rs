@@ -5,6 +5,8 @@
 //! stand for two instances: claims and leases taken through one are seen by the other.
 
 use std::collections::BTreeSet;
+use std::future::Future;
+use std::task::Poll;
 use std::time::Duration;
 
 use doewood_core::InstanceId;
@@ -16,8 +18,8 @@ use crate::{
     Backend, Blake3, CACHE_KEY_MAX_LEN, CACHE_MAX_BODY, CacheRow, Direction, DismissRequest,
     DismissalQuery, DueCompany, DueReason, Edge, EdgeKind, EdgeSource, EdgeState, Error, IconRow,
     MergeActor, MergeActorKind, MergeOp, MergeQuery, MergeRequest, NeighbourQuery, Node, NodeKind,
-    ObjectLocation, OwnedAlias, PutOutcome, SearchDoc, SearchQuery, SourceKey, SplitRequest,
-    StepVersions, StoredEdge, StoredIcon, UndoRequest, merged_into,
+    ObjectLocation, OwnedAlias, PropsPatch, PutOutcome, SearchDoc, SearchQuery, SourceKey,
+    SplitRequest, StepVersions, StoredEdge, StoredIcon, UndoRequest, merged_into,
 };
 
 /// Runs every check.
@@ -28,6 +30,7 @@ use crate::{
 pub async fn run<B: Backend + ?Sized>(a: &B, b: &B) {
     records(a).await;
     graph(a).await;
+    props_patches(a, b).await;
     dated_edges(a).await;
     locations(a).await;
     ended_locations(a).await;
@@ -242,6 +245,158 @@ pub async fn graph<B: Backend + ?Sized>(s: &B) {
         s.upsert_edge(&buyer.clone().with_confidence(2.0)).await,
         Err(Error::Invalid(_))
     ));
+}
+
+/// Runs two futures at once, each polled in turn, and waits for both: their store calls
+/// are in flight together.
+async fn join2<X: Future<Output = ()>, Y: Future<Output = ()>>(x: X, y: Y) {
+    let (mut x, mut y) = (Box::pin(x), Box::pin(y));
+    let (mut x_done, mut y_done) = (false, false);
+    std::future::poll_fn(|cx| {
+        if !x_done {
+            x_done = x.as_mut().poll(cx).is_ready();
+        }
+        if !y_done {
+            y_done = y.as_mut().poll(cx).is_ready();
+        }
+        if x_done && y_done {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+}
+
+/// Rounds each writer of [`props_patches`] runs.
+const PATCH_ROUNDS: usize = 40;
+
+/// One of the two writers of [`props_patches`]: its own keys, plus shared lists.
+async fn race_writer<B: Backend + ?Sized>(s: &B, node: Uuid, who: &str, rounds: usize) {
+    for i in 0..rounds {
+        let patch = PropsPatch::new()
+            .set(&[&format!("{who}{i}")], json!(i))
+            .set(&["last", who], json!(i))
+            .add_to_set(&["log"], json!(format!("{who}{i}")), 1000)
+            .push_capped(&["seen"], json!({"who": who, "i": i}), &["who"], 10);
+        s.update_props(node, &patch).await.unwrap().expect("node");
+    }
+}
+
+/// Partial prop updates (issue #51): `ensure_node` never replaces props, a patch changes only
+/// the keys it names, and two writers patching different keys of one node at the same time,
+/// through two handles, both keep every write.
+///
+/// # Panics
+///
+/// When the backend misbehaves.
+#[allow(clippy::too_many_lines)]
+pub async fn props_patches<B: Backend + ?Sized>(a: &B, b: &B) {
+    let id = a.ensure_node(NodeKind::Company, "patched").await.unwrap();
+    assert_eq!(
+        a.node(id).await.unwrap().map(|n| n.props),
+        Some(json!({})),
+        "created with empty props"
+    );
+    let patch = PropsPatch::new()
+        .set(&["name"], json!("ACME"))
+        .set(&["ids", "lei"], json!(["L1"]))
+        .set_if_absent(&["legal_form"], json!("doo"))
+        .add_to_set(&["names"], json!("ACME"), 3)
+        .push_capped(
+            &["matches"],
+            json!({"document": "d1", "v": 1}),
+            &["document"],
+            2,
+        );
+    let got = a.update_props(id, &patch).await.unwrap().expect("node");
+    let want = json!({
+        "name": "ACME",
+        "ids": {"lei": ["L1"]},
+        "legal_form": "doo",
+        "names": ["ACME"],
+        "matches": [{"document": "d1", "v": 1}],
+    });
+    assert_eq!(got.props, want);
+    assert_eq!(
+        (got.id, got.kind, got.key.as_str()),
+        (id, NodeKind::Company, "patched")
+    );
+    assert_eq!(a.node(id).await.unwrap(), Some(got));
+    // `ensure_node` again: same id, props untouched.
+    assert_eq!(
+        b.ensure_node(NodeKind::Company, "patched").await.unwrap(),
+        id
+    );
+    assert_eq!(a.node(id).await.unwrap().map(|n| n.props), Some(want));
+    // Only the named keys change.
+    let patch = PropsPatch::new()
+        .set_if_absent(&["legal_form"], json!("ad"))
+        .remove(&["name"])
+        .remove(&["ids", "lei"])
+        .add_to_set(&["names"], json!("ACME"), 3)
+        .add_to_set(&["names"], json!("ACME Trading"), 3)
+        .push_capped(&["matches"], json!({"document": "d2"}), &["document"], 2)
+        .push_capped(
+            &["matches"],
+            json!({"document": "d1", "v": 2}),
+            &["document"],
+            2,
+        )
+        .push_capped(&["matches"], json!({"document": "d3"}), &["document"], 2);
+    let got = b.update_props(id, &patch).await.unwrap().expect("node");
+    assert_eq!(
+        got.props,
+        json!({
+            "ids": {},
+            "legal_form": "doo",
+            "names": ["ACME", "ACME Trading"],
+            "matches": [{"document": "d1", "v": 2}, {"document": "d3"}],
+        })
+    );
+    // An empty patch changes nothing; a missing node is `None`; a bad patch is refused.
+    assert_eq!(
+        a.update_props(id, &PropsPatch::new()).await.unwrap(),
+        Some(got)
+    );
+    assert_eq!(
+        a.update_props(Uuid::now_v7(), &PropsPatch::new().set(&["x"], json!(1)))
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(matches!(
+        a.update_props(id, &PropsPatch::new().set(&[], json!(1)))
+            .await,
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        a.ensure_node(NodeKind::Document, "not-a-hash").await,
+        Err(Error::Invalid(_))
+    ));
+
+    // Two writers, two handles, the same node, many rounds.
+    let race = a.ensure_node(NodeKind::Company, "raced").await.unwrap();
+    join2(
+        race_writer(a, race, "a", PATCH_ROUNDS),
+        race_writer(b, race, "b", PATCH_ROUNDS),
+    )
+    .await;
+    let props = a.node(race).await.unwrap().expect("node").props;
+    for who in ["a", "b"] {
+        for i in 0..PATCH_ROUNDS {
+            assert_eq!(props[format!("{who}{i}")], json!(i), "{who}{i} kept");
+        }
+        assert_eq!(props["last"][who], json!(PATCH_ROUNDS - 1));
+        assert!(
+            props["seen"]
+                .as_array()
+                .unwrap()
+                .contains(&json!({"who": who, "i": PATCH_ROUNDS - 1}))
+        );
+    }
+    assert_eq!(props["log"].as_array().unwrap().len(), 2 * PATCH_ROUNDS);
+    assert_eq!(props["seen"].as_array().unwrap().len(), 2);
 }
 
 /// Dated corporate events: "who owned X on a day" is a query.

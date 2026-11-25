@@ -14,6 +14,7 @@ pub mod conformance;
 mod enrichment;
 mod error;
 pub mod merge;
+mod props;
 mod traits;
 mod types;
 
@@ -29,6 +30,7 @@ pub use merge::{
     MergeEntry, MergeQuery, MergeRequest, MergeTx, OwnedAlias, REASON_MAX_LEN, SPLIT_MAX_ITEMS,
     SplitRequest, UndoOutcome, UndoRequest, Undone, merged_into, merges_limit,
 };
+pub use props::{PATCH_MAX_DEPTH, PATCH_MAX_OPS, PropOp, PropsPatch};
 pub use traits::{
     Backend, CacheStore, ClaimStore, FreshnessStore, GraphStore, MergeStore, RecordStore,
     SearchStore, SketchStore, sketch_limit,
