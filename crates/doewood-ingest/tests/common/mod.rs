@@ -221,6 +221,11 @@ const H: f32 = 792.0;
 
 /// A one-page PDF with these lines of Helvetica text and an Info `Title`.
 pub fn pdf(lines: &[&str], title: &str) -> Vec<u8> {
+    pdf_pages(&[lines], title)
+}
+
+/// A PDF with one page per entry of `pages`, each with its lines of Helvetica text.
+pub fn pdf_pages(pages: &[&[&str]], title: &str) -> Vec<u8> {
     let mut doc = Document::with_version("1.7");
     let pages_id = doc.new_object_id();
     let font_id = doc.add_object(dictionary! {
@@ -229,31 +234,36 @@ pub fn pdf(lines: &[&str], title: &str) -> Vec<u8> {
         "BaseFont" => "Helvetica",
         "Encoding" => "WinAnsiEncoding",
     });
-    let mut ops = Vec::new();
-    for (i, l) in lines.iter().enumerate() {
-        let top = 72.0 + 16.0 * i as f32;
-        ops.push(Operation::new("BT", vec![]));
-        ops.push(Operation::new("Tf", vec!["F1".into(), 11.into()]));
-        ops.push(Operation::new("Td", vec![72.into(), (H - top).into()]));
-        ops.push(Operation::new(
-            "Tj",
-            vec![Object::string_literal(l.as_bytes().to_vec())],
-        ));
-        ops.push(Operation::new("ET", vec![]));
+    let mut kids: Vec<Object> = Vec::new();
+    for lines in pages {
+        let mut ops = Vec::new();
+        for (i, l) in lines.iter().enumerate() {
+            let top = 72.0 + 16.0 * i as f32;
+            ops.push(Operation::new("BT", vec![]));
+            ops.push(Operation::new("Tf", vec!["F1".into(), 11.into()]));
+            ops.push(Operation::new("Td", vec![72.into(), (H - top).into()]));
+            ops.push(Operation::new(
+                "Tj",
+                vec![Object::string_literal(l.as_bytes().to_vec())],
+            ));
+            ops.push(Operation::new("ET", vec![]));
+        }
+        let content = Content { operations: ops };
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+        });
+        kids.push(page_id.into());
     }
-    let content = Content { operations: ops };
-    let content_id = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
-    let page_id = doc.add_object(dictionary! {
-        "Type" => "Page",
-        "Parent" => pages_id,
-        "Contents" => content_id,
-    });
+    let count = i64::try_from(kids.len()).unwrap();
     doc.objects.insert(
         pages_id,
         Object::Dictionary(dictionary! {
             "Type" => "Pages",
-            "Kids" => vec![page_id.into()],
-            "Count" => 1,
+            "Kids" => kids,
+            "Count" => count,
             "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
             "MediaBox" => vec![0.into(), 0.into(), W.into(), H.into()],
         }),

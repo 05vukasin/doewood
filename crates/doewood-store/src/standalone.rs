@@ -26,6 +26,7 @@ use rusqlite::{
     Connection, OptionalExtension as _, Row, TransactionBehavior, params, params_from_iter,
 };
 use serde_json::Value;
+use serde_json::value::RawValue;
 use time::Date;
 use uuid::Uuid;
 
@@ -129,6 +130,10 @@ fn sql(e: rusqlite::Error) -> Error {
 
 fn json(text: &str) -> Result<Value> {
     serde_json::from_str(text).map_err(|e| backend(format!("stored JSON is invalid: {e}")))
+}
+
+fn raw_json(text: String) -> Result<Box<RawValue>> {
+    RawValue::from_string(text).map_err(|e| backend(format!("stored JSON is invalid: {e}")))
 }
 
 fn uuid(text: &str) -> Result<Uuid> {
@@ -428,10 +433,10 @@ impl RecordStore for Standalone {
     async fn put_record(
         &self,
         blake3: &Blake3,
-        body: &Value,
+        body: &RawValue,
         versions: &StepVersions,
     ) -> Result<PutOutcome> {
-        let (h, body, versions) = (*blake3, body.clone(), versions_to_json(versions));
+        let (h, body, versions) = (*blake3, body.get().to_owned(), versions_to_json(versions));
         self.run(move |conn| {
             let tx = conn.transaction().map_err(sql)?;
             let old: Option<(String, String)> = tx
@@ -442,7 +447,8 @@ impl RecordStore for Standalone {
                 .optional()
                 .map_err(sql)?;
             let outcome = match old {
-                Some((b, v)) if json(&b)? == body && json(&v)? == versions => {
+                // Bodies are compared as text: every writer stores the canonical form (#98).
+                Some((b, v)) if b == body && json(&v)? == versions => {
                     return Ok(PutOutcome::Unchanged);
                 }
                 Some(_) => PutOutcome::Updated,
@@ -457,7 +463,7 @@ impl RecordStore for Standalone {
             .and_then(|mut cached| {
                 cached.execute(params![
                     h.as_bytes().as_slice(),
-                    body.to_string(),
+                    body,
                     versions.to_string(),
                     now()
                 ])
@@ -486,7 +492,7 @@ impl RecordStore for Standalone {
             row.map(|(body, versions, updated_at)| {
                 Ok(Record {
                     blake3: h,
-                    body: json(&body)?,
+                    body: raw_json(body)?,
                     versions: versions_from_json(&json(&versions)?)?,
                     updated_at,
                 })
@@ -609,7 +615,7 @@ impl RecordStore for Standalone {
                 let (h, body, versions, updated_at) = row.map_err(sql)?;
                 Ok(Record {
                     blake3: Blake3::from_slice(&h)?,
-                    body: json(&body)?,
+                    body: raw_json(body)?,
                     versions: versions_from_json(&json(&versions)?)?,
                     updated_at,
                 })
@@ -1442,7 +1448,11 @@ mod tests {
             store.source(source).unwrap();
             store.ingest_status(source, &key).unwrap();
             backend
-                .put_record(&hash, &serde_json::json!({ "i": i }), &BTreeMap::new())
+                .put_record(
+                    &hash,
+                    &RawValue::from_string(format!("{{\"i\":{i}}}")).unwrap(),
+                    &BTreeMap::new(),
+                )
                 .await
                 .unwrap();
             let doc = backend

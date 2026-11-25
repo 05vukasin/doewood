@@ -217,7 +217,7 @@ async fn seed(a: &Instance, backend: &Arc<dyn Backend>, docs: usize) -> Seeded {
                 backend
                     .put_record(
                         &hash(i),
-                        &body,
+                        &doewood_model::canonical::to_canonical(&body).unwrap(),
                         &[("quail".to_owned(), "1".to_owned())].into(),
                     )
                     .await
