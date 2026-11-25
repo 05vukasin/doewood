@@ -72,8 +72,9 @@ pub trait GraphStore: Send + Sync {
     /// [`GraphStore::update_props`], so a create never replaces what another wrote.
     async fn ensure_node(&self, kind: NodeKind, key: &str) -> Result<Uuid>;
 
-    /// Applies `patch` to the node's props atomically: in one transaction, with the node
-    /// locked, on the props as stored. Keys the patch does not name stay as they are, so two
+    /// Applies `patch` to the node's props atomically, on the props as stored (in one
+    /// transaction with the node locked, or as a compare-and-set that applies it again when
+    /// another writer came first). Keys the patch does not name stay as they are, so two
     /// writers changing different keys never lose each other's writes (issue #51). Returns
     /// the node as written, `None` when there is no node `id`.
     async fn update_props(&self, id: Uuid, patch: &PropsPatch) -> Result<Option<Node>>;
@@ -158,8 +159,38 @@ pub trait GraphStore: Send + Sync {
         props: &Value,
     ) -> Result<NodeAlias>;
 
+    /// [`GraphStore::claim_alias`] of each `(alias, props)` for `node`, in order, as if one
+    /// call followed the other: the results are in the same order, and an alias given twice
+    /// is claimed by its first entry. Each claim is its own write, not one transaction. A
+    /// backend may send them together (issue #103: Postgres pipelines them on one
+    /// connection, one round trip).
+    async fn claim_aliases(
+        &self,
+        kind: NodeKind,
+        node: Uuid,
+        claims: &[(String, Value)],
+    ) -> Result<Vec<NodeAlias>> {
+        crate::validate_alias_count(claims.len())?;
+        let mut out = Vec::with_capacity(claims.len());
+        for (alias, props) in claims {
+            out.push(self.claim_alias(kind, alias, node, props).await?);
+        }
+        Ok(out)
+    }
+
     /// The alias, if claimed or blocked.
     async fn alias(&self, kind: NodeKind, alias: &str) -> Result<Option<NodeAlias>>;
+
+    /// [`GraphStore::alias`] of each of `aliases`, in the same order. A backend may read them
+    /// in one statement (issue #103). At most [`crate::ALIASES_MAX`] per call.
+    async fn aliases(&self, kind: NodeKind, aliases: &[String]) -> Result<Vec<Option<NodeAlias>>> {
+        crate::validate_alias_count(aliases.len())?;
+        let mut out = Vec::with_capacity(aliases.len());
+        for alias in aliases {
+            out.push(self.alias(kind, alias).await?);
+        }
+        Ok(out)
+    }
 
     /// Blocks an alias: it resolves to no node from now on (a key that turned out to belong
     /// to more than one), with `props` saying why.

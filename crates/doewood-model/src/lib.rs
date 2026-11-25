@@ -48,11 +48,11 @@ pub use traits::{
     ProposalStore, RecordStore, SearchStore, SketchStore, sketch_limit,
 };
 pub use types::{
-    Blake3, Direction, Edge, EdgeKind, EdgeSource, EdgeState, LiveEdge, Located, LocationEnded,
-    MergeActorKind, MergeOp, NODE_KEY_MAX_LEN, Neighbour, NeighbourQuery, Node, NodeAlias,
-    NodeKind, ObjectLocation, PENDING_REF_PREFIX, ProposalKind, ProposalReason, ProposalState,
-    PutOutcome, RECORDS_MAX_LIMIT, Record, SEARCH_MAX_LIMIT, SKETCH_MAX_BANDS,
+    ALIASES_MAX, Blake3, Direction, Edge, EdgeKind, EdgeSource, EdgeState, LiveEdge, Located,
+    LocationEnded, MergeActorKind, MergeOp, NODE_KEY_MAX_LEN, Neighbour, NeighbourQuery, Node,
+    NodeAlias, NodeKind, ObjectLocation, PENDING_REF_PREFIX, ProposalKind, ProposalReason,
+    ProposalState, PutOutcome, RECORDS_MAX_LIMIT, Record, SEARCH_MAX_LIMIT, SKETCH_MAX_BANDS,
     SKETCH_MAX_SIGNATURE, SearchDoc, SearchHit, SearchQuery, Sketch, SourceClaim, SourceKey,
-    StepVersions, StoredEdge, band_to_i64, records_limit, validate_alias, validate_hashes,
-    validate_node, validate_sketch, versions_from_json, versions_to_json,
+    StepVersions, StoredEdge, band_to_i64, records_limit, validate_alias, validate_alias_count,
+    validate_hashes, validate_node, validate_sketch, versions_from_json, versions_to_json,
 };
