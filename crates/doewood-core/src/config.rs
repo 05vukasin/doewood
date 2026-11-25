@@ -37,6 +37,8 @@ pub mod vars {
     pub const INGEST_MAX_CELLS: &str = "DOEWOOD_INGEST_MAX_CELLS";
     /// Directory of the OCR model files; defaults to `<data>/ocr-models`.
     pub const OCR_MODELS: &str = "DOEWOOD_OCR_MODELS";
+    /// Pages OCR'd at the same time (OCR engines); defaults from the memory (quail's plan).
+    pub const OCR_JOBS: &str = "DOEWOOD_OCR_JOBS";
 
     /// Variables earlier versions read that are runtime settings now (ADR 0001, section 3),
     /// with where each is set instead. A leftover one is ignored with a warning.
@@ -46,7 +48,7 @@ pub mod vars {
     )];
 
     /// Every bootstrap variable, in the order they are reported.
-    pub const ALL: [&str; 11] = [
+    pub const ALL: [&str; 12] = [
         DATA_DIR,
         LISTEN,
         OPS_LISTEN,
@@ -58,6 +60,7 @@ pub mod vars {
         INGEST_BUDGET_MIB,
         INGEST_MAX_CELLS,
         OCR_MODELS,
+        OCR_JOBS,
     ];
 }
 
@@ -88,6 +91,8 @@ pub const MIN_INGEST_MAX_CELLS: u64 = 10_000;
 pub const MAX_INGEST_MAX_CELLS: u64 = 100_000_000;
 /// Default of `DOEWOOD_OCR_MODELS`, inside the data directory.
 pub const OCR_MODELS_DIR: &str = "ocr-models";
+/// Largest accepted `DOEWOOD_OCR_JOBS`.
+pub const MAX_OCR_JOBS: u64 = 64;
 
 const fn addr(ip: [u8; 4], port: u16) -> SocketAddr {
     SocketAddr::V4(std::net::SocketAddrV4::new(
@@ -245,6 +250,7 @@ struct Origins {
     ingest_budget: Origin,
     ingest_max_cells: Origin,
     ocr_models: Origin,
+    ocr_jobs: Origin,
 }
 
 /// The effective bootstrap configuration.
@@ -273,6 +279,8 @@ pub struct BootstrapConfig {
     pub ingest_max_cells: Option<u64>,
     /// Directory of the OCR model files.
     pub ocr_models: PathBuf,
+    /// Pages OCR'd at the same time; `None` lets quail size it from the memory.
+    pub ocr_jobs: Option<usize>,
     origins: Origins,
 }
 
@@ -325,6 +333,14 @@ impl BootstrapConfig {
             Some(v) => (PathBuf::from(v), Origin::Env),
             None => (data_dir.join(OCR_MODELS_DIR), Origin::Default),
         };
+        let (ocr_jobs, ocr_jobs_origin) = parse_range(
+            get(vars::OCR_JOBS),
+            &mut w,
+            vars::OCR_JOBS,
+            1..=MAX_OCR_JOBS,
+            "pages",
+            "the memory",
+        );
         for (var, now) in vars::RETIRED {
             if get(var).is_some() {
                 warn(&mut w, var, format!("ignored: this is {now}"));
@@ -346,6 +362,7 @@ impl BootstrapConfig {
                 ingest_budget_bytes: ingest_budget_mib.map(|m| m << 20),
                 ingest_max_cells,
                 ocr_models,
+                ocr_jobs: ocr_jobs.and_then(|n| usize::try_from(n).ok()),
                 origins: Origins {
                     data_dir: data_dir_origin,
                     listen: listen_origin,
@@ -358,6 +375,7 @@ impl BootstrapConfig {
                     ingest_budget: ingest_budget_origin,
                     ingest_max_cells: ingest_max_cells_origin,
                     ocr_models: ocr_models_origin,
+                    ocr_jobs: ocr_jobs_origin,
                 },
             },
             warnings: w,
@@ -456,6 +474,13 @@ impl BootstrapConfig {
                 var: vars::OCR_MODELS,
                 value: self.ocr_models.display().to_string(),
                 origin: o.ocr_models,
+            },
+            Entry {
+                var: vars::OCR_JOBS,
+                value: self
+                    .ocr_jobs
+                    .map_or_else(|| "auto (memory)".to_owned(), |n| n.to_string()),
+                origin: o.ocr_jobs,
             },
         ]
     }
@@ -706,12 +731,14 @@ mod tests {
         assert_eq!(config.ingest_budget_bytes, None);
         assert_eq!(config.ingest_max_cells, None);
         assert_eq!(config.ocr_models, PathBuf::from("/d/ocr-models"));
+        assert_eq!(config.ocr_jobs, None);
         let Loaded { config, warnings } = load(
             &[
                 ("DOEWOOD_INGEST_JOBS", "6"),
                 ("DOEWOOD_INGEST_BUDGET_MIB", "768"),
                 ("DOEWOOD_INGEST_MAX_CELLS", "5000000"),
                 ("DOEWOOD_OCR_MODELS", "/models"),
+                ("DOEWOOD_OCR_JOBS", "2"),
             ],
             Some("h"),
         );
@@ -720,11 +747,13 @@ mod tests {
         assert_eq!(config.ingest_budget_bytes, Some(768 << 20));
         assert_eq!(config.ingest_max_cells, Some(5_000_000));
         assert_eq!(config.ocr_models, PathBuf::from("/models"));
+        assert_eq!(config.ocr_jobs, Some(2));
         let Loaded { config, warnings } = load(
             &[
                 ("DOEWOOD_INGEST_JOBS", "0"),
                 ("DOEWOOD_INGEST_BUDGET_MIB", "8"),
                 ("DOEWOOD_INGEST_MAX_CELLS", "200000000"),
+                ("DOEWOOD_OCR_JOBS", "0"),
             ],
             Some("h"),
         );
@@ -733,13 +762,15 @@ mod tests {
             [
                 "DOEWOOD_INGEST_JOBS",
                 "DOEWOOD_INGEST_BUDGET_MIB",
-                "DOEWOOD_INGEST_MAX_CELLS"
+                "DOEWOOD_INGEST_MAX_CELLS",
+                "DOEWOOD_OCR_JOBS"
             ]
         );
         assert!(warnings[2].message.contains("from 10000 to 100000000"));
         assert_eq!(config.ingest_jobs, None);
         assert_eq!(config.ingest_budget_bytes, None);
         assert_eq!(config.ingest_max_cells, None);
+        assert_eq!(config.ocr_jobs, None);
         assert_eq!(config.entries().len(), vars::ALL.len());
     }
 
@@ -800,6 +831,7 @@ mod tests {
                 ("DOEWOOD_INGEST_BUDGET_MIB", "1024"),
                 ("DOEWOOD_INGEST_MAX_CELLS", "4000000"),
                 ("DOEWOOD_OCR_MODELS", "/opt/ocr"),
+                ("DOEWOOD_OCR_JOBS", "2"),
             ],
             Some("ignored"),
         );
@@ -878,6 +910,7 @@ mod tests {
                 Origin::Fallback,
                 Origin::Fallback,
                 Origin::Fallback,
+                Origin::Default,
                 Origin::Default,
                 Origin::Default,
                 Origin::Default,
