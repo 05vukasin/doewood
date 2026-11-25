@@ -582,7 +582,8 @@ page of 100 every millisecond; 1 run each):
   read-only connections with the API, so they queue behind the API's pages; with 4 readers
   they wait half as long and ingest runs 1.7 times as fast. On Postgres the bigger pool does
   not help: the database (172 s executing for 2000 files, most of it the API's pages) and the
-  4 cores are the limit. 8 clients asking for 100 records every millisecond is far more than
+  4 cores are the limit. With 32 such clients and 2 readers, 2000 files did not finish in
+  10 minutes. 8 clients asking for 100 records every millisecond is far more than
   the API usually sees, but nothing gives ingest's reads priority yet; see #109.
 
 ### Requests and limits
