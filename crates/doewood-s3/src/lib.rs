@@ -8,8 +8,9 @@
 //!   emits [`ObjectEvent`]s (`New`, `Changed`, `Deleted`) to a bounded channel and commits a
 //!   checkpoint with every step, so that a restart resumes and memory stays bounded.
 //! - [`Discovery`]: one scanner task per active source, stopped on shutdown.
-//! - [`inlet`]: optional push notifications (the MinIO / S3 webhook parser; an SQS poller
-//!   later).
+//! - [`inlet`]: optional push notifications: the MinIO / S3 webhook parser, and the SQS inlet
+//!   that long-polls a queue of S3 event notifications (one task per source, run by
+//!   [`Discovery`] next to the scanner).
 //!
 //! Credentials come from the store's encrypted secrets through
 //! [`doewood_store::Store::source_credentials`] and never appear in logs, errors or `Debug`.
@@ -21,6 +22,8 @@ mod event;
 pub mod inlet;
 mod retry;
 mod scanner;
+#[cfg(feature = "sqs")]
+mod sigv4;
 
 pub use client::{
     ClientOptions, ListPage, ListRequest, ListedObject, ObjectBody, ObjectMeta, S3Client, S3Config,

@@ -134,6 +134,18 @@ pub(crate) fn prefix(v: &mut Violations, field: &str, value: &str) {
     }
 }
 
+/// An SQS queue URL (`http(s)://host[:port]/<account>/<queue>`). Never echoes the value.
+pub(crate) fn queue_url(v: &mut Violations, field: &str, value: &str) -> Option<String> {
+    let value = value.trim();
+    match doewood_store::valid_queue_url(value) {
+        Ok(()) => Some(value.to_owned()),
+        Err(why) => {
+            v.add(field, why);
+            None
+        }
+    }
+}
+
 /// A signing region: empty for the default, else 1 to 64 ASCII letters, digits, `-` or `_`.
 pub(crate) fn region(v: &mut Violations, field: &str, value: &str) -> Option<String> {
     let value = value.trim();

@@ -278,6 +278,187 @@ async fn sources_lifecycle_and_secrets() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sqs_inlets_are_set_through_the_api_and_keep_their_secrets() {
+    const QUEUE_KEY: &str = "test-queue-access-key-3456";
+    const QUEUE_SECRET: &str = "test-queue-secret-key-7890";
+    let a = Instance::start("inst-a", Some(Shared::sqlite().backend)).await;
+    let ch = a.channel().await;
+    let s3_port = closed_port().await;
+    let added = config(&ch)
+        .add_source(add_request(
+            &format!("http://127.0.0.1:{s3_port}"),
+            "docs",
+            "in/",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(added.sqs_inlet.is_none());
+    let id: doewood_core::SourceId = added.id.parse().unwrap();
+    // A queue on a closed local port: the inlet runs, and fails without leaking anything.
+    let queue_port = closed_port().await;
+    let queue_url = format!("http://127.0.0.1:{queue_port}/123456789012/doewood-test-events");
+    let request = pb::SetSqsInletRequest {
+        source_id: added.id.clone(),
+        queue_url: queue_url.clone(),
+        credentials: Some(pb::S3Credentials {
+            access_key_id: QUEUE_KEY.into(),
+            secret_access_key: QUEUE_SECRET.into(),
+            session_token: "test-queue-session-token".into(),
+        }),
+        ..pb::SetSqsInletRequest::default()
+    };
+    let set = config(&ch)
+        .set_sqs_inlet(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    let no_secret = |what: &str, text: &str| {
+        assert_no_secret(what, text);
+        for secret in [QUEUE_KEY, QUEUE_SECRET, "test-queue-session-token"] {
+            assert!(!text.contains(secret), "{what} leaks a secret: {text}");
+        }
+    };
+    no_secret("SetSqsInlet", &format!("{set:?}"));
+    let inlet = set.sqs_inlet.unwrap();
+    assert_eq!(inlet.queue_url, queue_url);
+    assert_eq!(inlet.region, "us-east-1");
+    assert!(inlet.enabled && inlet.credentials_set && inlet.running);
+    assert!(a.store.secret_exists(&format!("sqs/{id}")).unwrap());
+    assert!(a.discovery.is_inlet_running(id));
+    eventually("the inlet reports its failure", || async {
+        let s = get_source(&ch, &added.id).await;
+        s.sqs_inlet
+            .is_some_and(|i| i.errors > 0 && !i.last_error.is_empty())
+    })
+    .await;
+    let listed = config(&ch)
+        .list_sources(pb::ListSourcesRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    no_secret("ListSources", &format!("{listed:?}"));
+    let inlet = listed.sources[0].sqs_inlet.clone().unwrap();
+    assert!(
+        inlet.last_error.contains("ReceiveMessage"),
+        "{}",
+        inlet.last_error
+    );
+    assert!(inlet.last_error_at > 0);
+
+    // Off: stored, not polling; the scanner is untouched.
+    let off = config(&ch)
+        .set_sqs_inlet(pb::SetSqsInletRequest {
+            disabled: true,
+            credentials: None,
+            region: "eu-west-3".into(),
+            ..request.clone()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let inlet = off.sqs_inlet.unwrap();
+    assert!(!inlet.enabled && !inlet.running && inlet.credentials_set);
+    assert_eq!(inlet.region, "eu-west-3");
+    assert!(off.scanner_running && !a.discovery.is_inlet_running(id));
+    // An AWS queue URL gives its region (off, so nothing reaches AWS); clearing the queue's
+    // own credentials goes back to the source's.
+    let aws = config(&ch)
+        .set_sqs_inlet(pb::SetSqsInletRequest {
+            source_id: added.id.clone(),
+            queue_url: "https://sqs.eu-central-1.amazonaws.com/123456789012/doewood-test-events"
+                .into(),
+            disabled: true,
+            clear_credentials: true,
+            ..pb::SetSqsInletRequest::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .sqs_inlet
+        .unwrap();
+    assert_eq!(aws.region, "eu-central-1");
+    assert!(!aws.credentials_set && !aws.running);
+    assert!(!a.store.secret_exists(&format!("sqs/{id}")).unwrap());
+
+    // Validation reports every field, without echoing a value.
+    let err = config(&ch)
+        .set_sqs_inlet(pb::SetSqsInletRequest {
+            source_id: "nope".into(),
+            queue_url: "https://user:topsecret-pw@sqs.example/1/q".into(),
+            region: "eu west".into(),
+            credentials: Some(pb::S3Credentials::default()),
+            clear_credentials: true,
+            ..pb::SetSqsInletRequest::default()
+        })
+        .await
+        .unwrap_err();
+    invalid(
+        &err,
+        &[
+            "source_id",
+            "queue_url",
+            "region",
+            "credentials.access_key_id",
+            "clear_credentials",
+        ],
+    );
+    assert!(!err.message().contains("topsecret-pw"), "{}", err.message());
+    for bad in [
+        "",
+        "https://sqs.example/q",
+        "ftp://sqs.example/1/q",
+        "https://sqs.example/1/q?x",
+    ] {
+        let err = config(&ch)
+            .set_sqs_inlet(pb::SetSqsInletRequest {
+                queue_url: bad.into(),
+                ..request.clone()
+            })
+            .await
+            .unwrap_err();
+        invalid(&err, &["queue_url"]);
+    }
+    let missing = config(&ch)
+        .set_sqs_inlet(pb::SetSqsInletRequest {
+            source_id: doewood_core::SourceId::generate().to_string(),
+            ..request.clone()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), Code::NotFound, "{missing:?}");
+
+    // Removed: gone with its credentials. Removing the source removes a new one too.
+    config(&ch).set_sqs_inlet(request.clone()).await.unwrap();
+    let removed = config(&ch)
+        .remove_sqs_inlet(pb::RemoveSqsInletRequest {
+            source_id: added.id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(removed.sqs_inlet.is_none() && removed.scanner_running);
+    assert!(!a.discovery.is_inlet_running(id));
+    assert!(!a.store.secret_exists(&format!("sqs/{id}")).unwrap());
+    config(&ch).set_sqs_inlet(request.clone()).await.unwrap();
+    config(&ch)
+        .remove_source(pb::RemoveSourceRequest {
+            source_id: added.id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(!a.discovery.is_inlet_running(id));
+    assert!(!a.store.secret_exists(&format!("sqs/{id}")).unwrap());
+    assert!(
+        a.store
+            .setting(&format!("sqs_inlet/{id}"))
+            .unwrap()
+            .is_none()
+    );
+    a.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn source_validation_reports_every_field() {
     let a = Instance::start("inst-a", Some(Shared::sqlite().backend)).await;
     let ch = a.channel().await;

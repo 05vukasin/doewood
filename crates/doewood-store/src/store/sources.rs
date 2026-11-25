@@ -9,6 +9,7 @@ use doewood_core::SourceId;
 use rusqlite::{OptionalExtension as _, Row, params};
 use zeroize::Zeroizing;
 
+use super::sqs::{self, SqsInlet};
 use super::{Store, now};
 use crate::StoreError;
 
@@ -412,6 +413,8 @@ pub struct Source {
     pub created_at: i64,
     /// When it last changed (Unix seconds).
     pub updated_at: i64,
+    /// Its SQS event inlet, if one is set.
+    pub sqs: Option<SqsInlet>,
 }
 
 impl Source {
@@ -440,6 +443,8 @@ impl Source {
         let created_at = r.get("created_at")?;
         let updated_at = r.get("updated_at")?;
         let policy: String = r.get("policy_json")?;
+        let sqs: Option<String> = r.get("sqs_json")?;
+        let sqs_credentials: bool = r.get("sqs_credentials")?;
         Ok((|| {
             Ok(Self {
                 id: id
@@ -462,6 +467,14 @@ impl Source {
                 )?)?,
                 created_at,
                 updated_at,
+                sqs: sqs
+                    .map(|text| {
+                        let value = serde_json::from_str(&text).map_err(|_| {
+                            StoreError::InvalidSource("stored SQS inlet is not JSON".to_owned())
+                        })?;
+                        SqsInlet::from_json(&value, sqs_credentials)
+                    })
+                    .transpose()?,
             })
         })())
     }
@@ -533,7 +546,7 @@ impl S3Credentials {
         self.session_token.as_ref().map(|t| t.as_str())
     }
 
-    fn encode(&self) -> Zeroizing<Vec<u8>> {
+    pub(crate) fn encode(&self) -> Zeroizing<Vec<u8>> {
         let mut out = Zeroizing::new(Vec::new());
         for part in [
             CREDENTIALS_FORMAT,
@@ -547,7 +560,7 @@ impl S3Credentials {
         out
     }
 
-    fn decode(name: &str, bytes: &[u8]) -> Result<Self, StoreError> {
+    pub(crate) fn decode(name: &str, bytes: &[u8]) -> Result<Self, StoreError> {
         let bad = || StoreError::InvalidSource(format!("secret {name:?} is not S3 credentials"));
         let text = std::str::from_utf8(bytes).map_err(|_| bad())?;
         let mut parts = text.split('\n');
@@ -573,9 +586,13 @@ fn credentials_secret_name(id: SourceId) -> String {
     format!("s3/{id}")
 }
 
+/// The columns of a source, with its SQS inlet (`settings` row `sqs_inlet/<id>`, secret
+/// `sqs/<id>`): every query reads `FROM sources`.
 const SOURCE_COLUMNS: &str = "id, endpoint, bucket, prefix, region, url_style, \
     credentials_secret, max_object_bytes, policy_json, state, state_reason, scan_interval_s, \
-    created_at, updated_at";
+    created_at, updated_at, \
+    (SELECT value_json FROM settings WHERE key = 'sqs_inlet/' || sources.id) AS sqs_json, \
+    EXISTS (SELECT 1 FROM secrets WHERE name = 'sqs/' || sources.id) AS sqs_credentials";
 
 impl Store {
     /// Adds a source, with its credentials sealed in one transaction. A source with the same
@@ -827,6 +844,15 @@ impl Store {
         tx.execute(
             "DELETE FROM secrets WHERE name = ?1",
             [credentials_secret_name(id)],
+        )?;
+        // The SQS inlet and its credentials go with it.
+        tx.execute(
+            "DELETE FROM settings WHERE key = ?1",
+            [sqs::settings_key(id)],
+        )?;
+        tx.execute(
+            "DELETE FROM secrets WHERE name = ?1",
+            [sqs::secret_name(id)],
         )?;
         tx.commit()?;
         Ok(n > 0)

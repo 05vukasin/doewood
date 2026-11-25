@@ -53,7 +53,7 @@ pub fn retryable_status(status: u16, code: Option<&str>) -> bool {
 
 /// A value in `[0, 1)`. Backoff jitter needs no strong randomness: the clock's nanoseconds
 /// through a `SplitMix64` step, so concurrent clients spread out.
-fn jitter() -> f64 {
+pub(crate) fn jitter() -> f64 {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.subsec_nanos());

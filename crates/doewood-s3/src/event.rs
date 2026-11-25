@@ -42,8 +42,10 @@ impl EventKind {
 pub enum EventOrigin {
     /// The periodic listing.
     Scan,
-    /// A MinIO / S3 event notification.
+    /// A MinIO / S3 event notification posted to the webhook.
     Webhook,
+    /// An S3 event notification received from an SQS queue.
+    Sqs,
 }
 
 /// An object event. Delivery is at least once: an event is sent before discovery commits it,

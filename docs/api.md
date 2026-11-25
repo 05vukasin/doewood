@@ -29,7 +29,7 @@ The S3 event webhook is not part of the gRPC API: it is on the ops server (see
 
 | service | RPCs |
 |---|---|
-| `ConfigService` | `AddSource`, `UpdateSource`, `PauseSource`, `ResumeSource`, `RemoveSource`, `ListSources`, `GetSource`, `SetLlmPolicy`, `SetAiProvider`, `ListAiProviders`, `GetIngestSettings`, `SetIngestSettings`, `GetEnrichmentSettings`, `SetEnrichmentSettings` |
+| `ConfigService` | `AddSource`, `UpdateSource`, `PauseSource`, `ResumeSource`, `RemoveSource`, `ListSources`, `GetSource`, `SetLlmPolicy`, `SetSqsInlet`, `RemoveSqsInlet`, `SetAiProvider`, `ListAiProviders`, `GetIngestSettings`, `SetIngestSettings`, `GetEnrichmentSettings`, `SetEnrichmentSettings` |
 | `JobsService` | `WatchProgress` (server stream), `ReprocessJob`, `WatchReprocess` (server stream) |
 | `RecordsService` | `GetRecord`, `ListRecords` |
 | `GraphService` | `GetNode`, `Neighbours`, `CompanyDocuments`, `ListMerges`, `MergeCompanies`, `UndoMerge`, `SplitCompany`, `DismissPair`, `ListDismissals`, `ListProposals`, `AcceptProposal`, `RejectProposal` |
@@ -62,6 +62,17 @@ The comments in the `.proto` files are the reference for every field. In short:
 - **RemoveSource** releases the claim, stops the scanner, and deletes the source with its
   progress and credentials. If the shared store is unreachable it fails with `UNAVAILABLE` and
   removes nothing, so no claim is left behind.
+- **SetSqsInlet** sets the source's SQS event inlet (see [sources](sources.md#sqs)): the
+  `queue_url` (`https://sqs.<region>.amazonaws.com/<account>/<queue>`, without credentials,
+  query or fragment), the `region` (empty: the one in an AWS queue URL, else `us-east-1`),
+  `disabled` to store it without polling, and write-only `credentials` for the queue alone
+  (unset keeps the stored ones; with none the inlet signs with the source's;
+  `clear_credentials` deletes them). The inlet restarts at once; it polls only while the
+  source's scanner runs. `Source.sqs_inlet` shows the settings, `credentials_set` (never the
+  credentials), whether it runs, and counters since it started: messages received and
+  deleted, events emitted, records ignored, test events, malformed messages, errors and the
+  last error. **RemoveSqsInlet** deletes the inlet and its credentials; removing the source
+  does too.
 - While the shared Postgres is not connected yet, `AddSource`, `RemoveSource` and the records,
   graph and search RPCs answer `UNAVAILABLE`; the rest works. Once the start-up claim pass has
   run, `ResumeSource` needs the database too (it claims the source).
@@ -299,6 +310,17 @@ grpcurl -plaintext -d "{\"source_id\": \"$ID\", \"policy\": {\"mode\": \"LLM_MOD
 grpcurl -plaintext -d "{\"source_id\": \"$ID\"}" 127.0.0.1:7443 doewood.v1.ConfigService/RemoveSource
 ```
 
+An SQS inlet with credentials of its own (read from variables; they never come back):
+
+```sh
+grpcurl -plaintext -d @ 127.0.0.1:7443 doewood.v1.ConfigService/SetSqsInlet <<EOF
+{"source_id": "$ID",
+ "queue_url": "https://sqs.eu-central-1.amazonaws.com/123456789012/doewood-events",
+ "credentials": {"access_key_id": "$SQS_ACCESS_KEY", "secret_access_key": "$SQS_SECRET_KEY"}}
+EOF
+grpcurl -plaintext -d "{\"source_id\": \"$ID\"}" 127.0.0.1:7443 doewood.v1.ConfigService/RemoveSqsInlet
+```
+
 An AI provider (the key is read from a variable, and never comes back):
 
 ```sh
@@ -528,7 +550,7 @@ page took 471 ms before and 69 ms after, with the same results.
 
 `cargo test -p doewood-api` starts in-process servers and calls every RPC with a tonic client:
 the happy paths, validation errors, two instances sharing one backend (the claim conflict),
-secrets never coming back, the progress stream, a gRPC-Web request over HTTP/1.1, health,
-reflection and the message limit. `tests/icons.rs` checks the icon route's answers and
+secrets never coming back (SQS inlet credentials included), the progress stream, a gRPC-Web
+request over HTTP/1.1, health, reflection and the message limit. `tests/icons.rs` checks the icon route's answers and
 headers with a fake resolver. With `DOEWOOD_TEST_POSTGRES_URL` set, the claim, records,
 graph, merge-log and search tests also run against Postgres.

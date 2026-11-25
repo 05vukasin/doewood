@@ -4,8 +4,9 @@
 use doewood_core::SourceId;
 use doewood_model::SourceKey;
 use doewood_store::{
-    AI_PRESETS, AiProviderInput, ApiKey, IngestSettingsPatch, KeyChange, NewSource, S3Credentials,
-    SourcePatch, SourceState, UrlStyle, valid_min_jaccard, valid_provider_name,
+    AI_PRESETS, AiProviderInput, ApiKey, CredentialsChange, IngestSettingsPatch, KeyChange,
+    NewSource, S3Credentials, SourcePatch, SourceState, SqsInletInput, UrlStyle, valid_min_jaccard,
+    valid_provider_name,
 };
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
@@ -15,9 +16,9 @@ use crate::pb::{
     AddSourceRequest, AiProvider, EnrichmentSettings, GetEnrichmentSettingsRequest,
     GetIngestSettingsRequest, GetSourceRequest, IngestSettings, ListAiProvidersRequest,
     ListAiProvidersResponse, ListSourcesRequest, ListSourcesResponse, PauseSourceRequest,
-    RemoveSourceRequest, RemoveSourceResponse, ResumeSourceRequest, SetAiProviderRequest,
-    SetEnrichmentSettingsRequest, SetIngestSettingsRequest, SetLlmPolicyRequest, Source,
-    UpdateSourceRequest,
+    RemoveSourceRequest, RemoveSourceResponse, RemoveSqsInletRequest, ResumeSourceRequest,
+    SetAiProviderRequest, SetEnrichmentSettingsRequest, SetIngestSettingsRequest,
+    SetLlmPolicyRequest, SetSqsInletRequest, Source, UpdateSourceRequest,
 };
 use crate::validate::{self, Violations};
 use crate::{Api, ApiState, claims, convert, enrichment, error};
@@ -159,6 +160,37 @@ fn check_update(req: &UpdateSourceRequest) -> Result<(SourceId, SourcePatch, Key
         (None, false) => KeyUpdate::Keep,
     };
     Ok((id.unwrap_or_else(SourceId::generate), patch, key))
+}
+
+fn check_sqs(
+    req: &SetSqsInletRequest,
+) -> Result<(SourceId, SqsInletInput, CredentialsChange), Status> {
+    let mut v = Violations::default();
+    let id = validate::source_id(&mut v, "source_id", &req.source_id);
+    let queue_url = validate::queue_url(&mut v, "queue_url", &req.queue_url);
+    let region = validate::region(&mut v, "region", &req.region);
+    let credentials = req
+        .credentials
+        .as_ref()
+        .and_then(|c| validate::credentials(&mut v, "credentials", c));
+    if req.clear_credentials && req.credentials.is_some() {
+        v.add("clear_credentials", "cannot be combined with credentials");
+    }
+    v.check()?;
+    let change = match (credentials, req.clear_credentials) {
+        (Some(c), _) => CredentialsChange::Set(c),
+        (None, true) => CredentialsChange::Clear,
+        (None, false) => CredentialsChange::Keep,
+    };
+    Ok((
+        id.unwrap_or_else(SourceId::generate),
+        SqsInletInput {
+            queue_url: queue_url.unwrap_or_default(),
+            region,
+            enabled: !req.disabled,
+        },
+        change,
+    ))
 }
 
 enum KeyUpdate {
@@ -371,6 +403,61 @@ impl ConfigService for Api {
         let source = self.state.db(move |s| s.update_source(id, &patch)).await?;
         info!(source = %id, mode = source.llm_policy.mode.name(), "LLM policy set");
         self.state.llm_settings_changed();
+        Ok(Response::new(self.state.source_pb(&source)))
+    }
+
+    async fn set_sqs_inlet(
+        &self,
+        request: Request<SetSqsInletRequest>,
+    ) -> Result<Response<Source>, Status> {
+        let (id, input, change) = check_sqs(request.get_ref())?;
+        let _guard = self.state.lock_sources().await;
+        let source = self
+            .state
+            .db(move |s| {
+                s.set_sqs_inlet(id, &input, &change)?;
+                s.source(id)?
+                    .ok_or_else(|| doewood_store::StoreError::NoSuchSource(id.to_string()))
+            })
+            .await?;
+        // Only the inlet restarts, and only where the scanner runs (claimed, not paused).
+        let running = self
+            .state
+            .discovery()
+            .is_some_and(|d| d.restart_inlet(&source));
+        let inlet = source.sqs.as_ref();
+        // The region and on/off; never the credentials, nor the queue URL's account.
+        info!(
+            source = %id,
+            region = inlet.map_or("", doewood_store::SqsInlet::region),
+            enabled = inlet.is_some_and(|i| i.enabled),
+            own_credentials = inlet.is_some_and(|i| i.credentials_set),
+            running,
+            "SQS inlet set"
+        );
+        Ok(Response::new(self.state.source_pb(&source)))
+    }
+
+    async fn remove_sqs_inlet(
+        &self,
+        request: Request<RemoveSqsInletRequest>,
+    ) -> Result<Response<Source>, Status> {
+        let id = check_id("source_id", &request.get_ref().source_id)?;
+        let _guard = self.state.lock_sources().await;
+        let (removed, source) = self
+            .state
+            .db(move |s| {
+                let removed = s.remove_sqs_inlet(id)?;
+                let source = s
+                    .source(id)?
+                    .ok_or_else(|| doewood_store::StoreError::NoSuchSource(id.to_string()))?;
+                Ok((removed, source))
+            })
+            .await?;
+        if let Some(d) = self.state.discovery() {
+            d.restart_inlet(&source);
+        }
+        info!(source = %id, removed, "SQS inlet removed");
         Ok(Response::new(self.state.source_pb(&source)))
     }
 
