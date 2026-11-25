@@ -11,6 +11,10 @@ The code is `crates/doewood-registry/src/favicon/`: the resolver (`mod.rs`), the
 (`content.rs`). The binary wires it up in `crates/doewood/src/icons.rs`; the route is
 `crates/doewood-api/src/icons.rs`.
 
+The enrichment job resolves the icon of each company's verified website ahead of time, through
+the same resolver, guard and cache (see [enrichment.md](enrichment.md#website-and-favicon)), so
+the route usually answers from the cache.
+
 ## Finding an icon
 
 1. **The domain is validated** before anything is fetched: a bare host name, lowercased,

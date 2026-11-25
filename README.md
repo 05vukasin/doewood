@@ -13,8 +13,9 @@ discovery, the gRPC API, ingest (quail and hedgehog into records, the graph and 
 LLM queue (per-source policy, concurrency cap, daily budget, on-demand `Summarize`; see
 [docs/llm.md](docs/llm.md)), the container image with a Helm chart (see
 [docs/deploy.md](docs/deploy.md)), the company identity rules, the six registry clients and the
-favicon proxy (see [docs/registries.md](docs/registries.md)) are in. The enrichment job that runs the
-registry clients during ingest is next. See
+favicon proxy (see [docs/registries.md](docs/registries.md)), and the enrichment job that runs
+them next to ingest (registries, the decision gate, dated edges, websites and favicons; see
+[docs/enrichment.md](docs/enrichment.md)) are in. See
 [ADR 0002](docs/adr/0002-company-enrichment.md) (company identity and registries) and
 [ADR 0001](docs/adr/0001-architecture.md).
 
@@ -52,7 +53,8 @@ grpcurl -plaintext 127.0.0.1:7443 list            # the services, through reflec
 ```
 
 The bootstrap variables are listed in [docs/configuration.md](docs/configuration.md), sources
-and discovery in [docs/sources.md](docs/sources.md), ingest in [docs/ingest.md](docs/ingest.md),
+and discovery in [docs/sources.md](docs/sources.md), ingest in [docs/ingest.md](docs/ingest.md), the enrichment job in
+[docs/enrichment.md](docs/enrichment.md),
 the API, with `grpcurl` examples, in [docs/api.md](docs/api.md), company icons
 (`GET /icons/{domain}`) in [docs/favicons.md](docs/favicons.md), and the image and the Helm
 chart in [docs/deploy.md](docs/deploy.md).
@@ -74,7 +76,8 @@ crates/
                   rate-limited, cached; GLEIF, VIES, Wikidata, SEC EDGAR, APR and Companies
                   House; the favicon resolver with its SSRF guard (ADR 0002 section 5)
   doewood-ingest  ingest: fetch, quail and hedgehog, records, the graph (companies, references,
-                  similar documents) and search; feature `ocr` (on in the binary)
+                  similar documents) and search; feature `ocr` (on in the binary); and the
+                  enrichment job (ADR 0002 sections 1 to 3, 5 and 6)
   doewood-api     the gRPC API (tonic, gRPC-Web, health, reflection) and GET /icons/{domain};
                   protos in proto/doewood/v1
   doewood         the binary: serve, version, config check
@@ -82,10 +85,10 @@ charts/doewood    the Helm chart (StatefulSet, one volume per instance)
 Dockerfile        the image, with OCR
 ```
 
-The enrichment storage is in place: the registry and favicon caches in the store (shared
-Postgres, or the instance's SQLite file) and each company's freshness. Planned: the enrichment
-job that uses the registry clients, and their runtime settings (on/off, keys, the EDGAR
-contact). See [docs/registries.md](docs/registries.md).
+Enrichment runs in every instance: the registry and favicon caches in the store (shared
+Postgres, or the instance's SQLite file), each company's freshness and lease, the runtime
+settings (on/off, keys, the EDGAR contact), and the job that uses them. See
+[docs/enrichment.md](docs/enrichment.md) and [docs/registries.md](docs/registries.md).
 
 The `.proto` files compile with `protox` (pure Rust) in `doewood-api`'s build script, so
 `cargo build` needs no `protoc`.

@@ -1254,6 +1254,64 @@ async fn next(s: &mut tonic::Streaming<pb::ProgressUpdate>) -> pb::ProgressUpdat
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watch_progress_streams_the_enrichment_counters() {
+    let a = Instance::start("inst-a", Some(Shared::sqlite().backend)).await;
+    let ch = a.channel().await;
+    let mut jobs = JobsServiceClient::new(ch.clone());
+    // No enrichment job (as in these tests): no enrichment update at all.
+    let paused = {
+        let mut req = add_request("http://minio.test:9000", "docs", "");
+        req.paused = true;
+        config(&ch).add_source(req).await.unwrap().into_inner()
+    };
+    let mut stream = jobs
+        .watch_progress(pb::WatchProgressRequest { source_ids: vec![] })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(next(&mut stream).await.kind, Kind::Snapshot as i32);
+    // The binary sets the counters once its job runs; they come as their own update.
+    a.progress.set_enrichment(doewood_api::EnrichmentCounts {
+        enriched: 3,
+        merged: 1,
+        registry_warnings: 2,
+        ..doewood_api::EnrichmentCounts::default()
+    });
+    let u = loop {
+        let u = next(&mut stream).await;
+        if u.kind == Kind::Enrichment as i32 {
+            break u;
+        }
+    };
+    assert!(u.progress.is_none());
+    let e = u.enrichment.unwrap();
+    assert_eq!((e.enriched, e.merged, e.registry_warnings), (3, 1, 2));
+    // A watch of named sources does not get it.
+    let mut only = jobs
+        .watch_progress(pb::WatchProgressRequest {
+            source_ids: vec![paused.id.clone()],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(next(&mut only).await.kind, Kind::Snapshot as i32);
+    a.progress.set_enrichment(doewood_api::EnrichmentCounts {
+        enriched: 4,
+        ..doewood_api::EnrichmentCounts::default()
+    });
+    let quiet = tokio::time::timeout(Duration::from_millis(500), only.message()).await;
+    assert!(
+        quiet.is_err()
+            || quiet
+                .unwrap()
+                .unwrap()
+                .is_none_or(|u| u.kind != Kind::Enrichment as i32),
+        "a filtered watch gets no enrichment update"
+    );
+    a.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn watch_progress_streams_counters_and_state_changes() {
     let a = Instance::start("inst-a", Some(Shared::sqlite().backend)).await;
     let ch = a.channel().await;

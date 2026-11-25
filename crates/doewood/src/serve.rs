@@ -12,7 +12,8 @@
 //!    once it answers. Until then the instance runs degraded: `/readyz` says why, and the
 //!    connection is retried with backoff (see [`crate::shared`]).
 //! 7. build ingest (the quail engine, with OCR when built and its models are there) and start
-//!    its workers; they wait for the backend while the shared Postgres is not connected.
+//!    its workers, and start the enrichment job (ADR 0002 section 6); they wait for the backend
+//!    while the shared Postgres is not connected.
 //! 8. start one scanner per active S3 source (none configured: nothing starts), accept S3
 //!    event notifications on the ops server, and serve the gRPC API. Sources added through
 //!    the API start scanning at once. With `DOEWOOD_POSTGRES_URL`, no scanner starts before
@@ -22,8 +23,9 @@
 //!    channels, so a busy ingest slows the scanners down instead of growing a queue.
 //!
 //! On SIGTERM or SIGINT: report not ready, stop the servers (the API finishes the calls in
-//! flight and ends its streams), the scanners (each keeps its checkpoint) and ingest (each
-//! worker finishes its file; the rest stays pending), close the store, exit 0.
+//! flight and ends its streams), the scanners (each keeps its checkpoint), ingest (each
+//! worker finishes its file; the rest stays pending) and enrichment (the companies in flight
+//! get a few seconds; an unfinished one is enriched again later), close the store, exit 0.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -44,7 +46,7 @@ use tracing::{debug, error, info, warn};
 const API_DRAIN: Duration = Duration::from_secs(10);
 
 use crate::ops::{self, OpsState};
-use crate::{cleanup, icons, ingest, shared};
+use crate::{cleanup, enrichment, icons, ingest, shared};
 
 /// Builds the runtime and runs the service until a shutdown signal.
 pub fn main(loaded: Loaded) -> ExitCode {
@@ -169,6 +171,13 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
         .as_ref()
         .map(|(i, _)| i.start(ingest_rx, shutdown_rx.clone()));
     let summarizing = ingest.as_ref().map(|(_, s)| s.start(shutdown_rx.clone()));
+    let enriching = enrichment::start(
+        &config,
+        &store,
+        backend_rx.clone(),
+        &progress,
+        shutdown_rx.clone(),
+    );
     let shared = !config.is_standalone();
     let scanning = start_discovery(
         Arc::clone(&store),
@@ -236,6 +245,9 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
         && let Err(e) = task.await
     {
         warn!(error = %e, "LLM queue task failed");
+    }
+    if let Err(e) = enriching.await {
+        warn!(error = %e, "enrichment task failed");
     }
     if let Some(task) = supervisor
         && let Err(e) = task.await

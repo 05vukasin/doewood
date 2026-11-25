@@ -128,6 +128,13 @@ source changes: `KIND_COUNTERS`, `KIND_STATE_CHANGED` (with `previous_state`) or
 It ends when the client cancels or the server shuts down. `source_ids` narrows it; empty watches
 every source, including ones added later.
 
+A watch of every source (empty `source_ids`) also carries the instance's enrichment job: a
+`KIND_ENRICHMENT` update with the first snapshot and whenever its counters change, with
+`enrichment` set (and no `progress`): `enriched`, `merged`, `proposed`, `failed`,
+`registry_warnings`, `edges`, `websites`, `passes`, `last_pass_completed_at` and `running`,
+counted since the instance started (see [enrichment.md](enrichment.md#progress)). A client
+that does not know the kind can skip it.
+
 | counter | meaning |
 |---|---|
 | `seen` | objects under the prefix that discovery knows about |

@@ -1,0 +1,230 @@
+# Enrichment
+
+The enrichment job of [ADR 0002](adr/0002-company-enrichment.md) (sections 1 to 3, 5 and 6):
+it links the companies the documents mention to public registries, merges the ones that are
+the same company, writes what the registries say as company props and dated edges, and finds
+each company's website and favicon. It lives in `doewood-ingest` (`enrichment` module) and
+runs in every instance, next to ingest, started by `doewood serve`. The registry clients are
+those of [registries.md](registries.md).
+
+No LLM is involved (the LLM tier of ADR 0002 section 4 is a later, optional step). Only
+identifiers and names go to registries, and only domains to websites: documents never leave
+the instance (ADR 0002, the privacy rule). APR and EDGAR's name lookups are done locally on
+downloaded files, so not even the name is sent there.
+
+## Passes
+
+The job works in passes: one at start, then one every 30 seconds. A pass reads the runtime
+settings (so a change applies to the next pass), then pages through the companies the store
+says are due (`FreshnessStore::companies_due`, 100 at a time) and works on up to 4 companies
+at once. Each registry client keeps its own rate limit and backoff, so a cold start of a large
+corpus takes hours without slowing ingest down.
+
+A company is due (ADR 0002 section 6):
+
+- **new:** it has a document and was never enriched: right away;
+- **documents doubled:** its document count is at least twice what it was (and at least 2);
+- **scheduled:** a registry's refresh time has passed.
+
+A new or doubled company is asked of every registry; a scheduled one of the due registries
+and of any registry it was never asked (switched on since, say).
+
+**Leases.** Before it works on a company, the instance takes the company's lease
+(`ClaimStore::lease_company`, 15 minutes, renewed during the work) and gives it back after.
+With a shared Postgres, a company another instance holds is left out of `companies_due`, and
+a lease it cannot take is skipped, so one instance enriches each company and the others reuse
+the result (and the registry answers, cached in the shared store). A merge also takes the
+other company's lease first. A lease left behind by a crash expires.
+
+**Shutdown.** The pass stops taking companies; those in flight get 10 seconds, then are
+dropped (their leases expire and they are enriched again later).
+
+## Registry order
+
+Registries are asked in jurisdiction order (ADR 0002 section 2): the registry of the
+company's country first, then the other national registries it has an identifier for, then
+GLEIF, then Wikidata, the lowest tier. The country is the company's `jurisdiction` (from
+quail), else what its identifiers imply (a Serbian MB or PIB, an OIB, a VAT prefix, a UK
+company number).
+
+| registry | asked by | without an identifier |
+|---|---|---|
+| APR (Serbia) | MB (`id:rs_mb`) | name search in the open-data set, for a Serbian company |
+| Companies House (UK) | company number (`reg:companies_house`) | name search, for a UK company |
+| SEC EDGAR (US) | CIK (`reg:edgar`) | name lookup in the tickers file, for a US company |
+| VIES (EU) | an EU VAT number (`id:vat`) | nothing |
+| GLEIF | LEI (`id:lei`) | name search (with the country, when known) |
+| Wikidata | LEI, or its item (`reg:wikidata`) | nothing (no name search on the lowest tier) |
+
+One registry's answer can unlock another in the same pass: GLEIF's `registeredAs` is the UK
+company number or the Serbian MB (for a GB or RS entity, when it passes its check), and EDGAR
+gives the LEI. Each registry is asked at most once per company per pass. A PIB alone is not an
+APR lookup (the open data has no PIB): the company is then searched by name.
+
+## The decision gate
+
+Evidence is fused with noisy-OR over distinct sources (ADR 0002 section 1.6,
+`doewood_enrich::fusion`) and gated: **merge at 0.90 or more, review between 0.50 and 0.90,
+nothing below 0.50**; two conflicting high-precision hits are always for review.
+
+- **A name search's records.** Each candidate's registered name is scored against the
+  company's: the same key and legal form is the name ladder's 0.90, the same key with the form
+  missing on one side the legal-form-blind 0.85, otherwise the fuzzy score (scaled by its
+  Jaccard) with the jurisdiction veto. A record in another country than the company's is never
+  a candidate. A record at 0.90 or more is adopted: its identifiers join the company. Records in
+  the review band are kept as `registry_proposals` on the company, for a person.
+- **Other companies.** A company that owns an identifier the registry gave for this one is a
+  registry identifier hit (0.95); a company that owns a key of the registry's legal name or a
+  former name is a name-ladder hit (0.90, 0.88 squashed, 0.85 legal-form-blind). A company that
+  carries a different national number of the same kind (MB, PIB, OIB, VAT, Companies House
+  number, CIK) or is in another country is never a candidate. At 0.90 or more the two are
+  merged through the merge log (`MergeStore::merge_companies`, actor `enrichment`, with the
+  evidence, the confidence and the fused probability; the survivor is the one with more
+  documents), so a person can undo it. The review band and conflicts become `merge_proposals`
+  on the company.
+- **Dismissals are permanent.** A dismissed pair (`MergeStore::dismissal`) is never merged,
+  whatever the evidence; it is recorded as a proposal with reason `dismissed`.
+- **No circular evidence.** An identifier adopted from a name match is never a registry
+  identifier hit: a company that owns one is a proposal. Wikidata items never count as one
+  either (the lowest tier).
+
+## What it writes
+
+**Identifiers** become aliases of the company, first claim wins: `id:lei:…`, `id:rs_mb:…`,
+`reg:companies_house:…`, `reg:edgar:…` (the CIK zero-padded to 10 digits), `reg:wikidata:Q…`,
+and the verified website `domain:…`. One another company owns stays its own (the gate merged
+the two, or recorded a proposal). Former names become learned aliases (`name:<key>|<form>`).
+
+**Props** of the company: `registry.<name>` (each registry's facts and fetch date: status,
+legal form, registered name, events), `ids` and `registry_ids`, `legal_name`, `former_names`,
+`merge_proposals`, `registry_proposals` (at most 20 each), `website`, `icon` and
+`enriched_at`. The document name (`name`) is kept.
+
+**Edges** (ADR 0002 section 3), each with `source = registry`, the registry and record id
+(and fetch date) as evidence, `valid_from` / `valid_to`, a confidence and a state:
+
+| registry | edges | state |
+|---|---|---|
+| GLEIF Level 2 | `parent_of` (parent → company) and `subsidiary_of` (company → parent), from the relationship period; the ultimate parent too when it is another entity (`level: ultimate`); an inactive relationship is superseded | active |
+| GLEIF successions | `merged_into` the successor, on the date of the latest completed merger-type event (else the expiration) | active |
+| GLEIF events | `liquidated` (on the company itself) for a completed liquidation, bankruptcy, insolvency or dissolution event, or a dissolved entity | active |
+| GLEIF, Companies House, EDGAR former names | `renamed_to` on the company itself, on the day the old name ended (`props.from`, `props.to`); undated ones only become aliases | active |
+| Companies House PSCs | `parent_of` / `subsidiary_of` from a corporate-entity or legal-person PSC with majority control (more than 50% of shares or votes, or the right to appoint and remove directors), from `notified_on` to `ceased_on`; natural persons never | active |
+| Companies House status | `liquidated` for `dissolved` (on `date_of_cessation`) and `liquidation` | active |
+| APR status | `liquidated` for in liquidation, forced liquidation or bankruptcy (no date in the open data; `props.as_of`) | active |
+| EDGAR Exhibit 21 | `parent_of` (company → subsidiary) and `subsidiary_of`, from the annual report's filing date, to companies the graph already has (by name) | proposed |
+| EDGAR 8-K Item 2.01 | `acquired`, on the filing date, when the item's text names one of the company's Exhibit 21 subsidiaries | proposed |
+| Wikidata | `parent_of` / `subsidiary_of` from parent organization (P749) and owned by (P127, never a person), `merged_into` from replaced by (P1366) and followed by (P156), with the statements' dates, to companies the graph has that item for | proposed |
+
+Confidence is 0.95 for an official registry's edge, 0.6 for Exhibit 21 and 8-K text, 0.5 for
+Wikidata. Proposed edges never become active on their own (the trust order: registry, then
+documents, then web; a person or a registry makes them active).
+
+**The other end** of an edge: the company with that LEI or Companies House number, created
+(keyed by the identifier, `origin: registry`, with its registered name and name keys) when the
+graph has none; or the company that has that Wikidata item or name (Exhibit 21 rows, PSCs
+without a UK number), never created. An edge whose other end cannot be found is dropped.
+
+**The later dated parent is current.** When a company has two current parents (active, no
+end date, not an ultimate parent), the later dated one stays current; each earlier one ends on
+that day (its `parent_of` and `subsidiary_of` become superseded, with `valid_to`), and a
+`former_parent_of` edge records it, from its start to that day. So "who owned X on
+2022-05-01" is a query.
+
+## Website and favicon
+
+ADR 0002 section 5:
+
+1. **Candidates:** the official website from Wikidata, then the email domains seen in the
+   company's documents (quail's `signal.email_domain`, most frequent first; free-mail hosts
+   are never one). No domain is guessed from the name, and no search is made.
+2. **Verified** before it is stored: the domain is not owned by another company (alias
+   `domain:<domain>`), it resolves through the favicon SSRF guard (public addresses only,
+   redirects re-checked, the configured egress proxy), and the homepage, or the one
+   legal-notice page it links to on the same site (`impressum`, `legal`, `kontakt`,
+   `o-nama`, ...), contains the company's normalized name key (or a registered name's) as whole
+   words, or one of its identifiers (MB, PIB, LEI, VAT, Companies House number; spaced or
+   dotted forms too).
+3. **The favicon** of a verified domain is resolved through the same guard into the icon
+   cache (`favicons`, shared in shared mode), which `GET /icons/{domain}` serves from (see
+   [favicons.md](favicons.md)). The company's `icon` prop names that path.
+
+A website verified less than 30 days ago is not checked again. At most four candidates are
+tried per company.
+
+## Freshness
+
+After a company, the job records its enrichment (`record_enrichment`): the document count now,
+and for each registry asked the time it is due again, at the client's refresh
+([registries.md](registries.md)):
+
+| registry | refresh |
+|---|---|
+| GLEIF, APR, Companies House, Wikidata | 30 days |
+| VIES | 90 days |
+| EDGAR | 1 day (the submissions' freshness, standing in for "when new filings appear") |
+| any registry that failed | 6 hours |
+
+A registry that was not asked (switched off, not configured, nothing to ask it) keeps no due
+time; it is asked when the company is next due and it is switched on.
+
+## Settings
+
+The registry switches, the Companies House key, the EDGAR contact, APR's extra roots and the
+favicon fallback and proxy are the runtime settings of
+[registries.md](registries.md#configuring-the-registries), read on every pass. A switched-off
+registry, and Companies House without a key, has no client and is never asked. The clients are
+rebuilt only when what they are built from changes, so their rate limiters, pauses and APR's
+downloaded set carry over between passes.
+
+## Failure-soft
+
+A registry failure (down, refusing, rate limiting, a malformed answer) is a warning on that
+company, logged at `WARN` with the registry and why, counted in `registry_warnings`; the other
+registries still answer, the company is still recorded, and the failed registry is asked again
+after 6 hours. A store error fails that company only (counted in `failed`, retried on the next
+pass). Nothing the job does blocks ingest.
+
+## Progress
+
+`JobsService.WatchProgress` (a watch of every source) carries the job's counters since the
+instance started, as `KIND_ENRICHMENT` updates (see [api.md](api.md)): `enriched`, `merged`,
+`proposed`, `failed`, `registry_warnings`, `edges`, `websites`, `passes`,
+`last_pass_completed_at` and `running`.
+
+Log lines: `enrichment started` / `stopped`, `company enriched` (with the company, why it was
+due, and what it did), `companies merged` (survivor, absorbed, merge entry, probability),
+`website verified`, `registry warning`, and `enrichment pass done`.
+
+## Limits and assumptions
+
+- **Props are read and written whole.** The job re-reads a company right before it writes its
+  props, but a write by ingest in the same moment can be lost; the next pass writes the
+  registry facts again.
+- **No delta feeds yet.** GLEIF's daily files, Companies House streaming and EDGAR's RSS are
+  not read; the schedule above stands in (EDGAR daily).
+- **APR's open data** has no PIB, no dates of status changes, no mergers and no deleted
+  companies, so APR gives no dated events beyond the status.
+- **Merger filings** of Companies House name no counterpart; they are kept in
+  `registry.companies_house.events`, not as edges. 8-K acquisitions become edges only when
+  their text names a known subsidiary.
+- **Parser assumptions** of the registry clients (field names checked against public
+  documentation, and what is still assumed) are listed per registry in
+  [registries.md](registries.md).
+- **Proposals** are kept on the company's props; there is no API to list them across
+  companies yet.
+
+## Tests
+
+`cargo test -p doewood-ingest --test enrichment`, against SQLite and, with
+`DOEWOOD_TEST_POSTGRES_URL`, Postgres. Mock registries and mock websites on 127.0.0.1 only:
+invented companies and identifiers (valid check digits only), `*.test` host names resolved to
+the mock by a fake resolver, reached under a test-only address policy (the production policy is
+unchanged). They cover identifiers through APR, GLEIF and Wikidata to identifiers, props and
+dated edges; the gate's merge (registry identifier), dismissed pair, adopted name match, review
+band and no match; the trust order (official active, Wikidata and Exhibit 21 proposed); a later
+dated parent superseding the other into a former parent; leases between two instances
+(Postgres); a registry down while the others answer; switched-off registries and Companies
+House without a key never asked; website verification by name and by an identifier on the
+legal notice, refused for an unrelated page, a domain another company owns and free mail; and
+the favicon in the icon cache.

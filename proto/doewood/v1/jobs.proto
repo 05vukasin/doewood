@@ -9,7 +9,9 @@ import "doewood/v1/common.proto";
 service JobsService {
   // Streams the progress of the sources: first one SNAPSHOT update per source, then an update
   // whenever a source's counters or state change, until the client cancels or the server
-  // shuts down.
+  // shuts down. A watch of all sources (no `source_ids`) also gets the instance's enrichment
+  // job: one ENRICHMENT update with the first snapshot, then one whenever its counters change
+  // (none when the instance runs no enrichment job).
   rpc WatchProgress(WatchProgressRequest) returns (stream ProgressUpdate);
   // Starts a one-shot job that re-analyzes the files of a source whose stored quail/hedgehog
   // step versions differ from the running engine's (every file with `force`). Answers at once
@@ -76,6 +78,8 @@ message ProgressUpdate {
     KIND_STATE_CHANGED = 3;
     // It was removed. The last update about it.
     KIND_REMOVED = 4;
+    // The enrichment job's counters (`enrichment` is set, `progress` is not).
+    KIND_ENRICHMENT = 5;
   }
   Kind kind = 1;
   SourceProgress progress = 2;
@@ -83,6 +87,32 @@ message ProgressUpdate {
   SourceState previous_state = 3;
   // When the update was made, Unix seconds.
   int64 at = 4;
+  // For KIND_ENRICHMENT.
+  EnrichmentProgress enrichment = 5;
+}
+
+// The instance's enrichment job (ADR 0002 section 6), counted since the instance started.
+message EnrichmentProgress {
+  // Companies enriched (every due registry asked, whatever it answered).
+  uint64 enriched = 1;
+  // Companies merged by the decision gate (merge log actor `enrichment`).
+  uint64 merged = 2;
+  // Proposals recorded for a person: the review band, conflicts, dismissed pairs.
+  uint64 proposed = 3;
+  // Companies whose enrichment failed (a store error); retried on the next pass.
+  uint64 failed = 4;
+  // Registry warnings (a registry down, refusing, rate limiting, ...).
+  uint64 registry_warnings = 5;
+  // Dated edges written.
+  uint64 edges = 6;
+  // Websites verified and stored.
+  uint64 websites = 7;
+  // Passes over the due companies completed.
+  uint64 passes = 8;
+  // When the last pass completed, Unix seconds; 0 before the first.
+  int64 last_pass_completed_at = 9;
+  // Whether a pass is running now.
+  bool running = 10;
 }
 
 message ReprocessJobRequest {
