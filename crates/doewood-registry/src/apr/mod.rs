@@ -129,6 +129,17 @@ impl Default for AprConfig {
     }
 }
 
+/// What [`Apr::refresh`] downloaded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetInfo {
+    /// The set's date (`DatumPreseka`), when it has a valid one.
+    pub as_of: Option<time::Date>,
+    /// When it was downloaded.
+    pub fetched_at: time::OffsetDateTime,
+    /// Companies indexed.
+    pub companies: usize,
+}
+
 /// The APR client. Cheap to share (`Arc`); the snapshot and the rate limiter are shared by
 /// every caller, and one download serves them all.
 #[derive(Debug)]
@@ -318,6 +329,96 @@ impl Apr {
             value: hits,
             fetched_at,
         })
+    }
+
+    /// Downloads the set again now, whatever its age, and swaps it in for every caller (APR's
+    /// monthly refresh: it publishes no deltas, ADR 0002 section 6). A failed download keeps
+    /// the current set (and pauses the client, as any failed download).
+    pub async fn refresh(&self) -> Result<SetInfo, Warning> {
+        self.on()?;
+        let mut current = self.snapshot.lock().await;
+        match self.download().await {
+            Ok(s) => {
+                *current = Some(s.clone());
+                *self.paused.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                tracing::info!(
+                    companies = s.len(),
+                    as_of = s.as_of().unwrap_or(""),
+                    "apr: set downloaded again and swapped in"
+                );
+                Ok(SetInfo {
+                    as_of: crate::parse::date(s.as_of()),
+                    fetched_at: s.fetched_at,
+                    companies: s.len(),
+                })
+            }
+            Err(w) => {
+                let until = self.clock.monotonic() + self.failure_pause;
+                *self.paused.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some((until, w.kind.clone()));
+                Err(w)
+            }
+        }
+    }
+
+    /// After a [`refresh`](Self::refresh): stores the current set's record of `mb` (or "no
+    /// such MB") in the cache, so every instance's next lookup reads it, and says whether it
+    /// differs from the record the cache held (the snapshot date aside). `false` when the cache
+    /// held nothing: then the company is due on its own schedule anyway.
+    pub async fn update_cached(&self, mb: &Identifier) -> Result<bool, Warning> {
+        self.on()?;
+        if mb.kind != IdKind::RsMb {
+            return Err(warning(WarningKind::InvalidInput("not an MB".to_owned())));
+        }
+        let key = format!("companies/{}", mb.value);
+        let snapshot = self.snapshot().await?;
+        let now = snapshot.record(&mb.value);
+        let before = self.fetcher.cached(&key).await;
+        let changed = match (&before, &now) {
+            (None, _) => false,
+            (
+                Some(Fetch {
+                    body: Body::NotFound,
+                    ..
+                }),
+                n,
+            ) => n.is_some(),
+            (
+                Some(Fetch {
+                    body: Body::Found(_),
+                    ..
+                }),
+                None,
+            ) => true,
+            (
+                Some(Fetch {
+                    body: Body::Found(b),
+                    ..
+                }),
+                Some(n),
+            ) => match serde_json::from_slice::<model::RawRecord>(b) {
+                Ok(mut old) => {
+                    let mut new = n.clone();
+                    old.as_of = None;
+                    new.as_of = None;
+                    old != new
+                }
+                Err(_) => true,
+            },
+        };
+        let body = match now {
+            None => Body::NotFound,
+            Some(raw) => {
+                Body::Found(serde_json::to_vec(&raw).map_err(|e| self.malformed(e.to_string()))?)
+            }
+        };
+        let f = Fetch {
+            body,
+            fetched_at: snapshot.fetched_at,
+            cached: false,
+        };
+        self.fetcher.remember(&key, &f).await;
+        Ok(changed)
     }
 
     /// The current snapshot, downloaded and indexed when there is none or it is older than

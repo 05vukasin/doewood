@@ -61,7 +61,7 @@ impl ApiKey {
         text.replace(&self.0, "<redacted>")
     }
 
-    fn expose(&self) -> &str {
+    pub(crate) fn expose(&self) -> &str {
         &self.0
     }
 }

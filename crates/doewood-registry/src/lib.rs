@@ -27,6 +27,8 @@
 //!   merger filings of its filing history, and the name search. Skipped with no key.
 //! - [`favicon`]: the favicon resolver behind `GET /icons/{domain}` (ADR 0002 section 5),
 //!   with its SSRF guard and content checks.
+//! - [`feeds`]: the registry delta feeds (GLEIF delta files, the EDGAR daily index, the
+//!   Companies House stream) that tell which known companies changed.
 //! - [`fetch`]: the shared request loop (limiter, retries, cap, cache) over a [`Transport`].
 //! - [`limit`], [`clock`], [`cache`], [`http`]: its parts, each behind a small trait so the
 //!   decision logic is tested without a network.
@@ -40,6 +42,7 @@ pub mod clock;
 pub mod companies_house;
 pub mod edgar;
 pub mod favicon;
+pub mod feeds;
 pub mod fetch;
 pub mod gleif;
 pub mod http;
