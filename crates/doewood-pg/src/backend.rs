@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use deadpool_postgres::{Object, Pool, PoolError};
+use deadpool_postgres::{GenericClient, Object, Pool, PoolError};
 use doewood_core::InstanceId;
 use doewood_model::{
     Backend, Blake3, ClaimStore, Direction, Edge, EdgeKind, EdgeSource, Error, GraphStore,
@@ -17,12 +17,13 @@ use doewood_model::{
 };
 use serde_json::Value;
 use time::Date;
+use tokio_postgres::Row;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::ToSql;
-use tokio_postgres::{GenericClient, Row};
 use uuid::Uuid;
 
 use crate::PgStore;
+use crate::cached::Cached;
 
 /// One page of a source's records: `$1` endpoint, `$2` bucket, `$3` prefix, `$4` the hash the
 /// page starts after (or NULL), `$5` the page size. The `after` bound is repeated inside the
@@ -148,36 +149,34 @@ async fn upsert_node(
     props: &Value,
 ) -> Result<Uuid> {
     let row = c
-        .query_one(
+        .one(
             "INSERT INTO nodes (id, kind, key, props) VALUES ($1, $2, $3, $4) \
              ON CONFLICT ON CONSTRAINT nodes_kind_key \
              DO UPDATE SET props = EXCLUDED.props, updated_at = now() \
              RETURNING id",
             &[&Uuid::now_v7(), &kind.as_str(), &key, props],
         )
-        .await
-        .map_err(pg)?;
+        .await?;
     row.try_get(0).map_err(pg)
 }
 
 /// Inserts the node if it is missing and leaves an existing one's props untouched.
 async fn ensure_node(c: &impl GenericClient, kind: NodeKind, key: &str) -> Result<Uuid> {
     let row = c
-        .query_one(
+        .one(
             "INSERT INTO nodes (id, kind, key) VALUES ($1, $2, $3) \
              ON CONFLICT ON CONSTRAINT nodes_kind_key DO UPDATE SET kind = EXCLUDED.kind \
              RETURNING id",
             &[&Uuid::now_v7(), &kind.as_str(), &key],
         )
-        .await
-        .map_err(pg)?;
+        .await?;
     row.try_get(0).map_err(pg)
 }
 
 async fn upsert_edge(c: &impl GenericClient, e: &Edge) -> Result<Uuid> {
     e.validate()?;
     let row = c
-        .query_one(
+        .one(
             "INSERT INTO edges (id, src, dst, kind, props, evidence, confidence, state, \
              valid_from, valid_to, source) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
@@ -200,8 +199,7 @@ async fn upsert_edge(c: &impl GenericClient, e: &Edge) -> Result<Uuid> {
                 &e.source.as_str(),
             ],
         )
-        .await
-        .map_err(pg)?;
+        .await?;
     row.try_get(0).map_err(pg)
 }
 
@@ -210,12 +208,11 @@ async fn upsert_edge(c: &impl GenericClient, e: &Edge) -> Result<Uuid> {
 async fn follow_merges(c: &impl GenericClient, mut id: Uuid, hops: &mut usize) -> Result<Uuid> {
     loop {
         let row = c
-            .query_opt(
+            .opt(
                 "SELECT props->>'merged_into' FROM nodes WHERE id = $1",
                 &[&id],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         match row.and_then(|r| merged_into_column(&r)) {
             Some(next) => {
                 *hops += 1;
@@ -250,22 +247,21 @@ async fn upsert_live_edge(c: &mut Object, edge: &Edge) -> Result<LiveEdge> {
     let mut e = edge.clone();
     let (mut src_hops, mut dst_hops) = (0, 0);
     loop {
-        e.src = follow_merges(&***c, e.src, &mut src_hops).await?;
-        e.dst = follow_merges(&***c, e.dst, &mut dst_hops).await?;
+        e.src = follow_merges(&*c, e.src, &mut src_hops).await?;
+        e.dst = follow_merges(&*c, e.dst, &mut dst_hops).await?;
         let tx = c.transaction().await.map_err(pg)?;
         let mut ends = vec![e.src, e.dst];
         ends.sort_unstable();
         ends.dedup();
         let rows = tx
-            .query(
+            .rows(
                 "SELECT props->>'merged_into' FROM nodes WHERE id = ANY($1) \
                  ORDER BY id FOR SHARE",
                 &[&ends],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         if rows.iter().all(|r| merged_into_column(r).is_none()) {
-            let id = upsert_edge(&*tx, &e).await?;
+            let id = upsert_edge(&tx, &e).await?;
             tx.commit().await.map_err(pg)?;
             let redirects = u32::try_from(src_hops + dst_hops).unwrap_or(u32::MAX);
             return Ok(LiveEdge {
@@ -294,12 +290,11 @@ async fn update_props(
     // The row lock orders this after any other writer of the node (another patch, an
     // upsert, a merge) and lets it read what that writer committed.
     let Some(row) = tx
-        .query_opt(
+        .opt(
             &format!("SELECT {NODE_COLUMNS} FROM nodes n WHERE n.id = $1 FOR UPDATE"),
             &[&id],
         )
-        .await
-        .map_err(pg)?
+        .await?
     else {
         return Ok(None);
     };
@@ -315,12 +310,11 @@ async fn update_props(
     patch.apply(&mut props);
     node.props = Value::Object(props);
     if node.props != before {
-        tx.execute(
+        tx.exec(
             "UPDATE nodes SET props = $2, updated_at = now() WHERE id = $1",
             &[&id, &node.props],
         )
-        .await
-        .map_err(pg)?;
+        .await?;
     }
     tx.commit().await.map_err(pg)?;
     Ok(Some(node))
@@ -332,12 +326,11 @@ async fn update_props(
 /// the transaction ends. `false` when there is no node `id`.
 pub(crate) async fn lock_live(c: &impl GenericClient, id: Uuid) -> Result<bool> {
     let row = c
-        .query_opt(
+        .opt(
             "SELECT props->>'merged_into' FROM nodes WHERE id = $1 FOR SHARE",
             &[&id],
         )
-        .await
-        .map_err(pg)?;
+        .await?;
     match row {
         None => Ok(false),
         Some(r) => match merged_into_column(&r) {
@@ -357,13 +350,12 @@ fn claim_from(key: &SourceKey, row: &Row) -> Result<SourceClaim> {
 }
 
 async fn source_owner(c: &impl GenericClient, key: &SourceKey) -> Result<Option<SourceClaim>> {
-    c.query_opt(
+    c.opt(
         "SELECT owner, extract(epoch FROM claimed_at)::bigint FROM source_claims \
          WHERE endpoint = $1 AND bucket = $2 AND prefix = $3",
         &[&key.endpoint(), &key.bucket(), &key.prefix()],
     )
-    .await
-    .map_err(pg)?
+    .await?
     .map(|row| claim_from(key, &row))
     .transpose()
 }
@@ -378,7 +370,7 @@ impl RecordStore for PgStore {
     ) -> Result<PutOutcome> {
         let c = client(&self.pool).await?;
         let row = c
-            .query_opt(
+            .opt(
                 "INSERT INTO records (blake3, record, versions) VALUES ($1, $2, $3) \
                  ON CONFLICT (blake3) DO UPDATE SET record = EXCLUDED.record, \
                  versions = EXCLUDED.versions, updated_at = now() \
@@ -391,8 +383,7 @@ impl RecordStore for PgStore {
                     &versions_to_json(versions),
                 ],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         Ok(match row {
             None => PutOutcome::Unchanged,
             Some(r) if r.try_get::<_, bool>(0).map_err(pg)? => PutOutcome::Inserted,
@@ -402,13 +393,12 @@ impl RecordStore for PgStore {
 
     async fn get_record(&self, blake3: &Blake3) -> Result<Option<Record>> {
         let c = client(&self.pool).await?;
-        c.query_opt(
+        c.opt(
             "SELECT record, versions, extract(epoch FROM updated_at)::bigint FROM records \
              WHERE blake3 = $1",
             &[&blake3.as_bytes().as_slice()],
         )
-        .await
-        .map_err(pg)?
+        .await?
         .map(|r| {
             Ok(Record {
                 blake3: *blake3,
@@ -429,7 +419,7 @@ impl RecordStore for PgStore {
         let c = client(&self.pool).await?;
         let after = after.map(|h| h.as_bytes().to_vec());
         let rows = c
-            .query(
+            .rows(
                 LIST_RECORDS,
                 &[
                     &source.endpoint(),
@@ -439,8 +429,7 @@ impl RecordStore for PgStore {
                     &i64::from(records_limit(limit)),
                 ],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         rows.iter()
             .map(|r| {
                 Ok(Record {
@@ -458,12 +447,12 @@ impl RecordStore for PgStore {
 impl GraphStore for PgStore {
     async fn upsert_node(&self, kind: NodeKind, key: &str, props: &Value) -> Result<Uuid> {
         validate_node(kind, key, props)?;
-        upsert_node(&**client(&self.pool).await?, kind, key, props).await
+        upsert_node(&client(&self.pool).await?, kind, key, props).await
     }
 
     async fn ensure_node(&self, kind: NodeKind, key: &str) -> Result<Uuid> {
         validate_node(kind, key, &Value::Object(serde_json::Map::new()))?;
-        ensure_node(&**client(&self.pool).await?, kind, key).await
+        ensure_node(&client(&self.pool).await?, kind, key).await
     }
 
     async fn update_props(&self, id: Uuid, patch: &PropsPatch) -> Result<Option<Node>> {
@@ -476,31 +465,29 @@ impl GraphStore for PgStore {
 
     async fn node(&self, id: Uuid) -> Result<Option<Node>> {
         let c = client(&self.pool).await?;
-        c.query_opt(
+        c.opt(
             &format!("SELECT {NODE_COLUMNS} FROM nodes n WHERE n.id = $1"),
             &[&id],
         )
-        .await
-        .map_err(pg)?
+        .await?
         .map(|r| node_at(&r, 0))
         .transpose()
     }
 
     async fn node_by_key(&self, kind: NodeKind, key: &str) -> Result<Option<Node>> {
         let c = client(&self.pool).await?;
-        c.query_opt(
+        c.opt(
             &format!("SELECT {NODE_COLUMNS} FROM nodes n WHERE n.kind = $1 AND n.key = $2"),
             &[&kind.as_str(), &key],
         )
-        .await
-        .map_err(pg)?
+        .await?
         .map(|r| node_at(&r, 0))
         .transpose()
     }
 
     async fn upsert_edge(&self, edge: &Edge) -> Result<Uuid> {
         edge.validate()?;
-        upsert_edge(&**client(&self.pool).await?, edge).await
+        upsert_edge(&client(&self.pool).await?, edge).await
     }
 
     async fn upsert_live_edge(&self, edge: &Edge) -> Result<LiveEdge> {
@@ -546,7 +533,8 @@ impl GraphStore for PgStore {
         }
         sql.push_str(" ORDER BY e.kind COLLATE \"C\", e.valid_from NULLS FIRST, e.id");
         let c = client(&self.pool).await?;
-        let rows = c.query(&sql, &args.refs()).await.map_err(pg)?;
+        // Cached: at most 48 shapes (direction and the four optional filters).
+        let rows = c.rows(&sql, &args.refs()).await?;
         rows.iter()
             .map(|r| {
                 Ok(Neighbour {
@@ -560,7 +548,7 @@ impl GraphStore for PgStore {
     async fn company_documents(&self, company: Uuid) -> Result<Vec<Node>> {
         let c = client(&self.pool).await?;
         let rows = c
-            .query(
+            .rows(
                 &format!(
                     "SELECT DISTINCT {NODE_COLUMNS}, n.key COLLATE \"C\" AS sort_key \
                      FROM edges e JOIN nodes n ON n.id = e.src \
@@ -569,8 +557,7 @@ impl GraphStore for PgStore {
                 ),
                 &[&company],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         rows.iter().map(|r| node_at(r, 0)).collect()
     }
 
@@ -578,12 +565,12 @@ impl GraphStore for PgStore {
         let at = &at.checked()?;
         let mut c = client(&self.pool).await?;
         let tx = c.transaction().await.map_err(pg)?;
-        let document = ensure_node(&*tx, NodeKind::Document, &blake3.to_hex()).await?;
+        let document = ensure_node(&tx, NodeKind::Document, &blake3.to_hex()).await?;
         let props = serde_json::json!({
             "endpoint": at.endpoint, "bucket": at.bucket, "key": at.key,
         });
-        let location = upsert_node(&*tx, NodeKind::Location, &at.node_key(), &props).await?;
-        tx.execute(
+        let location = upsert_node(&tx, NodeKind::Location, &at.node_key(), &props).await?;
+        tx.exec(
             "INSERT INTO locations (node_id, document_id, blake3, endpoint, bucket, object_key) \
              VALUES ($1, $2, $3, $4, $5, $6) \
              ON CONFLICT (node_id) DO UPDATE SET document_id = EXCLUDED.document_id, \
@@ -597,17 +584,15 @@ impl GraphStore for PgStore {
                 &at.key,
             ],
         )
-        .await
-        .map_err(pg)?;
-        tx.execute(
+        .await?;
+        tx.exec(
             "UPDATE edges SET state = 'superseded', updated_at = now() \
              WHERE dst = $1 AND kind = 'located_at' AND src <> $2 AND state = 'active'",
             &[&location, &document],
         )
-        .await
-        .map_err(pg)?;
+        .await?;
         upsert_edge(
-            &*tx,
+            &tx,
             &Edge::new(document, location, EdgeKind::LocatedAt, EdgeSource::Storage),
         )
         .await?;
@@ -620,35 +605,32 @@ impl GraphStore for PgStore {
         let mut c = client(&self.pool).await?;
         let tx = c.transaction().await.map_err(pg)?;
         let Some(row) = tx
-            .query_opt(
+            .opt(
                 "DELETE FROM locations WHERE endpoint = $1 AND bucket = $2 AND object_key = $3 \
                  RETURNING node_id, document_id",
                 &[&at.endpoint, &at.bucket, &at.key],
             )
-            .await
-            .map_err(pg)?
+            .await?
         else {
             return Ok(None);
         };
         let (location, document): (Uuid, Uuid) =
             (row.try_get(0).map_err(pg)?, row.try_get(1).map_err(pg)?);
-        tx.execute(
+        tx.exec(
             "UPDATE edges SET state = 'superseded', \
              valid_to = greatest(coalesce(valid_from, $2), $2), updated_at = now() \
              WHERE dst = $1 AND kind = 'located_at' \
              AND state NOT IN ('retracted', 'superseded')",
             &[&location, &on],
         )
-        .await
-        .map_err(pg)?;
+        .await?;
         let remaining: i64 = tx
-            .query_one(
+            .one(
                 "SELECT count(*) FROM edges WHERE src = $1 AND kind = 'located_at' \
                  AND state NOT IN ('retracted', 'superseded')",
                 &[&document],
             )
-            .await
-            .map_err(pg)?
+            .await?
             .try_get(0)
             .map_err(pg)?;
         tx.commit().await.map_err(pg)?;
@@ -670,14 +652,13 @@ impl GraphStore for PgStore {
         let c = client(&self.pool).await?;
         // A no-op update on conflict, so the stored row always comes back.
         let row = c
-            .query_one(
+            .one(
                 "INSERT INTO node_aliases (kind, alias, node_id, props) VALUES ($1, $2, $3, $4) \
                  ON CONFLICT (kind, alias) DO UPDATE SET kind = node_aliases.kind \
                  RETURNING node_id, props",
                 &[&kind.as_str(), &alias, &node, props],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         Ok(NodeAlias {
             node: row.try_get(0).map_err(pg)?,
             props: row.try_get(1).map_err(pg)?,
@@ -695,16 +676,15 @@ impl GraphStore for PgStore {
         let mut c = client(&self.pool).await?;
         let tx = c.transaction().await.map_err(pg)?;
         // A missing node: the insert below fails as `claim_alias` does.
-        lock_live(&*tx, node).await?;
+        lock_live(&tx, node).await?;
         let row = tx
-            .query_one(
+            .one(
                 "INSERT INTO node_aliases (kind, alias, node_id, props) VALUES ($1, $2, $3, $4) \
                  ON CONFLICT (kind, alias) DO UPDATE SET kind = node_aliases.kind \
                  RETURNING node_id, props",
                 &[&kind.as_str(), &alias, &node, props],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         let got = NodeAlias {
             node: row.try_get(0).map_err(pg)?,
             props: row.try_get(1).map_err(pg)?,
@@ -715,12 +695,11 @@ impl GraphStore for PgStore {
 
     async fn alias(&self, kind: NodeKind, alias: &str) -> Result<Option<NodeAlias>> {
         let c = client(&self.pool).await?;
-        c.query_opt(
+        c.opt(
             "SELECT node_id, props FROM node_aliases WHERE kind = $1 AND alias = $2",
             &[&kind.as_str(), &alias],
         )
-        .await
-        .map_err(pg)?
+        .await?
         .map(|r| {
             Ok(NodeAlias {
                 node: r.try_get(0).map_err(pg)?,
@@ -733,19 +712,18 @@ impl GraphStore for PgStore {
     async fn block_alias(&self, kind: NodeKind, alias: &str, props: &Value) -> Result<()> {
         validate_alias(alias, props)?;
         let c = client(&self.pool).await?;
-        c.execute(
+        c.exec(
             "INSERT INTO node_aliases (kind, alias, node_id, props) VALUES ($1, $2, NULL, $3) \
              ON CONFLICT (kind, alias) DO UPDATE SET node_id = NULL, props = EXCLUDED.props, \
              updated_at = now()",
             &[&kind.as_str(), &alias, props],
         )
-        .await
-        .map_err(pg)?;
+        .await?;
         Ok(())
     }
 
     async fn aliases_of(&self, node: Uuid) -> Result<Vec<OwnedAlias>> {
-        crate::merges::aliases_of(&**client(&self.pool).await?, node).await
+        crate::merges::aliases_of(&client(&self.pool).await?, node).await
     }
 }
 
@@ -757,24 +735,21 @@ impl SketchStore for PgStore {
         let bands: Vec<i64> = bands.iter().map(|b| band_to_i64(*b)).collect();
         let mut c = client(&self.pool).await?;
         let tx = c.transaction().await.map_err(pg)?;
-        tx.execute(
+        tx.exec(
             "INSERT INTO sketches (blake3, signature) VALUES ($1, $2) \
              ON CONFLICT (blake3) DO UPDATE SET signature = EXCLUDED.signature, \
              updated_at = now()",
             &[&key, &signature],
         )
-        .await
-        .map_err(pg)?;
-        tx.execute("DELETE FROM sketch_bands WHERE blake3 = $1", &[&key])
-            .await
-            .map_err(pg)?;
-        tx.execute(
+        .await?;
+        tx.exec("DELETE FROM sketch_bands WHERE blake3 = $1", &[&key])
+            .await?;
+        tx.exec(
             "INSERT INTO sketch_bands (band, blake3) \
              SELECT DISTINCT b, $2::bytea FROM unnest($1::bigint[]) AS b",
             &[&bands, &key],
         )
-        .await
-        .map_err(pg)?;
+        .await?;
         tx.commit().await.map_err(pg)
     }
 
@@ -795,7 +770,7 @@ impl SketchStore for PgStore {
         let bands: Vec<i64> = bands.iter().map(|b| band_to_i64(*b)).collect();
         let c = client(&self.pool).await?;
         let rows = c
-            .query(
+            .rows(
                 "SELECT b.blake3, s.signature, count(DISTINCT b.band) AS shared \
                  FROM sketch_bands b JOIN sketches s ON s.blake3 = b.blake3 \
                  WHERE b.band = ANY($1) AND b.blake3 <> $2 \
@@ -806,8 +781,7 @@ impl SketchStore for PgStore {
                     &i64::from(sketch_limit(limit)),
                 ],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         rows.iter()
             .map(|r| {
                 Ok(Sketch {
@@ -828,7 +802,7 @@ impl ClaimStore for PgStore {
         for _ in 0..CLAIM_ATTEMPTS {
             // A no-op update on our own claim, so that it is returned; none on another's.
             let mine = c
-                .query_opt(
+                .opt(
                     "INSERT INTO source_claims (endpoint, bucket, prefix, owner) \
                      VALUES ($1, $2, $3, $4) \
                      ON CONFLICT ON CONSTRAINT source_claims_key \
@@ -842,12 +816,11 @@ impl ClaimStore for PgStore {
                         &owner.as_str(),
                     ],
                 )
-                .await
-                .map_err(pg)?;
+                .await?;
             if let Some(row) = mine {
                 return claim_from(key, &row);
             }
-            if let Some(claim) = source_owner(&**c, key).await? {
+            if let Some(claim) = source_owner(&c, key).await? {
                 return Err(Error::SourceClaimed {
                     key: key.clone(),
                     owner: claim.owner,
@@ -863,7 +836,7 @@ impl ClaimStore for PgStore {
     async fn release_source(&self, key: &SourceKey, owner: &InstanceId) -> Result<bool> {
         let c = client(&self.pool).await?;
         let n = c
-            .execute(
+            .exec(
                 "DELETE FROM source_claims \
                  WHERE endpoint = $1 AND bucket = $2 AND prefix = $3 AND owner = $4",
                 &[
@@ -873,12 +846,11 @@ impl ClaimStore for PgStore {
                     &owner.as_str(),
                 ],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         if n > 0 {
             return Ok(true);
         }
-        match source_owner(&**c, key).await? {
+        match source_owner(&c, key).await? {
             Some(claim) => Err(Error::SourceClaimed {
                 key: key.clone(),
                 owner: claim.owner,
@@ -888,7 +860,7 @@ impl ClaimStore for PgStore {
     }
 
     async fn source_owner(&self, key: &SourceKey) -> Result<Option<SourceClaim>> {
-        source_owner(&**client(&self.pool).await?, key).await
+        source_owner(&client(&self.pool).await?, key).await
     }
 
     async fn lease_company(
@@ -899,7 +871,7 @@ impl ClaimStore for PgStore {
     ) -> Result<bool> {
         let c = client(&self.pool).await?;
         let won = c
-            .query_opt(
+            .opt(
                 "INSERT INTO company_leases (company_id, owner, leased_at, expires_at) \
                  VALUES ($1, $2, now(), now() + make_interval(secs => $3)) \
                  ON CONFLICT (company_id) DO UPDATE SET owner = EXCLUDED.owner, \
@@ -909,20 +881,18 @@ impl ClaimStore for PgStore {
                  RETURNING owner",
                 &[&company, &owner.as_str(), &ttl.as_secs_f64()],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         Ok(won.is_some())
     }
 
     async fn release_company(&self, company: Uuid, owner: &InstanceId) -> Result<bool> {
         let c = client(&self.pool).await?;
         let n = c
-            .execute(
+            .exec(
                 "DELETE FROM company_leases WHERE company_id = $1 AND owner = $2",
                 &[&company, &owner.as_str()],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         Ok(n > 0)
     }
 }
@@ -931,7 +901,7 @@ impl ClaimStore for PgStore {
 impl SearchStore for PgStore {
     async fn index_document(&self, doc: &SearchDoc) -> Result<()> {
         let c = client(&self.pool).await?;
-        c.execute(
+        c.exec(
             "INSERT INTO search_index (blake3, title, body, kind, doc_date, amount) \
              VALUES ($1, $2, $3, $4, $5, $6) \
              ON CONFLICT (blake3) DO UPDATE SET title = EXCLUDED.title, body = EXCLUDED.body, \
@@ -946,8 +916,7 @@ impl SearchStore for PgStore {
                 &doc.amount,
             ],
         )
-        .await
-        .map_err(pg)?;
+        .await?;
         Ok(())
     }
 
@@ -1019,6 +988,8 @@ impl SearchStore for PgStore {
              LIMIT {limit} OFFSET {offset}"
         );
         let c = client(&self.pool).await?;
+        // Not cached: up to 256 shapes (one per combination of filters), each user-driven and
+        // rare next to the ingest statements.
         let rows = c.query(&sql, &args.refs()).await.map_err(pg)?;
         rows.iter()
             .map(|r| {

@@ -5,16 +5,17 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use deadpool_postgres::GenericClient;
 use doewood_core::InstanceId;
 use doewood_model::{
     CacheRow, CacheStore, DueCompany, DueReason, Enrichment, Error, FreshnessStore, IconRow,
     Result, StoredIcon, due_limit, validate_cache_key, validate_registry, validate_schedule,
 };
-use tokio_postgres::GenericClient;
 use uuid::Uuid;
 
 use crate::PgStore;
 use crate::backend::{bad, client, lock_live, pg};
+use crate::cached::Cached;
 
 /// A company's document count: documents with a live `party` edge to `n.id`.
 const DOCUMENTS: &str = "(SELECT count(DISTINCT e.src) FROM edges e JOIN nodes d ON d.id = e.src \
@@ -27,25 +28,23 @@ fn count(n: i64) -> Result<u64> {
 
 async fn enrichment(c: &impl GenericClient, company: Uuid) -> Result<Option<Enrichment>> {
     let Some(row) = c
-        .query_opt(
+        .opt(
             "SELECT extract(epoch FROM enriched_at)::bigint, documents FROM company_enrichment \
              WHERE company_id = $1",
             &[&company],
         )
-        .await
-        .map_err(pg)?
+        .await?
     else {
         return Ok(None);
     };
     let mut next_due = BTreeMap::new();
     for r in c
-        .query(
+        .rows(
             "SELECT registry, extract(epoch FROM next_due_at)::bigint FROM company_registry_due \
              WHERE company_id = $1",
             &[&company],
         )
-        .await
-        .map_err(pg)?
+        .await?
     {
         next_due.insert(r.try_get(0).map_err(pg)?, r.try_get(1).map_err(pg)?);
     }
@@ -63,14 +62,13 @@ impl CacheStore for PgStore {
         validate_registry(registry)?;
         validate_cache_key(key)?;
         let c = client(&self.pool).await?;
-        c.query_opt(
+        c.opt(
             "SELECT body, extract(epoch FROM fetched_at)::bigint, \
              extract(epoch FROM expires_at)::bigint FROM registry_cache \
              WHERE registry = $1 AND key = $2 AND expires_at > now()",
             &[&registry, &key],
         )
-        .await
-        .map_err(pg)?
+        .await?
         .map(|r| {
             Ok(CacheRow {
                 registry: registry.to_owned(),
@@ -86,7 +84,7 @@ impl CacheStore for PgStore {
     async fn cache_put(&self, row: &CacheRow) -> Result<()> {
         row.validate()?;
         let c = client(&self.pool).await?;
-        c.execute(
+        c.exec(
             "INSERT INTO registry_cache (registry, key, body, fetched_at, expires_at) \
              VALUES ($1, $2, $3, to_timestamp($4::bigint), to_timestamp($5::bigint)) \
              ON CONFLICT (registry, key) DO UPDATE SET body = EXCLUDED.body, \
@@ -99,21 +97,19 @@ impl CacheStore for PgStore {
                 &row.expires_at,
             ],
         )
-        .await
-        .map_err(pg)?;
+        .await?;
         Ok(())
     }
 
     async fn icon_get(&self, domain: &str) -> Result<Option<IconRow>> {
         let c = client(&self.pool).await?;
-        c.query_opt(
+        c.opt(
             "SELECT icon, format, extract(epoch FROM fetched_at)::bigint, \
              extract(epoch FROM expires_at)::bigint FROM favicons \
              WHERE domain = $1 AND expires_at > now()",
             &[&domain],
         )
-        .await
-        .map_err(pg)?
+        .await?
         .map(|r| {
             let icon: Option<Vec<u8>> = r.try_get(0).map_err(pg)?;
             let format: Option<String> = r.try_get(1).map_err(pg)?;
@@ -136,7 +132,7 @@ impl CacheStore for PgStore {
             Some(i) => (Some(i.bytes.as_slice()), Some(i.format.as_str())),
             None => (None, None),
         };
-        c.execute(
+        c.exec(
             "INSERT INTO favicons (domain, icon, format, fetched_at, expires_at) \
              VALUES ($1, $2, $3, to_timestamp($4::bigint), to_timestamp($5::bigint)) \
              ON CONFLICT (domain) DO UPDATE SET icon = EXCLUDED.icon, format = EXCLUDED.format, \
@@ -149,22 +145,20 @@ impl CacheStore for PgStore {
                 &row.expires_at,
             ],
         )
-        .await
-        .map_err(pg)?;
+        .await?;
         Ok(())
     }
 
     async fn purge_expired(&self) -> Result<u64> {
         let c = client(&self.pool).await?;
         let n: i64 = c
-            .query_one(
+            .one(
                 "WITH a AS (DELETE FROM registry_cache WHERE expires_at <= now() RETURNING 1), \
                  b AS (DELETE FROM favicons WHERE expires_at <= now() RETURNING 1) \
                  SELECT (SELECT count(*) FROM a) + (SELECT count(*) FROM b)",
                 &[],
             )
-            .await
-            .map_err(pg)?
+            .await?
             .try_get(0)
             .map_err(pg)?;
         count(n)
@@ -182,11 +176,11 @@ impl FreshnessStore for PgStore {
         let mut c = client(&self.pool).await?;
         let tx = c.transaction().await.map_err(pg)?;
         // A husk is never recorded (issue #62); the lock holds back a merge until the commit.
-        if !lock_live(&*tx, company).await? {
+        if !lock_live(&tx, company).await? {
             return Err(Error::NotFound(format!("no company {company}")));
         }
         let written = tx
-            .execute(
+            .exec(
                 &format!(
                     "INSERT INTO company_enrichment (company_id, enriched_at, documents) \
                      SELECT n.id, now(), {DOCUMENTS} FROM nodes n \
@@ -196,23 +190,21 @@ impl FreshnessStore for PgStore {
                 ),
                 &[&company],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         if written == 0 {
             return Err(Error::NotFound(format!("no company {company}")));
         }
         for (registry, every) in schedule {
-            tx.execute(
+            tx.exec(
                 "INSERT INTO company_registry_due (company_id, registry, next_due_at) \
                  VALUES ($1, $2, now() + make_interval(secs => $3)) \
                  ON CONFLICT (company_id, registry) DO UPDATE SET \
                  next_due_at = EXCLUDED.next_due_at",
                 &[&company, registry, &every.as_secs_f64()],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         }
-        let e = enrichment(&*tx, company)
+        let e = enrichment(&tx, company)
             .await?
             .ok_or_else(|| bad("enrichment", "missing after the write"))?;
         tx.commit().await.map_err(pg)?;
@@ -220,7 +212,7 @@ impl FreshnessStore for PgStore {
     }
 
     async fn enrichment(&self, company: Uuid) -> Result<Option<Enrichment>> {
-        enrichment(&**client(&self.pool).await?, company).await
+        enrichment(&client(&self.pool).await?, company).await
     }
 
     async fn mark_due(&self, company: Uuid, registries: &[String]) -> Result<()> {
@@ -229,17 +221,16 @@ impl FreshnessStore for PgStore {
         }
         let mut c = client(&self.pool).await?;
         let tx = c.transaction().await.map_err(pg)?;
-        if !lock_live(&*tx, company).await? {
+        if !lock_live(&tx, company).await? {
             return Err(Error::NotFound(format!("no company {company}")));
         }
         let kind = tx
-            .query_opt(
+            .opt(
                 "SELECT n.kind, f.company_id IS NOT NULL FROM nodes n \
                  LEFT JOIN company_enrichment f ON f.company_id = n.id WHERE n.id = $1",
                 &[&company],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         let Some(row) = kind.filter(|r| r.try_get::<_, &str>(0).is_ok_and(|k| k == "company"))
         else {
             return Err(Error::NotFound(format!("no company {company}")));
@@ -247,14 +238,13 @@ impl FreshnessStore for PgStore {
         // Never enriched: due already.
         if row.try_get::<_, bool>(1).map_err(pg)? {
             for registry in registries {
-                tx.execute(
+                tx.exec(
                     "INSERT INTO company_registry_due (company_id, registry, next_due_at) \
                      VALUES ($1, $2, now()) ON CONFLICT (company_id, registry) DO UPDATE SET \
                      next_due_at = least(company_registry_due.next_due_at, EXCLUDED.next_due_at)",
                     &[&company, registry],
                 )
-                .await
-                .map_err(pg)?;
+                .await?;
             }
         }
         tx.commit().await.map_err(pg)?;
@@ -269,7 +259,7 @@ impl FreshnessStore for PgStore {
     ) -> Result<Vec<DueCompany>> {
         let c = client(&self.pool).await?;
         let rows = c
-            .query(
+            .rows(
                 &format!(
                     "SELECT n.id, c.docs, f.documents, \
                      ARRAY(SELECT r.registry FROM company_registry_due r \
@@ -288,8 +278,7 @@ impl FreshnessStore for PgStore {
                 ),
                 &[&owner.as_str(), &after, &i64::from(due_limit(limit))],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         rows.iter()
             .map(|r| {
                 let documents = count(r.try_get(1).map_err(pg)?)?;

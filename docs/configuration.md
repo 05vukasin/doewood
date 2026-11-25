@@ -114,6 +114,12 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
   shares the database together**: once one new instance has started, the older ones stay not
   ready until they are upgraded. The instance's own SQLite file goes to schema 8 at the same
   time (the same table and the same move).
+- **Prepared statements.** Each pooled connection (16 per instance) prepares a statement
+  once and reuses it for the connection's life, so a statement is one round trip. Behind
+  PgBouncer in transaction mode this needs PgBouncer 1.21 or newer with
+  `max_prepared_statements` set (for example 200); older PgBouncer, or transaction mode
+  without that setting, breaks named prepared statements. Session mode and a direct
+  connection need nothing.
 - **Cache purge.** Every hour (first a minute after the start), each instance deletes the
   expired registry answers and icons. Every instance does it; the delete is idempotent.
 - **pgvector** is used when the server has it: doewood creates the extension (this needs a role
