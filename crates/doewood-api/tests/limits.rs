@@ -128,6 +128,12 @@ async fn grpc_web_call(a: &Instance) -> String {
     http1(a, &req).await.to_ascii_lowercase()
 }
 
+/// The retry pushback (issue #104) in milliseconds, if the answer has one.
+fn pushback(md: &tonic::metadata::MetadataMap) -> Option<u64> {
+    md.get("grpc-retry-pushback-ms")
+        .map(|v| v.to_str().unwrap().parse().unwrap())
+}
+
 /// A paused source, so a watch of every source starts with a snapshot.
 async fn add_paused_source(ch: &Channel) {
     config(ch)
@@ -242,18 +248,23 @@ async fn calls_beyond_the_cap_are_shed() {
     assert_eq!(err.code(), Code::Unavailable, "{err:?}");
     assert!(err.message().contains("overloaded"), "{}", err.message());
     assert!(started.elapsed() < Duration::from_secs(2));
-    // So is a gRPC-Web call, with the status in its headers.
+    // It tells the client how long to back off (issue #104).
+    let ms = pushback(err.metadata()).expect("a retry pushback");
+    assert!((100..200).contains(&ms), "{ms}");
+    // So is a gRPC-Web call, with the status and the pushback in its headers.
     let web = grpc_web_call(&a).await;
     assert!(web.starts_with("http/1.1 200"), "{web}");
     assert!(web.contains("grpc-status: 14"), "{web}");
-    // Health checks still answer.
+    assert!(web.contains("grpc-retry-pushback-ms: 1"), "{web}");
+    // Health checks still answer, without a pushback.
     let health = HealthClient::new(ch.clone())
         .check(HealthCheckRequest {
             service: String::new(),
         })
         .await
-        .unwrap()
-        .into_inner();
+        .unwrap();
+    assert_eq!(pushback(health.metadata()), None);
+    let health = health.into_inner();
     assert_eq!(
         health.status,
         tonic_health::pb::health_check_response::ServingStatus::Serving as i32
@@ -280,7 +291,9 @@ async fn calls_beyond_the_cap_are_shed() {
         .list_sources(pb::ListSourcesRequest {})
         .await
         .unwrap();
-    assert!(grpc_web_call(&a).await.contains("grpc-status:0"));
+    let web = grpc_web_call(&a).await;
+    assert!(web.contains("grpc-status:0"), "{web}");
+    assert!(!web.contains("grpc-retry-pushback-ms"), "{web}");
     // The streams were not touched.
     a.progress.set_enrichment(doewood_api::EnrichmentCounts {
         enriched: 1,

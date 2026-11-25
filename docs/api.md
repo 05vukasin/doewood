@@ -310,7 +310,7 @@ source's `max_object_bytes`; a file larger than ingest analyzes (512 MiB) is
 | `INVALID_ARGUMENT` | a field is wrong. Every problem is reported at once: the message lists `field: reason` pairs, and a `google.rpc.BadRequest` detail carries the same field paths (`credentials.access_key_id`, `llm_policy.kinds[2]`, ...). |
 | `NOT_FOUND` | the source, record, node or provider does not exist |
 | `ALREADY_EXISTS` | the source exists on this instance, or another instance has claimed it (named in the message) |
-| `UNAVAILABLE` | the shared Postgres is not connected (yet), or a call to it failed; retry. `ReprocessJob` and `Summarize` on an instance without ingest; `Summarize` of an object that cannot be read. The server is overloaded: more calls are in flight than `max_calls_in_flight` (the message says `overloaded`; nothing ran, retry with backoff). |
+| `UNAVAILABLE` | the shared Postgres is not connected (yet), or a call to it failed; retry. `ReprocessJob` and `Summarize` on an instance without ingest; `Summarize` of an object that cannot be read. The server is overloaded: more calls are in flight than `max_calls_in_flight` (the message says `overloaded` and the trailer `grpc-retry-pushback-ms` says how long to wait; nothing ran, retry with backoff). |
 | `DEADLINE_EXCEEDED` | the call ran longer than the server's deadline (`deadline_seconds`, default 60 s), or than the client's own deadline |
 | `CANCELLED` | the client's `grpc-timeout` ran out on the server side (the client usually reports its own `DEADLINE_EXCEEDED` first) |
 | `FAILED_PRECONDITION` | the shared database was migrated by a newer doewood. A merge of a dismissed pair or of a merged-away company; an undo that later merges depend on (named in the message), of an entry already undone, or of a split that dismissed its pair; a dismissal of two companies merged now. `Summarize` without a configured AI provider (or with one missing its key or base URL), of a source whose LLM policy is off, of a file without text, or of a file larger than ingest analyzes |
@@ -329,7 +329,7 @@ to do:
 | HTTP/2 keepalive | PING after 30 s without traffic, closed if no answer within 20 s (fixed) | nothing; a dead or vanished peer's connection, streams and tasks are freed |
 | TCP keepalive | probes after 60 s idle (fixed) | nothing; half-open connections behind a NAT or load balancer are found |
 | Connection age | GOAWAY at 30 min ± 10% (each connection draws its own age, so clients that connected together do not reconnect together), closed 5 min later (fixed) | new calls go to a new connection (which the load balancer may send to another replica); calls already running get the 5 minutes to finish; an open stream still running then ends with a transport error (the connection is closed): watch again |
-| Calls in flight, per instance | `max_calls_in_flight`, default 256 (runtime setting) | `UNAVAILABLE`, at once, with `overloaded` in the message; retry with backoff (another replica may answer) |
+| Calls in flight, per instance | `max_calls_in_flight`, default 256 (runtime setting) | `UNAVAILABLE`, at once, with `overloaded` in the message and a `grpc-retry-pushback-ms` trailer (100 to 199 ms); retry with backoff, no sooner than the pushback (another replica may answer) |
 | Server deadline | `deadline_seconds`, default 60 s (runtime setting) | `DEADLINE_EXCEEDED`; a shorter client `grpc-timeout` wins |
 
 - **Streams** (`WatchProgress`, `WatchReprocess`, reflection, the health `Watch`) count
@@ -360,6 +360,16 @@ to do:
 - **Retries:** `UNAVAILABLE` is safe to retry for every call (a shed call did not run). Use
   exponential backoff with jitter (for example 100 ms doubling to 10 s), and a client
   deadline on every unary call. gRPC clients reconnect on GOAWAY by themselves.
+- **Retry pushback (issue #104):** a shed call carries the trailer `grpc-retry-pushback-ms`
+  (gRFC A6; in a trailers-only response, so a gRPC-Web client finds it in the response
+  headers). Its value is drawn per call, uniformly from 100 to 199 ms, so clients shed at
+  the same moment do not all come back at the same moment. A gRPC client with a retry policy
+  (`retryPolicy` in its service config, `UNAVAILABLE` among `retryableStatusCodes`) waits
+  exactly that long before its next attempt; a client with its own retry loop should wait at
+  least that long and keep its backoff growing while the calls are still shed. Other
+  `UNAVAILABLE` answers (the shared store is not connected) and every other status carry no
+  pushback, and health checks are never shed. Retrying fast costs the calls that run:
+  [deploy.md](deploy.md#retries-and-shed-calls-issue-104) has the numbers.
 - **Load balancing** across replicas: see [deploy.md](deploy.md#load-balancing).
 
 ## Metrics

@@ -136,11 +136,14 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
   5 minutes, then they retry with backoff) and find the schema migrated. The version is in
   the `doewood_schema` table. A database migrated by a newer doewood is
   refused (not ready) until this one is upgraded.
-- **Schema 6** (the registry delta feeds of issue #49: the new table `registry_feeds`, one
-  row per feed with its lease, cursor and next run, and an index on company aliases in byte
-  order) is the current version. It only adds; as with every schema, older instances refuse
-  it, so all instances are upgraded together (below). The instance's own SQLite file goes to
-  schema 9 with the same table. **Schema 5** (the enrichment proposals of issue #52: the new
+- **Schema 7** (issue #102: the search index `search_tsv` gets `gin_pending_list_limit =
+  256` kB, and its pending list is merged once) is the current version. It changes no table
+  and no data, and the instance's own SQLite file is unchanged; as with every schema, older
+  instances refuse it, so all instances are upgraded together (below). See
+  [deploy.md](deploy.md#search-and-the-gin-pending-list-issue-102). **Schema 6** (the registry
+  delta feeds of issue #49: the new table `registry_feeds`, one row per feed with its lease,
+  cursor and next run, and an index on company aliases in byte order) was the one before. The
+  instance's own SQLite file went to schema 9 with the same table. **Schema 5** (the enrichment proposals of issue #52: the new
   table `company_proposals`, and the `merge_proposals` and `registry_proposals` lists of
   company props moved into it and removed from the props) was the one before. Its move is part of the migration: it
   runs once, in the same transaction that records schema 5, so it is never repeated or half done.
