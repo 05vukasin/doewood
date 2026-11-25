@@ -142,8 +142,8 @@ every source, including ones added later.
 A watch of every source (empty `source_ids`) also carries the instance's enrichment job: a
 `KIND_ENRICHMENT` update with the first snapshot and whenever its counters change, with
 `enrichment` set (and no `progress`): `enriched`, `merged`, `proposed`, `failed`,
-`registry_warnings`, `edges`, `websites`, `passes`, `last_pass_completed_at` and `running`,
-counted since the instance started (see [enrichment.md](enrichment.md#progress)). A client
+`registry_warnings`, `edges`, `redirected`, `websites`, `passes`, `last_pass_completed_at` and
+`running`, counted since the instance started (see [enrichment.md](enrichment.md#progress)). A client
 that does not know the kind can skip it.
 
 | counter | meaning |

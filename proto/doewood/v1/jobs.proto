@@ -113,6 +113,9 @@ message EnrichmentProgress {
   int64 last_pass_completed_at = 9;
   // Whether a pass is running now.
   bool running = 10;
+  // Dated edges that landed on the company an end was merged into while the company was
+  // worked on (a merge committed between the lookup and the write).
+  uint64 redirected = 11;
 }
 
 message ReprocessJobRequest {

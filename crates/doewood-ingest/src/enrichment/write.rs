@@ -57,6 +57,26 @@ pub(crate) struct Written {
     pub edges: u64,
     /// Proposals opened or updated.
     pub proposed: u64,
+    /// Edges that landed on the company an end was merged into since it was resolved.
+    pub redirected: u64,
+}
+
+/// Writes `edge` onto live companies ([`doewood_model::GraphStore::upsert_live_edge`], issue
+/// #60): a merge committed since its ends were resolved (by a person, or on another instance)
+/// moves it to the survivor, never leaves it on a husk. Counts a redirect in `redirected`.
+async fn put(b: &dyn Backend, edge: &Edge, redirected: &mut u64) -> Result<()> {
+    let live = b.upsert_live_edge(edge).await?;
+    if live.redirects > 0 {
+        debug!(
+            kind = %edge.kind,
+            src = %live.src,
+            dst = %live.dst,
+            hops = live.redirects,
+            "registry edge redirected to the company it was merged into"
+        );
+        *redirected += 1;
+    }
+    Ok(())
 }
 
 /// Writes the findings for `s`.
@@ -116,6 +136,7 @@ pub(crate) async fn write(job: &Job<'_>, s: &Subject, f: &Findings, g: &Gated) -
     }
     // 3. Edges.
     let mut written = 0;
+    let mut redirected = 0;
     for p in &edges {
         let Some(other) = resolve(b, s, &p.other).await? else {
             debug!(company = %me, other = ?p.other, kind = %p.kind, "the other company is unknown; edge dropped");
@@ -135,11 +156,11 @@ pub(crate) async fn write(job: &Job<'_>, s: &Subject, f: &Findings, g: &Gated) -
             .with_confidence(p.confidence)
             .with_state(p.state)
             .valid(p.valid_from, to);
-        b.upsert_edge(&edge).await?;
+        put(b, &edge, &mut redirected).await?;
         written += 1;
     }
     // 4. Two current parents: the later dated one is current.
-    written += former_parents(b, me).await?;
+    written += former_parents(b, me, &mut redirected).await?;
     // 5. Props.
     update_props(b, me, f, &owned).await?;
     // 6. Proposals.
@@ -147,6 +168,7 @@ pub(crate) async fn write(job: &Job<'_>, s: &Subject, f: &Findings, g: &Gated) -
     Ok(Written {
         edges: written,
         proposed,
+        redirected,
     })
 }
 
@@ -270,8 +292,8 @@ async fn create_or_find(
 /// ADR 0002 section 3: when two parents of `child` are current (active, undated end, not
 /// an ultimate parent), the later dated one stays current; each earlier one ends on that day
 /// (superseded, with its `subsidiary_of` twin) and becomes a `former_parent_of` edge. Returns
-/// the edges written.
-async fn former_parents(b: &dyn Backend, child: Uuid) -> Result<u64> {
+/// the edges written; redirects onto a survivor are counted in `redirected`.
+async fn former_parents(b: &dyn Backend, child: Uuid, redirected: &mut u64) -> Result<u64> {
     let query = NeighbourQuery {
         direction: Direction::In,
         edge_kinds: vec![EdgeKind::ParentOf],
@@ -312,11 +334,11 @@ async fn former_parents(b: &dyn Backend, child: Uuid) -> Result<u64> {
         if old.node.id == latest.node.id || e.valid_from.is_some_and(|d| d >= until) {
             continue;
         }
-        b.upsert_edge(&supersede(e, until)).await?;
+        put(b, &supersede(e, until), redirected).await?;
         for twin in b.neighbours(child, &twins).await? {
             let t = &twin.edge.edge;
             if twin.node.id == old.node.id && t.source == e.source && t.valid_from == e.valid_from {
-                b.upsert_edge(&supersede(t, until)).await?;
+                put(b, &supersede(t, until), redirected).await?;
             }
         }
         let mut evidence = e.evidence.as_array().cloned().unwrap_or_default();
@@ -337,7 +359,7 @@ async fn former_parents(b: &dyn Backend, child: Uuid) -> Result<u64> {
             .with_confidence(e.confidence)
             .with_state(EdgeState::Active)
             .valid(e.valid_from, Some(until));
-        b.upsert_edge(&former).await?;
+        put(b, &former, redirected).await?;
         written += 1;
     }
     Ok(written)

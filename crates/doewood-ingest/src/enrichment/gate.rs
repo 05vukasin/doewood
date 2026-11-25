@@ -35,7 +35,7 @@ use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use super::company::{Findings, Job};
+use super::company::{Findings, Job, OtherLease};
 use super::subject::Subject;
 use super::write::live_id;
 
@@ -169,6 +169,8 @@ pub(crate) struct Gated {
     pub merged: u64,
     /// The merge proposals, for the proposals table.
     pub proposals: Vec<ProposalRequest>,
+    /// A merge waits: who holds the other company's lease.
+    pub deferred: Option<OtherLease>,
 }
 
 /// Whether two companies carry different national registry numbers of one kind: then they
@@ -308,7 +310,8 @@ pub(crate) async fn run(job: &Job<'_>, s: &mut Subject, f: &Findings) -> Result<
                 .iter()
                 .find(|c| c.id == other)
                 .map_or(0.0, |c| c.probability);
-            if job.lease_other(other).await? {
+            let lease = job.lease_other(other).await?;
+            if lease == OtherLease::Taken {
                 let mine = b.company_documents(me).await?.len();
                 let theirs = b.company_documents(other).await?.len();
                 let (survivor, absorbed) = if theirs > mine {
@@ -349,7 +352,8 @@ pub(crate) async fn run(job: &Job<'_>, s: &mut Subject, f: &Findings) -> Result<
                     Err(e) => return Err(e),
                 }
             } else {
-                debug!(company = %me, other = %other, "the other company is leased elsewhere; merged later");
+                debug!(company = %me, other = %other, held = ?lease, "the other company is in work; merged later");
+                out.deferred = Some(lease);
             }
         }
         Decision::Review(reason) => {

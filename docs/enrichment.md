@@ -34,7 +34,10 @@ and of any registry it was never asked (switched on since, say).
 With a shared Postgres, a company another instance holds is left out of `companies_due`, and
 a lease it cannot take is skipped, so one instance enriches each company and the others reuse
 the result (and the registry answers, cached in the shared store). A merge also takes the
-other company's lease first. A lease left behind by a crash expires.
+other company's lease first. When another task of the same pass works on the other company,
+the company is run once more after that page's tasks are done, and the merge happens then;
+when another instance holds it, every registry of the company is due again after the retry
+interval (6 hours), and the merge happens on that run. A lease left behind by a crash expires.
 
 **Shutdown.** The pass stops taking companies; those in flight get 10 seconds, then are
 dropped (their leases expire and they are enriched again later).
@@ -127,6 +130,10 @@ documents, then web; a person or a registry makes them active).
 (keyed by the identifier, `origin: registry`, with its registered name and name keys) when the
 graph has none; or the company that has that Wikidata item or name (Exhibit 21 rows, PSCs
 without a UK number), never created. An edge whose other end cannot be found is dropped.
+Every edge write (the superseding and `former_parent_of` writes below too) resolves
+`merged_into` again in the same transaction (`GraphStore::upsert_live_edge`, issue #60): a
+merge committed since the ends were looked up (by a person, or on another instance) moves the
+edge to the survivor instead of leaving it on the merged-away company.
 
 **The later dated parent is current.** When a company has two current parents (active, no
 end date, not an ultimate parent), the later dated one stays current; each earlier one ends on
@@ -219,7 +226,8 @@ pass). Nothing the job does blocks ingest.
 
 `JobsService.WatchProgress` (a watch of every source) carries the job's counters since the
 instance started, as `KIND_ENRICHMENT` updates (see [api.md](api.md)): `enriched`, `merged`,
-`proposed`, `failed`, `registry_warnings`, `edges`, `websites`, `passes`,
+`proposed`, `failed`, `registry_warnings`, `edges`, `redirected` (edges that landed on the
+company an end was merged into while the company was worked on), `websites`, `passes`,
 `last_pass_completed_at` and `running`.
 
 Log lines: `enrichment started` / `stopped`, `company enriched` (with the company, why it was

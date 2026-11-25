@@ -35,6 +35,7 @@ fn counts(s: EnrichmentStats) -> EnrichmentCounts {
         failed: s.failed,
         registry_warnings: s.registry_warnings,
         edges: s.edges,
+        redirected: s.redirected,
         websites: s.websites,
         passes: s.passes,
         last_pass_completed_at: s.last_pass_completed_at,

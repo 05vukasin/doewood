@@ -28,8 +28,8 @@ use doewood_enrich::{CompanyName, IdKind, Identifier};
 use doewood_ingest::{Enrichment, EnrichmentOptions, EnrichmentParts, Templates, WebClientFactory};
 use doewood_model::{
     Backend, Blake3, Direction, DismissRequest, Edge, EdgeKind, EdgeSource, EdgeState, MergeActor,
-    MergeActorKind, MergeQuery, NeighbourQuery, NodeKind, ProposalKind, ProposalQuery,
-    ProposalReason, ProposalState, StepVersions, StoredEdge,
+    MergeActorKind, MergeQuery, MergeRequest, NeighbourQuery, NodeKind, ProposalKind,
+    ProposalQuery, ProposalReason, ProposalState, StepVersions, StoredEdge,
 };
 use doewood_registry::favicon::{
     AddressPolicy, DnsResolver, GuardOptions, GuardedClient, SiteOrigin,
@@ -105,6 +105,8 @@ struct Reply {
     status: u16,
     content_type: &'static str,
     body: Vec<u8>,
+    /// Sent only once this is `true` (see [`Reply::held`]).
+    hold: Option<watch::Receiver<bool>>,
 }
 
 impl Reply {
@@ -113,6 +115,7 @@ impl Reply {
             status: 200,
             content_type: "application/json",
             body: serde_json::to_vec(v).unwrap(),
+            hold: None,
         }
     }
 
@@ -121,6 +124,7 @@ impl Reply {
             status: 200,
             content_type: "text/html; charset=utf-8",
             body: s.as_bytes().to_vec(),
+            hold: None,
         }
     }
 
@@ -129,6 +133,7 @@ impl Reply {
             status: 200,
             content_type: "image/png",
             body,
+            hold: None,
         }
     }
 
@@ -137,7 +142,14 @@ impl Reply {
             status,
             content_type: "application/json",
             body: br#"{"errors":[{"status":"404","title":"Not Found"}]}"#.to_vec(),
+            hold: None,
         }
+    }
+
+    /// This reply, sent once `gate` turns `true`; the request is in [`Mock::seen`] before.
+    fn held(mut self, gate: &watch::Receiver<bool>) -> Self {
+        self.hold = Some(gate.clone());
+        self
     }
 }
 
@@ -189,6 +201,9 @@ impl Mock {
                     let bare = host.rsplit_once(':').map_or(host.as_str(), |(h, _)| h);
                     let reply = handler(bare, &target);
                     log.lock().unwrap().push(format!("{bare}{target}"));
+                    if let Some(mut gate) = reply.hold.clone() {
+                        let _ = gate.wait_for(|open| *open).await;
+                    }
                     let out = format!(
                         "HTTP/1.1 {} Mock\r\nConnection: close\r\nContent-Type: {}\r\n\
                          Content-Length: {}\r\n\r\n",
@@ -1569,4 +1584,301 @@ async fn a_lease_keeps_two_instances_off_one_company() {
         .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
         .await
         .unwrap();
+}
+
+/// Waits (at most 30 seconds) until `ok` holds.
+async fn until<F, Fut>(what: &str, mut ok: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !ok().await {
+        assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A pass in a task of its own, for a test that acts while it runs.
+fn spawn_pass(job: &Enrichment, b: &Arc<dyn Backend>) -> tokio::task::JoinHandle<u64> {
+    let (job, b) = (job.clone(), Arc::clone(b));
+    tokio::spawn(async move { pass(&job, &b).await })
+}
+
+/// A person merges company C into W while GLEIF is asked about C (issue #60): C's registry
+/// edges, resolved to C, land on W in the write, never on the merged-away C, and are counted
+/// as redirected.
+#[tokio::test(flavor = "multi_thread")]
+async fn registry_edges_land_on_the_survivor_of_a_merge_during_the_job() {
+    let (lei_c, lei_p) = (lei("HUSKCHILD"), lei("HUSKPARENT"));
+    let mut records = BTreeMap::new();
+    records.insert(
+        lei_c.clone(),
+        (
+            gleif_record(&lei_c, "FICTIVE HUSK CHILD LIMITED", "GB", "99000021"),
+            Some(relationship(&lei_c, &lei_p, "2021-04-01T00:00:00Z")),
+        ),
+    );
+    records.insert(
+        lei_p.clone(),
+        (
+            gleif_record(&lei_p, "FICTIVE HUSK PARENT PLC", "GB", "99000022"),
+            None,
+        ),
+    );
+    let (open, gate) = watch::channel(false);
+    let parent_path = format!("/gleif/lei-records/{lei_c}/direct-parent-relationship");
+    let held = parent_path.clone();
+    let mock = Mock::start(move |_, target| {
+        if target == held {
+            return gleif(target, &records).unwrap().held(&gate);
+        }
+        if let Some(r) = gleif(target, &records) {
+            return r;
+        }
+        if target.starts_with("/wikidata/") {
+            return Reply::json(&empty_sparql());
+        }
+        Reply::status(404)
+    })
+    .await;
+    let backends = Backends::all().await;
+    for (name, b, store) in &backends.list {
+        settings(store, &[("wikidata", false)], None);
+        open.send_replace(false);
+        let c = company(
+            b,
+            "Fictive Husk Child Limited",
+            "GB",
+            &[(IdKind::Lei, &lei_c)],
+            &[],
+            1,
+            None,
+        )
+        .await;
+        // W is not enriched in this pass: another instance holds it.
+        let w = company(
+            b,
+            "Fictive Survivor Holdings Limited",
+            "GB",
+            &[],
+            &[],
+            3,
+            None,
+        )
+        .await;
+        let elsewhere = InstanceId::new("enrich-elsewhere").unwrap();
+        assert!(
+            b.lease_company(w, &elsewhere, Duration::from_mins(5))
+                .await
+                .unwrap()
+        );
+        let job = job(b, store, &mock, "enrich-husk");
+        let before = mock.count(&parent_path);
+        let run = spawn_pass(&job, b);
+        // C's job has resolved C and asked GLEIF for its parent; the answer waits.
+        let (m, path) = (&mock, &parent_path);
+        until(
+            "the parent request",
+            || async move { m.count(path) > before },
+        )
+        .await;
+        b.merge_companies(&MergeRequest {
+            survivor: w,
+            absorbed: c,
+            actor: MergeActor {
+                kind: MergeActorKind::Manual,
+                instance: InstanceId::new("person").unwrap(),
+            },
+            evidence: json!([]),
+            confidence: 1.0,
+            probability: 1.0,
+        })
+        .await
+        .unwrap();
+        open.send_replace(true);
+        assert_eq!(run.await.unwrap(), 1, "{name}");
+
+        let p = owner(b, &format!("id:lei:{lei_p}"))
+            .await
+            .expect("the parent");
+        assert!(edges(b, c, EdgeKind::ParentOf).await.is_empty(), "{name}");
+        assert!(
+            edges(b, c, EdgeKind::SubsidiaryOf).await.is_empty(),
+            "{name}"
+        );
+        let parents = edges(b, w, EdgeKind::ParentOf).await;
+        assert_eq!(parents.len(), 1, "{name} {parents:?}");
+        let e = &parents[0].1.edge;
+        assert_eq!(
+            (e.src, e.dst, e.source),
+            (p, w, EdgeSource::Registry),
+            "{name}"
+        );
+        assert_eq!(e.valid_from, Some(day(2021, Month::April, 1)));
+        let up = edges(b, w, EdgeKind::SubsidiaryOf).await;
+        assert_eq!(up.len(), 1, "{name} {up:?}");
+        assert_eq!((up[0].1.edge.src, up[0].1.edge.dst), (w, p), "{name}");
+        assert_eq!(job.stats().redirected, 2, "{name} {:?}", job.stats());
+        assert_eq!(job.stats().edges, 2, "{name} {:?}", job.stats());
+    }
+    backends.drop_schema().await;
+}
+
+/// The gate's merge waits when the other company is in work (issue #60): held by another
+/// task of the same pass, the company runs once more after the page and the merge is done
+/// then; held by another instance, the company is due again after the retry interval.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_merge_that_waits_for_the_other_company_is_done_later() {
+    let (lei_x, lei_e) = (lei("OMIKRON"), lei("ELSEWHERE"));
+    let (mb_y, mb_f) = (mb("9930001"), mb("9930002"));
+    let mut records = BTreeMap::new();
+    records.insert(
+        lei_x.clone(),
+        (
+            gleif_record(&lei_x, "OMIKRON FIKTIV DOO", "RS", &mb_y),
+            None,
+        ),
+    );
+    records.insert(
+        lei_e.clone(),
+        (gleif_record(&lei_e, "ETA FIKTIV DOO", "RS", &mb_f), None),
+    );
+    // X's record waits until Y is in work; Y's name search until X's first run is done.
+    let (x_open, x_gate) = watch::channel(false);
+    let (y_open, y_gate) = watch::channel(false);
+    let x_path = format!("/gleif/lei-records/{lei_x}");
+    let x_held = x_path.clone();
+    let set = apr_set(&[]);
+    let mock = Mock::start(move |_, target| {
+        if target == x_held {
+            return gleif(target, &records).unwrap().held(&x_gate);
+        }
+        if target.starts_with("/gleif/lei-records?") && target.contains("Trgovina") {
+            return gleif(target, &records).unwrap().held(&y_gate);
+        }
+        if let Some(r) = gleif(target, &records) {
+            return r;
+        }
+        if target.starts_with("/apr/companies") {
+            return Reply::json(&set);
+        }
+        Reply::status(404)
+    })
+    .await;
+    let backends = Backends::all().await;
+    for (name, b, store) in &backends.list {
+        settings(store, &[("wikidata", false)], None);
+        x_open.send_replace(true);
+        y_open.send_replace(true);
+        let job = job(b, store, &mock, "enrich-wait");
+        let merges = |c: Uuid| {
+            let b = Arc::clone(b);
+            async move {
+                b.list_merges(&MergeQuery {
+                    company: Some(c),
+                    ..MergeQuery::default()
+                })
+                .await
+                .unwrap()
+            }
+        };
+
+        // E's merge target F is held by another instance: no merge, E due again in 6 hours.
+        let e = company(
+            b,
+            "Eta Fiktiv d.o.o.",
+            "RS",
+            &[(IdKind::Lei, &lei_e)],
+            &[],
+            3,
+            None,
+        )
+        .await;
+        let f = company(
+            b,
+            "Fi Fiktiv Usluge d.o.o.",
+            "RS",
+            &[(IdKind::RsMb, &mb_f)],
+            &[],
+            1,
+            None,
+        )
+        .await;
+        let elsewhere = InstanceId::new("enrich-elsewhere").unwrap();
+        assert!(
+            b.lease_company(f, &elsewhere, Duration::from_mins(5))
+                .await
+                .unwrap()
+        );
+        pass(&job, b).await;
+        assert!(merges(e).await.is_empty(), "{name}");
+        let rec = b.enrichment(e).await.unwrap().expect("recorded");
+        assert_eq!(
+            (rec.next_due["gleif"] - rec.enriched_at) / 3600,
+            6,
+            "{name} {rec:?}"
+        );
+
+        // X and Y run side by side; X's gate finds Y in work and waits.
+        x_open.send_replace(false);
+        y_open.send_replace(false);
+        let x = company(
+            b,
+            "Omikron Fiktiv d.o.o.",
+            "RS",
+            &[(IdKind::Lei, &lei_x)],
+            &[],
+            3,
+            None,
+        )
+        .await;
+        let y = company(
+            b,
+            "Omikron Fiktiv Trgovina d.o.o.",
+            "RS",
+            &[(IdKind::RsMb, &mb_y)],
+            &[],
+            1,
+            None,
+        )
+        .await;
+        let enriched = job.stats().enriched;
+        let run = spawn_pass(&job, b);
+        let m = &mock;
+        until("Y's name search", || async move {
+            m.seen()
+                .iter()
+                .any(|r| r.contains("lei-records?") && r.contains("Trgovina"))
+        })
+        .await;
+        x_open.send_replace(true);
+        until("X's first run", || async move {
+            b.enrichment(x).await.unwrap().is_some()
+        })
+        .await;
+        assert!(merges(x).await.is_empty(), "{name}: Y was in work");
+        y_open.send_replace(true);
+        assert_eq!(run.await.unwrap(), 2, "{name}");
+
+        let log = merges(x).await;
+        assert_eq!(log.len(), 1, "{name} {log:?}");
+        assert_eq!((log[0].survivor, log[0].absorbed), (x, y), "{name}");
+        assert_eq!(log[0].actor.kind, MergeActorKind::Enrichment);
+        assert_eq!(owner(b, &format!("id:rs_mb:{mb_y}")).await, Some(x));
+        // X's second run recorded the regular schedule; X and Y count once each.
+        let rec = b.enrichment(x).await.unwrap().unwrap();
+        assert_eq!(
+            (rec.next_due["gleif"] - rec.enriched_at) / 86_400,
+            30,
+            "{name} {rec:?}"
+        );
+        assert_eq!(
+            job.stats().enriched - enriched,
+            2,
+            "{name} {:?}",
+            job.stats()
+        );
+    }
+    backends.drop_schema().await;
 }
