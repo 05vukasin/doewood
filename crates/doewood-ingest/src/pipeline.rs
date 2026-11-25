@@ -350,6 +350,9 @@ pub struct Stats {
     pub bytes: u64,
     /// Locations ended by deletes.
     pub deleted: u64,
+    /// `party` edges written to the survivor of a merge that committed after the match
+    /// (issue #48).
+    pub redirected: u64,
 }
 
 /// What woke the dispatcher.
@@ -492,6 +495,7 @@ impl Ingest {
             skipped = s.skipped,
             failed = s.failed,
             analyzed = s.analyzed,
+            redirected = s.redirected,
             mib = s.bytes / (1 << 20),
             secs = self.inner.started.elapsed().as_secs(),
             "ingest dispatcher stopped"
@@ -743,6 +747,10 @@ impl Ingest {
                 settings.similar_min_jaccard,
             )
             .await?;
+        if stats.redirects > 0 {
+            lock(&self.inner.stats).redirected +=
+                u64::try_from(stats.redirects).unwrap_or(u64::MAX);
+        }
         debug!(
             source = %id,
             key,
@@ -751,6 +759,7 @@ impl Ingest {
             parties = stats.parties,
             refs = stats.refs,
             similar = stats.similar,
+            redirects = stats.redirects,
             "ingested"
         );
         // The record is stored: a summary, if the source's policy asks for one, comes later

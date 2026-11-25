@@ -544,6 +544,20 @@ pub struct StoredEdge {
     pub edge: Edge,
 }
 
+/// What [`crate::GraphStore::upsert_live_edge`] wrote: the edge's id and the ends it landed
+/// on, after following `merged_into` from merged-away companies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveEdge {
+    /// The edge's id.
+    pub id: Uuid,
+    /// The source it landed on.
+    pub src: Uuid,
+    /// The target it landed on.
+    pub dst: Uuid,
+    /// `merged_into` hops followed, both ends together: 0 when both ends were live.
+    pub redirects: u32,
+}
+
 /// Which way to follow edges from a node.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Direction {

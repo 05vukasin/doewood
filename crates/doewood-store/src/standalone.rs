@@ -9,12 +9,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use doewood_core::InstanceId;
 use doewood_model::{
-    Backend, Blake3, ClaimStore, Direction, Edge, EdgeKind, EdgeSource, Error, GraphStore, Located,
-    LocationEnded, Neighbour, NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation,
-    OwnedAlias, PropsPatch, PutOutcome, Record, RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc,
-    SearchHit, SearchQuery, SearchStore, Sketch, SketchStore, SourceClaim, SourceKey, StepVersions,
-    StoredEdge, band_to_i64, records_limit, sketch_limit, validate_alias, validate_node,
-    validate_sketch, versions_from_json, versions_to_json,
+    Backend, Blake3, ClaimStore, Direction, Edge, EdgeKind, EdgeSource, Error, GraphStore,
+    LiveEdge, Located, LocationEnded, MERGE_CHAIN_MAX, Neighbour, NeighbourQuery, Node, NodeAlias,
+    NodeKind, ObjectLocation, OwnedAlias, PropsPatch, PutOutcome, Record, RecordStore, Result,
+    SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore, Sketch, SketchStore,
+    SourceClaim, SourceKey, StepVersions, StoredEdge, band_to_i64, records_limit, sketch_limit,
+    validate_alias, validate_node, validate_sketch, versions_from_json, versions_to_json,
 };
 use rusqlite::types::Value as Sql;
 use rusqlite::{
@@ -242,6 +242,34 @@ fn upsert_edge(conn: &Connection, e: &Edge) -> Result<Uuid> {
         )
         .map_err(sql)?;
     uuid(&id)
+}
+
+/// Follows `merged_into` from `id`, counting the hops in `hops` (at most
+/// [`MERGE_CHAIN_MAX`]). A missing node is returned as it is: the edge write then fails.
+fn follow_merges(conn: &Connection, mut id: Uuid, hops: &mut usize) -> Result<Uuid> {
+    loop {
+        let next: Option<String> = conn
+            .query_row(
+                "SELECT json_extract(props_json, '$.merged_into') FROM nodes WHERE id = ?1",
+                [id.to_string()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql)?
+            .flatten();
+        match next.and_then(|s| Uuid::parse_str(&s).ok()) {
+            Some(next) => {
+                *hops += 1;
+                if *hops > MERGE_CHAIN_MAX {
+                    return Err(Error::Precondition(format!(
+                        "node {id} has more than {MERGE_CHAIN_MAX} merges in a chain"
+                    )));
+                }
+                id = next;
+            }
+            None => return Ok(id),
+        }
+    }
 }
 
 fn claim_row(key: &SourceKey, owner: &str, claimed_at: i64) -> Result<SourceClaim> {
@@ -480,6 +508,29 @@ impl GraphStore for Standalone {
         edge.validate()?;
         let edge = edge.clone();
         self.run(move |conn| upsert_edge(conn, &edge)).await
+    }
+
+    async fn upsert_live_edge(&self, edge: &Edge) -> Result<LiveEdge> {
+        edge.validate()?;
+        let mut e = edge.clone();
+        self.run(move |conn| {
+            // The write lock from the start: a merge runs wholly before or after this.
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql)?;
+            let (mut src_hops, mut dst_hops) = (0, 0);
+            e.src = follow_merges(&tx, e.src, &mut src_hops)?;
+            e.dst = follow_merges(&tx, e.dst, &mut dst_hops)?;
+            let id = upsert_edge(&tx, &e)?;
+            tx.commit().map_err(sql)?;
+            Ok(LiveEdge {
+                id,
+                src: e.src,
+                dst: e.dst,
+                redirects: u32::try_from(src_hops + dst_hops).unwrap_or(u32::MAX),
+            })
+        })
+        .await
     }
 
     async fn neighbours(&self, node: Uuid, q: &NeighbourQuery) -> Result<Vec<Neighbour>> {

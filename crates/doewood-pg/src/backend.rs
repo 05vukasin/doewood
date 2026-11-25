@@ -7,12 +7,12 @@ use async_trait::async_trait;
 use deadpool_postgres::{Object, Pool, PoolError};
 use doewood_core::InstanceId;
 use doewood_model::{
-    Backend, Blake3, ClaimStore, Direction, Edge, EdgeKind, EdgeSource, Error, GraphStore, Located,
-    LocationEnded, Neighbour, NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation,
-    OwnedAlias, PropsPatch, PutOutcome, Record, RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc,
-    SearchHit, SearchQuery, SearchStore, Sketch, SketchStore, SourceClaim, SourceKey, StepVersions,
-    StoredEdge, band_to_i64, records_limit, sketch_limit, validate_alias, validate_node,
-    validate_sketch, versions_from_json, versions_to_json,
+    Backend, Blake3, ClaimStore, Direction, Edge, EdgeKind, EdgeSource, Error, GraphStore,
+    LiveEdge, Located, LocationEnded, MERGE_CHAIN_MAX, Neighbour, NeighbourQuery, Node, NodeAlias,
+    NodeKind, ObjectLocation, OwnedAlias, PropsPatch, PutOutcome, Record, RecordStore, Result,
+    SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore, Sketch, SketchStore,
+    SourceClaim, SourceKey, StepVersions, StoredEdge, band_to_i64, records_limit, sketch_limit,
+    validate_alias, validate_node, validate_sketch, versions_from_json, versions_to_json,
 };
 use serde_json::Value;
 use time::Date;
@@ -204,6 +204,80 @@ async fn upsert_edge(c: &impl GenericClient, e: &Edge) -> Result<Uuid> {
     row.try_get(0).map_err(pg)
 }
 
+/// Follows `merged_into` from `id` without locks, counting the hops in `hops` (at most
+/// [`MERGE_CHAIN_MAX`]). A missing node is returned as it is: the edge write then fails.
+async fn follow_merges(c: &impl GenericClient, mut id: Uuid, hops: &mut usize) -> Result<Uuid> {
+    loop {
+        let row = c
+            .query_opt(
+                "SELECT props->>'merged_into' FROM nodes WHERE id = $1",
+                &[&id],
+            )
+            .await
+            .map_err(pg)?;
+        match row.and_then(|r| merged_into_column(&r)) {
+            Some(next) => {
+                *hops += 1;
+                if *hops > MERGE_CHAIN_MAX {
+                    return Err(Error::Precondition(format!(
+                        "node {id} has more than {MERGE_CHAIN_MAX} merges in a chain"
+                    )));
+                }
+                id = next;
+            }
+            None => return Ok(id),
+        }
+    }
+}
+
+/// Column 0 of `r`, `props->>'merged_into'`, as an id.
+fn merged_into_column(r: &Row) -> Option<Uuid> {
+    r.try_get::<_, Option<&str>>(0)
+        .ok()
+        .flatten()
+        .and_then(|s| Uuid::parse_str(s).ok())
+}
+
+/// [`GraphStore::upsert_live_edge`]: find the live ends without locks, then, in one
+/// transaction, lock them `FOR SHARE` and check they are still live before writing. A merge
+/// locks its two companies `FOR UPDATE`, so the share lock waits for a merge in flight and
+/// then reads what it committed; while the lock is held no merge of those companies can
+/// start, so the edge is in place before any later merge moves the edges. When an end was
+/// merged away in between, the transaction is rolled back (no lock is held while waiting for
+/// another) and the walk goes on from there.
+async fn upsert_live_edge(c: &mut Object, edge: &Edge) -> Result<LiveEdge> {
+    let mut e = edge.clone();
+    let (mut src_hops, mut dst_hops) = (0, 0);
+    loop {
+        e.src = follow_merges(&***c, e.src, &mut src_hops).await?;
+        e.dst = follow_merges(&***c, e.dst, &mut dst_hops).await?;
+        let tx = c.transaction().await.map_err(pg)?;
+        let mut ends = vec![e.src, e.dst];
+        ends.sort_unstable();
+        ends.dedup();
+        let rows = tx
+            .query(
+                "SELECT props->>'merged_into' FROM nodes WHERE id = ANY($1)                  ORDER BY id FOR SHARE",
+                &[&ends],
+            )
+            .await
+            .map_err(pg)?;
+        if rows.iter().all(|r| merged_into_column(r).is_none()) {
+            let id = upsert_edge(&*tx, &e).await?;
+            tx.commit().await.map_err(pg)?;
+            let redirects = u32::try_from(src_hops + dst_hops).unwrap_or(u32::MAX);
+            return Ok(LiveEdge {
+                id,
+                src: e.src,
+                dst: e.dst,
+                redirects,
+            });
+        }
+        // A merge committed between the walk and the lock: roll back, walk on.
+        tx.rollback().await.map_err(pg)?;
+    }
+}
+
 fn claim_from(key: &SourceKey, row: &Row) -> Result<SourceClaim> {
     let owner: &str = row.try_get(0).map_err(pg)?;
     Ok(SourceClaim {
@@ -386,6 +460,11 @@ impl GraphStore for PgStore {
     async fn upsert_edge(&self, edge: &Edge) -> Result<Uuid> {
         edge.validate()?;
         upsert_edge(&**client(&self.pool).await?, edge).await
+    }
+
+    async fn upsert_live_edge(&self, edge: &Edge) -> Result<LiveEdge> {
+        edge.validate()?;
+        upsert_live_edge(&mut client(&self.pool).await?, edge).await
     }
 
     async fn neighbours(&self, node: Uuid, q: &NeighbourQuery) -> Result<Vec<Neighbour>> {

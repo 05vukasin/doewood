@@ -26,9 +26,10 @@ pub use enrichment::{
 };
 pub use error::{Error, Result};
 pub use merge::{
-    DismissRequest, Dismissal, DismissalQuery, EVIDENCE_MAX_BYTES, MERGES_MAX_LIMIT, MergeActor,
-    MergeEntry, MergeQuery, MergeRequest, MergeTx, OwnedAlias, REASON_MAX_LEN, SPLIT_MAX_ITEMS,
-    SplitRequest, UndoOutcome, UndoRequest, Undone, merged_into, merges_limit,
+    DismissRequest, Dismissal, DismissalQuery, EVIDENCE_MAX_BYTES, MERGE_CHAIN_MAX,
+    MERGES_MAX_LIMIT, MergeActor, MergeEntry, MergeQuery, MergeRequest, MergeTx, OwnedAlias,
+    REASON_MAX_LEN, SPLIT_MAX_ITEMS, SplitRequest, UndoOutcome, UndoRequest, Undone, merged_into,
+    merges_limit,
 };
 pub use props::{PATCH_MAX_DEPTH, PATCH_MAX_OPS, PropOp, PropsPatch};
 pub use traits::{
@@ -36,7 +37,7 @@ pub use traits::{
     SearchStore, SketchStore, sketch_limit,
 };
 pub use types::{
-    Blake3, Direction, Edge, EdgeKind, EdgeSource, EdgeState, Located, LocationEnded,
+    Blake3, Direction, Edge, EdgeKind, EdgeSource, EdgeState, LiveEdge, Located, LocationEnded,
     MergeActorKind, MergeOp, NODE_KEY_MAX_LEN, Neighbour, NeighbourQuery, Node, NodeAlias,
     NodeKind, ObjectLocation, PENDING_REF_PREFIX, PutOutcome, RECORDS_MAX_LIMIT, Record,
     SEARCH_MAX_LIMIT, SKETCH_MAX_BANDS, SKETCH_MAX_SIGNATURE, SearchDoc, SearchHit, SearchQuery,

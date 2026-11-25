@@ -43,6 +43,7 @@ pub async fn run<B: Backend + ?Sized>(a: &B, b: &B) {
     caches(a, b).await;
     freshness(a, b).await;
     merges(a).await;
+    live_edges(a, b).await;
     a.ping().await.expect("ping");
 }
 
@@ -1890,4 +1891,118 @@ pub async fn merges<B: Backend + ?Sized>(s: &B) {
         s.undo_merge(&undo_req(sp2.id, false, false)).await,
         "dismissed",
     );
+}
+
+/// Edges onto live companies (issue #48): a writer resolved an alias to a company, then a
+/// merge committed (through another instance), then the writer writes its edge. It lands on
+/// the survivor, following chains, at either end; the husk gets nothing.
+///
+/// # Panics
+///
+/// When the backend misbehaves.
+pub async fn live_edges<B: Backend + ?Sized>(a: &B, b: &B) {
+    let company = |key: &'static str| async move {
+        a.upsert_node(NodeKind::Company, key, &json!({"name": key}))
+            .await
+            .unwrap()
+    };
+    let (absorbed, middle, survivor, holding) = (
+        company("live-x").await,
+        company("live-y").await,
+        company("live-z").await,
+        company("live-w").await,
+    );
+    let doc = |n: u8| async move {
+        a.upsert_node(NodeKind::Document, &hash(n).to_hex(), &json!({}))
+            .await
+            .unwrap()
+    };
+    let (d1, d2, d3) = (doc(241).await, doc(242).await, doc(243).await);
+    let party = |d: Uuid, c: Uuid| {
+        Edge::new(d, c, EdgeKind::Party, EdgeSource::Document)
+            .with_props(json!({"role": "buyer"}))
+            .with_confidence(0.8)
+    };
+    let parties_at = |c: Uuid| async move {
+        let query = NeighbourQuery {
+            direction: Direction::In,
+            edge_kinds: vec![EdgeKind::Party],
+            include_inactive: true,
+            ..NeighbourQuery::default()
+        };
+        let mut docs: Vec<Uuid> = a
+            .neighbours(c, &query)
+            .await
+            .unwrap()
+            .iter()
+            .map(|n| n.node.id)
+            .collect();
+        docs.sort_unstable();
+        docs
+    };
+
+    // Both ends live: written as given.
+    let live = a.upsert_live_edge(&party(d1, absorbed)).await.unwrap();
+    assert_eq!((live.src, live.dst, live.redirects), (d1, absorbed, 0));
+    let again = a.upsert_live_edge(&party(d1, absorbed)).await.unwrap();
+    assert_eq!(again, live, "an upsert: same edge, same id");
+
+    // The alias said absorbed; absorbed is merged into middle before the write.
+    b.merge_companies(&merge_req(middle, absorbed, MergeActorKind::Enrichment))
+        .await
+        .unwrap();
+    let moved = a.upsert_live_edge(&party(d2, absorbed)).await.unwrap();
+    assert_eq!((moved.src, moved.dst, moved.redirects), (d2, middle, 1));
+    assert!(parties_at(absorbed).await.is_empty(), "nothing on the husk");
+
+    // A chain: middle into survivor, then a write to absorbed.
+    b.merge_companies(&merge_req(survivor, middle, MergeActorKind::Manual))
+        .await
+        .unwrap();
+    let chained = a.upsert_live_edge(&party(d3, absorbed)).await.unwrap();
+    assert_eq!((chained.dst, chained.redirects), (survivor, 2));
+    assert!(parties_at(absorbed).await.is_empty() && parties_at(middle).await.is_empty());
+    let mut all = vec![d1, d2, d3];
+    all.sort_unstable();
+    assert_eq!(
+        parties_at(survivor).await,
+        all,
+        "the merges moved d1 and d2"
+    );
+
+    // Either end of an edge between companies.
+    let from_husk = a
+        .upsert_live_edge(&Edge::new(
+            absorbed,
+            holding,
+            EdgeKind::ParentOf,
+            EdgeSource::Registry,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        (from_husk.src, from_husk.dst, from_husk.redirects),
+        (survivor, holding, 2)
+    );
+    let to_husk = a
+        .upsert_live_edge(&Edge::new(
+            holding,
+            middle,
+            EdgeKind::TradingNameOf,
+            EdgeSource::Registry,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        (to_husk.src, to_husk.dst, to_husk.redirects),
+        (holding, survivor, 1)
+    );
+
+    // Bad edges and missing nodes fail as `upsert_edge` does.
+    let bad = a
+        .upsert_live_edge(&party(d1, absorbed).with_confidence(2.0))
+        .await;
+    assert!(matches!(bad, Err(Error::Invalid(_))), "{bad:?}");
+    let missing = a.upsert_live_edge(&party(d1, Uuid::now_v7())).await;
+    assert!(matches!(missing, Err(Error::NotFound(_))), "{missing:?}");
 }

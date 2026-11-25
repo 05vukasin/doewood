@@ -47,8 +47,10 @@ pub const REASON_MAX_LEN: usize = 2000;
 /// Largest evidence list of one entry, as JSON bytes.
 pub const EVIDENCE_MAX_BYTES: usize = 64 * 1024;
 
-/// Most `merged_into` hops followed, and most merges folded into one group.
-const MAX_CHAIN: usize = 64;
+/// Most `merged_into` hops followed from a merged-away company.
+pub const MERGE_CHAIN_MAX: usize = 64;
+const MAX_CHAIN: usize = MERGE_CHAIN_MAX;
+/// Most merges folded into one group.
 const MAX_GROUP: usize = 10_000;
 
 /// Props keys the merge log owns on company nodes.
