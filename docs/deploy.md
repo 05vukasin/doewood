@@ -241,6 +241,32 @@ the test's own copies of the files).
   the wall time).
 - glibc keeps some of the freed memory (RSS after the runs: 0.5 to 1.2 GiB above the start).
 
+### The instance store's read-only connections (issue #83)
+
+An on-disk instance store opens 2 read-only SQLite connections next to its writer (see
+[configuration.md](configuration.md#the-instance-store)). Each keeps SQLite's default page
+cache (up to 2000 KiB) and up to 128 prepared statements, and there is no `mmap`. Measured with
+`reader_memory` (`cargo test -p doewood-store --lib -- --ignored --nocapture reader_memory`,
+a 40 MiB store read in full on every connection): **2.1 MiB of RSS per reader** once its cache
+is full, so about 4 MiB for the default 2 (2, 4 readers: 2.08 MiB each). They also hold
+two more file handles to the store file and share its `-wal` and `-shm` files.
+
+Effect, measured with `throughput` on an on-disk store (`DOEWOOD_BENCH_FILES=2000
+DOEWOOD_BENCH_READERS=0|2`, 4 ingest workers, a `ListRecords` page of 100 every millisecond
+through the API, test profile, 4 cores, 3 runs each, medians):
+
+| watchers | readers | files/s | writer lock wait mean / p99 | `ListRecords` mean / p99 |
+|---|---|---|---|---|
+| 0 | 0 (before) | 105 | 2.03 ms / 59.2 ms | 85 ms / 160 ms |
+| 0 | 2 | 239 | 0.51 ms / 3.7 ms | 57 ms / 162 ms |
+| 10 | 0 (before) | 101 | 2.08 ms / 59.9 ms | 86 ms / 168 ms |
+| 10 | 2 | 236 | 0.50 ms / 3.7 ms | 58 ms / 173 ms |
+
+The reads no longer take the writer's lock, so ingest runs more than twice as fast while the
+API reads, and the writer's lock wait falls by an order of magnitude. A `ListRecords` page
+waits less on average, but its tail is the query itself (the test profile builds SQLite
+without optimisation), not the lock.
+
 ### Requests and limits
 
 Per doewood instance (one pod):

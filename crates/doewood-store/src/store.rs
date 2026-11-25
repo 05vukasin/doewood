@@ -997,5 +997,4 @@ mod tests {
         );
         store.close().unwrap();
     }
-
 }
