@@ -168,13 +168,24 @@ pub fn xlsx(sheet: &str, rows: &[&[&str]]) -> Vec<u8> {
 
 /// A large XLSX of `rows` x `cols` numbers (`cols` at most 26), for the time limits.
 pub fn big_xlsx(rows: usize, cols: usize, seed: u64) -> Vec<u8> {
+    big_xlsx_with(rows, cols, seed, false)
+}
+
+/// [`big_xlsx`], with every other column inline text (`text`) instead of numbers.
+pub fn big_xlsx_with(rows: usize, cols: usize, seed: u64, text: bool) -> Vec<u8> {
     let mut data = String::with_capacity(rows * cols * 24);
     for r in 1..=rows {
         data.push_str(&format!("<row r=\"{r}\">"));
         for c in 0..cols {
             let col = char::from(b'A' + u8::try_from(c).unwrap());
             let v = (r as u64 * 31 + c as u64) ^ seed;
-            data.push_str(&format!("<c r=\"{col}{r}\"><v>{v}</v></c>"));
+            if text && c % 2 == 1 {
+                data.push_str(&format!(
+                    "<c r=\"{col}{r}\" t=\"inlineStr\"><is><t>item {v} kom</t></is></c>"
+                ));
+            } else {
+                data.push_str(&format!("<c r=\"{col}{r}\"><v>{v}</v></c>"));
+            }
         }
         data.push_str("</row>");
     }

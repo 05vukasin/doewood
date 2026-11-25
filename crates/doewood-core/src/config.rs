@@ -30,6 +30,9 @@ pub mod vars {
     pub const API_MAX_MESSAGE_MIB: &str = "DOEWOOD_API_MAX_MESSAGE_MIB";
     /// Ingest workers (files analyzed at the same time); defaults from the CPUs and memory.
     pub const INGEST_JOBS: &str = "DOEWOOD_INGEST_JOBS";
+    /// Ingest memory budget in MiB (bytes of big files in flight); defaults from the workers
+    /// and memory.
+    pub const INGEST_BUDGET_MIB: &str = "DOEWOOD_INGEST_BUDGET_MIB";
     /// Directory of the OCR model files; defaults to `<data>/ocr-models`.
     pub const OCR_MODELS: &str = "DOEWOOD_OCR_MODELS";
 
@@ -41,7 +44,7 @@ pub mod vars {
     )];
 
     /// Every bootstrap variable, in the order they are reported.
-    pub const ALL: [&str; 9] = [
+    pub const ALL: [&str; 10] = [
         DATA_DIR,
         LISTEN,
         OPS_LISTEN,
@@ -50,6 +53,7 @@ pub mod vars {
         INSTANCE_ID,
         API_MAX_MESSAGE_MIB,
         INGEST_JOBS,
+        INGEST_BUDGET_MIB,
         OCR_MODELS,
     ];
 }
@@ -70,6 +74,10 @@ pub const DEFAULT_API_MAX_MESSAGE_MIB: u32 = 64;
 pub const MAX_API_MAX_MESSAGE_MIB: u32 = 1024;
 /// Largest accepted `DOEWOOD_INGEST_JOBS`.
 pub const MAX_INGEST_JOBS: usize = 256;
+/// Smallest accepted `DOEWOOD_INGEST_BUDGET_MIB`.
+pub const MIN_INGEST_BUDGET_MIB: u64 = 16;
+/// Largest accepted `DOEWOOD_INGEST_BUDGET_MIB` (1 TiB).
+pub const MAX_INGEST_BUDGET_MIB: u64 = 1 << 20;
 /// Default of `DOEWOOD_OCR_MODELS`, inside the data directory.
 pub const OCR_MODELS_DIR: &str = "ocr-models";
 
@@ -226,6 +234,7 @@ struct Origins {
     instance_id: Origin,
     api_max_message: Origin,
     ingest_jobs: Origin,
+    ingest_budget: Origin,
     ocr_models: Origin,
 }
 
@@ -248,6 +257,8 @@ pub struct BootstrapConfig {
     pub api_max_message_bytes: usize,
     /// Ingest workers; `None` lets ingest size them from the CPUs and memory.
     pub ingest_jobs: Option<usize>,
+    /// Ingest memory budget in bytes; `None` lets ingest size it from the workers and memory.
+    pub ingest_budget_bytes: Option<u64>,
     /// Directory of the OCR model files.
     pub ocr_models: PathBuf,
     origins: Origins,
@@ -294,6 +305,8 @@ impl BootstrapConfig {
         let (api_max_message_mib, api_max_message_origin) =
             parse_mib(get(vars::API_MAX_MESSAGE_MIB), &mut w);
         let (ingest_jobs, ingest_jobs_origin) = parse_jobs(get(vars::INGEST_JOBS), &mut w);
+        let (ingest_budget_mib, ingest_budget_origin) =
+            parse_budget(get(vars::INGEST_BUDGET_MIB), &mut w);
         let (ocr_models, ocr_models_origin) = match get(vars::OCR_MODELS) {
             Some(v) => (PathBuf::from(v), Origin::Env),
             None => (data_dir.join(OCR_MODELS_DIR), Origin::Default),
@@ -316,6 +329,7 @@ impl BootstrapConfig {
                     .unwrap_or(usize::MAX)
                     .saturating_mul(1024 * 1024),
                 ingest_jobs,
+                ingest_budget_bytes: ingest_budget_mib.map(|m| m << 20),
                 ocr_models,
                 origins: Origins {
                     data_dir: data_dir_origin,
@@ -326,6 +340,7 @@ impl BootstrapConfig {
                     instance_id: instance_origin,
                     api_max_message: api_max_message_origin,
                     ingest_jobs: ingest_jobs_origin,
+                    ingest_budget: ingest_budget_origin,
                     ocr_models: ocr_models_origin,
                 },
             },
@@ -405,6 +420,14 @@ impl BootstrapConfig {
                     .ingest_jobs
                     .map_or_else(|| "auto (CPUs and memory)".to_owned(), |n| n.to_string()),
                 origin: o.ingest_jobs,
+            },
+            Entry {
+                var: vars::INGEST_BUDGET_MIB,
+                value: self.ingest_budget_bytes.map_or_else(
+                    || "auto (workers and memory)".to_owned(),
+                    |b| format!("{} MiB", b >> 20),
+                ),
+                origin: o.ingest_budget,
             },
             Entry {
                 var: vars::OCR_MODELS,
@@ -574,6 +597,29 @@ fn parse_jobs(value: Option<OsString>, w: &mut Vec<ConfigWarning>) -> (Option<us
     }
 }
 
+fn parse_budget(value: Option<OsString>, w: &mut Vec<ConfigWarning>) -> (Option<u64>, Origin) {
+    let Some(v) = value else {
+        return (None, Origin::Default);
+    };
+    match v.to_str().map(|s| s.trim().parse::<u64>()) {
+        Some(Ok(n)) if (MIN_INGEST_BUDGET_MIB..=MAX_INGEST_BUDGET_MIB).contains(&n) => {
+            (Some(n), Origin::Env)
+        }
+        _ => {
+            let shown = v.to_string_lossy();
+            warn(
+                w,
+                vars::INGEST_BUDGET_MIB,
+                format!(
+                    "{shown:?} is not a whole number of MiB from {MIN_INGEST_BUDGET_MIB} to \
+                     {MAX_INGEST_BUDGET_MIB}; sizing from the workers and memory"
+                ),
+            );
+            (None, Origin::Fallback)
+        }
+    }
+}
+
 fn prepare_dir(path: &Path) -> Result<(), Error> {
     let fail = |source| Error::DataDir {
         path: path.to_owned(),
@@ -605,23 +651,33 @@ mod tests {
         let Loaded { config, warnings } = load(&[("DOEWOOD_DATA_DIR", "/d")], Some("h"));
         assert!(warnings.is_empty());
         assert_eq!(config.ingest_jobs, None);
+        assert_eq!(config.ingest_budget_bytes, None);
         assert_eq!(config.ocr_models, PathBuf::from("/d/ocr-models"));
         let Loaded { config, warnings } = load(
             &[
                 ("DOEWOOD_INGEST_JOBS", "6"),
+                ("DOEWOOD_INGEST_BUDGET_MIB", "768"),
                 ("DOEWOOD_OCR_MODELS", "/models"),
             ],
             Some("h"),
         );
         assert!(warnings.is_empty());
         assert_eq!(config.ingest_jobs, Some(6));
+        assert_eq!(config.ingest_budget_bytes, Some(768 << 20));
         assert_eq!(config.ocr_models, PathBuf::from("/models"));
-        let Loaded { config, warnings } = load(&[("DOEWOOD_INGEST_JOBS", "0")], Some("h"));
+        let Loaded { config, warnings } = load(
+            &[
+                ("DOEWOOD_INGEST_JOBS", "0"),
+                ("DOEWOOD_INGEST_BUDGET_MIB", "8"),
+            ],
+            Some("h"),
+        );
         assert_eq!(
             warnings.iter().map(|w| w.var).collect::<Vec<_>>(),
-            ["DOEWOOD_INGEST_JOBS"]
+            ["DOEWOOD_INGEST_JOBS", "DOEWOOD_INGEST_BUDGET_MIB"]
         );
         assert_eq!(config.ingest_jobs, None);
+        assert_eq!(config.ingest_budget_bytes, None);
         assert_eq!(config.entries().len(), vars::ALL.len());
     }
 
@@ -679,6 +735,7 @@ mod tests {
                 ("DOEWOOD_INSTANCE_ID", "worker-7"),
                 ("DOEWOOD_API_MAX_MESSAGE_MIB", "8"),
                 ("DOEWOOD_INGEST_JOBS", "3"),
+                ("DOEWOOD_INGEST_BUDGET_MIB", "1024"),
                 ("DOEWOOD_OCR_MODELS", "/opt/ocr"),
             ],
             Some("ignored"),
@@ -758,6 +815,7 @@ mod tests {
                 Origin::Fallback,
                 Origin::Fallback,
                 Origin::Fallback,
+                Origin::Default,
                 Origin::Default,
                 Origin::Default,
             ]

@@ -46,6 +46,8 @@ pub struct AnalyzerConfig {
     pub file_timeout: Duration,
     /// Largest file analyzed (`Limits::max_bytes`); bigger ones get identity only.
     pub max_bytes: u64,
+    /// Most cells read from one workbook ([`sheet::MAX_CELLS`]); a bigger one fails.
+    pub sheet_max_cells: u64,
     /// File workers that share the engine (sizes the OCR permits).
     pub workers: usize,
     /// Where the OCR models are.
@@ -57,6 +59,7 @@ impl Default for AnalyzerConfig {
         Self {
             file_timeout: Limits::default().timeout,
             max_bytes: Limits::default().max_bytes,
+            sheet_max_cells: sheet::MAX_CELLS,
             workers: 1,
             ocr_models: PathBuf::from("ocr-models"),
         }
@@ -111,6 +114,7 @@ pub struct Analyzer {
     plan: String,
     ocr: OcrState,
     limits: Limits,
+    sheet_max_cells: u64,
 }
 
 impl std::fmt::Debug for Analyzer {
@@ -163,6 +167,7 @@ impl Analyzer {
             plan,
             ocr,
             limits,
+            sheet_max_cells: config.sheet_max_cells,
         })
     }
 
@@ -259,7 +264,13 @@ impl Analyzer {
         deadline: Option<Instant>,
     ) -> (Json, StepVersions, Outcome) {
         let name = key.rsplit('/').next().unwrap_or(key);
-        let out = sheet::analyze(bytes, name, format.as_str(), deadline);
+        let out = sheet::analyze_with(
+            bytes,
+            name,
+            format.as_str(),
+            deadline,
+            self.sheet_max_cells,
+        );
         record.facts.extend(out.facts);
         record.steps.extend(out.steps);
         let mut problems = out.problems;

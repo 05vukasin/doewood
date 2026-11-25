@@ -25,6 +25,12 @@
 //!   analysis finishes on its thread (nothing can stop it from outside). Each worker leaves at
 //!   most [`MAX_OVERRUNS`] such analyses behind; one more and it waits for the oldest to end
 //!   before taking the next file, so stuck analyses cannot pile up files in memory.
+//! - **Memory budget** ([`IngestConfig::memory_budget`]). A file larger than
+//!   [`IngestConfig::small_file`] is admitted only once its listed size (at most the whole
+//!   budget) fits in the bytes the other big files leave free, and keeps that share until its
+//!   analysis really ends (an overrun's too). Small files are not charged and never wait. A big
+//!   file that does not fit waits in a FIFO list of its own while its worker takes other work;
+//!   only when that list is full does a worker wait for the budget itself.
 //! - **Shutdown** lets every worker finish the file in hand; pending objects stay pending.
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -63,6 +69,11 @@ const REPROCESS_PAGE: usize = 500;
 const MAX_JOBS: usize = 100;
 /// Analyses past the watchdog a worker may leave running while it takes the next files.
 pub const MAX_OVERRUNS: usize = 1;
+/// Files up to this size are not charged to the memory budget (16 MiB): at most this much per
+/// worker, inside its [`WORKER_BYTES`].
+pub const SMALL_FILE_BYTES: u64 = 16 << 20;
+/// The smallest default memory budget (256 MiB).
+pub const MIN_BUDGET: u64 = WORKER_BYTES / 2;
 
 /// How ingest runs.
 #[derive(Clone, Debug)]
@@ -82,6 +93,12 @@ pub struct IngestConfig {
     /// How long past the file's time cap (`Limits::timeout_cap`) the watchdog waits before it
     /// gives up on an analysis and fails the file.
     pub watchdog_grace: Duration,
+    /// Bytes of big files held at once, from their fetch to the end of their analysis
+    /// (`DOEWOOD_INGEST_BUDGET_MIB`, else [`plan_budget`]). A file larger than the whole budget
+    /// takes all of it.
+    pub memory_budget: u64,
+    /// Files up to this size are not charged to the budget ([`SMALL_FILE_BYTES`]).
+    pub small_file: u64,
     /// `similar_to` edges.
     pub similarity: SimilarityConfig,
     /// The engine.
@@ -90,11 +107,14 @@ pub struct IngestConfig {
 
 impl IngestConfig {
     /// The configuration for an instance: `jobs` from `DOEWOOD_INGEST_JOBS` (`None`: from the
-    /// CPUs and memory) and the OCR models directory. Tuning values such as the `similar_to`
-    /// threshold are runtime settings, read from the store for every file.
+    /// CPUs and memory), the memory budget from the jobs and memory, and the OCR models
+    /// directory. Tuning values such as the `similar_to` threshold are runtime settings, read
+    /// from the store for every file.
     pub fn new(jobs: Option<usize>, ocr_models: &Path) -> Self {
         let jobs = jobs.unwrap_or_else(default_jobs).max(1);
         Self {
+            memory_budget: plan_budget(jobs, available_memory()),
+            small_file: SMALL_FILE_BYTES,
             jobs,
             queue: jobs * 2,
             max_attempts: 3,
@@ -125,6 +145,16 @@ pub fn plan_jobs(cpus: usize, memory: Option<u64>) -> usize {
         usize::try_from(m / MEMORY_SHARE / WORKER_BYTES).unwrap_or(usize::MAX)
     });
     cpus.min(by_memory).clamp(1, MAX_AUTO_JOBS)
+}
+
+/// The default memory budget for `jobs` workers and `memory` bytes available (`None`:
+/// unknown): half of the workers' plan ([`WORKER_BYTES`] each, at most half the available
+/// memory, as [`plan_jobs`]), so the files in flight and the working sets beside them fit the
+/// plan; at least [`MIN_BUDGET`].
+pub fn plan_budget(jobs: usize, memory: Option<u64>) -> u64 {
+    let plan = (jobs.max(1) as u64).saturating_mul(WORKER_BYTES);
+    let plan = memory.map_or(plan, |m| plan.min(m / MEMORY_SHARE));
+    (plan / 2).max(MIN_BUDGET)
 }
 
 /// `MemAvailable`, lowered to the room under a cgroup v2 limit. `None` off Linux.
@@ -345,6 +375,8 @@ struct Inner {
     inflight: Mutex<HashSet<(SourceId, String)>>,
     /// Analyses on a blocking thread now, overruns included, and their files' bytes.
     analyzing: Arc<Analyzing>,
+    /// Bytes of big files in flight.
+    budget: Arc<Budget>,
     /// Runs on the blocking thread before each analysis (tests stall it there).
     #[cfg(test)]
     hook: Option<Hook>,
@@ -409,6 +441,108 @@ impl Drop for Counted {
     }
 }
 
+/// The memory budget: bytes of big files held at once, and the big files waiting for it.
+#[derive(Debug)]
+struct Budget {
+    total: u64,
+    small: u64,
+    /// Waiting big files beyond which the workers stop taking new jobs and wait for the budget.
+    max_waiting: usize,
+    state: Mutex<BudgetState>,
+    released: Notify,
+}
+
+#[derive(Debug)]
+struct BudgetState {
+    free: u64,
+    /// Big files put aside until their share is free, oldest first.
+    waiting: VecDeque<Job>,
+}
+
+/// A big file's share of the budget. Held by its worker and by its analysis (which may outlive
+/// the watchdog); the share is free again when the last one drops it.
+#[derive(Debug)]
+struct Charge {
+    budget: Arc<Budget>,
+    bytes: u64,
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        lock(&self.budget.state).free += self.bytes;
+        self.budget.released.notify_waiters();
+    }
+}
+
+impl Budget {
+    fn new(total: u64, small: u64, max_waiting: usize) -> Self {
+        let total = total.max(1);
+        Self {
+            total,
+            small,
+            max_waiting,
+            state: Mutex::new(BudgetState {
+                free: total,
+                waiting: VecDeque::new(),
+            }),
+            released: Notify::new(),
+        }
+    }
+
+    /// What a job costs: `None` for a small file or a delete (not charged), else its listed
+    /// size, at most the whole budget.
+    fn cost(&self, job: &Job) -> Option<u64> {
+        match job {
+            Job::Ingest { size, .. } if *size > self.small => Some((*size).min(self.total)),
+            _ => None,
+        }
+    }
+
+    /// Admits a big job if nothing waits before it and its share is free; else puts it at the
+    /// end of the waiting list.
+    fn offer(self: &Arc<Self>, job: Job, cost: u64) -> Option<(Job, Arc<Charge>)> {
+        let mut st = lock(&self.state);
+        if st.waiting.is_empty() && st.free >= cost {
+            st.free -= cost;
+            drop(st);
+            return Some((job, self.charge(cost)));
+        }
+        st.waiting.push_back(job);
+        None
+    }
+
+    /// The oldest waiting job, if its share is free now.
+    fn next_waiting(self: &Arc<Self>) -> Option<(Job, Arc<Charge>)> {
+        let mut st = lock(&self.state);
+        let cost = self.cost(st.waiting.front()?).unwrap_or(0);
+        if st.free < cost {
+            return None;
+        }
+        st.free -= cost;
+        let job = st.waiting.pop_front()?;
+        drop(st);
+        Some((job, self.charge(cost)))
+    }
+
+    fn charge(self: &Arc<Self>, bytes: u64) -> Arc<Charge> {
+        Arc::new(Charge {
+            budget: Arc::clone(self),
+            bytes,
+        })
+    }
+
+    /// Whether so many big files wait that the workers wait for the budget, not for new jobs.
+    fn full(&self) -> bool {
+        lock(&self.state).waiting.len() > self.max_waiting
+    }
+
+    /// Bytes charged now.
+    #[cfg(test)]
+    fn in_use(&self) -> u64 {
+        self.total - lock(&self.state).free
+    }
+}
+
 /// A worker's analyses that overran the watchdog and still run (each awaited by a task that
 /// logs when it ends), oldest first.
 type Overruns = VecDeque<JoinHandle<()>>;
@@ -430,6 +564,8 @@ enum Job {
         source: SourceId,
         key: String,
         etag: Option<String>,
+        /// The listed size, charged to the memory budget.
+        size: u64,
     },
     Delete {
         source: SourceId,
@@ -456,6 +592,8 @@ impl IngestHandle {
 impl Ingest {
     /// The service; [`start`](Self::start) runs it.
     pub fn new(parts: IngestParts) -> Self {
+        let c = &parts.config;
+        let budget = Arc::new(Budget::new(c.memory_budget, c.small_file, c.jobs.max(1)));
         Self {
             inner: Arc::new(Inner {
                 store: parts.store,
@@ -468,6 +606,7 @@ impl Ingest {
                 writer: Mutex::new(None),
                 inflight: Mutex::new(HashSet::new()),
                 analyzing: Arc::default(),
+                budget,
                 #[cfg(test)]
                 hook: None,
                 sweep_now: Notify::new(),
@@ -508,6 +647,8 @@ impl Ingest {
         info!(
             jobs = c.jobs,
             queue = c.queue,
+            memory_budget_mib = c.memory_budget >> 20,
+            sheet_max_cells = c.analyzer.sheet_max_cells,
             ocr = ?self.inner.analyzer.ocr(),
             "ingest started"
         );
@@ -579,6 +720,7 @@ impl Ingest {
                 source: e.source,
                 key: e.key,
                 etag: v.etag,
+                size: v.size,
             },
             EventKind::Deleted => Job::Delete {
                 source: e.source,
@@ -641,6 +783,7 @@ impl Ingest {
                         source: source.id,
                         key: o.key,
                         etag: o.etag,
+                        size: o.size,
                     };
                     if self.enqueue(job, tx, shutdown).await {
                         return true;
@@ -659,6 +802,7 @@ impl Ingest {
         rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Job>>>,
         mut shutdown: watch::Receiver<bool>,
     ) {
+        let budget = Arc::clone(&self.inner.budget);
         let mut overruns = Overruns::new();
         loop {
             // Too many analyses left running: wait for the oldest before taking more work.
@@ -677,19 +821,56 @@ impl Ingest {
                     _ = oldest => {}
                 }
             }
-            let job = {
-                let mut rx = rx.lock().await;
+            // Registered before the budget is looked at, so no release is missed.
+            let released = budget.released.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            // A big file whose share of the budget is free now goes first (oldest first).
+            let (job, charge) = if let Some((job, charge)) = budget.next_waiting() {
+                (job, Some(charge))
+            } else if budget.full() {
+                // Too many big files wait: wait for the budget, not for new work.
                 tokio::select! {
                     biased;
-                    _ = shutdown.wait_for(|s| *s) => None,
-                    j = rx.recv() => j,
+                    _ = shutdown.wait_for(|s| *s) => return,
+                    () = &mut released => continue,
+                }
+            } else {
+                let job = {
+                    let mut rx = rx.lock().await;
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.wait_for(|s| *s) => None,
+                        () = &mut released => continue,
+                        j = rx.recv() => j,
+                    }
+                };
+                let Some(job) = job else { return };
+                match budget.cost(&job) {
+                    None => (job, None),
+                    Some(cost) => {
+                        let Some((job, charge)) = budget.offer(job, cost) else {
+                            // Put aside until its share is free; this worker takes other work.
+                            debug!(cost, "a big file waits for the ingest memory budget");
+                            continue;
+                        };
+                        (job, Some(charge))
+                    }
                 }
             };
-            let Some(job) = job else { return };
             match job {
-                Job::Ingest { source, key, etag } => {
-                    self.run_ingest(source, &key, etag.as_deref(), &mut shutdown, &mut overruns)
-                        .await;
+                Job::Ingest {
+                    source, key, etag, ..
+                } => {
+                    self.run_ingest(
+                        source,
+                        &key,
+                        etag.as_deref(),
+                        charge,
+                        &mut shutdown,
+                        &mut overruns,
+                    )
+                    .await;
                     lock(&self.inner.inflight).remove(&(source, key));
                     (self.inner.on_change)(source);
                 }
@@ -701,12 +882,15 @@ impl Ingest {
         }
     }
 
-    /// Ingests one object version, with retries, and records how it ended.
+    /// Ingests one object version, with retries, and records how it ended. `charge` is the
+    /// file's share of the memory budget (`None`: a small file), held until it returns and by
+    /// its analysis until that ends.
     async fn run_ingest(
         &self,
         source: SourceId,
         key: &str,
         etag: Option<&str>,
+        charge: Option<Arc<Charge>>,
         shutdown: &mut watch::Receiver<bool>,
         overruns: &mut Overruns,
     ) {
@@ -723,7 +907,9 @@ impl Ingest {
             let Some(backend) = self.backend(shutdown).await else {
                 return; // shutdown: stays pending
             };
-            let result = self.ingest_once(&backend, source, key, overruns).await;
+            let result = self
+                .ingest_once(&backend, source, key, charge.as_ref(), overruns)
+                .await;
             let (k, e) = (key.to_owned(), etag.map(str::to_owned));
             let outcome = match result {
                 Ok(Some(outcome)) => outcome,
@@ -773,6 +959,7 @@ impl Ingest {
         backend: &Arc<dyn Backend>,
         id: SourceId,
         key: &str,
+        charge: Option<&Arc<Charge>>,
         overruns: &mut Overruns,
     ) -> Result<Option<IngestOutcome>, IngestError> {
         // The runtime settings are read per file, so a change applies without a restart.
@@ -800,7 +987,9 @@ impl Ingest {
             let outcome = stored_outcome(&r.body);
             (r.body, outcome)
         } else {
-            let a = self.analyze(bytes, blake3, key, overruns).await?;
+            let a = self
+                .analyze(bytes, blake3, key, charge.cloned(), overruns)
+                .await?;
             lock(&self.inner.stats).analyzed += 1;
             backend.put_record(&a.blake3, &a.body, &a.versions).await?;
             (a.body, a.outcome)
@@ -854,12 +1043,14 @@ impl Ingest {
 
     /// Analyzes one file on a blocking thread, under the watchdog. Past it the file fails as
     /// before, and the analysis, which nothing can stop from outside, is added to `overruns`
-    /// (the worker bounds those): its bytes are freed, and a `WARN` logged, when it returns.
+    /// (the worker bounds those): its bytes and its share of the memory budget are freed, and a
+    /// `WARN` logged, when it returns.
     async fn analyze(
         &self,
         bytes: Vec<u8>,
         blake3: Blake3,
         key: &str,
+        charge: Option<Arc<Charge>>,
         overruns: &mut Overruns,
     ) -> Result<Analysis, IngestError> {
         let analyzer = Arc::clone(&self.inner.analyzer);
@@ -870,6 +1061,7 @@ impl Ingest {
         let hook = self.inner.hook.clone();
         let mut task = tokio::task::spawn_blocking(move || {
             let _counted = counted;
+            let _charge = charge;
             #[cfg(test)]
             if let Some(h) = hook {
                 h(&k);
@@ -1201,6 +1393,18 @@ mod tests {
     /// stall on the gate. Every object is pending before the workers start, so the first
     /// sweep queues them in key order.
     fn run(objects: &[(&str, Vec<u8>)], held: &[&str]) -> Run {
+        run_with(objects, held, 1, |_| {}, None)
+    }
+
+    /// [`run`] with `jobs` workers, the configuration changed by `tune`, and `seen` called
+    /// on the blocking thread before each analysis (before the gate).
+    fn run_with(
+        objects: &[(&str, Vec<u8>)],
+        held: &[&str],
+        jobs: usize,
+        tune: impl FnOnce(&mut IngestConfig),
+        seen: Option<Hook>,
+    ) -> Run {
         let store = Arc::new(Store::open_in_memory(&MasterKey::from_bytes([9; 32])).unwrap());
         let backend: Arc<dyn Backend> = Arc::new(Standalone::new(Arc::clone(&store)));
         let source = store
@@ -1218,10 +1422,11 @@ mod tests {
             }));
         }
         store.record_objects(source, &changes, None).unwrap();
-        let mut config = IngestConfig::new(Some(1), Path::new("/nonexistent"));
+        let mut config = IngestConfig::new(Some(jobs), Path::new("/nonexistent"));
         config.watchdog_grace = Duration::from_millis(200);
         config.analyzer.file_timeout = Duration::from_millis(300);
         config.analyzer.ocr_models = "/nonexistent/doewood-ocr-models".into();
+        tune(&mut config);
         let analyzer = Arc::new(Analyzer::new(&config.analyzer).unwrap());
         let gate = Arc::new(Gate::default());
         lock(&gate.held).extend(held.iter().map(|k| (*k).to_owned()));
@@ -1236,7 +1441,12 @@ mod tests {
             on_llm_queued: Arc::new(|_| {}),
         });
         let g = Arc::clone(&gate);
-        Arc::get_mut(&mut ingest.inner).unwrap().hook = Some(Arc::new(move |k| g.wait(k)));
+        Arc::get_mut(&mut ingest.inner).unwrap().hook = Some(Arc::new(move |k| {
+            if let Some(seen) = &seen {
+                seen(k);
+            }
+            g.wait(k);
+        }));
         let (events, events_rx) = mpsc::channel(16);
         let (shutdown, shutdown_rx) = watch::channel(false);
         let handle = ingest.start(events_rx, shutdown_rx);
@@ -1375,6 +1585,118 @@ mod tests {
             .await;
         assert_eq!(r.ingest.stats().overruns, 2);
         r.stop().await;
+    }
+
+    /// The memory budget: a big file waits while another holds the budget, until that one's
+    /// analysis really ends (here: an overrun the watchdog gave up on), while small files flow
+    /// on the other worker. A file bigger than the budget takes all of it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_big_file_waits_for_the_budget_while_small_files_flow() {
+        const MIB: usize = 1 << 20;
+        let a = text(3001, 2 * MIB);
+        let b = text(3002, 5 * MIB);
+        let small: Vec<(String, Vec<u8>)> = (0..6)
+            .map(|i| (format!("c-small-{i}.txt"), text(3100 + i, 2000)))
+            .collect();
+        let mut objects = vec![("a-big.txt", a.clone()), ("b-bigger.txt", b.clone())];
+        objects.extend(small.iter().map(|(k, d)| (k.as_str(), d.clone())));
+        // What was charged when each analysis started.
+        let charged: Arc<Mutex<Vec<(String, u64)>>> = Arc::default();
+        let budget: Arc<Mutex<Option<Arc<Budget>>>> = Arc::default();
+        let seen: Hook = {
+            let (charged, budget) = (Arc::clone(&charged), Arc::clone(&budget));
+            Arc::new(move |k| {
+                if let Some(b) = lock(&budget).as_ref() {
+                    lock(&charged).push((k.to_owned(), b.in_use()));
+                }
+            })
+        };
+        let r = run_with(
+            &objects,
+            &["a-big.txt"],
+            2,
+            |c| {
+                c.memory_budget = 3 * MIB as u64;
+                c.small_file = 64 << 10;
+            },
+            Some(seen),
+        );
+        *lock(&budget) = Some(Arc::clone(&r.ingest.inner.budget));
+
+        // a holds 2 MiB past the watchdog; b (5 MiB, more than the whole budget) waits for
+        // all of it, and the small files go through meanwhile.
+        r.until("a failed and the small files are done", |r| {
+            r.status("a-big.txt").status == "failed"
+                && small.iter().all(|(k, _)| r.status(k).status == "done")
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(r.status("b-bigger.txt").status, "pending");
+        assert_eq!(r.analyzing(), (1, a.len() as u64));
+        assert_eq!(r.ingest.inner.budget.in_use(), a.len() as u64);
+
+        r.gate.release("a-big.txt");
+        r.until("b is done", |r| r.status("b-bigger.txt").status == "done")
+            .await;
+        r.until("every share is free", |r| {
+            r.ingest.inner.budget.in_use() == 0
+        })
+        .await;
+        let charged = lock(&charged).clone();
+        let at = |key: &str| charged.iter().find(|(k, _)| k == key).map(|(_, c)| *c);
+        assert_eq!(at("a-big.txt"), Some(a.len() as u64));
+        // b ran alone, with the whole budget; small files are never charged.
+        assert_eq!(at("b-bigger.txt"), Some(3 * MIB as u64));
+        r.stop().await;
+    }
+
+    #[test]
+    fn budget_is_fifo_and_small_files_are_free() {
+        let job = |key: &str, size: u64| Job::Ingest {
+            source: SourceId::generate(),
+            key: key.to_owned(),
+            etag: None,
+            size,
+        };
+        let key = |j: &Job| match j {
+            Job::Ingest { key, .. } => key.clone(),
+            Job::Delete { .. } => unreachable!(),
+        };
+        let b = Arc::new(Budget::new(100, 10, 1));
+        assert_eq!(b.cost(&job("s", 10)), None);
+        assert_eq!(b.cost(&job("m", 11)), Some(11));
+        assert_eq!(b.cost(&job("h", 1000)), Some(100));
+        let (_, first) = b.offer(job("first", 60), 60).expect("fits");
+        // 50 does not fit beside 60: it waits, and so does a 20 behind it (no overtaking).
+        assert!(b.offer(job("second", 50), 50).is_none());
+        assert!(b.offer(job("third", 20), 20).is_none());
+        assert!(b.full());
+        assert!(b.next_waiting().is_none());
+        drop(first);
+        let (j, second) = b.next_waiting().expect("second's turn");
+        assert_eq!(key(&j), "second");
+        let (j, third) = b.next_waiting().expect("third fits beside it");
+        assert_eq!(key(&j), "third");
+        assert_eq!(b.in_use(), 70);
+        drop((second, third));
+        assert_eq!(b.in_use(), 0);
+        assert!(!b.full());
+    }
+
+    #[test]
+    fn budget_follows_jobs_and_memory() {
+        const GIB: u64 = 1 << 30;
+        // 4 workers with room for them: half of 4 x 512 MiB.
+        assert_eq!(plan_budget(4, Some(8 * GIB)), GIB);
+        assert_eq!(plan_budget(4, None), GIB);
+        // A 4 GiB limit: 3 workers, 768 MiB.
+        assert_eq!(plan_jobs(4, Some(4 * GIB - (100 << 20))), 3);
+        assert_eq!(plan_budget(3, Some(4 * GIB - (100 << 20))), 768 << 20);
+        // More workers than the memory holds: half of half the memory.
+        assert_eq!(plan_budget(16, Some(4 * GIB)), GIB);
+        assert_eq!(plan_budget(1, Some(GIB)), MIN_BUDGET);
+        assert_eq!(plan_budget(0, Some(100 << 20)), MIN_BUDGET);
+        assert!(IngestConfig::new(Some(2), Path::new("/x")).memory_budget >= MIN_BUDGET);
     }
 
     #[test]

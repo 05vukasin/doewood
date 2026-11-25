@@ -53,6 +53,17 @@ const MAX_COLUMNS: usize = 64;
 /// Most sheets described one by one.
 const MAX_SHEETS: usize = 200;
 
+/// Peak memory of one workbook in ingest, per cell, rounded up: the file, hedgehog's
+/// workbook and its normalizer. Measured with `big_spreadsheets` (`tests/pipeline.rs`): 200 to
+/// 300 bytes a cell for numbers and text, file included; 380 MiB for 960k cells in #63.
+pub const CELL_BYTES: u64 = 320;
+/// Most cells read from one workbook (hedgehog's `max_cells`, and `max_shared_strings`): what
+/// one worker's plan ([`WORKER_BYTES`](crate::pipeline::WORKER_BYTES), 512 MiB) holds at
+/// [`CELL_BYTES`] a cell, rounded down to 100,000: 1,600,000. A bigger workbook fails like any
+/// other refused file (`sheet.read@1: file refused: the workbook has more than 1,600,000
+/// cells ...`), with its identity facts kept.
+pub const MAX_CELLS: u64 = crate::pipeline::WORKER_BYTES / CELL_BYTES / 100_000 * 100_000;
+
 /// What hedgehog made of a workbook.
 #[derive(Debug, Default)]
 pub struct SheetOutcome {
@@ -69,13 +80,27 @@ pub struct SheetOutcome {
 /// Reads and analyzes a workbook, stopping at `deadline` (the file's): hedgehog's read checks
 /// it per sheet and every 65,536 cells, its normalizer per sheet. A read past it fails the
 /// workbook (`sheet.read@1: file refused: ...time limit`); tables past it are a problem
-/// (`sheet.tables@1: ...`).
+/// (`sheet.tables@1: ...`). At most [`MAX_CELLS`] cells are read.
 pub fn analyze(bytes: &[u8], name: &str, format: &str, deadline: Option<Instant>) -> SheetOutcome {
+    analyze_with(bytes, name, format, deadline, MAX_CELLS)
+}
+
+/// [`analyze`] with another cell cap: a workbook of more than `max_cells` cells (or shared
+/// strings) fails (`sheet.read@1: file refused: the workbook has more than ... cells`).
+pub fn analyze_with(
+    bytes: &[u8],
+    name: &str,
+    format: &str,
+    deadline: Option<Instant>,
+    max_cells: u64,
+) -> SheetOutcome {
     let mut out = SheetOutcome::default();
-    // Only the deadline changes: cells and decompressed bytes keep hedgehog's limits.
+    // Decompressed bytes keep hedgehog's limit (2 GiB): parts are read in chunks, not held.
     let options = ReadOptions {
         limits: hh_core::reader::Limits {
             deadline,
+            max_cells,
+            max_shared_strings: max_cells,
             ..hh_core::reader::Limits::default()
         },
         ..ReadOptions::default()
