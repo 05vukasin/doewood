@@ -7,8 +7,8 @@
 //!   [`MAX_CONNECTION_AGE_GRACE`] more ([`Aged`]), so long-lived clients reconnect and spread
 //!   over the replicas.
 //! - **Per call** (runtime settings, `ConfigService.SetApiSettings`, read live by [`Limited`]):
-//!   a cap on calls in flight, beyond which a call is refused at once with UNAVAILABLE, and a
-//!   server deadline (DEADLINE_EXCEEDED). Both bound the response future: a unary call whole,
+//!   a cap on calls in flight, beyond which a call is refused at once with `UNAVAILABLE`, and a
+//!   server deadline (`DEADLINE_EXCEEDED`). Both bound the response future: a unary call whole,
 //!   a stream only while it is set up, so an open `WatchProgress` is neither counted nor cut.
 //!   Health checks are exempt from both; `Summarize` is counted but has no server deadline
 //!   (its analysis and provider calls are bounded on their own and can take minutes).
@@ -319,7 +319,7 @@ mod tests {
         let mut svc = Limited::new(
             Held {
                 release: Arc::clone(&release),
-                delay: Duration::from_secs(3600),
+                delay: Duration::from_hours(1),
             },
             Arc::clone(&l),
         );

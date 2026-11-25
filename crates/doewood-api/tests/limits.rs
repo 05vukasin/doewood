@@ -197,7 +197,7 @@ async fn api_settings_round_trip_and_validation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn calls_beyond_the_cap_are_shed() {
-    let held = Held::new(Duration::from_secs(60));
+    let held = Held::new(Duration::from_mins(1));
     let a = start(&held).await;
     let ch = a.channel().await;
     add_paused_source(&ch).await;

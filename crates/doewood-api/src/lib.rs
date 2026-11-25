@@ -144,7 +144,7 @@ pub async fn serve(
     match state.db(doewood_store::Store::api_settings).await {
         Ok(settings) => state.call_limits().set(settings),
         Err(e) => {
-            warn!(error = %e.message(), "API limits not read from the store; using the defaults")
+            warn!(error = %e.message(), "API limits not read from the store; using the defaults");
         }
     }
     let api = Api {
