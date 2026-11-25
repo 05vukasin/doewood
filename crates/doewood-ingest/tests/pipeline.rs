@@ -102,6 +102,18 @@ fn analyzer(jobs: usize) -> Arc<Analyzer> {
 
 impl Harness {
     fn start(store: Arc<Store>, backend: Arc<dyn Backend>, jobs: usize, retry: Duration) -> Self {
+        Self::start_with(store, backend, jobs, retry, Arc::new(|_| {}))
+    }
+
+    /// [`Harness::start`], with ingest's change callback (the binary wakes the progress
+    /// watchers through it).
+    fn start_with(
+        store: Arc<Store>,
+        backend: Arc<dyn Backend>,
+        jobs: usize,
+        retry: Duration,
+        on_change: Arc<dyn Fn(SourceId) + Send + Sync>,
+    ) -> Self {
         let source = store
             .add_source(&NewSource::new(ENDPOINT, BUCKET), None)
             .unwrap();
@@ -117,7 +129,7 @@ impl Harness {
             fetch: Arc::clone(&fetch) as Arc<dyn doewood_ingest::Fetch>,
             analyzer: analyzer(jobs),
             config,
-            on_change: Arc::new(|_| {}),
+            on_change,
             on_llm_queued: Arc::new(|_| {}),
         });
         let (events, events_rx) = mpsc::channel(16);
@@ -925,10 +937,27 @@ async fn throughput() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(400);
+    let watchers: usize = std::env::var("DOEWOOD_BENCH_WATCHERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let jobs = doewood_ingest::default_jobs();
     let store = Arc::new(Store::open_in_memory(&MasterKey::from_bytes([8; 32])).unwrap());
     let backend: Arc<dyn Backend> = Arc::new(Standalone::new(Arc::clone(&store)));
-    let h = Harness::start(Arc::clone(&store), backend, jobs, Duration::from_millis(10));
+    let progress = Arc::new(doewood_api::Progress::new());
+    let h = {
+        let progress = Arc::clone(&progress);
+        Harness::start_with(
+            Arc::clone(&store),
+            Arc::clone(&backend),
+            jobs,
+            Duration::from_millis(10),
+            Arc::new(move |_| progress.touch()),
+        )
+    };
+    let api = bench::Api::start(&store, &backend, &progress, watchers).await;
+    let probe = bench::Probe::start(&store);
+    let cpu = bench::cpu_seconds();
     let mut files = Vec::with_capacity(n);
     let mut bytes = 0usize;
     for i in 0..n {
@@ -986,14 +1015,170 @@ async fn throughput() {
     }
     h.settle().await;
     let secs = started.elapsed().as_secs_f64();
+    let cpu = bench::cpu_seconds() - cpu;
+    let wait = probe.stop();
+    let messages = api.stop().await;
     let c = store.object_counts(h.source).unwrap();
     #[allow(clippy::cast_precision_loss)]
     let (rate, mib) = (n as f64 / secs, bytes as f64 / f64::from(1 << 20));
     println!(
         "throughput: {n} files ({mib:.1} MiB) with {jobs} workers in {secs:.2}s = {rate:.0} \
-         files/s (done {}, skipped {}, failed {})",
+         files/s (done {}, skipped {}, failed {}); {watchers} progress watchers \
+         ({messages} messages); CPU {cpu:.2}s; store lock wait {wait}",
         c.done, c.skipped, c.failed
     );
     assert_eq!(c.done, n as u64);
     h.stop().await;
+}
+
+/// The `throughput` measurement's helpers: `WatchProgress` streams on a real API server, and
+/// how long a trivial store call waits for the store's lock.
+mod bench {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    use doewood_api::pb::jobs_service_client::JobsServiceClient;
+    use doewood_api::{ApiOptions, ApiParts, ApiState, Progress, pb};
+    use doewood_core::InstanceId;
+    use doewood_model::Backend;
+    use doewood_store::Store;
+    use tokio::sync::watch;
+
+    /// An API server with `watchers` open `WatchProgress` streams of every source.
+    pub struct Api {
+        shutdown: watch::Sender<bool>,
+        server: tokio::task::JoinHandle<Result<(), doewood_api::ServeError>>,
+        readers: Vec<tokio::task::JoinHandle<()>>,
+        messages: Arc<AtomicU64>,
+    }
+
+    impl Api {
+        pub async fn start(
+            store: &Arc<Store>,
+            backend: &Arc<dyn Backend>,
+            progress: &Arc<Progress>,
+            watchers: usize,
+        ) -> Self {
+            let (shutdown, shutdown_rx) = watch::channel(false);
+            let (_backend_tx, backend_rx) = watch::channel(Some(Arc::clone(backend)));
+            let state = ApiState::new(ApiParts {
+                store: Arc::clone(store),
+                backend: backend_rx,
+                instance: InstanceId::new("bench").unwrap(),
+                discovery: None,
+                progress: Arc::clone(progress),
+                reprocess: None,
+                summarize: None,
+                icons: None,
+                options: ApiOptions::default(),
+                shutdown: shutdown_rx.clone(),
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut stop = shutdown_rx;
+            let server = tokio::spawn(doewood_api::serve(listener, state, async move {
+                let _ = stop.wait_for(|s| *s).await;
+            }));
+            let messages = Arc::new(AtomicU64::new(0));
+            let mut readers = Vec::new();
+            for _ in 0..watchers {
+                let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+                    .unwrap()
+                    .connect()
+                    .await
+                    .unwrap();
+                let mut stream = JobsServiceClient::new(channel)
+                    .watch_progress(pb::WatchProgressRequest { source_ids: vec![] })
+                    .await
+                    .unwrap()
+                    .into_inner();
+                let messages = Arc::clone(&messages);
+                readers.push(tokio::spawn(async move {
+                    while let Ok(Some(_)) = stream.message().await {
+                        messages.fetch_add(1, Ordering::Relaxed);
+                    }
+                }));
+            }
+            Self {
+                shutdown,
+                server,
+                readers,
+                messages,
+            }
+        }
+
+        /// Stops the server; returns how many progress messages the watchers received.
+        pub async fn stop(self) -> u64 {
+            self.shutdown.send_replace(true);
+            for r in self.readers {
+                r.await.unwrap();
+            }
+            self.server.await.unwrap().unwrap();
+            self.messages.load(Ordering::Relaxed)
+        }
+    }
+
+    /// Times a trivial store call every millisecond: what it waits for the lock.
+    pub struct Probe {
+        stop: Arc<AtomicBool>,
+        thread: std::thread::JoinHandle<Vec<Duration>>,
+    }
+
+    impl Probe {
+        pub fn start(store: &Arc<Store>) -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread = {
+                let (store, stop) = (Arc::clone(store), Arc::clone(&stop));
+                std::thread::spawn(move || {
+                    let mut waits = Vec::new();
+                    while !stop.load(Ordering::Relaxed) {
+                        let t = Instant::now();
+                        store.schema_version().unwrap();
+                        waits.push(t.elapsed());
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    waits
+                })
+            };
+            Self { stop, thread }
+        }
+
+        /// Mean, 99th percentile and maximum.
+        pub fn stop(self) -> String {
+            self.stop.store(true, Ordering::Relaxed);
+            let mut w = self.thread.join().unwrap();
+            w.sort();
+            if w.is_empty() {
+                return "-".into();
+            }
+            let total: Duration = w.iter().sum();
+            let mean = total / u32::try_from(w.len()).unwrap();
+            let p99 = w[w.len() * 99 / 100];
+            format!(
+                "mean {:.0} us, p99 {:.0} us, max {:.1} ms ({} probes)",
+                mean.as_secs_f64() * 1e6,
+                p99.as_secs_f64() * 1e6,
+                w[w.len() - 1].as_secs_f64() * 1e3,
+                w.len()
+            )
+        }
+    }
+
+    /// User and system CPU time of this process (Linux), in seconds; 0 elsewhere.
+    pub fn cpu_seconds() -> f64 {
+        let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
+            return 0.0;
+        };
+        // Fields after the command name (which may hold spaces): utime is the 12th, stime the
+        // 13th, in clock ticks (100 per second on Linux).
+        let rest = stat.rsplit_once(')').map_or("", |(_, r)| r);
+        let f: Vec<f64> = rest
+            .split_whitespace()
+            .skip(11)
+            .take(2)
+            .filter_map(|v| v.parse().ok())
+            .collect();
+        f.iter().sum::<f64>() / 100.0
+    }
 }
