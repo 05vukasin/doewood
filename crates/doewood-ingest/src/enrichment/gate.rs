@@ -312,8 +312,8 @@ pub(crate) async fn run(job: &Job<'_>, s: &mut Subject, f: &Findings) -> Result<
                 .map_or(0.0, |c| c.probability);
             let lease = job.lease_other(other).await?;
             if lease == OtherLease::Taken {
-                let mine = b.company_documents(me).await?.len();
-                let theirs = b.company_documents(other).await?.len();
+                let mine = b.company_document_count(me).await?;
+                let theirs = b.company_document_count(other).await?;
                 let (survivor, absorbed) = if theirs > mine {
                     (other, me)
                 } else {

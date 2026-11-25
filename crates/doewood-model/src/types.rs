@@ -219,6 +219,21 @@ pub fn records_limit(limit: u32) -> u32 {
     }
 }
 
+/// Checks a batch of hashes for [`crate::RecordStore::record_versions`] and
+/// [`crate::RecordStore::fact_texts`]: at most [`RECORDS_MAX_LIMIT`].
+///
+/// # Errors
+///
+/// [`Error::Invalid`] when there are more.
+pub fn validate_hashes(hashes: &[Blake3]) -> Result<(), Error> {
+    if hashes.len() > RECORDS_MAX_LIMIT as usize {
+        return Err(Error::Invalid(format!(
+            "at most {RECORDS_MAX_LIMIT} hashes per call"
+        )));
+    }
+    Ok(())
+}
+
 /// What a put did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PutOutcome {

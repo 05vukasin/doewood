@@ -12,6 +12,7 @@ use crate::PgStore;
 
 mod companies_due;
 mod list_records;
+mod read_paths;
 
 const VAR: &str = "DOEWOOD_TEST_POSTGRES_URL";
 

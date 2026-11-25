@@ -34,7 +34,7 @@ use super::write::live_id;
 const REVERIFY_SECS: i64 = 30 * 24 * 60 * 60;
 /// Most candidates checked per company, and most documents read for email domains.
 const MAX_CANDIDATES: usize = 4;
-const MAX_DOCUMENTS: usize = 50;
+const MAX_DOCUMENTS: u32 = 50;
 /// The shortest name key that counts as found on a page.
 const MIN_KEY_CHARS: usize = 4;
 /// The shortest identifier that counts as found on a page.
@@ -154,31 +154,18 @@ pub(crate) async fn run(job: &Job<'_>, s: &Subject, f: &Findings) -> Result<bool
     Ok(false)
 }
 
-/// The email domains of the company's documents, most frequent first.
+/// The email domains of the company's documents, most frequent first. The first
+/// [`MAX_DOCUMENTS`] documents are read, and only their `signal.email_domain` facts (issue #75).
 async fn email_domains(b: &dyn Backend, company: uuid::Uuid) -> Result<Vec<String>> {
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    for doc in b
-        .company_documents(company)
+    let hashes: Vec<Blake3> = b
+        .company_documents_first(company, MAX_DOCUMENTS)
         .await?
-        .into_iter()
-        .take(MAX_DOCUMENTS)
-    {
-        let Ok(hash) = doc.key.parse::<Blake3>() else {
-            continue;
-        };
-        let Some(record) = b.get_record(&hash).await? else {
-            continue;
-        };
-        let Some(facts) = record.body.get("facts").and_then(Value::as_array) else {
-            continue;
-        };
-        for fact in facts {
-            if fact.get("key").and_then(Value::as_str) == Some("signal.email_domain")
-                && let Some(d) = fact["value"]["v"].as_str()
-            {
-                *counts.entry(d.trim().to_ascii_lowercase()).or_default() += 1;
-            }
-        }
+        .iter()
+        .filter_map(|doc| doc.key.parse().ok())
+        .collect();
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for (_, d) in b.fact_texts(&hashes, "signal.email_domain").await? {
+        *counts.entry(d.trim().to_ascii_lowercase()).or_default() += 1;
     }
     let mut list: Vec<(String, usize)> = counts.into_iter().collect();
     list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));

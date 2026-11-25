@@ -3,6 +3,7 @@
 //!
 //! Every call runs on tokio's blocking pool and takes the store's single connection.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,7 +15,7 @@ use doewood_model::{
     NodeKind, ObjectLocation, OwnedAlias, PropsPatch, PutOutcome, Record, RecordStore, Result,
     SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore, Sketch, SketchStore,
     SourceClaim, SourceKey, StepVersions, StoredEdge, band_to_i64, merged_into, records_limit,
-    sketch_limit, validate_alias, validate_node, validate_sketch, versions_from_json,
+    sketch_limit, validate_alias, validate_hashes, validate_node, validate_sketch, versions_from_json,
     versions_to_json,
 };
 use rusqlite::types::Value as Sql;
@@ -27,11 +28,45 @@ use uuid::Uuid;
 
 use crate::Store;
 use crate::store::now;
+use enrichment::DOCUMENTS;
 
 mod enrichment;
 mod feeds;
 mod merges;
 mod proposals;
+#[cfg(test)]
+mod read_paths;
+
+/// The candidate query for `bands` band keys, then the excluded hash and the limit. As on
+/// Postgres (issue #74): the bands are counted and limited on `sketch_bands` alone (its
+/// primary key), and only the survivors' signatures are read.
+fn sketch_candidates_sql(bands: usize) -> String {
+    let marks = vec!["?"; bands].join(", ");
+    format!(
+        "SELECT c.blake3, s.signature, c.shared \
+         FROM (SELECT blake3, count(*) AS shared FROM sketch_bands \
+         WHERE band IN ({marks}) AND blake3 <> ? \
+         GROUP BY blake3 ORDER BY shared DESC, blake3 LIMIT ?) c \
+         JOIN sketches s ON s.blake3 = c.blake3 ORDER BY c.shared DESC, c.blake3"
+    )
+}
+
+/// [`GraphStore::company_documents`], the first `limit` of them when given.
+fn company_documents(conn: &Connection, company: Uuid, limit: Option<u32>) -> Result<Vec<Node>> {
+    let mut stmt = conn
+        .prepare_cached(&format!(
+            "SELECT DISTINCT {NODE_COLUMNS} FROM edges e JOIN nodes n ON n.id = e.src \
+             WHERE e.dst = ?1 AND e.kind = 'party' AND n.kind = 'document' \
+             AND e.state NOT IN ('retracted', 'superseded') ORDER BY n.key LIMIT ?2"
+        ))
+        .map_err(sql)?;
+    // A negative limit is no limit.
+    let limit = limit.map_or(-1, i64::from);
+    let rows = stmt
+        .query_map(params![company.to_string(), limit], |r| node_at(r, 0))
+        .map_err(sql)?;
+    rows.map(|row| node_from(row.map_err(sql)?)).collect()
+}
 
 /// The SQLite backend. Cheap to clone: every clone shares the one store.
 #[derive(Clone, Debug)]
@@ -430,6 +465,71 @@ impl RecordStore for Standalone {
         .await
     }
 
+    async fn record_versions(&self, hashes: &[Blake3]) -> Result<BTreeMap<Blake3, StepVersions>> {
+        validate_hashes(hashes)?;
+        if hashes.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let marks = vec!["?"; hashes.len()].join(", ");
+        let args: Vec<Vec<u8>> = hashes.iter().map(|h| h.as_bytes().to_vec()).collect();
+        self.run(move |conn| {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT blake3, versions_json FROM records WHERE blake3 IN ({marks})"
+                ))
+                .map_err(sql)?;
+            let rows = stmt
+                .query_map(params_from_iter(args), |r| {
+                    Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(sql)?;
+            rows.map(|row| {
+                let (h, versions) = row.map_err(sql)?;
+                Ok((Blake3::from_slice(&h)?, versions_from_json(&json(&versions)?)?))
+            })
+            .collect()
+        })
+        .await
+    }
+
+    async fn fact_texts(&self, hashes: &[Blake3], key: &str) -> Result<Vec<(Blake3, String)>> {
+        validate_hashes(hashes)?;
+        if hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks = vec!["?"; hashes.len()].join(", ");
+        let mut args: Vec<Sql> = vec![Sql::Text(key.to_owned())];
+        args.extend(hashes.iter().map(|h| Sql::Blob(h.as_bytes().to_vec())));
+        self.run(move |conn| {
+            // As on Postgres: a `facts` that is not an array has no facts; a fact that is not
+            // an object, or whose key or `value.v` is not a string, is left out. The nested
+            // CASE keeps `json_type` off elements that are not JSON objects.
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT blake3, v FROM (SELECT r.blake3, CASE WHEN f.type = 'object' THEN \
+                     (CASE WHEN json_type(f.value, '$.key') = 'text' \
+                     AND json_extract(f.value, '$.key') = ?1 \
+                     AND json_type(f.value, '$.value.v') = 'text' \
+                     THEN json_extract(f.value, '$.value.v') END) END AS v \
+                     FROM records r, json_each(CASE WHEN json_type(r.body_json, '$.facts') = \
+                     'array' THEN json_extract(r.body_json, '$.facts') ELSE '[]' END) f \
+                     WHERE r.blake3 IN ({marks})) WHERE v IS NOT NULL"
+                ))
+                .map_err(sql)?;
+            let rows = stmt
+                .query_map(params_from_iter(args), |r| {
+                    Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(sql)?;
+            rows.map(|row| {
+                let (h, v) = row.map_err(sql)?;
+                Ok((Blake3::from_slice(&h)?, v))
+            })
+            .collect()
+        })
+        .await
+    }
+
     async fn list_records(
         &self,
         source: &SourceKey,
@@ -637,18 +737,28 @@ impl GraphStore for Standalone {
     }
 
     async fn company_documents(&self, company: Uuid) -> Result<Vec<Node>> {
+        self.run(move |conn| company_documents(conn, company, None))
+            .await
+    }
+
+    async fn company_documents_first(&self, company: Uuid, limit: u32) -> Result<Vec<Node>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.run(move |conn| company_documents(conn, company, Some(limit)))
+            .await
+    }
+
+    async fn company_document_count(&self, company: Uuid) -> Result<u64> {
         self.run(move |conn| {
-            let mut stmt = conn
-                .prepare(&format!(
-                    "SELECT DISTINCT {NODE_COLUMNS} FROM edges e JOIN nodes n ON n.id = e.src \
-                     WHERE e.dst = ?1 AND e.kind = 'party' AND n.kind = 'document' \
-                     AND e.state NOT IN ('retracted', 'superseded') ORDER BY n.key"
-                ))
+            let n: i64 = conn
+                .query_row(
+                    &format!("SELECT {DOCUMENTS} FROM (SELECT ?1 AS id) n"),
+                    [company.to_string()],
+                    |r| r.get(0),
+                )
                 .map_err(sql)?;
-            let rows = stmt
-                .query_map([company.to_string()], |r| node_at(r, 0))
-                .map_err(sql)?;
-            rows.map(|row| node_from(row.map_err(sql)?)).collect()
+            Ok(u64::try_from(n).unwrap_or(0))
         })
         .await
     }
@@ -850,30 +960,39 @@ impl GraphStore for Standalone {
 impl SketchStore for Standalone {
     async fn put_sketch(&self, blake3: &Blake3, signature: &[u8], bands: &[u64]) -> Result<()> {
         validate_sketch(signature, bands)?;
-        let (h, signature, bands) = (*blake3, signature.to_vec(), bands.to_vec());
+        let (h, signature) = (*blake3, signature.to_vec());
+        let bands: BTreeSet<i64> = bands.iter().map(|b| band_to_i64(*b)).collect();
         self.run(move |conn| {
             let tx = conn.transaction().map_err(sql)?;
             let key = h.as_bytes().as_slice();
+            // Issue #74: an unchanged sketch writes nothing. The signature row is updated
+            // only when it differs, and only the bands that changed are deleted or inserted.
             tx.execute(
                 "INSERT INTO sketches (blake3, signature, updated_at) VALUES (?1, ?2, ?3) \
                  ON CONFLICT (blake3) DO UPDATE SET signature = excluded.signature, \
-                 updated_at = excluded.updated_at",
+                 updated_at = excluded.updated_at WHERE signature IS NOT excluded.signature",
                 params![key, signature, now()],
             )
             .map_err(sql)?;
-            tx.execute("DELETE FROM sketch_bands WHERE blake3 = ?1", [key])
-                .map_err(sql)?;
-            {
-                let mut insert = tx
-                    .prepare_cached(
-                        "INSERT INTO sketch_bands (band, blake3) VALUES (?1, ?2) \
-                         ON CONFLICT DO NOTHING",
-                    )
+            let stored: BTreeSet<i64> = {
+                let mut stmt = tx
+                    .prepare_cached("SELECT band FROM sketch_bands WHERE blake3 = ?1")
                     .map_err(sql)?;
-                for band in bands {
-                    insert
-                        .execute(params![band_to_i64(band), key])
-                        .map_err(sql)?;
+                let rows = stmt.query_map([key], |r| r.get(0)).map_err(sql)?;
+                rows.collect::<rusqlite::Result<_>>().map_err(sql)?
+            };
+            {
+                let mut delete = tx
+                    .prepare_cached("DELETE FROM sketch_bands WHERE band = ?1 AND blake3 = ?2")
+                    .map_err(sql)?;
+                for band in stored.difference(&bands) {
+                    delete.execute(params![band, key]).map_err(sql)?;
+                }
+                let mut insert = tx
+                    .prepare_cached("INSERT INTO sketch_bands (band, blake3) VALUES (?1, ?2)")
+                    .map_err(sql)?;
+                for band in bands.difference(&stored) {
+                    insert.execute(params![band, key]).map_err(sql)?;
                 }
             }
             tx.commit().map_err(sql)
@@ -902,15 +1021,10 @@ impl SketchStore for Standalone {
             .collect();
         args.push(Sql::Blob(exclude.as_bytes().to_vec()));
         args.push(Sql::Integer(limit));
-        let marks = vec!["?"; bands.len()].join(", ");
+        let bands_len = bands.len();
         self.run(move |conn| {
             let mut stmt = conn
-                .prepare(&format!(
-                    "SELECT b.blake3, s.signature, count(DISTINCT b.band) AS shared \
-                     FROM sketch_bands b JOIN sketches s ON s.blake3 = b.blake3 \
-                     WHERE b.band IN ({marks}) AND b.blake3 <> ? \
-                     GROUP BY b.blake3 ORDER BY shared DESC, b.blake3 LIMIT ?"
-                ))
+                .prepare(&sketch_candidates_sql(bands_len))
                 .map_err(sql)?;
             let rows = stmt
                 .query_map(params_from_iter(args), |r| {
@@ -1054,7 +1168,10 @@ impl SearchStore for Standalone {
                  indexed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
                  ON CONFLICT (blake3) DO UPDATE SET title = excluded.title, \
                  body = excluded.body, kind = excluded.kind, doc_date = excluded.doc_date, \
-                 amount = excluded.amount, indexed_at = excluded.indexed_at",
+                 amount = excluded.amount, indexed_at = excluded.indexed_at \
+                 WHERE title IS NOT excluded.title OR body IS NOT excluded.body \
+                 OR kind IS NOT excluded.kind OR doc_date IS NOT excluded.doc_date \
+                 OR amount IS NOT excluded.amount",
                 params![
                     doc.blake3.as_bytes().as_slice(),
                     doc.title,
