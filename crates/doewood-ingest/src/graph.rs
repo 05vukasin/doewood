@@ -13,9 +13,10 @@
 //!   identifier and its name point at different companies, the identifier's company gets the
 //!   party: two conflicting high-precision hits are for review, never an automatic merge.
 //!   Merges come from enrichment or a person, through the merge log. A match never lands on a
-//!   merged-away company (it follows `merged_into`, at match time and again atomically with
-//!   the edge write, so a merge that commits in between moves it to the survivor), and a document split off a company with a
-//!   dismissal is not attached back to it: a dismissal is permanent.
+//!   merged-away company: it follows `merged_into` at match time, and again atomically with
+//!   the edge write, so a merge that commits in between sends it to the survivor (issue
+//!   #48). A document split off a company with a dismissal is not attached back to it: a
+//!   dismissal is permanent.
 //! - **References**: a cited number resolves to the document that has it as its own number
 //!   (an alias `number:<key>`); when that document is not known yet, the edge goes to a pending
 //!   Document node `ref:<key>`, and the edges move to the real document once it arrives.
