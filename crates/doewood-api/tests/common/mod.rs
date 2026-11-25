@@ -203,7 +203,13 @@ impl Shared {
             .await;
         let sep = if url.contains('?') { '&' } else { '?' };
         let scoped = format!("{url}{sep}options=-c%20search_path%3D{schema}");
-        let pg = doewood_pg::PgStore::connect(&doewood_core::PostgresUrl::parse(&scoped).unwrap())
+        // `DOEWOOD_BENCH_POOL`: the pool's size, for measurements (default as `serve`).
+        let pool = std::env::var("DOEWOOD_BENCH_POOL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(doewood_pg::default_pool_size);
+        let url = doewood_core::PostgresUrl::parse(&scoped).unwrap();
+        let pg = doewood_pg::PgStore::connect_with_pool(&url, pool)
             .await
             .unwrap();
         Some(Self {

@@ -353,7 +353,8 @@ run was not made) and what Postgres stores in `records.record` (`pg_column_size`
 
 ### The instance store's read-only connections (issue #83)
 
-An on-disk instance store opens 2 read-only SQLite connections next to its writer (see
+An on-disk instance store opens read-only SQLite connections next to its writer (2 when this
+was measured; one per CPU, at most 8, since #108; see
 [configuration.md](configuration.md#the-instance-store)). Each keeps SQLite's default page
 cache (up to 2000 KiB) and up to 128 prepared statements, and there is no `mmap`. Measured with
 `reader_memory` (`cargo test -p doewood-store --lib -- --ignored --nocapture reader_memory`,
@@ -523,7 +524,8 @@ What the numbers say:
   latency, and blocking-pool threads parked on the connections' locks (one per call in
   flight: 284 threads at the cap). One call alone (one client) takes 0.2 ms (`GetNode`) to
   1.7 ms (`ListRecords`, 100 records); `Neighbours` and `CompanyDocuments` make two store
-  calls and wait twice. More readers would be the next step (not measured).
+  calls and wait twice. More readers were the next step: see
+  [#108](#api-read-capacity-issue-108).
 - **Postgres saturates at about 100 clients** (about 6,000 calls/s), on the pool of 16
   connections: `GetNode` is 0.8 ms at 10 clients and 13 ms at 100, nearly all of it waiting
   for a pooled connection, and `Neighbours` and `CompanyDocuments` (two checkouts each)
@@ -550,6 +552,81 @@ What the numbers say:
 - The network layer is not the limit (as the io_uring research expected): the store's
   connections (SQLite) and the pool (Postgres) are, well below the HTTP/2 stack's 60,000+ requests/s on
   this machine.
+
+### API read capacity (issue #108)
+
+#105 (above) found the API saturating on the store's read-only connections (SQLite) and the
+pool (Postgres). Both are now sized from the CPUs the process may use
+(`available_parallelism`, which counts a cgroup CPU quota): **SQLite readers: one per CPU,
+between 1 and 8** (was 2); **Postgres pool: 4 per CPU, between 16 and 64** (was 16). Neither
+is a setting (ADR 0001); `serve` logs both (`store open` `readers`, `shared Postgres store
+ready` `pool`).
+
+| CPUs | 1 | 2 | 4 | 8 | 16 | 64 |
+|---|---|---|---|---|---|---|
+| SQLite readers | 1 | 2 | 4 | 8 | 8 | 8 |
+| Postgres pool | 16 | 16 | 16 | 32 | 64 | 64 |
+
+Measured with `api_load` (as above: release build, 10 s per step, 10,000 documents, 10% of the
+clients watching progress; `DOEWOOD_BENCH_CLIENTS=10,100,500 DOEWOOD_BENCH_READERS=2|4
+DOEWOOD_BENCH_POOL=16|32`) on the same 4 vCPU, `main` at `012a1e6` plus this branch, Postgres
+17 (`pgvector/pgvector:pg17`, default settings but `max_connections = 200` and
+`pg_stat_statements`) in a container on an `--internal` Docker network. SQLite: 2 runs each (the
+second 2-reader run stopped before its 500-client step), Postgres: 1 run each.
+
+| store | clients | calls/s | p50 | p99 | process CPU |
+|---|---|---|---|---|---|
+| SQLite, 2 readers (before) | 10 / 100 / 500 | 4,957 to 5,043 / 4,404 to 4,455 / 4,414 | 1.8 / 17 / 43 ms | 5.3 / 76 / 209 ms | 2.9 cores |
+| SQLite, 4 readers (now, 4 CPUs) | 10 / 100 / 500 | 5,216 to 5,218 / 5,209 to 5,282 / 4,877 to 5,105 | 1.8 / 15 / 37 to 39 ms | 4.9 / 69 / 197 to 207 ms | 3.2 to 3.4 |
+| Postgres, pool 16 (before and now on 4 CPUs) | 10 / 100 / 500 | 4,151 / 4,431 / 5,083 | 2.2 / 22 / 47 ms | 6.8 / 43 / 106 ms | 1.5 to 2.0 (+1.8 to 2.2 database) |
+| Postgres, pool 32 | 10 / 100 / 500 | 4,082 / 4,607 / 5,274 | 2.2 / 22 / 50 ms | 6.9 / 45 / 107 ms | 1.5 to 2.1 (+1.7 to 2.3) |
+
+- **SQLite: one reader per CPU is worth 3 to 5% at 10 clients and 10 to 19% at 100 and 500**
+  on 4 CPUs, and the per-method latencies fall by about the same share. The process then uses about
+  3.4 of the 4 cores, clients included: it is CPU-bound, so readers beyond the CPUs would only
+  queue on the cores instead of on the connections. Each reader costs about 2.1 MiB (above),
+  so 8 cost about 17 MiB; 8 is the cap because more than 8 was not measured.
+- **Postgres: 32 connections are no faster than 16 on 4 CPUs** (within 4%, run to run noise):
+  the process and the database share the 4 cores and use 3.7 to 3.9 of them, so the pool is
+  no longer the limit #105 saw once both sides are busy (this run's `Search` was in the slow
+  mode #102 describes: 3.1 ms at 10 clients, so throughput is below #105's). 4 connections per
+  CPU keeps the pool full on 4 CPUs and grows it with the CPUs that can drive more calls.
+  The database itself may run on more cores than the instance; its own capacity is the next
+  limit.
+- **Memory per connection.** A pooled connection costs the instance about 0.1 MiB (the
+  process RSS rose 0 to 2 MiB from 16 to 32 connections, clients included); a Postgres backend
+  about **2.1 MiB of private memory** once it has run the mix (the database container's `anon`
+  memory after the steps: 56.0 MiB with 16, 89.5 MiB with 32), besides `work_mem` while a
+  query sorts.
+- **`max_connections`.** Each instance opens up to its pool size; the database needs the sum
+  over every instance that may run at once, a rolling deploy's surge included, plus its
+  superuser slots and your tools: 3 replicas on 4 CPUs need 48, 3 on 16 CPUs 192. Postgres's
+  default is 100. A replica that cannot open a connection waits up to 10 s for one, then the
+  call fails as unavailable.
+
+Ingest under API load, measured with `throughput` (release build, 2000 files, 4 workers, the
+instance store on disk; `DOEWOOD_BENCH_READ_CLIENTS` clients each asking for a `ListRecords`
+page of 100 every millisecond; 1 run each):
+
+| store | API clients | readers / pool | files/s | worker time per file: store / record / graph | `ListRecords` mean |
+|---|---|---|---|---|---|
+| SQLite | 1 | 2 readers | 284 | 1.2 / 1.9 / 6.0 ms | 46 ms |
+| SQLite | 1 | 4 readers | 285 | 1.2 / 1.8 / 6.0 ms | 40 ms |
+| SQLite | 8 | 2 readers | 18 | 41 / 32 / 128 ms | 95 ms |
+| SQLite | 8 | 4 readers | 31 | 18 / 16 / 65 ms | 92 ms |
+| Postgres | 8 | pool 16, 4 readers | 21 | 6.4 / 25 / 143 ms | 99 ms |
+| Postgres | 8 | pool 32, 4 readers | 20 | 6.8 / 25 / 150 ms | 98 ms |
+
+- **No regression:** with a light API load ingest runs as before with 4 readers (285 against
+  284 files/s), and the writer's lock wait is unchanged (0.48 against 0.46 ms mean).
+- **Under a heavy API load ingest slows a lot, on both stores**, and more readers help: on
+  SQLite ingest's own reads (the graph, search candidates, records, settings) share the
+  read-only connections with the API, so they queue behind the API's pages; with 4 readers
+  they wait half as long and ingest runs 1.7 times as fast. On Postgres the bigger pool does
+  not help: the database (172 s executing for 2000 files, 165 s of it the API's `ListRecords` pages) and the
+  4 cores are the limit. With 32 such clients and 2 readers, 2000 files did not finish in
+  10 minutes. 8 clients asking for 100 records every millisecond is far more than
+  the API usually sees, but nothing gives ingest's reads priority yet; see #109.
 
 ### Requests and limits
 

@@ -63,4 +63,7 @@ pub use store::sqs::{
     CredentialsChange, QUEUE_URL_MAX_LEN, SQS_DEFAULT_REGION, SqsInlet, SqsInletInput,
     queue_url_region, valid_queue_url,
 };
-pub use store::{DEFAULT_READERS, MAX_READERS, SECRET_MAX_LEN, STORE_FILE, Snapshot, Store};
+pub use store::{
+    DEFAULT_READERS, MAX_READERS, SECRET_MAX_LEN, STORE_FILE, Snapshot, Store, default_readers,
+    plan_readers,
+};
