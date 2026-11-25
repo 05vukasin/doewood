@@ -880,6 +880,7 @@ async fn similarity_uses_the_stored_threshold() {
         store
             .set_ingest_settings(&IngestSettingsPatch {
                 similar_min_jaccard: Some(x),
+                ..IngestSettingsPatch::default()
             })
             .unwrap();
     };
