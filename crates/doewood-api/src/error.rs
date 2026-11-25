@@ -15,6 +15,7 @@ pub(crate) fn model(e: doewood_model::Error) -> Status {
         E::SourceClaimed { .. } => Status::already_exists(e.to_string()),
         E::Invalid(m) => Status::invalid_argument(m),
         E::NotFound(m) => Status::not_found(m),
+        E::Precondition(m) => Status::failed_precondition(m),
         E::Unavailable(_) => Status::unavailable(e.to_string()),
         E::SchemaTooNew { .. } => Status::failed_precondition(e.to_string()),
         other => internal("shared store", &other),
@@ -69,6 +70,10 @@ mod tests {
         assert_eq!(
             model(doewood_model::Error::NotFound("x".into())).code(),
             Code::NotFound
+        );
+        assert_eq!(
+            model(doewood_model::Error::Precondition("later merges".into())).code(),
+            Code::FailedPrecondition
         );
         assert_eq!(
             model(doewood_model::Error::Unavailable("down".into())).code(),

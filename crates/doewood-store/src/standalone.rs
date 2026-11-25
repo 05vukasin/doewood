@@ -11,10 +11,10 @@ use doewood_core::InstanceId;
 use doewood_model::{
     Backend, Blake3, ClaimStore, Direction, Edge, EdgeKind, EdgeSource, Error, GraphStore, Located,
     LocationEnded, Neighbour, NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation,
-    PutOutcome, Record, RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery,
-    SearchStore, Sketch, SketchStore, SourceClaim, SourceKey, StepVersions, StoredEdge,
-    band_to_i64, records_limit, sketch_limit, validate_alias, validate_node, validate_sketch,
-    versions_from_json, versions_to_json,
+    OwnedAlias, PutOutcome, Record, RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit,
+    SearchQuery, SearchStore, Sketch, SketchStore, SourceClaim, SourceKey, StepVersions,
+    StoredEdge, band_to_i64, records_limit, sketch_limit, validate_alias, validate_node,
+    validate_sketch, versions_from_json, versions_to_json,
 };
 use rusqlite::types::Value as Sql;
 use rusqlite::{Connection, OptionalExtension as _, Row, params, params_from_iter};
@@ -26,6 +26,7 @@ use crate::Store;
 use crate::store::now;
 
 mod enrichment;
+mod merges;
 
 /// The SQLite backend. Cheap to clone: every clone shares the one store.
 #[derive(Clone, Debug)]
@@ -662,6 +663,10 @@ impl GraphStore for Standalone {
             Ok(())
         })
         .await
+    }
+
+    async fn aliases_of(&self, node: Uuid) -> Result<Vec<OwnedAlias>> {
+        self.run(move |conn| merges::aliases_of(conn, node)).await
     }
 }
 

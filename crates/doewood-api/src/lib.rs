@@ -26,6 +26,7 @@ mod error;
 mod graph;
 mod icons;
 mod jobs;
+mod merges;
 mod progress;
 mod records;
 mod reprocess;

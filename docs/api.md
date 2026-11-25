@@ -32,7 +32,7 @@ The S3 event webhook is not part of the gRPC API: it is on the ops server (see
 | `ConfigService` | `AddSource`, `UpdateSource`, `PauseSource`, `ResumeSource`, `RemoveSource`, `ListSources`, `GetSource`, `SetLlmPolicy`, `SetAiProvider`, `ListAiProviders`, `GetIngestSettings`, `SetIngestSettings`, `GetEnrichmentSettings`, `SetEnrichmentSettings` |
 | `JobsService` | `WatchProgress` (server stream), `ReprocessJob`, `WatchReprocess` (server stream) |
 | `RecordsService` | `GetRecord`, `ListRecords` |
-| `GraphService` | `GetNode`, `Neighbours`, `CompanyDocuments` |
+| `GraphService` | `GetNode`, `Neighbours`, `CompanyDocuments`, `ListMerges`, `MergeCompanies`, `UndoMerge`, `SplitCompany`, `DismissPair`, `ListDismissals` |
 | `SearchService` | `Search` |
 | `SummarizeService` | `Summarize` |
 
@@ -151,6 +151,35 @@ every source, including ones added later.
 
 Dates are `YYYY-MM-DD` strings; JSON props and evidence are strings holding JSON.
 
+### Merges, undo, split and dismissals
+
+Every company merge and split is reversible (ADR 0002 section 1.8). The rules are in
+[ingest.md](ingest.md#merges-undo-and-dismissals); in short:
+
+- **ListMerges** pages through the merge log, newest first (`company_id` filters to entries
+  where it survived or was absorbed). Each entry has the actor (`ingest`, `enrichment` or
+  `manual`, and the instance), the evidence, the confidence, the fused probability, the undo
+  payload (`undo_json`: the aliases, edges and props that moved) and, once undone,
+  `undone_at` and `undone_by`.
+- **MergeCompanies** is a person's merge: `absorbed_id` into `survivor_id`. The absorbed
+  company's aliases and edges move to the survivor, its props are folded in, and its node
+  stays with `{"merged_into": <survivor>}`.
+- **UndoMerge** restores what the entry's payload lists. When later live merges or splits
+  involve the same companies it answers `FAILED_PRECONDITION` naming them; with `cascade`
+  they are undone first, newest first (`undone_ids` gives the order). With `dismiss` the two
+  companies become a dismissed pair. `skipped` lists what could not be put back because it
+  changed since (an alias blocked, an edge identity taken).
+- **SplitCompany** gives a new company (`name`) the named `aliases`, the `party` edges of
+  `document_ids`, and `edge_ids`; it is logged like a merge, so UndoMerge reverses it (the new
+  company is deleted when nothing else attached to it). With `dismiss` the two are dismissed
+  too, and that split can no longer be undone.
+- **DismissPair** records a permanent "not the same" pair, in both directions: no merge
+  between them, or between companies merged into them, is ever made, whatever the evidence.
+  Dismissing a pair again returns the first dismissal; a pair merged now is refused (undo the
+  merge with `dismiss`). **ListDismissals** pages through them, newest first.
+
+Page tokens are opaque: pass `next_page_token` back as `page_token` until it comes back empty.
+
 ### Reprocessing
 
 - **ReprocessJob** starts a one-shot job for a source and answers at once with its `job_id`. It
@@ -189,7 +218,7 @@ set and the reason in `warnings`. Without a configured provider it answers
 | `NOT_FOUND` | the source, record, node or provider does not exist |
 | `ALREADY_EXISTS` | the source exists on this instance, or another instance has claimed it (named in the message) |
 | `UNAVAILABLE` | the shared Postgres is not connected (yet), or a call to it failed; retry. `ReprocessJob` and `Summarize` on an instance without ingest; `Summarize` of an object that cannot be read |
-| `FAILED_PRECONDITION` | the shared database was migrated by a newer doewood. `Summarize` without a configured AI provider (or with one missing its key or base URL), of a source whose LLM policy is off, or of a file without text |
+| `FAILED_PRECONDITION` | the shared database was migrated by a newer doewood. A merge of a dismissed pair or of a merged-away company; an undo that later merges depend on (named in the message), of an entry already undone, or of a split that dismissed its pair; a dismissal of two companies merged now. `Summarize` without a configured AI provider (or with one missing its key or base URL), of a source whose LLM policy is off, or of a file without text |
 | `OUT_OF_RANGE` | a message larger than the limit |
 | `INTERNAL` | anything else; the details are in the server log, not in the message |
 
@@ -274,6 +303,11 @@ grpcurl -plaintext -d '{"key": {"kind": "NODE_KIND_COMPANY", "key": "acme"}}' \
 grpcurl -plaintext -d '{"node_id": "<uuid>", "direction": "DIRECTION_IN", "edge_kinds": ["EDGE_KIND_PARTY"]}' \
     127.0.0.1:7443 doewood.v1.GraphService/Neighbours
 grpcurl -plaintext -d '{"company_id": "<uuid>"}' 127.0.0.1:7443 doewood.v1.GraphService/CompanyDocuments
+grpcurl -plaintext -d '{"company_id": "<uuid>", "page_size": 20}' 127.0.0.1:7443 doewood.v1.GraphService/ListMerges
+grpcurl -plaintext -d '{"merge_id": "<uuid>", "dismiss": true, "reason": "not the same company"}' \
+    127.0.0.1:7443 doewood.v1.GraphService/UndoMerge
+grpcurl -plaintext -d '{"company_id": "<uuid>", "name": "ACME Trading", "document_ids": ["<uuid>"]}' \
+    127.0.0.1:7443 doewood.v1.GraphService/SplitCompany
 grpcurl -plaintext -d '{"text": "invoice", "kind": "invoice", "date_from": "2026-01-01", "amount_min": 100, "limit": 20}' \
     127.0.0.1:7443 doewood.v1.SearchService/Search
 ```
@@ -451,4 +485,4 @@ the happy paths, validation errors, two instances sharing one backend (the claim
 secrets never coming back, the progress stream, a gRPC-Web request over HTTP/1.1, health,
 reflection and the message limit. `tests/icons.rs` checks the icon route's answers and
 headers with a fake resolver. With `DOEWOOD_TEST_POSTGRES_URL` set, the claim, records,
-graph and search tests also run against Postgres.
+graph, merge-log and search tests also run against Postgres.

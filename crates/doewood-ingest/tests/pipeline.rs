@@ -11,10 +11,14 @@ use std::time::Duration;
 
 use common::MemFetch;
 use doewood_core::{MasterKey, SourceId};
-use doewood_ingest::{Analyzer, AnalyzerConfig, Ingest, IngestConfig, IngestParts, ReprocessState};
+use doewood_ingest::facts::{DocFacts, Party};
+use doewood_ingest::{
+    Analyzer, AnalyzerConfig, GraphWriter, Ingest, IngestConfig, IngestParts, ReprocessState,
+    SimilarityConfig,
+};
 use doewood_model::{
-    Backend, Blake3, Direction, EdgeKind, EdgeState, NeighbourQuery, NodeKind, SearchQuery,
-    SourceKey,
+    Backend, Blake3, Direction, EdgeKind, EdgeState, MergeActor, MergeActorKind, NeighbourQuery,
+    NodeKind, ObjectLocation, SearchQuery, SourceKey, SplitRequest,
 };
 use doewood_s3::{EventKind, EventOrigin, ObjectEvent, ObjectVersion};
 use doewood_store::{NewSource, ObjectChange, SeenObject, Standalone, Store};
@@ -724,6 +728,97 @@ async fn pipeline_end_to_end() {
         for s in all {
             s.drop_schema().await;
         }
+    }
+}
+
+/// ADR 0002 section 1.8: a document a person split off a company, recording the pair as not
+/// the same, is not attached back to that company when it is written again (a reprocess).
+/// Without the dismissal the ladder attaches it again, by the name key the company kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dismissal_keeps_a_split_off_document_apart() {
+    let store = Arc::new(Store::open_in_memory(&MasterKey::from_bytes([7; 32])).unwrap());
+    for shared in Shared::all(&store).await {
+        let (name, b) = (shared.name, &shared.backend);
+        let writer = GraphWriter::new(Arc::clone(b), SimilarityConfig::default());
+        for (n, dismiss) in [(71u8, true), (72, false)] {
+            let h = Blake3([n; 32]);
+            b.put_record(
+                &h,
+                &serde_json::json!({}),
+                &doewood_model::StepVersions::new(),
+            )
+            .await
+            .unwrap();
+            let at = ObjectLocation {
+                endpoint: ENDPOINT.into(),
+                bucket: BUCKET.into(),
+                key: format!("split/{n}.pdf"),
+            };
+            let facts = DocFacts {
+                parties: vec![Party {
+                    quail_key: "party.1".into(),
+                    surface: format!("Dismissal Test {n} d.o.o."),
+                    score: 0.9,
+                    roles: vec!["buyer".into()],
+                    legal_form: None,
+                    jurisdiction: None,
+                    ids: vec![],
+                    mentions: vec![],
+                }],
+                ..DocFacts::default()
+            };
+            writer.write(&h, &at, &facts, "x.pdf", 0.8).await.unwrap();
+            let doc = b
+                .node_by_key(NodeKind::Document, &h.to_hex())
+                .await
+                .unwrap()
+                .unwrap()
+                .id;
+            let parties = || async {
+                let query = NeighbourQuery {
+                    direction: Direction::Out,
+                    edge_kinds: vec![EdgeKind::Party],
+                    ..NeighbourQuery::default()
+                };
+                b.neighbours(doc, &query).await.unwrap()
+            };
+            let first = parties().await;
+            assert_eq!(first.len(), 1, "{name}");
+            let company = first[0].node.id;
+            let split = b
+                .split_company(&SplitRequest {
+                    company,
+                    key: None,
+                    props: serde_json::json!({"name": "the other one"}),
+                    aliases: vec![],
+                    documents: vec![doc],
+                    edges: vec![],
+                    actor: MergeActor {
+                        kind: MergeActorKind::Manual,
+                        instance: doewood_core::InstanceId::new("inst-a").unwrap(),
+                    },
+                    evidence: serde_json::json!([]),
+                    dismiss,
+                })
+                .await
+                .unwrap();
+            // Reprocess: the same facts again.
+            writer.write(&h, &at, &facts, "x.pdf", 0.8).await.unwrap();
+            let after = parties().await;
+            let ids: Vec<_> = after.iter().map(|nb| nb.node.id).collect();
+            if dismiss {
+                assert_eq!(ids, [split.absorbed], "{name}: stays split off");
+                assert_eq!(
+                    after[0].edge.edge.props["match"]["dismissed"],
+                    company.to_string(),
+                    "{name}"
+                );
+            } else {
+                assert_eq!(ids.len(), 2, "{name}: attached again without a dismissal");
+                assert!(ids.contains(&company) && ids.contains(&split.absorbed));
+            }
+        }
+        shared.drop_schema().await;
     }
 }
 

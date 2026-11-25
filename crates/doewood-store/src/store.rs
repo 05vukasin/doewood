@@ -295,8 +295,10 @@ mod tests {
         assert_eq!(
             store.tables().unwrap(),
             [
+                "company_dismissals",
                 "company_enrichment",
                 "company_leases",
+                "company_merges",
                 "company_registry_due",
                 "edges",
                 "favicons",

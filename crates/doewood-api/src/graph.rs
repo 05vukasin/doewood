@@ -1,4 +1,5 @@
-//! `GraphService`: nodes, neighbours and a company's documents.
+//! `GraphService`: nodes, neighbours and a company's documents, and the merge log (in
+//! `merges`).
 
 use doewood_model::{NODE_KEY_MAX_LEN, NeighbourQuery, NodeKind};
 use tonic::{Request, Response, Status};
@@ -166,5 +167,57 @@ impl GraphService for Api {
         Ok(Response::new(CompanyDocumentsResponse {
             documents: docs.iter().map(convert::node).collect(),
         }))
+    }
+
+    async fn list_merges(
+        &self,
+        request: Request<pb::ListMergesRequest>,
+    ) -> Result<Response<pb::ListMergesResponse>, Status> {
+        Ok(Response::new(
+            self.list_merges_rpc(request.get_ref()).await?,
+        ))
+    }
+
+    async fn merge_companies(
+        &self,
+        request: Request<pb::MergeCompaniesRequest>,
+    ) -> Result<Response<pb::MergeEntry>, Status> {
+        Ok(Response::new(
+            self.merge_companies_rpc(request.get_ref()).await?,
+        ))
+    }
+
+    async fn undo_merge(
+        &self,
+        request: Request<pb::UndoMergeRequest>,
+    ) -> Result<Response<pb::UndoMergeResponse>, Status> {
+        Ok(Response::new(self.undo_merge_rpc(request.get_ref()).await?))
+    }
+
+    async fn split_company(
+        &self,
+        request: Request<pb::SplitCompanyRequest>,
+    ) -> Result<Response<pb::MergeEntry>, Status> {
+        Ok(Response::new(
+            self.split_company_rpc(request.get_ref()).await?,
+        ))
+    }
+
+    async fn dismiss_pair(
+        &self,
+        request: Request<pb::DismissPairRequest>,
+    ) -> Result<Response<pb::Dismissal>, Status> {
+        Ok(Response::new(
+            self.dismiss_pair_rpc(request.get_ref()).await?,
+        ))
+    }
+
+    async fn list_dismissals(
+        &self,
+        request: Request<pb::ListDismissalsRequest>,
+    ) -> Result<Response<pb::ListDismissalsResponse>, Status> {
+        Ok(Response::new(
+            self.list_dismissals_rpc(request.get_ref()).await?,
+        ))
     }
 }

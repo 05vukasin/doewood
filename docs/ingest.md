@@ -87,6 +87,10 @@ The record is the quail record JSON, keyed by BLAKE3, with step versions: one pe
     nothing merges on a fuzzy match.
   - The `party` edge has quail's role and confidence, the match step, its reliability and the
     evidence (mentions, identifiers); the company keeps its names, identifiers and matches.
+  - Ingest never merges two company nodes. When a party's identifier and its name point at
+    different companies, the identifier's company gets the party and nothing merges: two
+    conflicting high-precision hits are for review (ADR 0002 section 1.6), never an automatic
+    merge. Merges come from the enrichment job and from people, through the merge log below.
 - **`amends` / `cites`** from `ref.cites`. A cited number resolves to the document that has it as
   its own number (`ref.doc_number`); until that document is known, the edge goes to a pending
   Document node `ref:<number>`, and moves to the real document when it arrives.
@@ -96,6 +100,49 @@ The record is the quail record JSON, keyed by BLAKE3, with step versions: one pe
   for every file, so a change applies to the next file without a restart).
 - **Search:** title (`ref.title`, else the card's, the file's own, the file name), body (the
   summary card, the extractive summary, keywords, sheet text), kind, date and amount.
+
+## Merges, undo and dismissals
+
+Every merge and split is reversible (ADR 0002 section 1.8, ADR 0001 section 7). The rules are
+in `doewood_model::merge` and run once over each backend's transaction, so both behave the
+same; the API is in [api.md](api.md#merges-undo-split-and-dismissals).
+
+- **The log.** Each merge or split is one entry in `company_merges`, written in the same
+  transaction as the change: the actor (`ingest`, `enrichment` or `manual`, and the instance),
+  the surviving and absorbed companies, the evidence, the confidence, the fused probability,
+  and an undo payload listing exactly what moved.
+- **A merge** moves the absorbed company's aliases (identifiers and name keys) and its edges
+  (`party` edges from documents, dated company edges) to the survivor, keeping each edge's id.
+  An edge whose moved identity the survivor already has is superseded instead (a document that
+  names both); edges between the two stay as they are. Props are folded: missing keys are
+  added, lists (`names`, `ids.<kind>`) get what they lack, the survivor's values win. The
+  absorbed node stays, with `{"merged_into": <survivor>, "merge": <entry>}`, so its id still
+  resolves; ingest follows `merged_into` and never attaches to it.
+- **Undo** puts back what the payload lists: the aliases still owned by the survivor, the edges
+  still at the survivor, the superseded edges' states, the absorbed node's props, and it takes
+  out of the survivor's props exactly what the merge added (values written since stay).
+  Documents that attached to the survivor after the merge stay with it. Anything that changed
+  since and cannot be put back (an alias blocked or claimed by another company, an edge
+  identity taken) is skipped and reported.
+- **Later merges.** An undo is refused (`FAILED_PRECONDITION`, naming them) while later live
+  entries involve one of its companies, or a company of such an entry. With `cascade` those are
+  undone first, newest first, in the same transaction. This is the safe choice: a later merge
+  may have moved the same aliases again, so undoing out of order could not restore exactly.
+- **Split.** A new company (key `split:<entry>`) takes the named aliases, the `party` edges of
+  the named documents and the named edges, logged like a merge. Undoing it moves everything at
+  the new company back (what attached to it since too) and deletes it when nothing is left.
+- **Dismissal.** A permanent "not the same" pair in `company_dismissals`, both directions,
+  never deleted. A merge is refused when any company of the survivor's group (it and what was
+  merged into it) is dismissed from any company of the absorbed one's, whatever the evidence;
+  the enrichment gate asks `MergeStore::dismissal` before merging. An undo can record one
+  (`dismiss`), and so can a split; a split that dismissed its pair cannot be undone. Ingest
+  honours it too: when the ladder finds a company a document is not attached to, while the
+  document is attached to a company dismissed from that one (a person split it off), the party
+  stays where it is (`match.dismissed` on the edge names the company it was kept from).
+- **Concurrency.** On Postgres every merge-log write takes one advisory lock and locks the
+  companies involved, so merges from several instances run one at a time and no edge or alias
+  is added to a company while it moves. Standalone, the store's single connection does the
+  same.
 
 ## LLM summaries
 

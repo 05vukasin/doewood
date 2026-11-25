@@ -238,6 +238,48 @@ async fn concurrent_claims_have_one_winner() {
     db.drop_schema().await;
 }
 
+/// Two instances merging one pair in opposite directions at once: one merge wins, the other
+/// sees the husk and is refused, and the log has one entry.
+#[tokio::test]
+async fn concurrent_merges_of_one_pair_have_one_winner() {
+    use doewood_model::{
+        GraphStore, MergeActor, MergeActorKind, MergeQuery, MergeRequest, MergeStore, NodeKind,
+    };
+    let Some(url) = test_url() else { return };
+    let db = Scratch::new(&url).await;
+    let stores = [db.store().await, db.store().await];
+    let x = stores[0]
+        .upsert_node(NodeKind::Company, "race-x", &serde_json::json!({}))
+        .await
+        .unwrap();
+    let y = stores[0]
+        .upsert_node(NodeKind::Company, "race-y", &serde_json::json!({}))
+        .await
+        .unwrap();
+    let req = |survivor, absorbed, who: &str| MergeRequest {
+        survivor,
+        absorbed,
+        actor: MergeActor {
+            kind: MergeActorKind::Enrichment,
+            instance: InstanceId::new(who).unwrap(),
+        },
+        evidence: serde_json::json!([]),
+        confidence: 1.0,
+        probability: 0.99,
+    };
+    let (one, two) = (req(x, y, "inst-a"), req(y, x, "inst-b"));
+    let (r1, r2) = tokio::join!(
+        stores[0].merge_companies(&one),
+        stores[1].merge_companies(&two),
+    );
+    assert!(r1.is_ok() != r2.is_ok(), "{r1:?} {r2:?}");
+    let lost = if r1.is_ok() { r2 } else { r1 };
+    assert!(matches!(lost, Err(Error::Precondition(_))), "{lost:?}");
+    let log = stores[1].list_merges(&MergeQuery::default()).await.unwrap();
+    assert_eq!(log.len(), 1);
+    db.drop_schema().await;
+}
+
 /// Needs no database: nothing listens on port 1.
 #[tokio::test]
 async fn an_unreachable_database_is_unavailable_and_fails_fast() {
