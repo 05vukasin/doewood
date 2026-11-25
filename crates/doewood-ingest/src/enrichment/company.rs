@@ -303,6 +303,17 @@ enum Step {
     Wikidata,
 }
 
+/// What [`Job::lease_other`] got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OtherLease {
+    /// The lease is this job's now.
+    Taken,
+    /// Another task of this instance works on that company.
+    Here,
+    /// Another instance holds its lease.
+    Elsewhere,
+}
+
 /// One company's enrichment, under its lease.
 pub(crate) struct Job<'a> {
     pub backend: Arc<dyn Backend>,
@@ -342,11 +353,10 @@ impl<'a> Job<'a> {
             .clone()
     }
 
-    /// Takes the lease on another company (for a merge). `false`: another instance, or
-    /// another task of this one, holds it.
-    pub async fn lease_other(&self, id: Uuid) -> Result<bool> {
+    /// Takes the lease on another company (for a merge).
+    pub async fn lease_other(&self, id: Uuid) -> Result<OtherLease> {
         if !super::take(self.busy, id) {
-            return Ok(false);
+            return Ok(OtherLease::Here);
         }
         let ok = match self.backend.lease_company(id, self.owner, self.lease).await {
             Ok(ok) => ok,
@@ -360,10 +370,11 @@ impl<'a> Job<'a> {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(id);
+            Ok(OtherLease::Taken)
         } else {
             super::give_back(self.busy, &[id]);
+            Ok(OtherLease::Elsewhere)
         }
-        Ok(ok)
     }
 
     async fn renew(&self, id: Uuid) {
@@ -395,9 +406,22 @@ impl<'a> Job<'a> {
         let written = super::write::write(self, &subject, &f, &gated).await?;
         out.edges = written.edges;
         out.proposed = written.proposed;
+        out.redirected = written.redirected;
         out.website = super::website::run(self, &subject, &f).await?;
-        b.record_enrichment(subject.id(), &f.schedule(self.retry))
-            .await?;
+        // A merge that waits for the other company's lease is done later (issue #60): the
+        // pass runs the company again once its own tasks are done ([`OtherLease::Here`]),
+        // and every registry is due again after the retry interval, as after a failure.
+        let schedule = match gated.deferred {
+            Some(lease) => {
+                out.deferred = lease == OtherLease::Here;
+                f.schedule(self.retry)
+                    .into_iter()
+                    .map(|(r, _)| (r, self.retry))
+                    .collect()
+            }
+            None => f.schedule(self.retry),
+        };
+        b.record_enrichment(subject.id(), &schedule).await?;
         Ok(out)
     }
 

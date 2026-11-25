@@ -51,6 +51,8 @@ pub struct EnrichmentCounts {
     pub registry_warnings: u64,
     /// Edges written.
     pub edges: u64,
+    /// Edges redirected onto the company an end was merged into.
+    pub redirected: u64,
     /// Websites verified.
     pub websites: u64,
     /// Passes completed.
@@ -70,6 +72,7 @@ impl From<EnrichmentCounts> for pb::EnrichmentProgress {
             failed: c.failed,
             registry_warnings: c.registry_warnings,
             edges: c.edges,
+            redirected: c.redirected,
             websites: c.websites,
             passes: c.passes,
             last_pass_completed_at: c.last_pass_completed_at,

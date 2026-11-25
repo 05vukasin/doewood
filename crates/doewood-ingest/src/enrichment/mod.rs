@@ -97,6 +97,9 @@ pub struct EnrichmentStats {
     pub registry_warnings: u64,
     /// Edges written.
     pub edges: u64,
+    /// Edges that landed on the company an end was merged into while the company was worked
+    /// on (issue #60).
+    pub redirected: u64,
     /// Websites verified and stored.
     pub websites: u64,
     /// Passes completed.
@@ -115,6 +118,7 @@ struct Counters {
     failed: AtomicU64,
     registry_warnings: AtomicU64,
     edges: AtomicU64,
+    redirected: AtomicU64,
     websites: AtomicU64,
     passes: AtomicU64,
     last_pass_completed_at: AtomicI64,
@@ -131,6 +135,7 @@ impl Counters {
             failed: get(&self.failed),
             registry_warnings: get(&self.registry_warnings),
             edges: get(&self.edges),
+            redirected: get(&self.redirected),
             websites: get(&self.websites),
             passes: get(&self.passes),
             last_pass_completed_at: self.last_pass_completed_at.load(Ordering::Relaxed),
@@ -229,8 +234,24 @@ pub struct Outcome {
     pub warnings: u64,
     /// Edges written.
     pub edges: u64,
+    /// Edges redirected onto the company an end was merged into.
+    pub redirected: u64,
     /// Whether a website was verified and stored.
     pub website: bool,
+    /// A merge waited for a company another task of this instance worked on: the company is
+    /// run again once the page's tasks are done.
+    pub deferred: bool,
+}
+
+/// What [`Enrichment::one`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Worked {
+    /// Not worked on (leased elsewhere, or by another task).
+    Skipped,
+    /// Worked on.
+    Done,
+    /// Worked on; to be run again once the page's tasks are done (a merge waited for one).
+    Again,
 }
 
 impl Enrichment {
@@ -362,9 +383,12 @@ impl Enrichment {
                 let clients = clients.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
-                    me.one(&backend, &clients, &due).await
+                    let worked = me.one(&backend, &clients, &due, false).await;
+                    (due, worked)
                 });
             }
+            // Companies whose merge waited for another task of this pass.
+            let mut again = Vec::new();
             let mut stop = shutdown.clone();
             let mut closed = false;
             loop {
@@ -377,8 +401,12 @@ impl Enrichment {
                 };
                 match next {
                     Some(None) => break,
-                    Some(Some(Ok(true))) => worked += 1,
-                    Some(Some(Ok(false))) => {}
+                    Some(Some(Ok((_, Worked::Done)))) => worked += 1,
+                    Some(Some(Ok((due, Worked::Again)))) => {
+                        worked += 1;
+                        again.push(due);
+                    }
+                    Some(Some(Ok((_, Worked::Skipped)))) => {}
                     Some(Some(Err(e))) => warn!(error = %e, "an enrichment task failed"),
                     None if !stopping(&stop) => {}
                     None => {
@@ -394,6 +422,14 @@ impl Enrichment {
                     }
                 }
             }
+            // The page's tasks are done, so the companies those merges waited for are free
+            // now (issue #60): one more run each, one at a time.
+            for due in again {
+                if stopping(shutdown) {
+                    break 'pages;
+                }
+                self.one(backend, &clients, &due, true).await;
+            }
         }
         c.running.store(false, Ordering::Relaxed);
         c.passes.fetch_add(1, Ordering::Relaxed);
@@ -408,25 +444,32 @@ impl Enrichment {
         worked
     }
 
-    /// One company: lease, enrich, release. Returns whether it was worked on.
-    async fn one(&self, backend: &Arc<dyn Backend>, clients: &Clients, due: &DueCompany) -> bool {
+    /// One company: lease, enrich, release. `retried`: its second run in this pass, after a
+    /// merge waited for another task.
+    async fn one(
+        &self,
+        backend: &Arc<dyn Backend>,
+        clients: &Clients,
+        due: &DueCompany,
+        retried: bool,
+    ) -> Worked {
         let owner = &self.inner.instance;
         let ttl = self.inner.options.lease;
         if !take(&self.inner.busy, due.company) {
             debug!(company = %due.company, "another task is enriching this company");
-            return false;
+            return Worked::Skipped;
         }
         match backend.lease_company(due.company, owner, ttl).await {
             Ok(true) => {}
             Ok(false) => {
                 give_back(&self.inner.busy, &[due.company]);
                 debug!(company = %due.company, "another instance is enriching this company");
-                return false;
+                return Worked::Skipped;
             }
             Err(e) => {
                 give_back(&self.inner.busy, &[due.company]);
                 warn!(company = %due.company, error = %e, "company lease failed; skipped");
-                return false;
+                return Worked::Skipped;
             }
         }
         let job = company::Job::new(
@@ -447,13 +490,20 @@ impl Enrichment {
             }
         }
         give_back(&self.inner.busy, &held);
+        let mut worked = Worked::Done;
         match result {
             Ok(o) => {
-                c.enriched.fetch_add(1, Ordering::Relaxed);
+                if o.deferred && !retried {
+                    // Counted once, on its second run.
+                    worked = Worked::Again;
+                } else {
+                    c.enriched.fetch_add(1, Ordering::Relaxed);
+                }
                 c.merged.fetch_add(o.merged, Ordering::Relaxed);
                 c.proposed.fetch_add(o.proposed, Ordering::Relaxed);
                 c.registry_warnings.fetch_add(o.warnings, Ordering::Relaxed);
                 c.edges.fetch_add(o.edges, Ordering::Relaxed);
+                c.redirected.fetch_add(o.redirected, Ordering::Relaxed);
                 if o.website {
                     c.websites.fetch_add(1, Ordering::Relaxed);
                 }
@@ -463,8 +513,10 @@ impl Enrichment {
                     merged = o.merged,
                     proposed = o.proposed,
                     edges = o.edges,
+                    redirected = o.redirected,
                     warnings = o.warnings,
                     website = o.website,
+                    merge_waits = o.deferred,
                     "company enriched"
                 );
             }
@@ -474,7 +526,7 @@ impl Enrichment {
             }
         }
         self.changed();
-        true
+        worked
     }
 }
 
