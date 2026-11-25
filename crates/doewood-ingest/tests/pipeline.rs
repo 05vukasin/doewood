@@ -88,20 +88,31 @@ struct Harness {
     handle: Option<doewood_ingest::IngestHandle>,
 }
 
-fn analyzer(jobs: usize) -> Arc<Analyzer> {
-    Arc::new(
-        Analyzer::new(&AnalyzerConfig {
-            workers: jobs,
-            // No models here: OCR (when built) reports itself unavailable and never fails.
-            ocr_models: PathBuf::from("/nonexistent/doewood-ocr-models"),
-            ..AnalyzerConfig::default()
-        })
-        .unwrap(),
-    )
+fn analyzer(jobs: usize, file_timeout: Option<Duration>) -> Arc<Analyzer> {
+    let mut config = AnalyzerConfig {
+        workers: jobs,
+        // No models here: OCR (when built) reports itself unavailable and never fails.
+        ocr_models: PathBuf::from("/nonexistent/doewood-ocr-models"),
+        ..AnalyzerConfig::default()
+    };
+    if let Some(t) = file_timeout {
+        config.file_timeout = t;
+    }
+    Arc::new(Analyzer::new(&config).unwrap())
 }
 
 impl Harness {
     fn start(store: Arc<Store>, backend: Arc<dyn Backend>, jobs: usize, retry: Duration) -> Self {
+        Self::start_with(store, backend, jobs, retry, None)
+    }
+
+    fn start_with(
+        store: Arc<Store>,
+        backend: Arc<dyn Backend>,
+        jobs: usize,
+        retry: Duration,
+        file_timeout: Option<Duration>,
+    ) -> Self {
         let source = store
             .add_source(&NewSource::new(ENDPOINT, BUCKET), None)
             .unwrap();
@@ -115,7 +126,7 @@ impl Harness {
             store: Arc::clone(&store),
             backend: backend_rx,
             fetch: Arc::clone(&fetch) as Arc<dyn doewood_ingest::Fetch>,
-            analyzer: analyzer(jobs),
+            analyzer: analyzer(jobs, file_timeout),
             config,
             on_change: Arc::new(|_| {}),
             on_llm_queued: Arc::new(|_| {}),
@@ -996,5 +1007,94 @@ async fn throughput() {
         c.done, c.skipped, c.failed
     );
     assert_eq!(c.done, n as u64);
+    h.stop().await;
+}
+
+/// Peak and current RSS while a few spreadsheets too big for their file timeout go through:
+/// `cargo test -p doewood-ingest --test pipeline -- --ignored --nocapture timed_out_spreadsheets`
+/// (`DOEWOOD_BENCH_ROWS` rows of 26 numbers each, default 200,000; `DOEWOOD_BENCH_TIMEOUT_MS`
+/// file timeout, default 300).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "a measurement, not a check"]
+async fn timed_out_spreadsheets() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    fn rss_kib() -> u64 {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        status
+            .lines()
+            .find(|l| l.starts_with("VmRSS:"))
+            .and_then(|l| l.split_whitespace().nth(1)?.parse().ok())
+            .unwrap_or(0)
+    }
+
+    let rows: usize = std::env::var("DOEWOOD_BENCH_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200_000);
+    let timeout: u64 = std::env::var("DOEWOOD_BENCH_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+    let files: Vec<(String, Vec<u8>)> = (0..3u64)
+        .map(|i| (format!("big/{i}.xlsx"), common::big_xlsx(rows, 26, i)))
+        .collect();
+    let size: usize = files.iter().map(|(_, d)| d.len()).sum();
+    let store = Arc::new(Store::open_in_memory(&MasterKey::from_bytes([10; 32])).unwrap());
+    let backend: Arc<dyn Backend> = Arc::new(Standalone::new(Arc::clone(&store)));
+    let h = Harness::start_with(
+        Arc::clone(&store),
+        backend,
+        2,
+        Duration::from_millis(10),
+        Some(Duration::from_millis(timeout)),
+    );
+    let base = rss_kib();
+    let (peak, stop) = (
+        Arc::new(AtomicU64::new(base)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let sampler = {
+        let (peak, stop) = (Arc::clone(&peak), Arc::clone(&stop));
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                peak.fetch_max(rss_kib(), Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+    };
+    let started = std::time::Instant::now();
+    let batch: Vec<(&str, Vec<u8>, bool)> = files
+        .iter()
+        .map(|(k, d)| (k.as_str(), d.clone(), true))
+        .collect();
+    h.put(&batch).await;
+    drop(batch);
+    h.settle().await;
+    let secs = started.elapsed().as_secs_f64();
+    stop.store(true, Ordering::Relaxed);
+    sampler.join().unwrap();
+    let c = store.object_counts(h.source).unwrap();
+    let mut errors = Vec::new();
+    for i in 0..3 {
+        let s = h.status(&format!("big/{i}.xlsx"));
+        errors.push(format!("{} {:?}", s.status, s.last_error));
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let (mib, total) = (
+        |kib: u64| kib as f64 / 1024.0,
+        size as f64 / f64::from(1 << 20),
+    );
+    println!(
+        "timed_out_spreadsheets: 3 x {rows} rows ({:.1} MiB in all), {timeout} ms timeout, \
+         2 workers, {secs:.2}s; \
+         RSS before {:.0} MiB, peak {:.0} MiB, after {:.0} MiB; done {} failed {}; {errors:?}",
+        total,
+        mib(base),
+        mib(peak.load(Ordering::Relaxed)),
+        mib(rss_kib()),
+        c.done,
+        c.failed,
+    );
     h.stop().await;
 }

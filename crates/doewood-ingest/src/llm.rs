@@ -664,7 +664,9 @@ impl Summaries {
         from_store: bool,
         slot: Slot,
     ) -> Result<(Blake3, Json), SummarizeError> {
-        let blake3 = Blake3(*blake3::hash(&bytes).as_bytes());
+        let (bytes, blake3) = crate::pipeline::hash(bytes)
+            .await
+            .map_err(|e| SummarizeError::Internal(e.message))?;
         // An object already stored with current step versions is read from its record.
         let backend = self.inner.backend.borrow().clone();
         let stored = if from_store {
@@ -688,7 +690,7 @@ impl Summaries {
             let limit = analyzer.limits().timeout_cap() + Duration::from_mins(1);
             let task = tokio::task::spawn_blocking(move || {
                 let _slot = slot;
-                analyzer.analyze(bytes, &name).body
+                analyzer.analyze_hashed(bytes, blake3, &name).body
             });
             match tokio::time::timeout(limit, task).await {
                 Ok(Ok(b)) => b,

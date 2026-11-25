@@ -7,7 +7,7 @@
 //! known panics on hostile files, and a panic must end only that file.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use hh_core::normalize::Options as NormalizeOptions;
 use hh_core::reader::ReadOptions;
@@ -66,12 +66,21 @@ pub struct SheetOutcome {
     pub failed: Option<String>,
 }
 
-/// Reads and analyzes a workbook within `timeout`.
-pub fn analyze(bytes: &[u8], name: &str, format: &str, timeout: Duration) -> SheetOutcome {
+/// Reads and analyzes a workbook, stopping at `deadline` (the file's): hedgehog's read checks
+/// it per sheet and every 65,536 cells, its normalizer per sheet. A read past it fails the
+/// workbook (`sheet.read@1: file refused: ...time limit`); tables past it are a problem
+/// (`sheet.tables@1: ...`).
+pub fn analyze(bytes: &[u8], name: &str, format: &str, deadline: Option<Instant>) -> SheetOutcome {
     let mut out = SheetOutcome::default();
-    let deadline = Instant::now().checked_add(timeout);
-    let read =
-        guarded(|| hh_core::reader::open_bytes_with(bytes, Some(name), ReadOptions::default()));
+    // Only the deadline changes: cells and decompressed bytes keep hedgehog's limits.
+    let options = ReadOptions {
+        limits: hh_core::reader::Limits {
+            deadline,
+            ..hh_core::reader::Limits::default()
+        },
+        ..ReadOptions::default()
+    };
+    let read = guarded(|| hh_core::reader::open_bytes_with(bytes, Some(name), options));
     let wb = match read {
         Ok(Ok(wb)) => wb,
         Ok(Err(e)) => {
@@ -236,7 +245,7 @@ mod tests {
             b"PK\x03\x04garbage",
             "x.xlsx",
             "xlsx",
-            Duration::from_secs(5),
+            Instant::now().checked_add(std::time::Duration::from_secs(5)),
         );
         assert!(out.failed.is_some());
         assert!(out.facts.is_empty());
