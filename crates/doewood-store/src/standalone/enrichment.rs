@@ -93,7 +93,7 @@ impl CacheStore for Standalone {
         validate_registry(registry)?;
         validate_cache_key(key)?;
         let (registry, key) = (registry.to_owned(), key.to_owned());
-        self.run(move |conn| {
+        self.read(move |conn| {
             let row = conn
                 .query_row(
                     "SELECT body, fetched_at, expires_at FROM registry_cache \
@@ -139,7 +139,7 @@ impl CacheStore for Standalone {
 
     async fn icon_get(&self, domain: &str) -> Result<Option<IconRow>> {
         let domain = domain.to_owned();
-        self.run(move |conn| {
+        self.read(move |conn| {
             let row = conn
                 .query_row(
                     "SELECT icon, format, fetched_at, expires_at FROM favicons \
@@ -280,7 +280,7 @@ impl FreshnessStore for Standalone {
     }
 
     async fn enrichment(&self, company: Uuid) -> Result<Option<Enrichment>> {
-        self.run(move |conn| enrichment(conn, company)).await
+        self.read(move |conn| enrichment(conn, company)).await
     }
 
     async fn mark_due(&self, company: Uuid, registries: &[String]) -> Result<()> {
@@ -333,7 +333,7 @@ impl FreshnessStore for Standalone {
         limit: u32,
     ) -> Result<Vec<DueCompany>> {
         let owner = owner.clone();
-        self.run(move |conn| {
+        self.read(move |conn| {
             let at = now();
             let rows = {
                 let mut stmt = conn.prepare_cached(COMPANIES_DUE).map_err(sql)?;

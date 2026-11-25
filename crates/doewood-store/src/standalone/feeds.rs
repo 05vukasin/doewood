@@ -65,7 +65,7 @@ impl FeedStore for Standalone {
     async fn feed_state(&self, feed: &str) -> Result<Option<FeedState>> {
         validate_feed(feed)?;
         let feed = feed.to_owned();
-        self.run(move |conn| {
+        self.read(move |conn| {
             conn.query_row(
                 "SELECT cursor, next_run_at, coalesce(updated_at, 0), \
                  CASE WHEN lease_expires_at > ?2 THEN owner END \
@@ -123,7 +123,7 @@ impl FeedStore for Standalone {
             return Ok(Vec::new());
         }
         let aliases = aliases.to_vec();
-        self.run(move |conn| {
+        self.read(move |conn| {
             let marks = vec!["?"; aliases.len()].join(", ");
             let mut stmt = conn
                 .prepare(&format!(
@@ -155,7 +155,7 @@ impl FeedStore for Standalone {
         validate_cache_key(prefix)?;
         let limit = i64::from(due_limit(limit).min(u32::try_from(FEED_BATCH_MAX).unwrap_or(1000)));
         let (prefix, after) = (prefix.to_owned(), after.map(str::to_owned));
-        self.run(move |conn| {
+        self.read(move |conn| {
             let mut stmt = conn
                 .prepare_cached(
                     "SELECT alias, node_id FROM node_aliases \

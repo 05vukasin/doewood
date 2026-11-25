@@ -1,7 +1,10 @@
 //! Standalone mode (ADR 0001, section 2): the store traits of `doewood-model` over the
 //! instance's own SQLite file. Search uses FTS5; claims and leases are local to the instance.
 //!
-//! Every call runs on tokio's blocking pool and takes the store's single connection.
+//! Every call runs on tokio's blocking pool. Writes take the store's single writer; pure reads
+//! (records, graph, search, sketches, caches, the merge log) run on its read-only connections
+//! ([`Store::readers`]), each in one read transaction. Every write commits before it returns,
+//! so a later read sees it; a read concurrent with a write sees the state before it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -88,6 +91,20 @@ impl Standalone {
     {
         let store = Arc::clone(&self.store);
         tokio::task::spawn_blocking(move || f(&mut store.conn()))
+            .await
+            .map_err(|e| backend(format!("blocking task failed: {e}")))?
+    }
+
+    /// Runs a pure read on one of the store's read-only connections (the writer when it has
+    /// none), in one transaction: it sees what was committed when it started, and does not
+    /// wait for a write in progress.
+    async fn read<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+    {
+        let store = Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || store.read(sql, f))
             .await
             .map_err(|e| backend(format!("blocking task failed: {e}")))?
     }
@@ -460,7 +477,7 @@ impl RecordStore for Standalone {
 
     async fn get_record(&self, blake3: &Blake3) -> Result<Option<Record>> {
         let h = *blake3;
-        self.run(move |conn| {
+        self.read(move |conn| {
             let row: Option<(String, String, i64)> = conn
                 .prepare_cached(
                     "SELECT body_json, versions_json, updated_at FROM records WHERE blake3 = ?1",
@@ -492,7 +509,7 @@ impl RecordStore for Standalone {
         }
         let marks = vec!["?"; hashes.len()].join(", ");
         let args: Vec<Vec<u8>> = hashes.iter().map(|h| h.as_bytes().to_vec()).collect();
-        self.run(move |conn| {
+        self.read(move |conn| {
             let mut stmt = conn
                 .prepare(&format!(
                     "SELECT blake3, versions_json FROM records WHERE blake3 IN ({marks})"
@@ -523,7 +540,7 @@ impl RecordStore for Standalone {
         let marks = vec!["?"; hashes.len()].join(", ");
         let mut args: Vec<Sql> = vec![Sql::Text(key.to_owned())];
         args.extend(hashes.iter().map(|h| Sql::Blob(h.as_bytes().to_vec())));
-        self.run(move |conn| {
+        self.read(move |conn| {
             // As on Postgres: a `facts` that is not an array has no facts; a fact that is not
             // an object, or whose key or `value.v` is not a string, is left out. The nested
             // CASE keeps `json_type` off elements that are not JSON objects.
@@ -561,7 +578,7 @@ impl RecordStore for Standalone {
     ) -> Result<Vec<Record>> {
         let (source, after) = (source.clone(), after.copied());
         let limit = i64::from(records_limit(limit));
-        self.run(move |conn| {
+        self.read(move |conn| {
             // `> coalesce(?4, x'')` rather than `?4 IS NULL OR ...`: the OR kept SQLite from
             // starting the scan at the page token, so every page read the records before it
             // (issue #13). Every hash is 32 bytes, so all are greater than the empty blob.
@@ -639,7 +656,7 @@ impl GraphStore for Standalone {
     }
 
     async fn node(&self, id: Uuid) -> Result<Option<Node>> {
-        self.run(move |conn| {
+        self.read(move |conn| {
             conn.prepare_cached(&format!(
                 "SELECT {NODE_COLUMNS} FROM nodes n WHERE n.id = ?1"
             ))
@@ -654,7 +671,7 @@ impl GraphStore for Standalone {
 
     async fn node_by_key(&self, kind: NodeKind, key: &str) -> Result<Option<Node>> {
         let key = key.to_owned();
-        self.run(move |conn| {
+        self.read(move |conn| {
             conn.prepare_cached(&format!(
                 "SELECT {NODE_COLUMNS} FROM nodes n WHERE n.kind = ?1 AND n.key = ?2"
             ))
@@ -698,7 +715,7 @@ impl GraphStore for Standalone {
 
     async fn neighbours(&self, node: Uuid, q: &NeighbourQuery) -> Result<Vec<Neighbour>> {
         let q = q.clone();
-        self.run(move |conn| {
+        self.read(move |conn| {
             let me = node.to_string();
             let (at_node, other) = match q.direction {
                 Direction::Out => ("e.src = ?1", "e.dst"),
@@ -758,7 +775,7 @@ impl GraphStore for Standalone {
     }
 
     async fn company_documents(&self, company: Uuid) -> Result<Vec<Node>> {
-        self.run(move |conn| company_documents(conn, company, None))
+        self.read(move |conn| company_documents(conn, company, None))
             .await
     }
 
@@ -766,12 +783,12 @@ impl GraphStore for Standalone {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        self.run(move |conn| company_documents(conn, company, Some(limit)))
+        self.read(move |conn| company_documents(conn, company, Some(limit)))
             .await
     }
 
     async fn company_document_count(&self, company: Uuid) -> Result<u64> {
-        self.run(move |conn| {
+        self.read(move |conn| {
             let n: i64 = conn
                 .query_row(
                     &format!("SELECT {DOCUMENTS} FROM (SELECT ?1 AS id) n"),
@@ -950,7 +967,7 @@ impl GraphStore for Standalone {
 
     async fn alias(&self, kind: NodeKind, alias: &str) -> Result<Option<NodeAlias>> {
         let alias = alias.to_owned();
-        self.run(move |conn| {
+        self.read(move |conn| {
             let row: Option<(Option<String>, String)> = conn
                 .prepare_cached(
                     "SELECT node_id, props_json FROM node_aliases WHERE kind = ?1 AND alias = ?2",
@@ -991,7 +1008,7 @@ impl GraphStore for Standalone {
     }
 
     async fn aliases_of(&self, node: Uuid) -> Result<Vec<OwnedAlias>> {
-        self.run(move |conn| merges::aliases_of(conn, node)).await
+        self.read(move |conn| merges::aliases_of(conn, node)).await
     }
 }
 
@@ -1061,7 +1078,7 @@ impl SketchStore for Standalone {
         args.push(Sql::Blob(exclude.as_bytes().to_vec()));
         args.push(Sql::Integer(limit));
         let bands_len = bands.len();
-        self.run(move |conn| {
+        self.read(move |conn| {
             let mut stmt = conn
                 .prepare(&sketch_candidates_sql(bands_len))
                 .map_err(sql)?;
@@ -1154,7 +1171,7 @@ impl ClaimStore for Standalone {
 
     async fn source_owner(&self, key: &SourceKey) -> Result<Option<SourceClaim>> {
         let key = key.clone();
-        self.run(move |conn| source_owner(conn, &key)).await
+        self.read(move |conn| source_owner(conn, &key)).await
     }
 
     async fn lease_company(
@@ -1237,7 +1254,7 @@ impl SearchStore for Standalone {
 
     async fn search(&self, q: &SearchQuery) -> Result<Vec<SearchHit>> {
         let q = q.clone();
-        self.run(move |conn| {
+        self.read(move |conn| {
             let words = q.words();
             let mut args = Vec::new();
             let mut sql_text = if words.is_empty() {
@@ -1543,6 +1560,78 @@ mod tests {
         // Claims are local: both "instances" share this one store.
         let b = a.clone();
         doewood_model::conformance::run(&a, &b).await;
+    }
+
+    /// The suite again on an on-disk store, where the reads run on read-only connections.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_with_readers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_with_readers(
+            &tmp.path().join("s.sqlite"),
+            &MasterKey::from_bytes([1; 32]),
+            2,
+        )
+        .unwrap();
+        assert_eq!(store.readers(), 2);
+        let a = Standalone::new(Arc::new(store));
+        let b = a.clone();
+        doewood_model::conformance::run(&a, &b).await;
+    }
+
+    /// A read does not wait for a write transaction on the writer, and sees the state
+    /// committed before it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reads_go_on_while_a_write_holds_the_writer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            Store::open_with_readers(
+                &tmp.path().join("s.sqlite"),
+                &MasterKey::from_bytes([1; 32]),
+                2,
+            )
+            .unwrap(),
+        );
+        let s = Standalone::new(Arc::clone(&store));
+        let id = s
+            .upsert_node(NodeKind::Company, "a", &serde_json::json!({"v": 1}))
+            .await
+            .unwrap();
+        let (held, release) = std::sync::mpsc::channel::<()>();
+        let (started, wait) = std::sync::mpsc::channel::<()>();
+        let writer = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                let conn = store.conn();
+                conn.execute_batch("BEGIN IMMEDIATE; UPDATE nodes SET props_json = '{\"v\":2}';")
+                    .unwrap();
+                started.send(()).unwrap();
+                release.recv().unwrap();
+                conn.execute_batch("COMMIT").unwrap();
+            })
+        };
+        wait.recv().unwrap();
+        let t = std::time::Instant::now();
+        let node = tokio::time::timeout(Duration::from_secs(2), s.node(id))
+            .await
+            .expect("the read waited for the writer")
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.props, serde_json::json!({"v": 1}));
+        let found = tokio::time::timeout(
+            Duration::from_secs(2),
+            s.node_by_key(NodeKind::Company, "a"),
+        )
+        .await
+        .expect("the read waited for the writer")
+        .unwrap();
+        assert!(found.is_some());
+        let took = t.elapsed();
+        held.send(()).unwrap();
+        writer.join().unwrap();
+        assert!(took < Duration::from_secs(2), "{took:?}");
+        // Committed now: the next read sees it.
+        let node = s.node(id).await.unwrap().unwrap();
+        assert_eq!(node.props, serde_json::json!({"v": 2}));
     }
 
     #[tokio::test]
