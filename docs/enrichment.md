@@ -103,7 +103,7 @@ legal form, registered name, events), `ids` and `registry_ids`, `legal_name`, `f
 most 20), `website`, `icon` and `enriched_at`. The proposals lists of schema 4
 (`merge_proposals`, `registry_proposals`) are removed when the job writes (the migration
 moved them, and an undo of an older merge can bring them back). The document name (`name`) is kept. The job writes only these keys, as one
-atomic patch (`GraphStore::update_props`, see [ingest.md](ingest.md#company-props)), so what
+atomic patch (`GraphStore::update_live_props`, see [ingest.md](ingest.md#company-props)), so what
 ingest writes to the same company at the same moment is never lost.
 
 **Edges** (ADR 0002 section 3), each with `source = registry`, the registry and record id
@@ -134,6 +134,20 @@ Every edge write (the superseding and `former_parent_of` writes below too) resol
 `merged_into` again in the same transaction (`GraphStore::upsert_live_edge`, issue #60): a
 merge committed since the ends were looked up (by a person, or on another instance) moves the
 edge to the survivor instead of leaving it on the merged-away company.
+
+**A company merged away during its job** (by a person, or on another instance; issue #62)
+gets nothing more. The job writes the edges first (they follow the merge, above), then the
+company's own aliases and props, its website and its freshness, each onto the live company
+only: `GraphStore::claim_live_alias`, `GraphStore::update_live_props` and
+`FreshnessStore::record_enrichment` check `merged_into` atomically with the write (under the
+node's row lock on Postgres, in the write transaction on SQLite) and refuse a husk with
+`Error::MergedAway`. The job then stops for that company: what it wrote before the merge was
+moved or folded by the merge, nothing lands on the husk afterwards, and the company it was
+merged into is made due for every enabled registry (`FreshnessStore::mark_due`, which leaves
+its last enrichment as it was), so the next pass enriches the survivor with the identifiers it
+has now, the husk's included. The company does not count as `enriched`. The job does not
+redirect these writes to the survivor: its findings came from the husk's identifiers only, so
+the survivor is enriched as itself instead.
 
 **The later dated parent is current.** When a company has two current parents (active, no
 end date, not an ultimate parent), the later dated one stays current; each earlier one ends on

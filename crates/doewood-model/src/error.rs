@@ -27,6 +27,16 @@ pub enum Error {
     /// merges depend on, an entry already undone. The message says what to do instead.
     #[error("{0}")]
     Precondition(String),
+    /// The company was merged away (a husk with `merged_into`, ADR 0002 section 1.8), so a
+    /// write that must land on a live company was refused. `into` is the company it was
+    /// merged into (which may itself have been merged away since).
+    #[error("company {company} was merged into {into}")]
+    MergedAway {
+        /// The merged-away company the write named.
+        company: uuid::Uuid,
+        /// The company it was merged into.
+        into: uuid::Uuid,
+    },
     /// The backend cannot be reached right now; the operation may succeed later.
     #[error("store unavailable: {0}")]
     Unavailable(String),

@@ -17,7 +17,7 @@ pub(crate) fn model(e: doewood_model::Error) -> Status {
         E::NotFound(m) => Status::not_found(m),
         E::Precondition(m) => Status::failed_precondition(m),
         E::Unavailable(_) => Status::unavailable(e.to_string()),
-        E::SchemaTooNew { .. } => Status::failed_precondition(e.to_string()),
+        E::SchemaTooNew { .. } | E::MergedAway { .. } => Status::failed_precondition(e.to_string()),
         other => internal("shared store", &other),
     }
 }
@@ -74,6 +74,16 @@ mod tests {
         assert_eq!(
             model(doewood_model::Error::Precondition("later merges".into())).code(),
             Code::FailedPrecondition
+        );
+        let merged = model(doewood_model::Error::MergedAway {
+            company: uuid::Uuid::nil(),
+            into: uuid::Uuid::max(),
+        });
+        assert_eq!(merged.code(), Code::FailedPrecondition);
+        assert!(
+            merged.message().contains("was merged into"),
+            "{}",
+            merged.message()
         );
         assert_eq!(
             model(doewood_model::Error::Unavailable("down".into())).code(),

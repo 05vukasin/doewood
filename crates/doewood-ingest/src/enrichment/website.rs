@@ -106,8 +106,9 @@ pub(crate) async fn run(job: &Job<'_>, s: &Subject, f: &Findings) -> Result<bool
             continue;
         };
         let evidence = json!({"source": source, "page": page.as_str(), "matched": matched});
+        // Onto the live company only: a merge since the job started ends it (issue #62).
         let got = b
-            .claim_alias(NodeKind::Company, &alias, me, &evidence)
+            .claim_live_alias(NodeKind::Company, &alias, me, &evidence)
             .await?;
         if got.node != Some(me) {
             continue;
@@ -144,7 +145,7 @@ pub(crate) async fn run(job: &Job<'_>, s: &Subject, f: &Findings) -> Result<bool
                 }),
             )
             .set(&["icon"], icon);
-        if b.update_props(me, &patch).await?.is_none() {
+        if b.update_live_props(me, &patch).await?.is_none() {
             return Ok(false);
         }
         info!(company = %me, %domain, source, matched, "website verified");

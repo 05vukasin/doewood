@@ -121,7 +121,10 @@ count doubles. The store keeps, per company, the last enrichment time, its docum
 `doewood-model`; tables `company_enrichment` and `company_registry_due`):
 
 - `record_enrichment(company, [(registry, interval)])` sets the time and the count to now and
-  each listed registry's due time to now plus its interval; other registries keep theirs.
+  each listed registry's due time to now plus its interval; other registries keep theirs. A
+  merged-away company is refused (`Error::MergedAway`, issue #62).
+- `mark_due(company, [registry])` makes each listed registry due now (an earlier due time
+  stays), without touching the time and the count; a company never enriched is due already.
 - `companies_due(owner, after, limit)` is one page (by id, at most 1000) of the companies with
   at least one document that were never enriched (`New`), whose count is at least twice the
   count then, and at least 2 (`Doubled`), or with a registry due (`Scheduled`, naming the

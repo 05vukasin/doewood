@@ -47,6 +47,7 @@ pub async fn run<B: Backend + ?Sized>(a: &B, b: &B) {
     proposals(a, b).await;
     decisions(a).await;
     live_edges(a, b).await;
+    live_writes(a, b).await;
     a.ping().await.expect("ping");
 }
 
@@ -2401,4 +2402,170 @@ pub async fn live_edges<B: Backend + ?Sized>(a: &B, b: &B) {
     assert!(matches!(bad, Err(Error::Invalid(_))), "{bad:?}");
     let missing = a.upsert_live_edge(&party(d1, Uuid::now_v7())).await;
     assert!(matches!(missing, Err(Error::NotFound(_))), "{missing:?}");
+}
+
+/// Aliases, props and freshness onto live companies only (issue #62): after a merge committed
+/// through another instance, `claim_live_alias`, `update_live_props`, `record_enrichment` and
+/// `mark_due` refuse the husk with [`Error::MergedAway`] and write nothing; `mark_due` makes
+/// registries due without recording an enrichment.
+///
+/// # Panics
+///
+/// When the backend misbehaves.
+#[allow(clippy::too_many_lines)]
+pub async fn live_writes<B: Backend + ?Sized>(a: &B, b: &B) {
+    let company = |key: &'static str| async move {
+        a.upsert_node(NodeKind::Company, key, &json!({"name": key}))
+            .await
+            .unwrap()
+    };
+    let (husk, survivor, fresh) = (
+        company("husk-c").await,
+        company("husk-w").await,
+        company("husk-n").await,
+    );
+    let hour = Duration::from_hours(1);
+    let schedule = |names: &[&str]| -> Vec<(String, Duration)> {
+        names.iter().map(|n| ((*n).to_owned(), hour)).collect()
+    };
+    let refused = |r: Result<(), Error>, what: &str| match r {
+        Err(Error::MergedAway { company, into }) => {
+            assert_eq!((company, into), (husk, survivor), "{what}");
+        }
+        other => panic!("{what}: {other:?}"),
+    };
+    let evidence = json!({"step": "registry", "confidence": 0.95});
+
+    // Live: the same as the plain calls.
+    let got = a
+        .claim_live_alias(
+            NodeKind::Company,
+            "id:lei:HUSKC0000000000000A1",
+            husk,
+            &evidence,
+        )
+        .await
+        .unwrap();
+    assert_eq!(got.node, Some(husk));
+    let n = a
+        .update_live_props(
+            husk,
+            &PropsPatch::new().set(&["legal_name"], json!("C d.o.o.")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(n.props["legal_name"], json!("C d.o.o."));
+    a.record_enrichment(husk, &schedule(&["gleif"]))
+        .await
+        .unwrap();
+    let w0 = a
+        .record_enrichment(survivor, &schedule(&["gleif", "wikidata"]))
+        .await
+        .unwrap();
+    assert!(
+        a.update_live_props(Uuid::now_v7(), &PropsPatch::new())
+            .await
+            .unwrap()
+            .is_none(),
+        "no node: None, as update_props"
+    );
+
+    // A person merges C into W on another instance.
+    b.merge_companies(&merge_req(survivor, husk, MergeActorKind::Manual))
+        .await
+        .unwrap();
+    let husk_props = a.node(husk).await.unwrap().unwrap().props;
+    let husk_fresh = a.enrichment(husk).await.unwrap();
+    assert_eq!(
+        a.alias(NodeKind::Company, "id:lei:HUSKC0000000000000A1")
+            .await
+            .unwrap()
+            .and_then(|x| x.node),
+        Some(survivor),
+        "a claim made before the merge was moved by it"
+    );
+
+    // Nothing more lands on the husk.
+    refused(
+        a.claim_live_alias(NodeKind::Company, "name:husk c late|", husk, &evidence)
+            .await
+            .map(drop),
+        "claim_live_alias",
+    );
+    assert!(
+        a.alias(NodeKind::Company, "name:husk c late|")
+            .await
+            .unwrap()
+            .is_none(),
+        "not claimed"
+    );
+    refused(
+        a.update_live_props(husk, &PropsPatch::new().set(&["legal_name"], json!("late")))
+            .await
+            .map(drop),
+        "update_live_props",
+    );
+    refused(
+        a.record_enrichment(husk, &schedule(&["gleif", "vies"]))
+            .await
+            .map(drop),
+        "record_enrichment",
+    );
+    refused(a.mark_due(husk, &["gleif".to_owned()]).await, "mark_due");
+    assert_eq!(a.node(husk).await.unwrap().unwrap().props, husk_props);
+    assert_eq!(a.enrichment(husk).await.unwrap(), husk_fresh);
+
+    // The survivor: due now for the registries named, its enrichment as it was.
+    a.mark_due(survivor, &["gleif".to_owned(), "vies".to_owned()])
+        .await
+        .unwrap();
+    let w1 = a.enrichment(survivor).await.unwrap().unwrap();
+    assert_eq!(
+        (w1.enriched_at, w1.documents),
+        (w0.enriched_at, w0.documents)
+    );
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap();
+    for r in ["gleif", "vies"] {
+        assert!(w1.next_due[r] <= now + 1, "{r} due now: {w1:?}");
+    }
+    assert_eq!(
+        w1.next_due["wikidata"], w0.next_due["wikidata"],
+        "not named: kept"
+    );
+    // An earlier due time stays.
+    a.mark_due(survivor, &["gleif".to_owned()]).await.unwrap();
+    assert!(
+        a.enrichment(survivor).await.unwrap().unwrap().next_due["gleif"] <= w1.next_due["gleif"]
+    );
+    let live = a
+        .claim_live_alias(NodeKind::Company, "name:husk w late|", survivor, &evidence)
+        .await
+        .unwrap();
+    assert_eq!(live.node, Some(survivor));
+
+    // Never enriched: due already, nothing recorded.
+    a.mark_due(fresh, &["gleif".to_owned()]).await.unwrap();
+    assert!(a.enrichment(fresh).await.unwrap().is_none());
+
+    // Bad input and missing companies.
+    let bad = a.mark_due(survivor, &["Not A Registry".to_owned()]).await;
+    assert!(matches!(bad, Err(Error::Invalid(_))), "{bad:?}");
+    let missing = a.mark_due(Uuid::now_v7(), &["gleif".to_owned()]).await;
+    assert!(matches!(missing, Err(Error::NotFound(_))), "{missing:?}");
+    let doc = a
+        .upsert_node(NodeKind::Document, &hash(244).to_hex(), &json!({}))
+        .await
+        .unwrap();
+    let not_company = a.mark_due(doc, &["gleif".to_owned()]).await;
+    assert!(
+        matches!(not_company, Err(Error::NotFound(_))),
+        "{not_company:?}"
+    );
 }
