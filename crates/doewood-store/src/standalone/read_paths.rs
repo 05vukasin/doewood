@@ -13,6 +13,7 @@ use doewood_model::{
 use rusqlite::types::Value as Sql;
 use rusqlite::{Connection, params, params_from_iter};
 use serde_json::json;
+use serde_json::value::RawValue;
 use uuid::Uuid;
 
 use super::{Standalone, sketch_candidates_sql};
@@ -222,9 +223,13 @@ async fn unchanged_writes_write_nothing() {
     let store = Arc::new(Store::open_in_memory(&MasterKey::from_bytes([1; 32])).unwrap());
     let s = Standalone::new(Arc::clone(&store));
     let h = Blake3([7; 32]);
-    s.put_record(&h, &json!({}), &doewood_model::StepVersions::new())
-        .await
-        .unwrap();
+    s.put_record(
+        &h,
+        &RawValue::from_string("{}".into()).unwrap(),
+        &doewood_model::StepVersions::new(),
+    )
+    .await
+    .unwrap();
     s.put_sketch(&h, &[1, 2, 3], &[5, 6, u64::MAX])
         .await
         .unwrap();
@@ -305,7 +310,8 @@ async fn email_domains_before(s: &Standalone, company: Uuid) -> Vec<(Blake3, Str
     {
         let hash: Blake3 = doc.key.parse().unwrap();
         let record = s.get_record(&hash).await.unwrap().unwrap();
-        for fact in record.body["facts"].as_array().unwrap() {
+        let body = record.body_value().unwrap();
+        for fact in body["facts"].as_array().unwrap() {
             if fact["key"] == "signal.email_domain"
                 && let Some(d) = fact["value"]["v"].as_str()
             {

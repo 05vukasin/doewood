@@ -18,10 +18,12 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use doewood_model::canonical::{to_canonical, to_canonical_with};
 use doewood_model::{Blake3, StepVersions};
 use quail_core::{Blob, FileRecord, Format, Limits, Profile, Status};
 use quail_engine::Engine;
 use serde_json::Value as Json;
+use serde_json::value::RawValue;
 use tracing::info;
 
 use crate::cpus::CpuSlots;
@@ -97,8 +99,8 @@ pub struct Analysis {
     pub blake3: Blake3,
     /// Where it went.
     pub route: Route,
-    /// The record, as stored.
-    pub body: Json,
+    /// The record, as stored: JSON text, written without a `Value` tree (issue #98).
+    pub body: Box<RawValue>,
     /// The step versions, as stored.
     pub versions: StepVersions,
     /// How it ended.
@@ -233,6 +235,30 @@ impl Analyzer {
     /// The analysis holds one of the instance's CPU slots until it returns; a spreadsheet's
     /// normalizer borrows the free ones for its call.
     pub fn analyze_hashed(&self, bytes: Vec<u8>, blake3: Blake3, key: &str) -> Analysis {
+        let (parts, versions, outcome, route) = self.analyze_parts(bytes, blake3, key);
+        Analysis {
+            blake3,
+            route,
+            body: parts.to_body(),
+            versions,
+            outcome,
+        }
+    }
+
+    /// The record of [`analyze`](Self::analyze) before it is written as text: for the tests
+    /// that compare record text with the `serde_json::Value` it was written from before #98.
+    #[doc(hidden)]
+    pub fn analyze_record(&self, bytes: Vec<u8>, key: &str) -> RecordParts {
+        let blake3 = content_hash(&bytes);
+        self.analyze_parts(bytes, blake3, key).0
+    }
+
+    fn analyze_parts(
+        &self,
+        bytes: Vec<u8>,
+        blake3: Blake3,
+        key: &str,
+    ) -> (RecordParts, StepVersions, Outcome, Route) {
         let _slot = self.cpus.enter();
         let deadline = Instant::now().checked_add(self.limits.timeout);
         let sniff = quail_engine::detect(&bytes);
@@ -247,7 +273,7 @@ impl Analyzer {
             quail_hash_matches(&record, &blake3),
             "the hash passed in is not quail's hash.blake3"
         );
-        let (body, versions, outcome) = match route {
+        let (parts, versions, outcome) = match route {
             Route::Sheet(format) => {
                 self.sheet_record(record, blob.as_bytes(), key, format, deadline)
             }
@@ -262,16 +288,14 @@ impl Analyzer {
                     _ => Outcome::Analyzed,
                 };
                 let versions = self.versions(&record, false);
-                (to_json(&record), versions, outcome)
+                let parts = RecordParts {
+                    record,
+                    format: None,
+                };
+                (parts, versions, outcome)
             }
         };
-        Analysis {
-            blake3,
-            route,
-            body,
-            versions,
-            outcome,
-        }
+        (parts, versions, outcome, route)
     }
 
     fn sheet_record(
@@ -281,7 +305,7 @@ impl Analyzer {
         key: &str,
         format: crate::route::SheetFormat,
         deadline: Option<Instant>,
-    ) -> (Json, StepVersions, Outcome) {
+    ) -> (RecordParts, StepVersions, Outcome) {
         let name = key.rsplit('/').next().unwrap_or(key);
         let out = sheet::analyze_on(
             bytes,
@@ -316,9 +340,11 @@ impl Analyzer {
             record.status = Status::Ok;
         }
         let versions = self.versions(&record, true);
-        let mut body = to_json(&record);
-        body["format"] = Json::String(format.as_str().to_owned());
-        (body, versions, outcome)
+        let parts = RecordParts {
+            record,
+            format: Some(format.as_str()),
+        };
+        (parts, versions, outcome)
     }
 
     fn versions(&self, record: &FileRecord, sheet: bool) -> StepVersions {
@@ -362,9 +388,33 @@ fn quail_hash_matches(record: &FileRecord, blake3: &Blake3) -> bool {
         .all(|f| matches!(&f.value, quail_core::Value::Bytes(b) if b[..] == blake3.0[..]))
 }
 
-fn to_json(record: &FileRecord) -> Json {
-    // A FileRecord always serializes (no maps with non-string keys, no failing types).
-    serde_json::to_value(record).unwrap_or(Json::Null)
+/// A record before it is written: quail's record (with hedgehog's facts for a spreadsheet),
+/// and the `format` a spreadsheet's record carries instead of quail's container format.
+#[doc(hidden)]
+pub struct RecordParts {
+    /// quail's record.
+    pub record: FileRecord,
+    /// The record's `format`, when it is not quail's.
+    pub format: Option<&'static str>,
+}
+
+impl RecordParts {
+    /// The stored text of the record: what `serde_json::to_value(record)` (with `format` set)
+    /// gave as text before issue #98, written straight from the record (no `Value` tree).
+    pub fn to_body(&self) -> Box<RawValue> {
+        let written = match self.format {
+            Some(f) => to_canonical_with(&self.record, "format", f),
+            None => to_canonical(&self.record),
+        };
+        // A FileRecord always serializes (no maps with non-string keys, no failing types).
+        written.unwrap_or_else(|_| {
+            let fallback = match self.format {
+                Some(f) => serde_json::json!({ "format": f }),
+                None => Json::Null,
+            };
+            to_canonical(&fallback).unwrap_or_default()
+        })
+    }
 }
 
 /// `<profile>:<16 hex>`, a digest of every planned step and its version.

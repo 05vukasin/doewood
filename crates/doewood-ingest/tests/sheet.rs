@@ -98,9 +98,10 @@ fn the_analyzer_refuses_a_workbook_over_the_default_cap() {
          1,600,000); DOEWOOD_INGEST_MAX_CELLS raises the cap (it follows the memory per ingest \
          worker)"
     );
-    assert_eq!(a.body["status"]["state"], "failed");
-    assert_eq!(a.body["format"], "xlsx");
-    let facts = a.body["facts"].as_array().unwrap();
+    let body: serde_json::Value = serde_json::from_str(a.body.get()).unwrap();
+    assert_eq!(body["status"]["state"], "failed");
+    assert_eq!(body["format"], "xlsx");
+    let facts = body["facts"].as_array().unwrap();
     assert!(facts.iter().any(|f| f["key"] == "hash.blake3"), "{facts:?}");
     assert!(!facts.iter().any(|f| f["key"] == "sheet.cells"));
 }

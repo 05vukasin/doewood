@@ -188,6 +188,14 @@ The record is the quail record JSON, keyed by BLAKE3, with step versions: one pe
 | `quail.plan` | `<profile>:<digest of every planned step and its version>` |
 | `hedgehog` | the hedgehog revision (spreadsheets) |
 
+The record is written as JSON text straight from quail's record (`doewood_model::canonical`),
+with no `serde_json::Value` tree in between: compact, object keys sorted, byte for byte the text
+the tree wrote before issue #98. Both stores take and return that text (`Record::body` is a
+`RawValue`; SQLite keeps it as it is, Postgres as jsonb and gives it back in the same form), and
+readers deserialize only what they use: `DocFacts` reads the facts it needs into quail values
+and skips the rest as text, the outcome of a stored record reads `format` and `status` only.
+Numbers are in [Sizing, Records](deploy.md#records).
+
 ## The graph
 
 - **Document** (BLAKE3) and **Location** through `upsert_location`.
@@ -345,6 +353,10 @@ are there for enrichment, and no document merges on a fuzzy match yet.
   the watchdog: a second big file waits for the budget until that analysis ends, small files
   flow meanwhile, and a file bigger than the budget takes all of it. `tests/sheet.rs`:
   hedgehog's read past the deadline, or over the cell cap, fails the workbook.
+- `tests/record_text.rs`: generated files of every kind (PDF, DOCX, XLSX, text, CSV, image,
+  ZIP, unknown, empty, broken PDF and XLSX): the record text is the `Value` tree's text byte for
+  byte, `DocFacts` reads the same as reading every fact, and SQLite (and Postgres with
+  `DOEWOOD_TEST_POSTGRES_URL`) store it and give that text back, a second write unchanged.
 - `tests/minio_postgres.rs`: an S3 put in MinIO to a record in Postgres, with both
   `DOEWOOD_TEST_S3_ENDPOINT` and `DOEWOOD_TEST_POSTGRES_URL` set (CI's `ingest-e2e` job).
 
@@ -352,15 +364,21 @@ are there for enrichment, and no document merges on a fuzzy match yet.
 
 `throughput` in `tests/pipeline.rs`: 2000 generated files (PDF, DOCX, TXT, XLSX in equal parts,
 4.7 MiB), fetched from memory, analyzed without OCR, stored in in-memory SQLite (records, graph,
-search). Test profile (dependencies at opt-level 2). The worker count is `default_jobs()` (CPUs
-and memory); the test does not read `DOEWOOD_INGEST_JOBS`. `DOEWOOD_BENCH_WATCHERS=n` opens n
-`WatchProgress` streams on a real API server during the run, and the test also prints the
-process CPU time and how long a trivial store call waits for the store's lock (sampled every
-millisecond). `crates/doewood-api/tests/progress_bench.rs` (ignored) measures the same with
+search), or in Postgres (a schema of its own) when `DOEWOOD_TEST_POSTGRES_URL` is set. Test
+profile (dependencies at opt-level 2). The worker count is `default_jobs()` (CPUs and memory),
+or `DOEWOOD_BENCH_JOBS`; the test does not read `DOEWOOD_INGEST_JOBS`.
+`DOEWOOD_BENCH_WATCHERS=n` opens n `WatchProgress` streams on a real API server during the
+run, and the test also prints the process CPU time, how long a trivial store call waits for
+the store's lock (sampled every millisecond), and where the workers' time went
+(`Stats::time`: instance store, fetch, analyze, record, graph, and the company lock's wait and
+hold). On Postgres with `pg_stat_statements` loaded (`-c
+shared_preload_libraries=pg_stat_statements`) it also prints the statements per file and the
+costliest ones. `crates/doewood-api/tests/progress_bench.rs` (ignored) measures the same with
 n streams on a 200 000-object source while the watchers are woken every millisecond.
 
 ```
-DOEWOOD_BENCH_FILES=2000 cargo test -p doewood-ingest --test pipeline -- --ignored --nocapture throughput
+DOEWOOD_BENCH_FILES=2000 cargo test -p doewood-ingest --test pipeline -- --ignored --nocapture --exact throughput
+DOEWOOD_TEST_POSTGRES_URL=postgres://... DOEWOOD_BENCH_JOBS=4 DOEWOOD_BENCH_FILES=2000 cargo test -p doewood-ingest --test pipeline -- --ignored --nocapture --exact throughput
 ```
 
 | machine | cores, RAM | workers | files/s | notes |
@@ -368,9 +386,15 @@ DOEWOOD_BENCH_FILES=2000 cargo test -p doewood-ingest --test pipeline -- --ignor
 | laptop | 16, 14 GiB | 9 | 409 | from PR #5 |
 | server (AMD EPYC-Genoa) | 4, 7.6 GiB | 4 | 313 | median of 317, 313, 311 |
 | server, `taskset -c 0,1` | 2 | 2 | 228 | median of 242, 226, 228 |
+| server, SQLite (issue #69) | 4, 7.6 GiB | 1 / 2 / 4 | 111 / 253 / 324 | medians of 3 |
+| server, Postgres 17.12 (issue #69) | 4, 7.6 GiB | 1 / 2 / 4 | 56 / 136 / 246 | medians of 3; 47 statements per file |
+| server, Postgres, `taskset -c 0,1` | 2 | 2 | 122 | median of 122, 115, 124 |
 
-Server: Linux 7.0.0-30, rustc 1.97.1, commit `ba0b963`. Throughput grows less than linearly
-with workers here (2 to 4 workers: 1.4x).
+Server: Linux 7.0.0-30, rustc 1.97.1, commit `ba0b963` for the first rows, `f8c6e3a` (with
+the stage counters) for the issue #69 rows. Throughput grows less than linearly with workers
+here (2 to 4 workers: 1.3x on SQLite, 1.8x on Postgres). On Postgres the time goes to round
+trips, and the company lock is not the limit at 4 workers: see
+[deploy.md](deploy.md#ingest-on-postgres-issue-69).
 
 ## Read paths
 

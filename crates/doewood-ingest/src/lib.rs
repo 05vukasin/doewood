@@ -36,6 +36,6 @@ pub use llm::{
 };
 pub use pipeline::{
     Fetch, Ingest, IngestConfig, IngestError, IngestHandle, IngestParts, ReprocessState,
-    ReprocessStatus, S3Fetch, Stats, default_jobs,
+    ReprocessStatus, S3Fetch, StageTimes, Stats, default_jobs,
 };
 pub use route::{Route, SheetFormat};

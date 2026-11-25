@@ -9,6 +9,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use doewood_core::InstanceId;
 use serde_json::Value;
+use serde_json::value::RawValue;
 use time::Date;
 use uuid::Uuid;
 
@@ -24,12 +25,13 @@ use crate::{
 /// quail and hedgehog records, keyed by BLAKE3.
 #[async_trait]
 pub trait RecordStore: Send + Sync {
-    /// Inserts or replaces the record. Writing the same body and versions again is
+    /// Inserts or replaces the record. `body` is JSON text in the form
+    /// [`crate::canonical::to_canonical`] writes. Writing the same body and versions again is
     /// [`PutOutcome::Unchanged`] and does not touch `updated_at`.
     async fn put_record(
         &self,
         blake3: &Blake3,
-        body: &Value,
+        body: &RawValue,
         versions: &StepVersions,
     ) -> Result<PutOutcome>;
 
