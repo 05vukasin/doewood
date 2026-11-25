@@ -3,6 +3,7 @@
 
 mod cleanup;
 mod dev;
+mod enrichment;
 mod icons;
 mod ingest;
 mod logging;

@@ -22,6 +22,9 @@ doewood-core.workspace = true
 # The company identity rules (ADR 0002 section 1).
 doewood-enrich.workspace = true
 doewood-model.workspace = true
+# The registry clients and the favicon resolver the enrichment job uses (ADR 0002 sections 2,
+# 5 and 6).
+doewood-registry.workspace = true
 doewood-s3.workspace = true
 doewood-store.workspace = true
 # hedgehog for spreadsheets. Its patched calamine and rust_xlsxwriter are patched in at the
@@ -34,6 +37,9 @@ quail-cli = { git = "https://github.com/05vukasin/quail", rev = "62108d4" }
 quail-core = { git = "https://github.com/05vukasin/quail", rev = "62108d4" }
 quail-engine = { git = "https://github.com/05vukasin/quail", rev = "62108d4" }
 quail-ocr = { git = "https://github.com/05vukasin/quail", rev = "62108d4", optional = true }
+# The free-mail list, so a free-mail domain never becomes a company's website (ADR 0002
+# section 1.5).
+quail-signals = { git = "https://github.com/05vukasin/quail", rev = "62108d4" }
 quail-sketch = { git = "https://github.com/05vukasin/quail", rev = "62108d4" }
 # LLM summaries (ADR 0001, section 6): `summary.llm` through an HTTP API. Feature `api` sends
 # document text (the card and the digest) to the provider a source's policy and the configured
@@ -45,9 +51,12 @@ thiserror.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 tracing.workspace = true
+url = "2.5"
 uuid.workspace = true
 
 [dev-dependencies]
+# The favicon of the enrichment tests, built in code.
+image = { version = "0.25", default-features = false, features = ["png"] }
 doewood-pg.workspace = true
 # Writes the generated DOCX and XLSX fixtures (stored entries only), like quail's tests.
 zip = { version = "9.0.5", default-features = false }

@@ -9,6 +9,8 @@
 //!
 //! A watch recomputes a snapshot when [`Progress`] reports a change (debounced) and at a
 //! fixed interval (state changes the scanners write to the store), and sends what changed.
+//! A watch of every source also gets the enrichment job's counters ([`EnrichmentCounts`]),
+//! when the instance runs one.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -34,10 +36,53 @@ pub struct EventCounts {
     pub deleted: u64,
 }
 
+/// The enrichment job's counters since the instance started (ADR 0002 section 6).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EnrichmentCounts {
+    /// Companies enriched.
+    pub enriched: u64,
+    /// Companies merged by the gate.
+    pub merged: u64,
+    /// Proposals recorded for a person.
+    pub proposed: u64,
+    /// Companies whose enrichment failed.
+    pub failed: u64,
+    /// Registry warnings.
+    pub registry_warnings: u64,
+    /// Edges written.
+    pub edges: u64,
+    /// Websites verified.
+    pub websites: u64,
+    /// Passes completed.
+    pub passes: u64,
+    /// When the last pass completed, Unix seconds; 0 before the first.
+    pub last_pass_completed_at: i64,
+    /// Whether a pass is running.
+    pub running: bool,
+}
+
+impl From<EnrichmentCounts> for pb::EnrichmentProgress {
+    fn from(c: EnrichmentCounts) -> Self {
+        Self {
+            enriched: c.enriched,
+            merged: c.merged,
+            proposed: c.proposed,
+            failed: c.failed,
+            registry_warnings: c.registry_warnings,
+            edges: c.edges,
+            websites: c.websites,
+            passes: c.passes,
+            last_pass_completed_at: c.last_pass_completed_at,
+            running: c.running,
+        }
+    }
+}
+
 /// The live event counters, shared by the binary (which feeds them) and the API.
 #[derive(Debug)]
 pub struct Progress {
     counts: Mutex<HashMap<SourceId, EventCounts>>,
+    enrichment: Mutex<Option<EnrichmentCounts>>,
     version: watch::Sender<u64>,
 }
 
@@ -52,8 +97,33 @@ impl Progress {
     pub fn new() -> Self {
         Self {
             counts: Mutex::new(HashMap::new()),
+            enrichment: Mutex::new(None),
             version: watch::Sender::new(0),
         }
+    }
+
+    /// Sets the enrichment job's counters (the binary calls it as they change).
+    pub fn set_enrichment(&self, counts: EnrichmentCounts) {
+        let changed = {
+            let mut e = self
+                .enrichment
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let changed = *e != Some(counts);
+            *e = Some(counts);
+            changed
+        };
+        if changed {
+            self.touch();
+        }
+    }
+
+    /// The enrichment job's counters; `None` when the instance runs none.
+    pub fn enrichment(&self) -> Option<EnrichmentCounts> {
+        *self
+            .enrichment
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn counts(&self) -> MutexGuard<'_, HashMap<SourceId, EventCounts>> {
@@ -115,6 +185,7 @@ impl Watch {
     pub(crate) async fn run(mut self, tx: mpsc::Sender<Result<ProgressUpdate, Status>>) {
         let mut changes = self.progress.subscribe();
         let mut last: BTreeMap<SourceId, SourceProgress> = BTreeMap::new();
+        let mut last_enrichment: Option<EnrichmentCounts> = None;
         let mut first = true;
         loop {
             if *self.shutdown.borrow() {
@@ -128,7 +199,21 @@ impl Watch {
                     return;
                 }
             };
-            for update in diff(&last, &now, first) {
+            let mut updates = diff(&last, &now, first);
+            if self.only.is_empty()
+                && let Some(e) = self.progress.enrichment()
+                && last_enrichment != Some(e)
+            {
+                last_enrichment = Some(e);
+                updates.push(ProgressUpdate {
+                    kind: Kind::Enrichment as i32,
+                    progress: None,
+                    previous_state: 0,
+                    at: unix_now(),
+                    enrichment: Some(e.into()),
+                });
+            }
+            for update in updates {
                 // A client that stops reading must not hold the task (and the store) past
                 // shutdown.
                 let sent = tokio::select! {
@@ -232,6 +317,7 @@ fn diff(
             progress: Some(p.clone()),
             previous_state: previous,
             at,
+            enrichment: None,
         });
     }
     for (id, old) in last {
@@ -245,6 +331,7 @@ fn diff(
                 }),
                 previous_state: old.state,
                 at,
+                enrichment: None,
             });
         }
     }
@@ -300,6 +387,27 @@ mod tests {
         p.forget(a);
         assert_eq!(p.get(a), EventCounts::default());
         assert!(rx.has_changed().unwrap());
+    }
+
+    #[test]
+    fn enrichment_counts_wake_watchers_when_they_change() {
+        let p = Progress::new();
+        assert_eq!(p.enrichment(), None);
+        let mut rx = p.subscribe();
+        rx.mark_unchanged();
+        let c = EnrichmentCounts {
+            enriched: 2,
+            merged: 1,
+            ..EnrichmentCounts::default()
+        };
+        p.set_enrichment(c);
+        assert!(rx.has_changed().unwrap());
+        rx.mark_unchanged();
+        p.set_enrichment(c);
+        assert!(!rx.has_changed().unwrap(), "the same counts wake nobody");
+        assert_eq!(p.enrichment(), Some(c));
+        let pb: pb::EnrichmentProgress = c.into();
+        assert_eq!((pb.enriched, pb.merged), (2, 1));
     }
 
     #[test]

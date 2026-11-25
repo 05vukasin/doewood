@@ -7,11 +7,14 @@
 //! - [`company`]: the deterministic company identity rules of ADR 0002 section 1, from
 //!   `doewood-enrich`.
 //! - [`graph`]: documents, locations, companies, references, `similar_to` and search.
+//! - [`enrichment`]: the enrichment job (ADR 0002 sections 1 to 3, 5 and 6): registries,
+//!   the decision gate, dated edges, website and favicon.
 //! - [`llm`]: the LLM queue (per-source policy, concurrency cap, daily budget) and
 //!   on-demand `Summarize` (ADR 0001, section 6).
 
 pub mod analyze;
 pub mod company;
+pub mod enrichment;
 pub mod facts;
 pub mod graph;
 pub mod llm;
@@ -20,6 +23,9 @@ pub mod route;
 pub mod sheet;
 
 pub use analyze::{Analysis, Analyzer, AnalyzerConfig, OcrState, Outcome};
+pub use enrichment::{
+    Enrichment, EnrichmentOptions, EnrichmentParts, EnrichmentStats, Templates, WebClientFactory,
+};
 pub use graph::{GraphWriter, SimilarityConfig, WriteStats};
 pub use llm::{
     Clock, OnDemandSummary, QueueConfig, Summaries, SummariesParts, SummarizeError, SummarizeInput,
