@@ -377,6 +377,138 @@ API reads, and the writer's lock wait falls by an order of magnitude. A `ListRec
 waits less on average, but its tail is the query itself (the test profile builds SQLite
 without optimisation), not the lock.
 
+### Ingest on Postgres (issue #69)
+
+`throughput` in `crates/doewood-ingest/tests/pipeline.rs` (ignored; see
+[ingest.md](ingest.md#throughput)): 2000 generated small files (PDF, DOCX, TXT, XLSX, 4.7
+MiB), fetched from memory, no OCR, in process, test profile. The shared store is the
+instance's SQLite store, or Postgres 17.12 (`pgvector/pgvector:pg17`, default settings plus
+`pg_stat_statements`) in a container on an `--internal` Docker network on the same machine.
+`main` at `f8c6e3a` with this branch's counters; medians of 3 runs; `taskset` pins only the
+doewood process.
+
+| store | workers | files/s | runs | company lock: wait / held per file | statements per file |
+|---|---|---|---|---|---|
+| SQLite | 1 | 111 | 111, 110, 115 | 0 / 0.67 ms | |
+| SQLite | 2 | 253 | 272, 250, 253 | 0.01 / 0.63 ms | |
+| SQLite | 4 | 324 | 324, 333, 302 | 0.47 / 1.21 ms | |
+| SQLite, `taskset -c 0,1` | 2 | 222 | 221, 222, 253 | 0.04 / 0.84 ms | |
+| Postgres | 1 | 56 | 53, 56, 57 | 0 / 1.80 ms | 47 |
+| Postgres | 2 | 136 | 136, 138, 133 | 0.08 / 1.54 ms | 47 |
+| Postgres | 4 | 246 | 246, 243, 248 | 1.08 / 1.55 ms | 47 |
+| Postgres, `taskset -c 0,1` | 2 | 122 | 122, 115, 124 | 0.11 / 1.72 ms | 47 |
+
+Where the workers' time goes (4 workers, share of workers x wall time; the test prints it from
+`Stats::time`, which the ingest log line at shutdown also carries):
+
+| stage | SQLite | Postgres |
+|---|---|---|
+| instance store (status, source, settings) | 10% (1.2 ms/file) | 4% (0.6 ms) |
+| analyze (hash, quail, hedgehog) | 30% (3.7 ms) | 21% (3.5 ms) |
+| record (read, write) | 15% (1.8 ms) | 12% (2.0 ms) |
+| graph and search | 40% (4.9 ms) | 58% (9.5 ms) |
+| of which waiting for the company lock | 4% (0.5 ms) | 7% (1.1 ms) |
+| of which holding it | 10% (1.2 ms) | 9% (1.6 ms) |
+
+- **Postgres ingest is about 75% of SQLite at 4 workers (246 vs 324 files/s) and half at 1 or
+  2.** The difference is round trips: 47 statements per file (from `pg_stat_statements`),
+  of which Postgres spends 1.4 ms per file executing (2.8 s for 2000 files at 4 workers; the
+  costliest are the record upsert, the sketch bands and the search row), while the graph
+  stage alone takes 9.5 ms per file. Each statement waits for its answer before the next is
+  sent. See #103.
+- **The company lock is not the bottleneck at 4 workers or fewer.** Workers wait for it 0 to
+  7% of their time; it is held 1.5 to 1.8 ms per file on Postgres (round trips under the
+  lock), so one instance cannot pass about 600 files/s through it, 2.5 times what 4 workers
+  reach here. It becomes the limit with more workers or cheaper files; narrowing it is #78
+  (a decision issue), and fewer round trips (above) also shorten the time it is held.
+- More workers help both stores (1 to 4 workers: 2.9x SQLite, 4.4x Postgres, where workers
+  mostly wait on the network). One SQLite worker is slower per file than two (every stage
+  takes 20 to 30% longer; not explained yet).
+- The instance store's lock wait (a trivial call every millisecond) stayed under 0.4 ms mean
+  in every run.
+
+### API under many clients (issue #80)
+
+`api_load` in `crates/doewood-api/tests/api_load.rs` (ignored): an in-process API server on a
+seeded store (10,000 documents with records, locations, search rows, a `party` edge each to one
+of 500 companies and a `similar_to` chain; 20 sources), driven over loopback by tonic clients in
+the same process. Each client is its own connection and a closed loop (no think time) of
+`ListSources` 10%, `ListRecords` (page of 100) 20%, `GetNode` 15%, `Neighbours` (`similar_to`)
+15%, `CompanyDocuments` 15% and `Search` 25%; one client in ten holds a `WatchProgress` stream
+instead (on a connection of its own), woken every 10 ms as ingest does. A shed call
+(`UNAVAILABLE`) is retried as [api.md](api.md#limits) advises (100 ms doubling to 10 s, jitter).
+Default limits (`max_calls_in_flight` 256, 256 streams per connection, the Postgres pool of 16;
+the instance store in a file with its 2 read-only connections, as `serve` opens it). Release
+build, 10 s per step after a 2 s warm-up, 3 runs; the table is the median run. SQLite rows on
+`main` at `93376bb` (with #83), Postgres rows at `f8c6e3a`. Postgres 17.12
+(`pgvector/pgvector:pg17`, default settings) in a container on an `--internal` Docker network,
+on the same 4 vCPU; nothing calls out (no enrichment, no registries, no icons).
+
+```
+cargo test --release -p doewood-api --test api_load -- --ignored --nocapture
+DOEWOOD_TEST_POSTGRES_URL=postgres://... cargo test --release -p doewood-api --test api_load -- --ignored --nocapture
+```
+
+(`DOEWOOD_BENCH_CLIENTS=10,100,500,1000`, `DOEWOOD_BENCH_SECS`, `DOEWOOD_BENCH_DOCS`,
+`DOEWOOD_BENCH_PER_CONN`, `DOEWOOD_BENCH_WATCH_PCT`, `DOEWOOD_BENCH_IDLE`,
+`DOEWOOD_BENCH_ONLY=<method>`, `DOEWOOD_BENCH_BACKOFF_MS`, `DOEWOOD_BENCH_DB_CPU_STAT`: see the
+file's header.)
+
+| store | clients | calls/s | p50 | p99 | shed / 10 s | process CPU | RSS | threads |
+|---|---|---|---|---|---|---|---|---|
+| SQLite | 10 | 4,943 | 1.9 ms | 5.4 ms | 0 | 2.9 cores | 45 MiB | 33 |
+| SQLite | 100 | 4,505 | 17 ms | 75 ms | 0 | 2.9 | 70 MiB | 123 |
+| SQLite | 500 | 4,743 | 40 ms | 197 ms | 15,354 | 3.0 | 139 MiB | 280 |
+| SQLite | 1000 | 4,358 | 44 ms | 216 ms | 30,396 | 3.0 | 209 MiB | 284 |
+| SQLite, no readers | 10 / 100 / 1000 | 3,586 / 3,320 / 3,031 | 2.5 / 23 / 66 ms | 7.5 / 89 / 255 ms | 0 / 0 / 22,773 | 2.1 to 2.3 | | |
+| Postgres | 10 | 5,109 | 1.6 ms | 6.0 ms | 0 | 1.8 (+1.8 database) | 21 MiB | 15 |
+| Postgres | 100 | 5,903 | 17 ms | 33 ms | 0 | 2.1 (+1.7) | 35 MiB | 17 |
+| Postgres | 500 | 5,645 | 44 ms | 93 ms | 19,722 | 2.2 (+1.6) | 93 MiB | 17 |
+| Postgres | 1000 | 5,380 | 48 ms | 110 ms | 37,827 | 2.2 (+1.5) | 159 MiB | 17 |
+
+Calls/s are successful calls; process CPU, RSS and threads are the whole test process, the
+clients included. Runs: SQLite 3,978 to 4,943 calls/s in every step of the three runs
+(`DOEWOOD_BENCH_READERS=0`, every read on the writer as before #83: one run); Postgres 4,570
+to 6,005 in two runs, and 2,671 to 3,008 in the third (see below).
+
+What the numbers say:
+
+- **SQLite saturates at 10 clients** (about 4,500 calls/s; 3,300 with every read on the
+  writer): the API's reads share the store's 2 read-only connections, each behind its own
+  lock, and the process stays below 3 of the 4 cores. The read-only connections (#83) added
+  about a third and freed the writer: a trivial write-side call now waits 7 us (p50) at any
+  load, against 1.7 ms at 10 clients and 57 ms at 500 without them. More clients only add
+  latency, and blocking-pool threads parked on the connections' locks (one per call in
+  flight: 284 threads at the cap). One call alone (one client) takes 0.2 ms (`GetNode`) to
+  1.7 ms (`ListRecords`, 100 records); `Neighbours` and `CompanyDocuments` make two store
+  calls and wait twice. More readers would be the next step (not measured).
+- **Postgres saturates at about 100 clients** (about 6,000 calls/s), on the pool of 16
+  connections: `GetNode` is 0.8 ms at 10 clients and 13 ms at 100, nearly all of it waiting
+  for a pooled connection, and `Neighbours` and `CompanyDocuments` (two checkouts each)
+  twice that. Neither the database (1.5 to 1.8 cores) nor the process (2.2 cores) is at the
+  machine's 4 cores. `ListSources` (the instance store) stays at 1 to 3 ms.
+- **Beyond the cap, shedding works**: with 500 and 1000 clients the server refuses the calls
+  over 256 in flight at once (`doewood_grpc_shed_total` agreed with the clients' count within
+  5%), the calls it takes keep their latency (p99 under 230 ms on SQLite, under 110 ms on
+  Postgres), and throughput stays within 10% of the peak. No call failed otherwise, no stream ended
+  early, and nothing hit the 60 s deadline. With impatient clients (a fixed 20 ms retry,
+  `DOEWOOD_BENCH_BACKOFF_MS=20`, one run) a 1000-client step sheds 10 times as many calls
+  (about 25,000 a second) and Postgres throughput falls to 2,252 calls/s (SQLite: 3,428): the
+  refusals cost CPU (the process at 3 to 3.8 cores) that the calls then lack. Clients must
+  back off as documented; see #104.
+- **Memory:** 13 to 13.5 KiB per idle connection (2000 opened at once: +26 MiB, client side
+  included), about 70 KiB per busy client (1000 clients with 100 streams: 160 to 210 MiB).
+- **Postgres `Search` is unstable between runs:** in one run of three `Search` took 6.9 ms
+  alone instead of 1.8 ms, the database used 2.8 cores, and throughput was half (2,700 to
+  3,000 calls/s) in every step; in a fourth run the slow mode ended by itself in the last
+  step (2,624 to 4,402 calls/s, the database from 2.8 to 1.8 cores). The likely cause is the GIN
+  index's pending list (new search rows wait there until a vacuum, and every search scans it): a
+  rare-term lookup on 10,000 rows took 0.54 ms with the list full and 0.065 ms after `VACUUM`.
+  See #102.
+- The network layer is not the limit (as the io_uring research expected): the store's
+  connections (SQLite) and the pool (Postgres) are, well below the HTTP/2 stack's 60,000+ requests/s on
+  this machine.
+
 ### Requests and limits
 
 Per doewood instance (one pod):

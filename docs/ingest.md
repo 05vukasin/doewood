@@ -331,15 +331,21 @@ are there for enrichment, and no document merges on a fuzzy match yet.
 
 `throughput` in `tests/pipeline.rs`: 2000 generated files (PDF, DOCX, TXT, XLSX in equal parts,
 4.7 MiB), fetched from memory, analyzed without OCR, stored in in-memory SQLite (records, graph,
-search). Test profile (dependencies at opt-level 2). The worker count is `default_jobs()` (CPUs
-and memory); the test does not read `DOEWOOD_INGEST_JOBS`. `DOEWOOD_BENCH_WATCHERS=n` opens n
-`WatchProgress` streams on a real API server during the run, and the test also prints the
-process CPU time and how long a trivial store call waits for the store's lock (sampled every
-millisecond). `crates/doewood-api/tests/progress_bench.rs` (ignored) measures the same with
+search), or in Postgres (a schema of its own) when `DOEWOOD_TEST_POSTGRES_URL` is set. Test
+profile (dependencies at opt-level 2). The worker count is `default_jobs()` (CPUs and memory),
+or `DOEWOOD_BENCH_JOBS`; the test does not read `DOEWOOD_INGEST_JOBS`.
+`DOEWOOD_BENCH_WATCHERS=n` opens n `WatchProgress` streams on a real API server during the
+run, and the test also prints the process CPU time, how long a trivial store call waits for
+the store's lock (sampled every millisecond), and where the workers' time went
+(`Stats::time`: instance store, fetch, analyze, record, graph, and the company lock's wait and
+hold). On Postgres with `pg_stat_statements` loaded (`-c
+shared_preload_libraries=pg_stat_statements`) it also prints the statements per file and the
+costliest ones. `crates/doewood-api/tests/progress_bench.rs` (ignored) measures the same with
 n streams on a 200 000-object source while the watchers are woken every millisecond.
 
 ```
-DOEWOOD_BENCH_FILES=2000 cargo test -p doewood-ingest --test pipeline -- --ignored --nocapture throughput
+DOEWOOD_BENCH_FILES=2000 cargo test -p doewood-ingest --test pipeline -- --ignored --nocapture --exact throughput
+DOEWOOD_TEST_POSTGRES_URL=postgres://... DOEWOOD_BENCH_JOBS=4 DOEWOOD_BENCH_FILES=2000 cargo test -p doewood-ingest --test pipeline -- --ignored --nocapture --exact throughput
 ```
 
 | machine | cores, RAM | workers | files/s | notes |
@@ -347,9 +353,15 @@ DOEWOOD_BENCH_FILES=2000 cargo test -p doewood-ingest --test pipeline -- --ignor
 | laptop | 16, 14 GiB | 9 | 409 | from PR #5 |
 | server (AMD EPYC-Genoa) | 4, 7.6 GiB | 4 | 313 | median of 317, 313, 311 |
 | server, `taskset -c 0,1` | 2 | 2 | 228 | median of 242, 226, 228 |
+| server, SQLite (issue #69) | 4, 7.6 GiB | 1 / 2 / 4 | 111 / 253 / 324 | medians of 3 |
+| server, Postgres 17.12 (issue #69) | 4, 7.6 GiB | 1 / 2 / 4 | 56 / 136 / 246 | medians of 3; 47 statements per file |
+| server, Postgres, `taskset -c 0,1` | 2 | 2 | 122 | median of 122, 115, 124 |
 
-Server: Linux 7.0.0-30, rustc 1.97.1, commit `ba0b963`. Throughput grows less than linearly
-with workers here (2 to 4 workers: 1.4x).
+Server: Linux 7.0.0-30, rustc 1.97.1, commit `ba0b963` for the first rows, `f8c6e3a` (with
+the stage counters) for the issue #69 rows. Throughput grows less than linearly with workers
+here (2 to 4 workers: 1.3x on SQLite, 1.8x on Postgres). On Postgres the time goes to round
+trips, and the company lock is not the limit at 4 workers: see
+[deploy.md](deploy.md#ingest-on-postgres-issue-69).
 
 ## Read paths
 
