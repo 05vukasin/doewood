@@ -34,7 +34,7 @@ object over the cap fails without a retry.
 
 - **One engine per instance**, built like the `quail` CLI builds its own
   (`quail_cli::registry::builder`: `quail-cli` is a library too, so no quail change was needed).
-  The file timeout is quail's (2 min).
+  The file timeout is quail's (2 min); see [Time limits](#time-limits).
 - **Routing** comes from the bytes: quail's sniff (`engine.sniff`), then a bounded look for the
   spreadsheet containers quail calls a plain ZIP or OLE file. XLSX/XLSM, XLSB, ODS and XLS go to
   hedgehog; PDF, DOCX and text (CSV included: quail reads text) to quail. An object key's
@@ -53,6 +53,31 @@ object over the cap fails without a retry.
   pages are flagged `needs_ocr`. `--no-default-features` builds without ONNX Runtime.
 - **Content already stored** with the current step versions is not analyzed again: a second
   copy only adds its location.
+
+## Time limits
+
+- **Hashed once.** Each fetched file is hashed (BLAKE3) once, on a blocking thread, before the
+  record lookup; the analyzer takes that hash (`Analyzer::analyze_hashed`). quail's
+  `hash.identity` still hashes for its own record.
+- **One deadline per file**, the file timeout from when the analysis starts. quail's engine
+  starts its clock there (it does not start a step past it, and its steps check it as they
+  go); hedgehog's read (`ReadOptions.limits.deadline`, checked per sheet and every 65,536 cells)
+  and its normalizer (`NormalizeOptions.deadline`) get the same instant. A spreadsheet takes at
+  most the file timeout, not quail's plus hedgehog's. A read past it fails the file
+  (`sheet.read: ... time limit`); tables past it are a problem of a partial record. The other
+  hedgehog limits (cells, decompressed bytes) are its defaults. The fetch is not under it: the
+  S3 read timeout bounds a stalled transfer, and a large object takes as long as it takes.
+- **The watchdog.** A step that does not stop on time (a native call that never checks) is
+  backed up by a watchdog of the file's time cap (the timeout, or more with OCR) plus 1 minute
+  (`IngestConfig::watchdog_grace`). Past it the file ends `failed` with `analysis did not finish
+  within <n>s`, without a retry, as before, and the worker takes the next file.
+- **What a timed-out analysis still holds.** Nothing can stop a thread from outside, so the
+  analysis runs on until its step returns; then its file's bytes are freed, and one `WARN`
+  says how long it ran (its result is discarded: the file stays `failed`). A worker leaves at
+  most one such analysis behind (`MAX_OVERRUNS`); after a second it waits for the older one to
+  end before it takes another file. So stuck analyses hold at most two files per worker instead
+  of piling up, and a step that never returns costs one worker at most two files' memory.
+  `Stats::overruns` counts them.
 
 ## Records and step versions
 
@@ -216,6 +241,10 @@ are there for enrichment, and no document merges on a fuzzy match yet.
   SQLite (and Postgres with `DOEWOOD_TEST_POSTGRES_URL`), then the records, the graph (pending
   references, companies across spellings and identifiers, `similar_to`), search, retries,
   deletes and reprocessing. `throughput` (ignored) measures files per second.
+- Unit tests in `pipeline.rs` stall an analysis past the watchdog: the file fails, the worker
+  goes on, the stalled analysis keeps its bytes counted until it returns and then frees them, a
+  worker leaves at most one behind, and each file is hashed once. `tests/sheet.rs`: hedgehog's
+  read past the deadline fails the workbook.
 - `tests/minio_postgres.rs`: an S3 put in MinIO to a record in Postgres, with both
   `DOEWOOD_TEST_S3_ENDPOINT` and `DOEWOOD_TEST_POSTGRES_URL` set (CI's `ingest-e2e` job).
 

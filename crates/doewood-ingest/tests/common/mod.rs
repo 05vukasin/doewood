@@ -150,6 +150,44 @@ pub fn xlsx(sheet: &str, rows: &[&[&str]]) -> Vec<u8> {
     ])
 }
 
+/// A large XLSX of `rows` x `cols` numbers (`cols` at most 26), for the time limits.
+pub fn big_xlsx(rows: usize, cols: usize, seed: u64) -> Vec<u8> {
+    let mut data = String::with_capacity(rows * cols * 24);
+    for r in 1..=rows {
+        data.push_str(&format!("<row r=\"{r}\">"));
+        for c in 0..cols {
+            let col = char::from(b'A' + u8::try_from(c).unwrap());
+            let v = (r as u64 * 31 + c as u64) ^ seed;
+            data.push_str(&format!("<c r=\"{col}{r}\"><v>{v}</v></c>"));
+        }
+        data.push_str("</row>");
+    }
+    let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    let rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    zip_of(&[
+        (
+            "[Content_Types].xml",
+            r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#.to_owned(),
+        ),
+        (
+            "_rels/.rels",
+            format!(r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{rel}/officeDocument" Target="xl/workbook.xml"/></Relationships>"#),
+        ),
+        (
+            "xl/workbook.xml",
+            format!(r#"<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="{ns}" xmlns:r="{rel}"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>"#),
+        ),
+        (
+            "xl/_rels/workbook.xml.rels",
+            format!(r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{rel}/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#),
+        ),
+        (
+            "xl/worksheets/sheet1.xml",
+            format!(r#"<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="{ns}"><sheetData>{data}</sheetData></worksheet>"#),
+        ),
+    ])
+}
+
 /// US Letter, points.
 const W: f32 = 612.0;
 const H: f32 = 792.0;
