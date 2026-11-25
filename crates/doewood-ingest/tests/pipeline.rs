@@ -423,8 +423,9 @@ async fn scenario(store: Arc<Store>, shared: &Shared) {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(xl.body["format"], "xlsx", "{name}");
-    let keys: Vec<&str> = xl.body["facts"]
+    let xl_body = xl.body_value().unwrap();
+    assert_eq!(xl_body["format"], "xlsx", "{name}");
+    let keys: Vec<&str> = xl_body["facts"]
         .as_array()
         .unwrap()
         .iter()
@@ -442,8 +443,9 @@ async fn scenario(store: Arc<Store>, shared: &Shared) {
     assert_eq!(xl.versions["hedgehog"], "fac6eba");
     assert_eq!(xl.versions["doewood.ingest"], "1");
     let blob_rec = b.get_record(&h.hash("in/blob.bin")).await.unwrap().unwrap();
-    assert_eq!(blob_rec.body["format"], "unknown", "{name}");
-    let blob_keys: Vec<&str> = blob_rec.body["facts"]
+    let blob_body = blob_rec.body_value().unwrap();
+    assert_eq!(blob_body["format"], "unknown", "{name}");
+    let blob_keys: Vec<&str> = blob_body["facts"]
         .as_array()
         .unwrap()
         .iter()
@@ -782,7 +784,7 @@ async fn a_dismissal_keeps_a_split_off_document_apart() {
             let h = Blake3([n; 32]);
             b.put_record(
                 &h,
-                &serde_json::json!({}),
+                &doewood_model::canonical::to_canonical(&serde_json::json!({})).unwrap(),
                 &doewood_model::StepVersions::new(),
             )
             .await

@@ -23,7 +23,8 @@ pending sweep (objects_seen)┘                                         (cap)   
 - **Workers:** `DOEWOOD_INGEST_JOBS`, else one per CPU, at most what half the available memory
   holds at 512 MiB a worker (a cgroup v2 limit counts), at most 32. Every analysis runs on a
   blocking thread; the quail engine is shared. Big files also wait for the
-  [memory budget](#memory).
+  [memory budget](#memory). A spreadsheet may borrow idle workers' CPUs
+  ([Memory](#memory), Threads).
 - **Shutdown:** each worker finishes the file in hand; the rest stays pending for the next start.
 
 ## Fetch
@@ -135,9 +136,41 @@ more), so none of them can abort the instance with an out-of-memory error.
   ingest worker)`. The cap in use is logged at start (`sheet_max_cells` in `ingest started`).
   Raise it only with the memory for it: about 320 bytes a cell for each worker that may read
   such a workbook at once.
-- **One thread per analysis.** Each worker's hedgehog normalizer runs with `threads: Some(1)`,
-  and since hedgehog `fac6eba` every inner fan-out honours it, so a worker's analysis really is
-  single-threaded: the workers, not hedgehog, decide how many CPUs ingest uses.
+- **Threads: one per analysis, more for a spreadsheet when the instance is idle** (issue
+  #101). The instance has CPU slots: its CPUs (`available_parallelism`, which follows a cgroup
+  CPU quota), at most the workers. Each running analysis holds one slot until it returns (an
+  analysis the watchdog gave up on too). When a spreadsheet's hedgehog normalizer starts, it
+  borrows the slots nobody holds, so it runs with `threads: Some(1 + free slots)`, at most 4
+  threads in all (`MAX_SHEET_THREADS`; hedgehog's row model streams on at most 4). It gives
+  them back when the call returns, fails or panics. Since hedgehog `fac6eba` every inner
+  fan-out honours `threads`, so under load each analysis is single-threaded and the workers
+  decide how many CPUs ingest uses.
+  - A loan only takes slots that are free at that moment, so lending never takes the count
+    over the CPUs. An analysis that starts while slots are lent does not wait: it runs beside
+    them, one thread, until that normalize returns, and the next normalize borrows nothing.
+  - The output does not depend on the threads (hedgehog's determinism guarantee; checked by
+    `lent_threads_give_the_same_tables` in `tests/sheet.rs`).
+  - Memory: the lent threads did not raise the peak measurably (below). A lent slot is an idle
+    worker's, so its 512 MiB plan is not in use meanwhile; with fewer workers than CPUs
+    (a memory-sized instance) only the workers' slots are lent.
+
+  `lent_threads_measure` in `tests/sheet.rs` (generated XLSX, 38,462 rows x 26 cells, every
+  other one text: 1,000,012 cells; read and tables; 4 vCPU server, test profile; RSS is the
+  peak above the start):
+
+  | | slots | threads per workbook | wall, run 1 / 2 | peak RSS, run 1 / 2 |
+  |---|---|---|---|---|
+  | 1 workbook, before | 1 | 1 | 1.91 / 1.90 s | +210 / +209 MiB |
+  | 1 workbook, after | 4 | 4 | 1.33 / 1.30 s | +201 / +203 MiB |
+  | 4 workbooks at once, before | 1 | 1 each | 2.59 / 2.51 s | +696 / +717 MiB |
+  | 4 workbooks at once, after | 4 | 1 each | 2.53 / 2.46 s | +667 / +666 MiB |
+
+  The read (calamine) stays on one thread; only the tables step is lent threads. With numbers
+  only, one workbook took 0.76 s before and 0.60 s after.
+
+  ```
+  DOEWOOD_BENCH_TEXT=1 DOEWOOD_BENCH_FILES=1 cargo test -p doewood-ingest --test sheet -- --ignored --nocapture lent_threads_measure
+  ```
 - **quail's limits** stay its defaults: 256 MiB decompressed and 64 MiB of text per file, 40
   million pixels a rendered page, which already fit a worker. OCR has its own budget (quail's
   OCR permits, about 1 GiB an engine; see [deploy.md](deploy.md#sizing)).
@@ -154,6 +187,14 @@ The record is the quail record JSON, keyed by BLAKE3, with step versions: one pe
 | `doewood.ingest` | doewood's own conversion |
 | `quail.plan` | `<profile>:<digest of every planned step and its version>` |
 | `hedgehog` | the hedgehog revision (spreadsheets) |
+
+The record is written as JSON text straight from quail's record (`doewood_model::canonical`),
+with no `serde_json::Value` tree in between: compact, object keys sorted, byte for byte the text
+the tree wrote before issue #98. Both stores take and return that text (`Record::body` is a
+`RawValue`; SQLite keeps it as it is, Postgres as jsonb and gives it back in the same form), and
+readers deserialize only what they use: `DocFacts` reads the facts it needs into quail values
+and skips the rest as text, the outcome of a stored record reads `format` and `status` only.
+Numbers are in [Sizing, Records](deploy.md#records).
 
 ## The graph
 
@@ -312,6 +353,10 @@ are there for enrichment, and no document merges on a fuzzy match yet.
   the watchdog: a second big file waits for the budget until that analysis ends, small files
   flow meanwhile, and a file bigger than the budget takes all of it. `tests/sheet.rs`:
   hedgehog's read past the deadline, or over the cell cap, fails the workbook.
+- `tests/record_text.rs`: generated files of every kind (PDF, DOCX, XLSX, text, CSV, image,
+  ZIP, unknown, empty, broken PDF and XLSX): the record text is the `Value` tree's text byte for
+  byte, `DocFacts` reads the same as reading every fact, and SQLite (and Postgres with
+  `DOEWOOD_TEST_POSTGRES_URL`) store it and give that text back, a second write unchanged.
 - `tests/minio_postgres.rs`: an S3 put in MinIO to a record in Postgres, with both
   `DOEWOOD_TEST_S3_ENDPOINT` and `DOEWOOD_TEST_POSTGRES_URL` set (CI's `ingest-e2e` job).
 

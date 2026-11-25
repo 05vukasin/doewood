@@ -17,10 +17,11 @@ use doewood_model::{
     versions_from_json, versions_to_json,
 };
 use serde_json::Value;
+use serde_json::value::RawValue;
 use time::Date;
 use tokio_postgres::Row;
 use tokio_postgres::error::SqlState;
-use tokio_postgres::types::ToSql;
+use tokio_postgres::types::{Json, ToSql};
 use uuid::Uuid;
 
 use crate::PgStore;
@@ -383,12 +384,21 @@ async fn source_owner(c: &impl GenericClient, key: &SourceKey) -> Result<Option<
     .transpose()
 }
 
+/// A stored record as the canonical text the stores return (#98). jsonb's own text has other
+/// spacing and key order, so it goes through a `Value`, as the record did before.
+fn record_text(record: &Value) -> Result<Box<RawValue>> {
+    doewood_model::canonical::to_canonical(record).map_err(|e| Error::Backend {
+        backend: "postgres",
+        message: format!("stored record: {e}"),
+    })
+}
+
 #[async_trait]
 impl RecordStore for PgStore {
     async fn put_record(
         &self,
         blake3: &Blake3,
-        body: &Value,
+        body: &RawValue,
         versions: &StepVersions,
     ) -> Result<PutOutcome> {
         let c = client(&self.pool).await?;
@@ -402,7 +412,8 @@ impl RecordStore for PgStore {
                  RETURNING (xmax = 0) AS inserted",
                 &[
                     &blake3.as_bytes().as_slice(),
-                    body,
+                    // The text as it is: jsonb parses it on the server.
+                    &Json(body),
                     &versions_to_json(versions),
                 ],
             )
@@ -425,7 +436,7 @@ impl RecordStore for PgStore {
         .map(|r| {
             Ok(Record {
                 blake3: *blake3,
-                body: r.try_get(0).map_err(pg)?,
+                body: record_text(&r.try_get(0).map_err(pg)?)?,
                 versions: versions_from_json(&r.try_get::<_, Value>(1).map_err(pg)?)?,
                 updated_at: r.try_get(2).map_err(pg)?,
             })
@@ -498,7 +509,7 @@ impl RecordStore for PgStore {
             .map(|r| {
                 Ok(Record {
                     blake3: Blake3::from_slice(r.try_get::<_, &[u8]>(0).map_err(pg)?)?,
-                    body: r.try_get(1).map_err(pg)?,
+                    body: record_text(&r.try_get(1).map_err(pg)?)?,
                     versions: versions_from_json(&r.try_get::<_, Value>(2).map_err(pg)?)?,
                     updated_at: r.try_get(3).map_err(pg)?,
                 })

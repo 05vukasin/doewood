@@ -212,7 +212,12 @@ async fn s3_put_to_postgres_record() {
     let records = wait_for(2).await;
     let mut formats: Vec<String> = records
         .iter()
-        .map(|r| r.body["format"].as_str().unwrap().to_owned())
+        .map(|r| {
+            r.body_value().unwrap()["format"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
         .collect();
     formats.sort();
     assert_eq!(formats, ["pdf", "xlsx"]);

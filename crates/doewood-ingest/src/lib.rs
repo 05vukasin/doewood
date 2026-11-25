@@ -3,6 +3,7 @@
 //! - [`route`]: quail for documents, hedgehog for spreadsheets, from the bytes.
 //! - [`analyze`]: one quail engine per instance (OCR behind the `ocr` feature), hedgehog
 //!   under `catch_unwind`, the record and its step versions.
+//! - [`cpus`]: the instance's CPU slots, lent to a spreadsheet's normalizer when idle.
 //! - [`facts`]: what the graph and search need, read from the record.
 //! - [`company`]: the deterministic company identity rules of ADR 0002 section 1, from
 //!   `doewood-enrich`.
@@ -14,6 +15,7 @@
 
 pub mod analyze;
 pub mod company;
+pub mod cpus;
 pub mod enrichment;
 pub mod facts;
 pub mod graph;

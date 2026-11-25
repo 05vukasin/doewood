@@ -33,6 +33,7 @@
 //!   only when that list is full does a worker wait for the budget itself.
 //! - **Shutdown** lets every worker finish the file in hand; pending objects stay pending.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -44,7 +45,7 @@ use doewood_core::SourceId;
 use doewood_model::{Backend, Blake3, ObjectLocation};
 use doewood_s3::{ClientOptions, EventKind, ObjectEvent, S3Client, S3Config, S3Error};
 use doewood_store::{IngestOutcome, Source, SourceState, Store, StoreError};
-use serde_json::Value as Json;
+use serde_json::value::RawValue;
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -127,6 +128,7 @@ impl IngestConfig {
             analyzer: AnalyzerConfig {
                 sheet_max_cells: plan_cells(jobs, memory),
                 workers: jobs,
+                cpus: crate::cpus::available().min(jobs),
                 ocr_models: ocr_models.to_owned(),
                 ..AnalyzerConfig::default()
             },
@@ -137,8 +139,7 @@ impl IngestConfig {
 /// Workers for this machine: one per CPU, at most what half the available memory holds at
 /// [`WORKER_BYTES`] each, between 1 and [`MAX_AUTO_JOBS`].
 pub fn default_jobs() -> usize {
-    let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    plan_jobs(cpus, available_memory())
+    plan_jobs(crate::cpus::available(), available_memory())
 }
 
 /// [`default_jobs`] for `cpus` and `memory` bytes available (`None`: unknown).
@@ -684,6 +685,7 @@ impl Ingest {
             queue = c.queue,
             memory_budget_mib = c.memory_budget >> 20,
             sheet_max_cells = c.analyzer.sheet_max_cells,
+            cpu_slots = self.inner.analyzer.cpus().total(),
             ocr = ?self.inner.analyzer.ocr(),
             "ingest started"
         );
@@ -1378,16 +1380,17 @@ pub(crate) async fn hash(bytes: Vec<u8>) -> Result<(Vec<u8>, Blake3), IngestErro
     .map_err(|e| IngestError::permanent(format!("hashing panicked: {e}")))
 }
 
-fn stored_outcome(body: &Json) -> Outcome {
-    if body["status"]["state"] == "failed" {
+fn stored_outcome(body: &RawValue) -> Outcome {
+    use crate::facts::{member, text};
+    // Only `format` and `status` are read, the rest skipped (issue #98).
+    let status = member(body, "status");
+    if text(status.and_then(|s| member(s, "state"))).as_deref() == Some("failed") {
         return Outcome::Failed(
-            body["status"]["error"]
-                .as_str()
-                .unwrap_or("analysis failed")
-                .to_owned(),
+            text(status.and_then(|s| member(s, "error")))
+                .map_or_else(|| "analysis failed".to_owned(), Cow::into_owned),
         );
     }
-    match body["format"].as_str() {
+    match text(member(body, "format")).as_deref() {
         Some("unknown" | "zip" | "image") | None => Outcome::Unsupported,
         Some(_) => Outcome::Analyzed,
     }
@@ -1817,23 +1820,42 @@ mod tests {
 
     #[test]
     fn stored_records_keep_their_outcome() {
+        let raw = |v: &serde_json::Value| doewood_model::canonical::to_canonical(v).unwrap();
         assert_eq!(
-            stored_outcome(&json!({"format": "pdf", "status": {"state": "ok"}})),
+            stored_outcome(&raw(&json!({"format": "pdf", "status": {"state": "ok"}}))),
             Outcome::Analyzed
         );
         assert_eq!(
-            stored_outcome(&json!({"format": "xlsx", "status": {"state": "partial"}})),
+            stored_outcome(&raw(
+                &json!({"format": "xlsx", "status": {"state": "partial"}})
+            )),
             Outcome::Analyzed
         );
         assert_eq!(
-            stored_outcome(&json!({"format": "unknown", "status": {"state": "ok"}})),
+            stored_outcome(&raw(
+                &json!({"format": "unknown", "status": {"state": "ok"}})
+            )),
             Outcome::Unsupported
         );
         assert_eq!(
-            stored_outcome(
+            stored_outcome(&raw(
                 &json!({"format": "pdf", "status": {"state": "failed", "error": "bad"}})
-            ),
+            )),
             Outcome::Failed("bad".into())
+        );
+        // Not a record, or members of the wrong type: as `Value` indexing read them.
+        assert_eq!(stored_outcome(&raw(&json!(42))), Outcome::Unsupported);
+        assert_eq!(
+            stored_outcome(&raw(&json!(["failed", "pdf"]))),
+            Outcome::Unsupported
+        );
+        assert_eq!(
+            stored_outcome(&raw(&json!({"format": 7, "status": "failed"}))),
+            Outcome::Unsupported
+        );
+        assert_eq!(
+            stored_outcome(&raw(&json!({"status": {"state": "failed", "error": 1}}))),
+            Outcome::Failed("analysis failed".into())
         );
     }
 }
