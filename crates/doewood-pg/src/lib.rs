@@ -9,6 +9,9 @@
 //!   verified when TLS is used.
 //! - **A pool** (`deadpool-postgres`) with bounded waits, so a dead database fails calls quickly
 //!   instead of hanging them.
+//! - **Prepared statements** are cached per pooled connection (`deadpool-postgres`' statement
+//!   cache), so a statement is one round trip instead of two. The pool recycles with
+//!   `RecyclingMethod::Fast`, which keeps them.
 //! - **Migrations** are embedded and applied on connect, together with the pgvector setup, in
 //!   one transaction under an advisory lock ([`MIGRATION_LOCK`]), so instances starting
 //!   together migrate once: the others wait (at most 5 minutes) and find the schema migrated.
@@ -17,6 +20,7 @@
 //!   `search_index.embedding` is added; otherwise this is logged and skipped, never fatal.
 
 mod backend;
+mod cached;
 mod enrichment;
 mod feeds;
 mod merges;
@@ -82,6 +86,9 @@ impl PgStore {
             config,
             tls::connector()?,
             ManagerConfig {
+                // Runs nothing on recycle, so the cached prepared statements stay valid; a
+                // custom recycle with `DISCARD ALL` would drop them on the server while the
+                // pool still holds them.
                 recycling_method: RecyclingMethod::Fast,
             },
         );

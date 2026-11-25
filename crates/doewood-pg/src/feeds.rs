@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::PgStore;
 use crate::backend::{client, pg};
+use crate::cached::Cached;
 
 #[async_trait]
 impl FeedStore for PgStore {
@@ -20,7 +21,7 @@ impl FeedStore for PgStore {
         validate_feed(feed)?;
         let c = client(&self.pool).await?;
         let won = c
-            .query_opt(
+            .opt(
                 "INSERT INTO registry_feeds (feed, owner, lease_expires_at) \
                  VALUES ($1, $2, now() + make_interval(secs => $3)) \
                  ON CONFLICT (feed) DO UPDATE SET owner = EXCLUDED.owner, \
@@ -30,8 +31,7 @@ impl FeedStore for PgStore {
                  RETURNING owner",
                 &[&feed, &owner.as_str(), &ttl.as_secs_f64()],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         Ok(won.is_some())
     }
 
@@ -39,28 +39,26 @@ impl FeedStore for PgStore {
         validate_feed(feed)?;
         let c = client(&self.pool).await?;
         let n = c
-            .execute(
+            .exec(
                 "UPDATE registry_feeds SET owner = NULL, lease_expires_at = NULL \
                  WHERE feed = $1 AND owner = $2",
                 &[&feed, &owner.as_str()],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         Ok(n > 0)
     }
 
     async fn feed_state(&self, feed: &str) -> Result<Option<FeedState>> {
         validate_feed(feed)?;
         let c = client(&self.pool).await?;
-        c.query_opt(
+        c.opt(
             "SELECT cursor, extract(epoch FROM next_run_at)::bigint, \
              coalesce(extract(epoch FROM updated_at)::bigint, 0), \
              CASE WHEN lease_expires_at > now() THEN owner END \
              FROM registry_feeds WHERE feed = $1",
             &[&feed],
         )
-        .await
-        .map_err(pg)?
+        .await?
         .map(|r| {
             Ok(FeedState {
                 feed: feed.to_owned(),
@@ -84,15 +82,14 @@ impl FeedStore for PgStore {
         validate_cursor(cursor)?;
         let c = client(&self.pool).await?;
         let n = c
-            .execute(
+            .exec(
                 "UPDATE registry_feeds SET cursor = $3, \
                  next_run_at = to_timestamp(greatest(0, least($4::bigint, 253402300799))), \
                  updated_at = now() \
                  WHERE feed = $1 AND owner = $2 AND lease_expires_at > now()",
                 &[&feed, &owner.as_str(), &cursor, &next_run_at],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         Ok(n > 0)
     }
 
@@ -103,14 +100,13 @@ impl FeedStore for PgStore {
         }
         let c = client(&self.pool).await?;
         let rows = c
-            .query(
+            .rows(
                 "SELECT alias, node_id FROM node_aliases \
                  WHERE kind = 'company' AND node_id IS NOT NULL AND alias = ANY($1) \
                  ORDER BY alias COLLATE \"C\"",
                 &[&aliases],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         rows.iter()
             .map(|r| Ok((r.try_get(0).map_err(pg)?, r.try_get(1).map_err(pg)?)))
             .collect()
@@ -126,7 +122,7 @@ impl FeedStore for PgStore {
         let limit = i64::from(due_limit(limit).min(u32::try_from(FEED_BATCH_MAX).unwrap_or(1000)));
         let c = client(&self.pool).await?;
         let rows = c
-            .query(
+            .rows_uncached(
                 "SELECT alias, node_id FROM node_aliases \
                  WHERE kind = 'company' AND node_id IS NOT NULL \
                  AND alias COLLATE \"C\" >= $1::text COLLATE \"C\" AND starts_with(alias, $1) \
@@ -134,8 +130,7 @@ impl FeedStore for PgStore {
                  ORDER BY alias COLLATE \"C\" LIMIT $3",
                 &[&prefix, &after, &limit],
             )
-            .await
-            .map_err(pg)?;
+            .await?;
         rows.iter()
             .map(|r| Ok((r.try_get(0).map_err(pg)?, r.try_get(1).map_err(pg)?)))
             .collect()
