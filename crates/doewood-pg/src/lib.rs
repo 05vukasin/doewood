@@ -39,12 +39,29 @@ use tracing::info;
 
 pub use migrate::{MIGRATION_LOCK, SCHEMA_VERSION};
 
-/// Connections in the pool.
-const POOL_SIZE: usize = 16;
+/// Fewest connections in the pool when none are asked for.
+pub const MIN_POOL_SIZE: usize = 16;
+/// Most connections in the pool when none are asked for.
+pub const MAX_POOL_SIZE: usize = 64;
+/// Pooled connections per CPU when none are asked for.
+const POOL_PER_CPU: usize = 4;
 /// Connect timeout when the URL sets none.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a call waits for a free connection, or for a new one to open.
 const POOL_WAIT: Duration = Duration::from_secs(10);
+
+/// The pool size for this machine: [`plan_pool_size`] for its CPUs (as the process sees them,
+/// cgroup quota included).
+pub fn default_pool_size() -> usize {
+    plan_pool_size(std::thread::available_parallelism().map_or(1, std::num::NonZero::get))
+}
+
+/// Pooled connections for `cpus` CPUs: four per CPU, between [`MIN_POOL_SIZE`] and
+/// [`MAX_POOL_SIZE`].
+pub fn plan_pool_size(cpus: usize) -> usize {
+    cpus.saturating_mul(POOL_PER_CPU)
+        .clamp(MIN_POOL_SIZE, MAX_POOL_SIZE)
+}
 
 /// The Postgres backend. Cheap to clone: clones share the pool.
 #[derive(Clone)]
@@ -67,15 +84,26 @@ impl PgStore {
     /// Fails with [`Error::Unavailable`] when the database cannot be reached, so the caller
     /// can retry; error messages never contain the password.
     pub async fn connect(url: &PostgresUrl) -> Result<Self> {
+        Self::connect_with_pool(url, default_pool_size()).await
+    }
+
+    /// [`PgStore::connect`] with a pool of `size` connections (at least 1) instead of
+    /// [`default_pool_size`]. For measurements; `serve` uses the default.
+    pub async fn connect_with_pool(url: &PostgresUrl, size: usize) -> Result<Self> {
         let config: tokio_postgres::Config = url.expose().parse().map_err(|e| {
             Error::Invalid(format!(
                 "DOEWOOD_POSTGRES_URL is not a valid Postgres URL: {e}"
             ))
         })?;
-        Self::connect_config(config).await
+        Self::connect_sized(config, size).await
     }
 
-    pub(crate) async fn connect_config(mut config: tokio_postgres::Config) -> Result<Self> {
+    #[cfg(test)]
+    pub(crate) async fn connect_config(config: tokio_postgres::Config) -> Result<Self> {
+        Self::connect_sized(config, default_pool_size()).await
+    }
+
+    async fn connect_sized(mut config: tokio_postgres::Config, size: usize) -> Result<Self> {
         if config.get_connect_timeout().is_none() {
             config.connect_timeout(CONNECT_TIMEOUT);
         }
@@ -93,7 +121,7 @@ impl PgStore {
             },
         );
         let pool = Pool::builder(manager)
-            .max_size(POOL_SIZE)
+            .max_size(size.max(1))
             .runtime(Runtime::Tokio1)
             .wait_timeout(Some(POOL_WAIT))
             .create_timeout(Some(POOL_WAIT))
@@ -105,9 +133,15 @@ impl PgStore {
         info!(
             schema = version,
             pgvector = vector,
+            pool = size.max(1),
             "shared Postgres store ready"
         );
         Ok(Self { pool, vector })
+    }
+
+    /// The pool's size: the most connections this instance opens to the database.
+    pub fn pool_size(&self) -> usize {
+        self.pool.status().max_size
     }
 
     /// Whether pgvector is installed and `search_index.embedding` exists.
