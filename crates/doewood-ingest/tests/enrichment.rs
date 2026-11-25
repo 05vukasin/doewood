@@ -516,7 +516,8 @@ async fn company(
             .collect();
         b.put_record(
             &hash,
-            &json!({"format": "pdf", "facts": facts}),
+            &doewood_model::canonical::to_canonical(&json!({"format": "pdf", "facts": facts}))
+                .unwrap(),
             &StepVersions::new(),
         )
         .await

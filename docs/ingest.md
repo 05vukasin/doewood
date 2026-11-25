@@ -155,6 +155,14 @@ The record is the quail record JSON, keyed by BLAKE3, with step versions: one pe
 | `quail.plan` | `<profile>:<digest of every planned step and its version>` |
 | `hedgehog` | the hedgehog revision (spreadsheets) |
 
+The record is written as JSON text straight from quail's record (`doewood_model::canonical`),
+with no `serde_json::Value` tree in between: compact, object keys sorted, byte for byte the text
+the tree wrote before issue #98. Both stores take and return that text (`Record::body` is a
+`RawValue`; SQLite keeps it as it is, Postgres as jsonb and gives it back in the same form), and
+readers deserialize only what they use: `DocFacts` reads the facts it needs into quail values
+and skips the rest as text, the outcome of a stored record reads `format` and `status` only.
+Numbers are in [Sizing, Records](deploy.md#records).
+
 ## The graph
 
 - **Document** (BLAKE3) and **Location** through `upsert_location`.
@@ -312,6 +320,10 @@ are there for enrichment, and no document merges on a fuzzy match yet.
   the watchdog: a second big file waits for the budget until that analysis ends, small files
   flow meanwhile, and a file bigger than the budget takes all of it. `tests/sheet.rs`:
   hedgehog's read past the deadline, or over the cell cap, fails the workbook.
+- `tests/record_text.rs`: generated files of every kind (PDF, DOCX, XLSX, text, CSV, image,
+  ZIP, unknown, empty, broken PDF and XLSX): the record text is the `Value` tree's text byte for
+  byte, `DocFacts` reads the same as reading every fact, and SQLite (and Postgres with
+  `DOEWOOD_TEST_POSTGRES_URL`) store it and give that text back, a second write unchanged.
 - `tests/minio_postgres.rs`: an S3 put in MinIO to a record in Postgres, with both
   `DOEWOOD_TEST_S3_ENDPOINT` and `DOEWOOD_TEST_POSTGRES_URL` set (CI's `ingest-e2e` job).
 

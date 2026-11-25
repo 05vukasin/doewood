@@ -418,7 +418,8 @@ impl Harness {
             .await
             .unwrap()
             .expect("record stored")
-            .body
+            .body_value()
+            .unwrap()
     }
 
     async fn stop(mut self) {

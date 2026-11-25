@@ -40,7 +40,8 @@ fn probe() {
         let r = a.analyze(bytes, name);
         let d = DocFacts::from_record(&r.body);
         println!("== {name}: route {:?} outcome {:?}", r.route, r.outcome);
-        println!("   status {}", r.body["status"]);
+        let body: serde_json::Value = serde_json::from_str(r.body.get()).unwrap();
+        println!("   status {}", body["status"]);
         println!("   versions {:?}", r.versions);
         println!(
             "   title {:?} kind {:?} date {:?} amount {:?}",
@@ -54,7 +55,7 @@ fn probe() {
             );
         }
         println!("   minhash {}", d.minhash.as_ref().map_or(0, |m| m.1.len()));
-        let keys: Vec<&str> = r.body["facts"]
+        let keys: Vec<&str> = body["facts"]
             .as_array()
             .unwrap()
             .iter()

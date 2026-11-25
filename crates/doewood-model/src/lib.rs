@@ -9,6 +9,7 @@
 //!
 //! The `conformance` feature exports the test suite every backend must pass.
 
+pub mod canonical;
 #[cfg(feature = "conformance")]
 pub mod conformance;
 mod enrichment;

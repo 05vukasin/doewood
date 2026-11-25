@@ -408,9 +408,13 @@ async fn company(b: &Arc<dyn Backend>, name: &str, country: &str, aliases: &[Str
         bytes[..4].copy_from_slice(&n.to_be_bytes());
         bytes[31] = 0xfe;
         let hash = Blake3(bytes);
-        b.put_record(&hash, &json!({"format": "pdf"}), &StepVersions::new())
-            .await
-            .unwrap();
+        b.put_record(
+            &hash,
+            &doewood_model::canonical::to_canonical(&json!({"format": "pdf"})).unwrap(),
+            &StepVersions::new(),
+        )
+        .await
+        .unwrap();
         let doc = b
             .upsert_node(NodeKind::Document, &hash.to_hex(), &json!({}))
             .await

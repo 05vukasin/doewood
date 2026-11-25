@@ -325,11 +325,27 @@ run was not made) and what Postgres stores in `records.record` (`pg_column_size`
 - **`hash.cdc`** (one entry per 8 KiB chunk, never read by doewood) is small on small files but
   76 % of the 22 MiB DOCX's record (110 KB, 26 KB without it; 2291 entries) and 71 % of the
   190k-row XLSX's.
-- **In memory** a record is a `serde_json::Value` tree on its way to the store and back. That
-  tree is about 16 times the JSON text (counted with a counting allocator): 450 KB for a 28 KB
-  record, 6.8 MB for the 150-page PDF, 1.9 MB for the big DOCX (0.3 MB without `hash.cdc`).
-  serde_json's maps are B-trees, and every small object (each fact, its `src`, its value)
-  allocates a whole node. Per file in flight this is small next to the file and OCR.
+- **In memory** a record was a `serde_json::Value` tree on its way to the store and back,
+  about 16 times the JSON text: serde_json's maps are B-trees, and every small object (each
+  fact, its `src`, its value) allocated a whole node. Since #98 the record is written as text
+  straight from quail's record (the same bytes: compact, keys sorted) and read without a tree;
+  `DocFacts` reads only the facts it uses. Per record, counted with a counting allocator on
+  generated files (`2927bfa`, one run each; times are medians of 15 to 101 runs, workspace
+  built at `opt-level=3`):
+
+  | record (JSON text) | write: peak / held, before | after | read: peak / held, before | after | write / read time, before → after |
+  |---|---|---|---|---|---|
+  | small DOCX (20 KB) | 337 / 337 KB | 65 / 20 KB | 325 / 306 KB | 36 / 21 KB | 227 → 107 µs / 182 → 70 µs |
+  | 150-page PDF (273 KB) | 4.9 / 4.9 MB | 0.61 / 0.27 MB | 4.5 / 4.4 MB | 0.43 / 0.28 MB | 3.7 → 1.6 ms / 3.0 → 1.1 ms |
+  | 22 MiB DOCX (102 KB) | 1.8 / 1.8 MB | 0.30 / 0.10 MB | 1.9 / 1.8 MB | 0.12 / 0.10 MB | 1.0 → 0.41 ms / 0.94 → 0.25 ms |
+  | 190k-row XLSX (227 KB) | 4.1 / 4.1 MB | 0.71 / 0.23 MB | 4.2 / 4.0 MB | 0.28 / 0.24 MB | 2.3 → 0.87 ms / 2.0 → 0.49 ms |
+
+  *Write* is building the stored text (before: the tree, then its text); *held* is what stays
+  while the graph and search are written (before: the tree). *Read* is a SQLite record read and
+  `DocFacts` (before: the tree, and every fact read into a quail value). The write peak is a
+  scratch buffer per nesting level for objects whose keys do not come sorted. Postgres still
+  reads jsonb into a `Value` and writes the canonical text from it (the tree is dropped before
+  the record is returned).
 - **TOAST:** jsonb is 1.28 times the JSON text before compression; `pglz` (the default) stores
   37 % of the text (2.08 MB for these 204 records, 12.7 KB a record with the index). `lz4`
   stored 9 % more (2.27 MB) but wrote the records 45 % faster (98 against 179 ms) and read them
