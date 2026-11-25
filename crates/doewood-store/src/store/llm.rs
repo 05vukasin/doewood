@@ -123,14 +123,17 @@ impl Store {
         kind: Option<&str>,
     ) -> Result<(), StoreError> {
         let now = now();
-        self.conn().execute(
-            "INSERT INTO llm_jobs (source_id, blake3, kind, status, attempts, queued_at, \
+        self.conn()
+            .prepare_cached(
+                "INSERT INTO llm_jobs (source_id, blake3, kind, status, attempts, queued_at, \
              updated_at) VALUES (?1, ?2, ?3, 'pending', 0, ?4, ?4) \
              ON CONFLICT (source_id, blake3) DO UPDATE SET kind = excluded.kind, \
              status = 'pending', attempts = 0, last_error = NULL, queued_at = excluded.queued_at, \
              updated_at = excluded.updated_at WHERE llm_jobs.status != 'pending'",
-            params![source.to_string(), &blake3[..], kind, now],
-        )?;
+            )
+            .and_then(|mut cached| {
+                cached.execute(params![source.to_string(), &blake3[..], kind, now])
+            })?;
         Ok(())
     }
 
@@ -176,19 +179,20 @@ impl Store {
         use rusqlite::OptionalExtension as _;
         let row = self
             .conn()
-            .query_row(
+            .prepare_cached(
                 "SELECT kind, status, attempts, last_error FROM llm_jobs \
                  WHERE source_id = ?1 AND blake3 = ?2",
-                params![source.to_string(), &blake3[..]],
-                |r| {
+            )
+            .and_then(|mut cached| {
+                cached.query_row(params![source.to_string(), &blake3[..]], |r| {
                     Ok((
                         r.get::<_, Option<String>>(0)?,
                         r.get::<_, String>(1)?,
                         r.get::<_, i64>(2)?,
                         r.get::<_, Option<String>>(3)?,
                     ))
-                },
-            )
+                })
+            })
             .optional()?;
         row.map(|(kind, status, attempts, last_error)| {
             Ok(LlmJob {
@@ -213,18 +217,22 @@ impl Store {
         error: Option<&str>,
         called: bool,
     ) -> Result<bool, StoreError> {
-        let n = self.conn().execute(
-            "UPDATE llm_jobs SET status = ?3, last_error = ?4, attempts = attempts + ?5, \
+        let n = self
+            .conn()
+            .prepare_cached(
+                "UPDATE llm_jobs SET status = ?3, last_error = ?4, attempts = attempts + ?5, \
              updated_at = ?6 WHERE source_id = ?1 AND blake3 = ?2 AND status = 'pending'",
-            params![
-                source.to_string(),
-                &blake3[..],
-                status.as_str(),
-                error.map(|e| truncate(e, MAX_ERROR_LEN)),
-                i64::from(called),
-                now()
-            ],
-        )?;
+            )
+            .and_then(|mut cached| {
+                cached.execute(params![
+                    source.to_string(),
+                    &blake3[..],
+                    status.as_str(),
+                    error.map(|e| truncate(e, MAX_ERROR_LEN)),
+                    i64::from(called),
+                    now()
+                ])
+            })?;
         Ok(n > 0)
     }
 
@@ -234,9 +242,8 @@ impl Store {
         let conn = self.conn();
         let mut counts = LlmCounts::default();
         {
-            let mut stmt = conn.prepare_cached(
-                "SELECT status, count(*) FROM llm_jobs WHERE source_id = ?1 GROUP BY status",
-            )?;
+            let mut stmt =
+                conn.prepare_cached("SELECT status, n FROM llm_job_counts WHERE source_id = ?1")?;
             let rows = stmt.query_map([source.to_string()], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
             })?;
@@ -252,12 +259,11 @@ impl Store {
             }
         }
         counts.last_error = conn
-            .query_row(
+            .prepare_cached(
                 "SELECT last_error FROM llm_jobs WHERE source_id = ?1 AND status = 'failed' \
                  AND last_error IS NOT NULL ORDER BY updated_at DESC LIMIT 1",
-                [source.to_string()],
-                |r| r.get(0),
-            )
+            )?
+            .query_row([source.to_string()], |r| r.get(0))
             .optional()?;
         Ok(counts)
     }
@@ -267,11 +273,12 @@ impl Store {
         use rusqlite::OptionalExtension as _;
         let row: Option<(i64, i64)> = self
             .conn()
-            .query_row(
-                "SELECT tokens, calls FROM llm_usage WHERE source_id = ?1 AND day = ?2",
-                params![source.to_string(), day],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            .prepare_cached("SELECT tokens, calls FROM llm_usage WHERE source_id = ?1 AND day = ?2")
+            .and_then(|mut cached| {
+                cached.query_row(params![source.to_string(), day], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+            })
             .optional()?;
         Ok(row.map_or_else(LlmUsage::default, |(t, c)| LlmUsage {
             tokens: u64::try_from(t).unwrap_or(0),
@@ -289,22 +296,22 @@ impl Store {
     ) -> Result<LlmUsage, StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO llm_usage (source_id, day, tokens, calls) VALUES (?1, ?2, ?3, 1) \
              ON CONFLICT (source_id, day) DO UPDATE SET \
              tokens = min(llm_usage.tokens + excluded.tokens, 9223372036854775807), \
              calls = llm_usage.calls + 1",
-            params![source.to_string(), day, to_i64(tokens)],
-        )?;
-        tx.execute(
-            "DELETE FROM llm_usage WHERE source_id = ?1 AND day < ?2 - 1",
-            params![source.to_string(), day],
-        )?;
-        let (t, c): (i64, i64) = tx.query_row(
-            "SELECT tokens, calls FROM llm_usage WHERE source_id = ?1 AND day = ?2",
-            params![source.to_string(), day],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
+        )
+        .and_then(|mut cached| cached.execute(params![source.to_string(), day, to_i64(tokens)]))?;
+        tx.prepare_cached("DELETE FROM llm_usage WHERE source_id = ?1 AND day < ?2 - 1")
+            .and_then(|mut cached| cached.execute(params![source.to_string(), day]))?;
+        let (t, c): (i64, i64) = tx
+            .prepare_cached("SELECT tokens, calls FROM llm_usage WHERE source_id = ?1 AND day = ?2")
+            .and_then(|mut cached| {
+                cached.query_row(params![source.to_string(), day], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+            })?;
         tx.commit()?;
         Ok(LlmUsage {
             tokens: u64::try_from(t).unwrap_or(0),

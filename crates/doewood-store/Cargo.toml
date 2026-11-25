@@ -23,6 +23,8 @@ uuid.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+# Tracing (no extra crate): a test checks that hot statements are prepared once.
+rusqlite = { version = "0.41", features = ["bundled", "trace"] }
 doewood-model = { workspace = true, features = ["conformance"] }
 tempfile = "3.20"
 tokio = { workspace = true, features = ["macros", "rt"] }
