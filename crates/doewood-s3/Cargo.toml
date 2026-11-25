@@ -8,14 +8,18 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["webhook"]
+default = ["webhook", "sqs"]
 # Parsing MinIO / S3 event notification JSON (the API step mounts the handler).
 webhook = ["dep:serde", "dep:serde_json"]
+# The SQS inlet: long-polls a queue of S3 event notifications (AWS JSON protocol, SigV4).
+sqs = ["webhook", "dep:hmac", "dep:sha2"]
 
 [dependencies]
 bytes = "1"
 doewood-core.workspace = true
 doewood-store.workspace = true
+# SigV4 for SQS (rusty-s3 signs only for `s3`); both already come with rusty-s3.
+hmac = { version = "0.13", optional = true }
 jiff = { version = "1", default-features = false, features = ["std"] }
 percent-encoding = "2.3"
 # HTTP/1.1 only, rustls with the `ring` provider (no C toolchain for aws-lc), no proxy
@@ -26,13 +30,20 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rusty-s3 = { version = "0.12", default-features = false, features = ["rustcrypto", "xml"] }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
+sha2 = { version = "0.11", default-features = false, optional = true }
 thiserror.workspace = true
 tokio = { version = "1.47", features = ["rt", "sync", "time", "macros"] }
 tracing = "0.1"
 url = "2.5"
 
 [dev-dependencies]
-tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# Captures logs in tests (that no credential is logged).
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt"] }
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+
+[[test]]
+name = "sqs"
+required-features = ["sqs"]
 
 [lints]
 workspace = true

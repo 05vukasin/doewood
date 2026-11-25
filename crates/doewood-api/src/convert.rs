@@ -5,7 +5,8 @@ use doewood_core::InstanceId;
 use doewood_model::{
     Direction, EdgeKind, EdgeSource, EdgeState, Node, NodeKind, Record, SearchHit, StoredEdge,
 };
-use doewood_store::{AiProvider, LlmMode, LlmPolicy, Source, SourceState, UrlStyle};
+use doewood_s3::inlet::InletStatsSnapshot;
+use doewood_store::{AiProvider, LlmMode, LlmPolicy, Source, SourceState, SqsInlet, UrlStyle};
 
 use crate::pb;
 use crate::validate::format_date;
@@ -41,7 +42,42 @@ pub(crate) fn llm_policy(p: &LlmPolicy) -> pb::LlmPolicy {
     }
 }
 
-pub(crate) fn source(s: &Source, owner: &InstanceId, scanner_running: bool) -> pb::Source {
+/// What discovery says about a source's tasks.
+#[derive(Debug, Default)]
+pub(crate) struct Running {
+    pub scanner: bool,
+    pub inlet: bool,
+    pub inlet_stats: Option<InletStatsSnapshot>,
+}
+
+/// A source's SQS inlet: its settings, whether credentials of its own are set (never the
+/// credentials), and what it did since it started.
+pub(crate) fn sqs_inlet(
+    i: &SqsInlet,
+    running: bool,
+    stats: Option<InletStatsSnapshot>,
+) -> pb::SqsInlet {
+    let stats = stats.unwrap_or_default();
+    let (last_error_at, last_error) = stats.last_error.unwrap_or_default();
+    pb::SqsInlet {
+        queue_url: i.queue_url.clone(),
+        region: i.region().to_owned(),
+        enabled: i.enabled,
+        credentials_set: i.credentials_set,
+        running,
+        messages_received: stats.received,
+        messages_deleted: stats.deleted,
+        events_emitted: stats.emitted,
+        records_ignored: stats.ignored,
+        test_events: stats.test_events,
+        malformed_messages: stats.malformed,
+        errors: stats.errors,
+        last_error,
+        last_error_at,
+    }
+}
+
+pub(crate) fn source(s: &Source, owner: &InstanceId, running: Running) -> pb::Source {
     pb::Source {
         id: s.id.to_string(),
         endpoint: s.endpoint.clone(),
@@ -56,9 +92,13 @@ pub(crate) fn source(s: &Source, owner: &InstanceId, scanner_running: bool) -> p
         state: source_state(s.state) as i32,
         state_reason: s.state_reason.clone().unwrap_or_default(),
         owner_instance: owner.to_string(),
-        scanner_running,
+        scanner_running: running.scanner,
         created_at: s.created_at,
         updated_at: s.updated_at,
+        sqs_inlet: s
+            .sqs
+            .as_ref()
+            .map(|i| sqs_inlet(i, running.inlet, running.inlet_stats)),
     }
 }
 

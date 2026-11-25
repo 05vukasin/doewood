@@ -172,48 +172,70 @@ impl WebhookInlet {
         body: &[u8],
     ) -> Result<WebhookOutcome, WebhookError> {
         let notifications = parse_notifications(body)?;
-        let store = Arc::clone(&self.store);
-        let src = blocking(move || store.source(source))
-            .await?
-            .ok_or(WebhookError::UnknownSource(source))?;
-        let mut outcome = WebhookOutcome::default();
-        if !src.state.is_scanned() {
-            outcome.ignored = notifications.len();
-            return Ok(outcome);
-        }
-        for n in notifications {
-            if n.bucket != src.bucket || !n.key.starts_with(&src.prefix) {
-                outcome.ignored += 1;
-                continue;
-            }
-            let store = Arc::clone(&self.store);
-            let key = n.key.clone();
-            let seen = blocking(move || store.seen_object(source, &key)).await?;
-            let kind = match n.kind {
-                NotificationKind::Created(version) => classify(seen.as_ref(), version),
-                NotificationKind::Removed => seen.is_some().then_some(EventKind::Deleted),
-            };
-            let Some(kind) = kind else {
-                outcome.ignored += 1;
-                continue;
-            };
-            let diff = Diff { key: n.key, kind };
-            let change: ObjectChange = diff.change();
-            self.events
-                .send(ObjectEvent {
-                    source,
-                    key: diff.key,
-                    kind: diff.kind,
-                    origin: EventOrigin::Webhook,
-                })
-                .await
-                .map_err(|_| S3Error::ChannelClosed)?;
-            let store = Arc::clone(&self.store);
-            blocking(move || store.record_objects(source, &[change], None)).await?;
-            outcome.emitted += 1;
-        }
-        Ok(outcome)
+        deliver(
+            &self.store,
+            &self.events,
+            source,
+            notifications,
+            EventOrigin::Webhook,
+        )
+        .await
     }
+}
+
+/// Hands parsed notifications for `source` off as events: compares each record with
+/// `objects_seen`, sends the event, then records it, like a scan does. Records of another
+/// bucket, outside the prefix, already seen, or of a source that is not scanned are ignored.
+/// A failure part-way leaves the rest undone; handing the same notifications off again is
+/// safe, since what was recorded is then seen.
+pub(crate) async fn deliver(
+    store: &Arc<Store>,
+    events: &mpsc::Sender<ObjectEvent>,
+    source: SourceId,
+    notifications: Vec<Notification>,
+    origin: EventOrigin,
+) -> Result<WebhookOutcome, WebhookError> {
+    let s = Arc::clone(store);
+    let src = blocking(move || s.source(source))
+        .await?
+        .ok_or(WebhookError::UnknownSource(source))?;
+    let mut outcome = WebhookOutcome::default();
+    if !src.state.is_scanned() {
+        outcome.ignored = notifications.len();
+        return Ok(outcome);
+    }
+    for n in notifications {
+        if n.bucket != src.bucket || !n.key.starts_with(&src.prefix) {
+            outcome.ignored += 1;
+            continue;
+        }
+        let s = Arc::clone(store);
+        let key = n.key.clone();
+        let seen = blocking(move || s.seen_object(source, &key)).await?;
+        let kind = match n.kind {
+            NotificationKind::Created(version) => classify(seen.as_ref(), version),
+            NotificationKind::Removed => seen.is_some().then_some(EventKind::Deleted),
+        };
+        let Some(kind) = kind else {
+            outcome.ignored += 1;
+            continue;
+        };
+        let diff = Diff { key: n.key, kind };
+        let change: ObjectChange = diff.change();
+        events
+            .send(ObjectEvent {
+                source,
+                key: diff.key,
+                kind: diff.kind,
+                origin,
+            })
+            .await
+            .map_err(|_| S3Error::ChannelClosed)?;
+        let s = Arc::clone(store);
+        blocking(move || s.record_objects(source, &[change], None)).await?;
+        outcome.emitted += 1;
+    }
+    Ok(outcome)
 }
 
 async fn blocking<T: Send + 'static>(
