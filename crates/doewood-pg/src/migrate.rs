@@ -10,6 +10,7 @@ use crate::backend::pg;
 const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_init.sql"),
     include_str!("migrations/0002_ingest.sql"),
+    include_str!("migrations/0003_enrichment.sql"),
 ];
 
 /// The schema version this binary writes.

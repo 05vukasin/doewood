@@ -1,6 +1,8 @@
 //! `GET /icons/{domain}` for the API: `doewood-registry`'s favicon resolver with the production
-//! SSRF policy (public addresses and default ports only), the system resolver, and an
-//! in-memory cache (ADR 0002 section 5).
+//! SSRF policy (public addresses and default ports only), the system resolver, and the
+//! backend's `favicons` table as the cache (ADR 0002 section 5): the shared Postgres, so every
+//! instance fetches an icon once, or the instance's SQLite file standalone. While the shared
+//! store is not connected yet, icons are cached in memory.
 //!
 //! The runtime settings (`favicon.fallback`, off by default, and `favicon.egress_proxy`) are
 //! read from the store for every lookup, so a change applies without a restart. A new proxy
@@ -10,12 +12,14 @@
 use std::sync::{Arc, Mutex, PoisonError};
 
 use doewood_api::{BoxFuture, IconAnswer, Icons};
+use doewood_model::{Backend, CacheStore};
 use doewood_registry::favicon::{
     Fallback, FaviconOptions, FaviconResolver, GuardOptions, GuardedClient, PublicOnly,
-    ResolveError, SystemDns,
+    ResolveError, StoreIconCache, SystemDns,
 };
-use doewood_registry::{Cache, MemoryCache, SystemClock};
+use doewood_registry::{Cache, SystemClock};
 use doewood_store::{FaviconSettings, Store};
+use tokio::sync::watch;
 use tracing::warn;
 use url::Url;
 
@@ -28,11 +32,18 @@ pub struct FaviconIcons {
 }
 
 impl FaviconIcons {
-    /// Icons cached in memory, with the settings of `store`.
-    pub fn new(store: Arc<Store>) -> Self {
+    /// Icons cached in the backend `backend` holds (in memory while it holds none), with the
+    /// settings of `store`.
+    pub fn new(store: Arc<Store>, backend: watch::Receiver<Option<Arc<dyn Backend>>>) -> Self {
+        let source = move || {
+            backend
+                .borrow()
+                .as_ref()
+                .map(|b| Arc::clone(b) as Arc<dyn CacheStore>)
+        };
         Self {
             store,
-            cache: Arc::new(MemoryCache::default()),
+            cache: Arc::new(StoreIconCache::new(Arc::new(source))),
             current: Mutex::new(None),
         }
     }
@@ -109,7 +120,8 @@ mod tests {
 
     fn icons() -> FaviconIcons {
         let store = Store::open_in_memory(&MasterKey::from_bytes([7; 32])).unwrap();
-        FaviconIcons::new(Arc::new(store))
+        let (_tx, rx) = watch::channel(None);
+        FaviconIcons::new(Arc::new(store), rx)
     }
 
     #[tokio::test]

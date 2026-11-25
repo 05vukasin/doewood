@@ -44,7 +44,7 @@ use tracing::{debug, error, info, warn};
 const API_DRAIN: Duration = Duration::from_secs(10);
 
 use crate::ops::{self, OpsState};
-use crate::{icons, ingest, shared};
+use crate::{cleanup, icons, ingest, shared};
 
 /// Builds the runtime and runs the service until a shutdown signal.
 pub fn main(loaded: Loaded) -> ExitCode {
@@ -158,6 +158,9 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
         None
     };
 
+    // Expired registry answers and icons are purged from the backend every hour.
+    let purging = cleanup::start(backend_rx.clone(), shutdown_rx.clone());
+
     let progress = Arc::new(Progress::new());
     let ingest = ingest::build(&config, &store, backend_rx.clone(), &progress).await;
     let (ingest_tx, ingest_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
@@ -190,7 +193,10 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
         }),
         summarize: ingest
             .map(|(_, s)| Arc::new(ingest::OnDemandSummaries(s)) as Arc<dyn doewood_api::OnDemand>),
-        icons: Some(Arc::new(icons::FaviconIcons::new(Arc::clone(&store)))),
+        icons: Some(Arc::new(icons::FaviconIcons::new(
+            Arc::clone(&store),
+            backend_rx.clone(),
+        ))),
         options: ApiOptions {
             max_message_bytes: config.api_max_message_bytes,
             shared_claims: shared,
@@ -235,6 +241,9 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
         && let Err(e) = task.await
     {
         warn!(error = %e, "shared store supervisor failed");
+    }
+    if let Err(e) = purging.await {
+        warn!(error = %e, "cache purge task failed");
     }
     let backend = backend_rx.borrow().as_ref().map(|b| b.name());
     info!(backend, "servers stopped");

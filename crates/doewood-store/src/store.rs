@@ -294,8 +294,11 @@ mod tests {
         assert_eq!(
             store.tables().unwrap(),
             [
+                "company_enrichment",
                 "company_leases",
+                "company_registry_due",
                 "edges",
+                "favicons",
                 "jobs",
                 "llm_jobs",
                 "llm_usage",
@@ -304,6 +307,7 @@ mod tests {
                 "nodes",
                 "objects_seen",
                 "records",
+                "registry_cache",
                 "scan_checkpoints",
                 "search_fts",
                 "search_fts_config",

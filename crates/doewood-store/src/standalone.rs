@@ -25,6 +25,8 @@ use uuid::Uuid;
 use crate::Store;
 use crate::store::now;
 
+mod enrichment;
+
 /// The SQLite backend. Cheap to clone: every clone shares the one store.
 #[derive(Clone, Debug)]
 pub struct Standalone {

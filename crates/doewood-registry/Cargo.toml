@@ -14,6 +14,8 @@ rust-version.workspace = true
 async-trait.workspace = true
 # LEI, VAT and MB/PIB validation before any request; name normalization.
 doewood-enrich.workspace = true
+# The store traits only (no database): the registry and favicon caches in the store.
+doewood-model.workspace = true
 # The favicon content checks decode ICO, PNG, GIF, JPEG and WEBP to refuse blank icons; no
 # SVG, no AVIF decoder (ADR 0002 section 5.4). Already in the tree through quail.
 image = { version = "0.25", default-features = false, features = ["gif", "ico", "jpeg", "png", "webp"] }
@@ -32,6 +34,9 @@ tracing.workspace = true
 url = "2.5"
 
 [dev-dependencies]
+# The store-backed caches tested against the standalone SQLite backend.
+doewood-core.workspace = true
+doewood-store.workspace = true
 # The mock registry server of the tests listens on 127.0.0.1 only.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 

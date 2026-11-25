@@ -12,13 +12,17 @@
 //! 3. Every request, the fallback's included, goes through the SSRF guard ([`guard`]).
 //! 4. Every icon passes the content checks ([`content`]).
 //! 5. Answers are cached ([`Cache`]): a hit 30 days, a miss 6 hours. The time budgets are 6 s
-//!    for the site, 5 s for the fallback, 12 s in total.
+//!    for the site, 5 s for the fallback, 12 s in total. [`StoreIconCache`] keeps them in the
+//!    store's `favicons` table (the shared Postgres, so every instance fetches an icon once).
 
 pub mod addr;
+mod cache;
 pub mod content;
 pub mod domain;
 pub mod guard;
 pub mod html;
+
+pub use cache::{CACHE_PREFIX, StoreIconCache};
 
 use std::collections::HashMap;
 use std::fmt;
@@ -218,7 +222,7 @@ impl FaviconResolver {
         fallback: Option<&Fallback>,
     ) -> Result<Option<Icon>, ResolveError> {
         let domain = Domain::parse(domain)?;
-        let key = format!("favicon:{domain}");
+        let key = format!("{CACHE_PREFIX}{domain}");
         if let Some(cached) = self.cached(&key).await {
             return Ok(cached);
         }
@@ -250,18 +254,12 @@ impl FaviconResolver {
             .await
             .ok()
             .flatten();
-        let value = match &icon {
-            Some(i) => Cached::Found(i.bytes.clone()),
-            None => Cached::NotFound,
+        let (value, ttl) = match &icon {
+            Some(i) => (Cached::Found(i.bytes.clone()), self.options.hit_ttl),
+            None => (Cached::NotFound, self.options.miss_ttl),
         };
         self.cache
-            .put(
-                &key,
-                CacheEntry {
-                    value,
-                    fetched_at: self.clock.now_utc(),
-                },
-            )
+            .put(&key, CacheEntry::new(value, self.clock.now_utc(), ttl))
             .await;
         Ok(icon)
     }

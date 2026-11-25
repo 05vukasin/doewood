@@ -13,8 +13,9 @@ use time::{Date, Month};
 use uuid::Uuid;
 
 use crate::{
-    Backend, Blake3, Direction, Edge, EdgeKind, EdgeSource, EdgeState, Error, NeighbourQuery,
-    NodeKind, ObjectLocation, PutOutcome, SearchDoc, SearchQuery, SourceKey, StepVersions,
+    Backend, Blake3, CACHE_KEY_MAX_LEN, CACHE_MAX_BODY, CacheRow, Direction, DueCompany, DueReason,
+    Edge, EdgeKind, EdgeSource, EdgeState, Error, IconRow, NeighbourQuery, NodeKind,
+    ObjectLocation, PutOutcome, SearchDoc, SearchQuery, SourceKey, StepVersions, StoredIcon,
 };
 
 /// Runs every check.
@@ -34,6 +35,8 @@ pub async fn run<B: Backend + ?Sized>(a: &B, b: &B) {
     claims(a, b).await;
     leases(a, b).await;
     search(a).await;
+    caches(a, b).await;
+    freshness(a, b).await;
     a.ping().await.expect("ping");
 }
 
@@ -933,4 +936,317 @@ pub async fn search<B: Backend + ?Sized>(s: &B) {
         [d3, d2],
         "no amount never matches a range"
     );
+}
+
+/// Now, in Unix seconds.
+fn unix_now() -> i64 {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after 1970")
+        .as_secs();
+    i64::try_from(secs).expect("seconds fit")
+}
+
+/// The registry and favicon caches, across two instances: round trips, replacement, expiry on
+/// read, the purge and the input checks.
+///
+/// # Panics
+///
+/// When the backend misbehaves.
+#[allow(clippy::too_many_lines)]
+pub async fn caches<B: Backend + ?Sized>(a: &B, b: &B) {
+    let now = unix_now();
+    let row = |registry: &str, key: &str, body: Option<&[u8]>, expires_at: i64| CacheRow {
+        registry: registry.to_owned(),
+        key: key.to_owned(),
+        body: body.map(<[u8]>::to_vec),
+        fetched_at: now - 10,
+        expires_at,
+    };
+    assert_eq!(a.cache_get("gleif", "lei-records/X").await.unwrap(), None);
+    let found = row("gleif", "lei-records/X", Some(b"{\"data\":1}"), now + 3600);
+    a.cache_put(&found).await.unwrap();
+    // The other instance sees it.
+    assert_eq!(
+        b.cache_get("gleif", "lei-records/X").await.unwrap(),
+        Some(found.clone())
+    );
+    // Another registry, or a key differing only in case, is another entry.
+    assert_eq!(b.cache_get("vies", "lei-records/X").await.unwrap(), None);
+    assert_eq!(b.cache_get("gleif", "lei-records/x").await.unwrap(), None);
+    // Replaced, here by "no such record".
+    let missing = row("gleif", "lei-records/X", None, now + 60);
+    b.cache_put(&missing).await.unwrap();
+    assert_eq!(
+        a.cache_get("gleif", "lei-records/X").await.unwrap(),
+        Some(missing)
+    );
+    // An empty body is a body.
+    let empty = row("vies", "check/Ä", Some(b""), now + 60);
+    a.cache_put(&empty).await.unwrap();
+    assert_eq!(a.cache_get("vies", "check/Ä").await.unwrap(), Some(empty));
+    // Expired rows are not returned, and the purge deletes them.
+    a.cache_put(&row("edgar", "old", Some(b"x"), now - 1))
+        .await
+        .unwrap();
+    a.cache_put(&row("edgar", "older", None, now - 3600))
+        .await
+        .unwrap();
+    assert_eq!(a.cache_get("edgar", "old").await.unwrap(), None);
+    assert_eq!(b.cache_get("edgar", "older").await.unwrap(), None);
+    // Every cached body as stored, at the size limit too.
+    let big = row(
+        "companies_house",
+        &"k".repeat(CACHE_KEY_MAX_LEN),
+        Some(&vec![7; CACHE_MAX_BODY]),
+        now + 60,
+    );
+    a.cache_put(&big).await.unwrap();
+    assert_eq!(
+        b.cache_get("companies_house", &big.key).await.unwrap(),
+        Some(big.clone())
+    );
+
+    // Icons.
+    let icon = |domain: &str, format: Option<&str>, expires_at: i64| IconRow {
+        domain: domain.to_owned(),
+        icon: format.map(|f| StoredIcon {
+            format: f.to_owned(),
+            bytes: vec![0x89, b'P', b'N', b'G', 1, 2, 3],
+        }),
+        fetched_at: now - 5,
+        expires_at,
+    };
+    assert_eq!(a.icon_get("acme.example").await.unwrap(), None);
+    let hit = icon("acme.example", Some("png"), now + 86_400);
+    a.icon_put(&hit).await.unwrap();
+    assert_eq!(b.icon_get("acme.example").await.unwrap(), Some(hit));
+    let miss = icon("acme.example", None, now + 3600);
+    b.icon_put(&miss).await.unwrap();
+    assert_eq!(a.icon_get("acme.example").await.unwrap(), Some(miss));
+    a.icon_put(&icon("gone.example", Some("ico"), now - 1))
+        .await
+        .unwrap();
+    assert_eq!(a.icon_get("gone.example").await.unwrap(), None);
+
+    // Three expired rows (two answers, one icon), and nothing else.
+    assert_eq!(b.purge_expired().await.unwrap(), 3);
+    assert_eq!(a.purge_expired().await.unwrap(), 0);
+    assert!(a.cache_get("vies", "check/Ä").await.unwrap().is_some());
+    assert!(a.icon_get("acme.example").await.unwrap().is_some());
+
+    // Input checks.
+    for bad in [
+        row("GLEIF", "k", None, now),
+        row("gleif", "", None, now),
+        row("gleif", "a\0b", None, now),
+        row("gleif", &"k".repeat(CACHE_KEY_MAX_LEN + 1), None, now),
+        row("gleif", "k", Some(&vec![0; CACHE_MAX_BODY + 1]), now),
+    ] {
+        assert!(
+            matches!(a.cache_put(&bad).await, Err(Error::Invalid(_))),
+            "{:?}",
+            (&bad.registry, bad.key.len())
+        );
+    }
+    for bad in [
+        icon("Acme.example", None, now),
+        icon("acme.example/x", None, now),
+        icon("acme.example", Some("svg"), now),
+    ] {
+        assert!(
+            matches!(a.icon_put(&bad).await, Err(Error::Invalid(_))),
+            "{bad:?}"
+        );
+    }
+}
+
+/// Company freshness and the "due now" query, across two instances: new companies, the
+/// schedule per registry, a doubled document count, leases and paging.
+///
+/// # Panics
+///
+/// When the backend misbehaves.
+#[allow(clippy::too_many_lines)]
+pub async fn freshness<B: Backend + ?Sized>(a: &B, b: &B) {
+    let (ia, ib) = (instance("inst-a"), instance("inst-b"));
+    let day = Duration::from_hours(24);
+    let company = |key: &'static str| async move {
+        a.upsert_node(NodeKind::Company, key, &json!({}))
+            .await
+            .unwrap()
+    };
+    // Documents 200.. mention companies through `party` edges.
+    let mut next_doc = 200u8;
+    let mut mention = async |co: Uuid, state: EdgeState| {
+        let doc = a
+            .upsert_node(NodeKind::Document, &hash(next_doc).to_hex(), &json!({}))
+            .await
+            .unwrap();
+        next_doc += 1;
+        a.upsert_edge(&Edge::new(doc, co, EdgeKind::Party, EdgeSource::Document).with_state(state))
+            .await
+            .unwrap();
+    };
+    let ours = |due: Vec<DueCompany>, mine: &[Uuid]| -> Vec<DueCompany> {
+        due.into_iter()
+            .filter(|d| mine.contains(&d.company))
+            .collect()
+    };
+
+    let quiet = company("fresh-no-docs").await;
+    let xco = company("fresh-xco").await;
+    mention(xco, EdgeState::Active).await;
+    let mine = [quiet, xco];
+    // New: due at once, from either instance; a company without documents never is.
+    for s in [a, b] {
+        assert_eq!(
+            ours(s.companies_due(&ia, None, 0).await.unwrap(), &mine),
+            [DueCompany {
+                company: xco,
+                reason: DueReason::New,
+                documents: 1,
+                due: Vec::new(),
+            }]
+        );
+    }
+    assert_eq!(a.enrichment(xco).await.unwrap(), None);
+
+    // Enriched: GLEIF due in 30 days, VIES at once.
+    let before = unix_now();
+    let first = a
+        .record_enrichment(
+            xco,
+            &[
+                ("gleif".to_owned(), day * 30),
+                ("vies".to_owned(), Duration::ZERO),
+            ],
+        )
+        .await
+        .unwrap();
+    let after = unix_now();
+    assert_eq!((first.company, first.documents), (xco, 1));
+    assert!(
+        (before - 1..=after + 1).contains(&first.enriched_at),
+        "{first:?}"
+    );
+    assert_eq!(
+        first.next_due.keys().collect::<Vec<_>>(),
+        ["gleif", "vies"],
+        "{first:?}"
+    );
+    assert!(
+        (first.next_due["gleif"] - first.enriched_at - 30 * 86_400).abs() <= 1,
+        "{first:?}"
+    );
+    assert!(
+        (first.next_due["vies"] - first.enriched_at).abs() <= 1,
+        "{first:?}"
+    );
+    assert_eq!(b.enrichment(xco).await.unwrap(), Some(first.clone()));
+    assert_eq!(
+        ours(b.companies_due(&ib, None, 0).await.unwrap(), &mine),
+        [DueCompany {
+            company: xco,
+            reason: DueReason::Scheduled,
+            documents: 1,
+            due: vec!["vies".to_owned()],
+        }]
+    );
+
+    // VIES refreshed for 90 days; GLEIF keeps its time. Nothing is due.
+    let e2 = b
+        .record_enrichment(xco, &[("vies".to_owned(), day * 90)])
+        .await
+        .unwrap();
+    assert_eq!(e2.next_due["gleif"], first.next_due["gleif"]);
+    assert!(e2.next_due["vies"] > first.next_due["vies"]);
+    assert!(ours(a.companies_due(&ia, None, 0).await.unwrap(), &mine).is_empty());
+
+    // A retracted mention does not count; a second live one doubles the count.
+    mention(xco, EdgeState::Retracted).await;
+    assert!(ours(a.companies_due(&ia, None, 0).await.unwrap(), &mine).is_empty());
+    mention(xco, EdgeState::Active).await;
+    assert_eq!(
+        ours(a.companies_due(&ia, None, 0).await.unwrap(), &mine),
+        [DueCompany {
+            company: xco,
+            reason: DueReason::Doubled,
+            documents: 2,
+            due: Vec::new(),
+        }]
+    );
+    let e3 = a.record_enrichment(xco, &[]).await.unwrap();
+    assert_eq!(e3.documents, 2);
+    assert_eq!(e3.next_due, e2.next_due);
+    // Three is not twice two.
+    mention(xco, EdgeState::Active).await;
+    assert!(ours(a.companies_due(&ia, None, 0).await.unwrap(), &mine).is_empty());
+
+    // Another instance's lease hides a company until it ends; one's own lease does not.
+    let yco = company("fresh-yco").await;
+    mention(yco, EdgeState::Active).await;
+    let mine = [quiet, xco, yco];
+    assert!(
+        a.lease_company(yco, &ia, Duration::from_mins(1))
+            .await
+            .unwrap()
+    );
+    assert!(ours(b.companies_due(&ib, None, 0).await.unwrap(), &mine).is_empty());
+    assert_eq!(
+        ours(b.companies_due(&ia, None, 0).await.unwrap(), &mine).len(),
+        1
+    );
+    assert!(a.lease_company(yco, &ia, Duration::ZERO).await.unwrap());
+    assert_eq!(
+        ours(b.companies_due(&ib, None, 0).await.unwrap(), &mine).len(),
+        1
+    );
+
+    // Paging: by id, after the token, at most `limit`.
+    let mut all = vec![yco];
+    for key in ["fresh-p1", "fresh-p2", "fresh-p3", "fresh-p4"] {
+        let co = company(key).await;
+        mention(co, EdgeState::Active).await;
+        all.push(co);
+    }
+    all.sort();
+    let full: Vec<Uuid> = ours(a.companies_due(&ia, None, 1000).await.unwrap(), &all)
+        .iter()
+        .map(|d| d.company)
+        .collect();
+    assert_eq!(full, all);
+    let mut walked = Vec::new();
+    let mut token = None;
+    loop {
+        let page = a.companies_due(&ia, token, 2).await.unwrap();
+        assert!(page.len() <= 2);
+        assert!(page.windows(2).all(|w| w[0].company < w[1].company));
+        let Some(last) = page.last() else { break };
+        token = Some(last.company);
+        walked.extend(page.iter().map(|d| d.company).filter(|c| all.contains(c)));
+    }
+    assert_eq!(walked, all);
+
+    // Errors: no such company, a node of another kind, a bad schedule.
+    let doc = a
+        .upsert_node(NodeKind::Document, &hash(199).to_hex(), &json!({}))
+        .await
+        .unwrap();
+    for id in [Uuid::now_v7(), doc] {
+        assert!(
+            matches!(a.record_enrichment(id, &[]).await, Err(Error::NotFound(_))),
+            "{id}"
+        );
+    }
+    assert!(matches!(
+        a.record_enrichment(xco, &[("Bad".to_owned(), day)]).await,
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        a.record_enrichment(xco, &[("gleif".to_owned(), Duration::MAX)])
+            .await,
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(a.enrichment(doc).await.unwrap(), None);
 }

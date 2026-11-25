@@ -1,0 +1,269 @@
+//! The enrichment job's storage over Postgres (schema 3): the registry and favicon caches and
+//! company freshness, shared by every instance.
+
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use doewood_core::InstanceId;
+use doewood_model::{
+    CacheRow, CacheStore, DueCompany, DueReason, Enrichment, Error, FreshnessStore, IconRow,
+    Result, StoredIcon, due_limit, validate_cache_key, validate_registry, validate_schedule,
+};
+use tokio_postgres::GenericClient;
+use uuid::Uuid;
+
+use crate::PgStore;
+use crate::backend::{bad, client, pg};
+
+/// A company's document count: documents with a live `party` edge to `n.id`.
+const DOCUMENTS: &str = "(SELECT count(DISTINCT e.src) FROM edges e JOIN nodes d ON d.id = e.src \
+     WHERE e.dst = n.id AND e.kind = 'party' AND d.kind = 'document' \
+     AND e.state NOT IN ('retracted', 'superseded'))";
+
+fn count(n: i64) -> Result<u64> {
+    u64::try_from(n).map_err(|e| bad("count", e))
+}
+
+async fn enrichment(c: &impl GenericClient, company: Uuid) -> Result<Option<Enrichment>> {
+    let Some(row) = c
+        .query_opt(
+            "SELECT extract(epoch FROM enriched_at)::bigint, documents FROM company_enrichment \
+             WHERE company_id = $1",
+            &[&company],
+        )
+        .await
+        .map_err(pg)?
+    else {
+        return Ok(None);
+    };
+    let mut next_due = BTreeMap::new();
+    for r in c
+        .query(
+            "SELECT registry, extract(epoch FROM next_due_at)::bigint FROM company_registry_due \
+             WHERE company_id = $1",
+            &[&company],
+        )
+        .await
+        .map_err(pg)?
+    {
+        next_due.insert(r.try_get(0).map_err(pg)?, r.try_get(1).map_err(pg)?);
+    }
+    Ok(Some(Enrichment {
+        company,
+        enriched_at: row.try_get(0).map_err(pg)?,
+        documents: count(row.try_get(1).map_err(pg)?)?,
+        next_due,
+    }))
+}
+
+#[async_trait]
+impl CacheStore for PgStore {
+    async fn cache_get(&self, registry: &str, key: &str) -> Result<Option<CacheRow>> {
+        validate_registry(registry)?;
+        validate_cache_key(key)?;
+        let c = client(&self.pool).await?;
+        c.query_opt(
+            "SELECT body, extract(epoch FROM fetched_at)::bigint, \
+             extract(epoch FROM expires_at)::bigint FROM registry_cache \
+             WHERE registry = $1 AND key = $2 AND expires_at > now()",
+            &[&registry, &key],
+        )
+        .await
+        .map_err(pg)?
+        .map(|r| {
+            Ok(CacheRow {
+                registry: registry.to_owned(),
+                key: key.to_owned(),
+                body: r.try_get(0).map_err(pg)?,
+                fetched_at: r.try_get(1).map_err(pg)?,
+                expires_at: r.try_get(2).map_err(pg)?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn cache_put(&self, row: &CacheRow) -> Result<()> {
+        row.validate()?;
+        let c = client(&self.pool).await?;
+        c.execute(
+            "INSERT INTO registry_cache (registry, key, body, fetched_at, expires_at) \
+             VALUES ($1, $2, $3, to_timestamp($4::bigint), to_timestamp($5::bigint)) \
+             ON CONFLICT (registry, key) DO UPDATE SET body = EXCLUDED.body, \
+             fetched_at = EXCLUDED.fetched_at, expires_at = EXCLUDED.expires_at",
+            &[
+                &row.registry,
+                &row.key,
+                &row.body.as_deref(),
+                &row.fetched_at,
+                &row.expires_at,
+            ],
+        )
+        .await
+        .map_err(pg)?;
+        Ok(())
+    }
+
+    async fn icon_get(&self, domain: &str) -> Result<Option<IconRow>> {
+        let c = client(&self.pool).await?;
+        c.query_opt(
+            "SELECT icon, format, extract(epoch FROM fetched_at)::bigint, \
+             extract(epoch FROM expires_at)::bigint FROM favicons \
+             WHERE domain = $1 AND expires_at > now()",
+            &[&domain],
+        )
+        .await
+        .map_err(pg)?
+        .map(|r| {
+            let icon: Option<Vec<u8>> = r.try_get(0).map_err(pg)?;
+            let format: Option<String> = r.try_get(1).map_err(pg)?;
+            Ok(IconRow {
+                domain: domain.to_owned(),
+                icon: icon
+                    .zip(format)
+                    .map(|(bytes, format)| StoredIcon { format, bytes }),
+                fetched_at: r.try_get(2).map_err(pg)?,
+                expires_at: r.try_get(3).map_err(pg)?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn icon_put(&self, row: &IconRow) -> Result<()> {
+        row.validate()?;
+        let c = client(&self.pool).await?;
+        let (bytes, format) = match &row.icon {
+            Some(i) => (Some(i.bytes.as_slice()), Some(i.format.as_str())),
+            None => (None, None),
+        };
+        c.execute(
+            "INSERT INTO favicons (domain, icon, format, fetched_at, expires_at) \
+             VALUES ($1, $2, $3, to_timestamp($4::bigint), to_timestamp($5::bigint)) \
+             ON CONFLICT (domain) DO UPDATE SET icon = EXCLUDED.icon, format = EXCLUDED.format, \
+             fetched_at = EXCLUDED.fetched_at, expires_at = EXCLUDED.expires_at",
+            &[
+                &row.domain,
+                &bytes,
+                &format,
+                &row.fetched_at,
+                &row.expires_at,
+            ],
+        )
+        .await
+        .map_err(pg)?;
+        Ok(())
+    }
+
+    async fn purge_expired(&self) -> Result<u64> {
+        let c = client(&self.pool).await?;
+        let n: i64 = c
+            .query_one(
+                "WITH a AS (DELETE FROM registry_cache WHERE expires_at <= now() RETURNING 1), \
+                 b AS (DELETE FROM favicons WHERE expires_at <= now() RETURNING 1) \
+                 SELECT (SELECT count(*) FROM a) + (SELECT count(*) FROM b)",
+                &[],
+            )
+            .await
+            .map_err(pg)?
+            .try_get(0)
+            .map_err(pg)?;
+        count(n)
+    }
+}
+
+#[async_trait]
+impl FreshnessStore for PgStore {
+    async fn record_enrichment(
+        &self,
+        company: Uuid,
+        schedule: &[(String, Duration)],
+    ) -> Result<Enrichment> {
+        validate_schedule(schedule)?;
+        let mut c = client(&self.pool).await?;
+        let tx = c.transaction().await.map_err(pg)?;
+        let written = tx
+            .execute(
+                &format!(
+                    "INSERT INTO company_enrichment (company_id, enriched_at, documents) \
+                     SELECT n.id, now(), {DOCUMENTS} FROM nodes n \
+                     WHERE n.id = $1 AND n.kind = 'company' \
+                     ON CONFLICT (company_id) DO UPDATE SET \
+                     enriched_at = EXCLUDED.enriched_at, documents = EXCLUDED.documents"
+                ),
+                &[&company],
+            )
+            .await
+            .map_err(pg)?;
+        if written == 0 {
+            return Err(Error::NotFound(format!("no company {company}")));
+        }
+        for (registry, every) in schedule {
+            tx.execute(
+                "INSERT INTO company_registry_due (company_id, registry, next_due_at) \
+                 VALUES ($1, $2, now() + make_interval(secs => $3)) \
+                 ON CONFLICT (company_id, registry) DO UPDATE SET \
+                 next_due_at = EXCLUDED.next_due_at",
+                &[&company, registry, &every.as_secs_f64()],
+            )
+            .await
+            .map_err(pg)?;
+        }
+        let e = enrichment(&*tx, company)
+            .await?
+            .ok_or_else(|| bad("enrichment", "missing after the write"))?;
+        tx.commit().await.map_err(pg)?;
+        Ok(e)
+    }
+
+    async fn enrichment(&self, company: Uuid) -> Result<Option<Enrichment>> {
+        enrichment(&**client(&self.pool).await?, company).await
+    }
+
+    async fn companies_due(
+        &self,
+        owner: &InstanceId,
+        after: Option<Uuid>,
+        limit: u32,
+    ) -> Result<Vec<DueCompany>> {
+        let c = client(&self.pool).await?;
+        let rows = c
+            .query(
+                &format!(
+                    "SELECT n.id, c.docs, f.documents, \
+                     ARRAY(SELECT r.registry FROM company_registry_due r \
+                     WHERE r.company_id = n.id AND r.next_due_at <= now() \
+                     ORDER BY r.registry COLLATE \"C\") \
+                     FROM nodes n CROSS JOIN LATERAL (SELECT {DOCUMENTS} AS docs) c \
+                     LEFT JOIN company_enrichment f ON f.company_id = n.id \
+                     WHERE n.kind = 'company' AND ($2::uuid IS NULL OR n.id > $2) \
+                     AND c.docs > 0 \
+                     AND NOT EXISTS (SELECT 1 FROM company_leases l WHERE l.company_id = n.id \
+                     AND l.owner <> $1 AND l.expires_at > now()) \
+                     AND (f.company_id IS NULL OR c.docs >= 2 * greatest(f.documents, 1) \
+                     OR EXISTS (SELECT 1 FROM company_registry_due r \
+                     WHERE r.company_id = n.id AND r.next_due_at <= now())) \
+                     ORDER BY n.id LIMIT $3"
+                ),
+                &[&owner.as_str(), &after, &i64::from(due_limit(limit))],
+            )
+            .await
+            .map_err(pg)?;
+        rows.iter()
+            .map(|r| {
+                let documents = count(r.try_get(1).map_err(pg)?)?;
+                let then: Option<i64> = r.try_get(2).map_err(pg)?;
+                let reason = match then {
+                    None => DueReason::New,
+                    Some(t) if documents >= 2 * count(t)?.max(1) => DueReason::Doubled,
+                    Some(_) => DueReason::Scheduled,
+                };
+                Ok(DueCompany {
+                    company: r.try_get(0).map_err(pg)?,
+                    reason,
+                    documents,
+                    due: r.try_get(3).map_err(pg)?,
+                })
+            })
+            .collect()
+    }
+}

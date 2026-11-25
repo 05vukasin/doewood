@@ -152,6 +152,42 @@ async fn list_records_matches_the_query_before_issue_13() {
     db.drop_schema().await;
 }
 
+/// Schema 3's `(endpoint, bucket, object_key COLLATE "C")` index turns the prefix into a range
+/// (issue #27). Sequential scans are off so that the small table does not hide it.
+#[tokio::test]
+async fn the_prefix_is_a_range_on_the_c_index() {
+    let Some(url) = test_url() else { return };
+    let db = Scratch::new(&url).await;
+    drop(db.store().await);
+    let c = db.client().await;
+    c.batch_execute(&seed(700)).await.unwrap();
+    c.batch_execute("SET enable_seqscan = off").await.unwrap();
+    let plan: Vec<String> = c
+        .query(
+            &format!("EXPLAIN (COSTS OFF) {LIST_RECORDS}"),
+            &[
+                &ENDPOINT,
+                &"b0",
+                &"dept0/2026/file-40",
+                &None::<&[u8]>,
+                &50_i64,
+            ],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    let plan = plan.join("\n");
+    assert!(plan.contains("locations_by_key_c"), "{plan}");
+    assert!(
+        plan.contains("object_key)::text >= 'dept0/2026/file-40'::text")
+            && plan.contains("object_key)::text < 'dept0/2026/file-41'::text"),
+        "{plan}"
+    );
+    db.drop_schema().await;
+}
+
 /// The median of `runs` timings of `f`, in milliseconds.
 async fn median_ms<F: AsyncFnMut()>(runs: usize, mut f: F) -> f64 {
     f().await;

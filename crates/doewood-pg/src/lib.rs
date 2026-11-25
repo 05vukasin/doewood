@@ -1,6 +1,7 @@
 //! doewood's shared store (ADR 0001, section 2): one Postgres database that every instance
-//! uses for records, the graph, source claims, company leases and search. It implements the
-//! `doewood-model` store traits.
+//! uses for records, the graph, source claims, company leases, search, and the enrichment
+//! job's registry and favicon caches and company freshness (ADR 0002 sections 2, 5 and 6). It
+//! implements the `doewood-model` store traits.
 //!
 //! - **No database at build time:** plain `tokio-postgres` with run-time SQL, no macros.
 //! - **TLS** through rustls (ring), trusting the system roots plus the Mozilla roots. The URL's
@@ -14,6 +15,7 @@
 //!   `search_index.embedding` is added; otherwise this is logged and skipped, never fatal.
 
 mod backend;
+mod enrichment;
 mod migrate;
 #[cfg(test)]
 mod tests;

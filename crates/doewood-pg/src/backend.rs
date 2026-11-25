@@ -28,10 +28,12 @@ use crate::PgStore;
 /// EXISTS: Postgres plans this as a merge semi join over `records_pkey` and
 /// `locations_by_blake3` and does not carry the bound across, so without it the locations side
 /// reads every row before `after` and walking all pages is quadratic (issue #13, docs/api.md).
+/// The prefix is matched in the "C" collation, so a selective prefix becomes a range scan of
+/// `locations_by_key_c` (issue #27); `starts_with` gives the same answer in any collation.
 pub(crate) const LIST_RECORDS: &str = "SELECT r.blake3, r.record, r.versions, extract(epoch FROM r.updated_at)::bigint \
      FROM records r WHERE ($4::bytea IS NULL OR r.blake3 > $4) \
      AND EXISTS (SELECT 1 FROM locations l WHERE l.blake3 = r.blake3 \
-     AND l.endpoint = $1 AND l.bucket = $2 AND starts_with(l.object_key, $3) \
+     AND l.endpoint = $1 AND l.bucket = $2 AND starts_with(l.object_key COLLATE \"C\", $3) \
      AND ($4::bytea IS NULL OR l.blake3 > $4)) \
      ORDER BY r.blake3 LIMIT $5";
 
@@ -69,7 +71,7 @@ pub(crate) async fn client(pool: &Pool) -> Result<Object> {
     })
 }
 
-fn bad(what: &str, e: impl std::fmt::Display) -> Error {
+pub(crate) fn bad(what: &str, e: impl std::fmt::Display) -> Error {
     Error::Backend {
         backend: "postgres",
         message: format!("stored {what}: {e}"),
@@ -803,7 +805,8 @@ impl SearchStore for PgStore {
             let _ = write!(
                 sql,
                 " AND EXISTS (SELECT 1 FROM locations l WHERE l.blake3 = s.blake3 \
-                 AND l.endpoint = {e} AND l.bucket = {b} AND starts_with(l.object_key, {p}))"
+                 AND l.endpoint = {e} AND l.bucket = {b} \
+                 AND starts_with(l.object_key COLLATE \"C\", {p}))"
             );
         }
         let (limit, offset) = (
