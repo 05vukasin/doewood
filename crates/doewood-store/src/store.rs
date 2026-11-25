@@ -313,6 +313,7 @@ mod tests {
                 "objects_seen",
                 "records",
                 "registry_cache",
+                "registry_feeds",
                 "scan_checkpoints",
                 "search_fts",
                 "search_fts_config",

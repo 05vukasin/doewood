@@ -8,7 +8,8 @@ use async_trait::async_trait;
 use doewood_core::InstanceId;
 use doewood_model::{
     CacheRow, CacheStore, DueCompany, DueReason, Enrichment, Error, FreshnessStore, IconRow,
-    Result, StoredIcon, due_limit, validate_cache_key, validate_registry, validate_schedule,
+    Result, StoredIcon, due_limit, validate_batch, validate_cache_key, validate_registry,
+    validate_schedule,
 };
 use rusqlite::{Connection, OptionalExtension as _, params};
 use uuid::Uuid;
@@ -177,6 +178,23 @@ impl CacheStore for Standalone {
         })
         .await
     }
+
+    async fn cache_invalidate(&self, registry: &str, key_prefix: &str) -> Result<u64> {
+        validate_registry(registry)?;
+        validate_cache_key(key_prefix)?;
+        let (registry, prefix) = (registry.to_owned(), key_prefix.to_owned());
+        self.run(move |conn| {
+            let n = conn
+                .execute(
+                    "DELETE FROM registry_cache WHERE registry = ?1 \
+                     AND key >= ?2 AND substr(key, 1, length(?2)) = ?2",
+                    params![registry, prefix],
+                )
+                .map_err(sql)?;
+            Ok(n as u64)
+        })
+        .await
+    }
 }
 
 #[async_trait]
@@ -300,6 +318,32 @@ impl FreshnessStore for Standalone {
                     })
                 })
                 .collect()
+        })
+        .await
+    }
+
+    async fn mark_due(&self, companies: &[Uuid], registry: &str) -> Result<u64> {
+        validate_registry(registry)?;
+        validate_batch(companies.len())?;
+        let (companies, registry) = (companies.to_vec(), registry.to_owned());
+        self.run(move |conn| {
+            let tx = conn.transaction().map_err(sql)?;
+            let at = now();
+            let mut n = 0;
+            for c in &companies {
+                n += tx
+                    .execute(
+                        "INSERT INTO company_registry_due (company_id, registry, next_due_at) \
+                         SELECT f.company_id, ?2, ?3 FROM company_enrichment f \
+                         WHERE f.company_id = ?1 \
+                         ON CONFLICT (company_id, registry) DO UPDATE SET \
+                         next_due_at = min(company_registry_due.next_due_at, excluded.next_due_at)",
+                        params![c.to_string(), registry, at],
+                    )
+                    .map_err(sql)?;
+            }
+            tx.commit().map_err(sql)?;
+            Ok(n as u64)
         })
         .await
     }

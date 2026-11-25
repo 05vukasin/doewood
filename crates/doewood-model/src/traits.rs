@@ -13,11 +13,11 @@ use uuid::Uuid;
 
 use crate::{
     Blake3, CacheRow, DismissRequest, Dismissal, DismissalQuery, DueCompany, Edge, Enrichment,
-    IconRow, LiveEdge, Located, LocationEnded, MergeEntry, MergeQuery, MergeRequest, Neighbour,
-    NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation, OwnedAlias, Proposal, ProposalQuery,
-    ProposalRequest, PropsPatch, PutOutcome, Record, ResolveRequest, Result, SearchDoc, SearchHit,
-    SearchQuery, Sketch, SourceClaim, SourceKey, SplitRequest, StepVersions, UndoOutcome,
-    UndoRequest,
+    FeedState, IconRow, LiveEdge, Located, LocationEnded, MergeEntry, MergeQuery, MergeRequest,
+    Neighbour, NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation, OwnedAlias, Proposal,
+    ProposalQuery, ProposalRequest, PropsPatch, PutOutcome, Record, ResolveRequest, Result,
+    SearchDoc, SearchHit, SearchQuery, Sketch, SourceClaim, SourceKey, SplitRequest, StepVersions,
+    UndoOutcome, UndoRequest,
 };
 
 /// quail and hedgehog records, keyed by BLAKE3.
@@ -265,6 +265,11 @@ pub trait CacheStore: Send + Sync {
 
     /// Deletes the expired rows of both caches. Returns how many.
     async fn purge_expired(&self) -> Result<u64>;
+
+    /// Deletes the cached answers of `registry` whose key starts with `key_prefix` (a valid,
+    /// non-empty cache key), so the next lookup asks the registry again: a delta feed said the
+    /// record changed (issue #49). Returns how many.
+    async fn cache_invalidate(&self, registry: &str, key_prefix: &str) -> Result<u64>;
 }
 
 /// Company freshness (ADR 0002 section 6): which companies are due for enrichment. The lease
@@ -296,6 +301,52 @@ pub trait FreshnessStore: Send + Sync {
         after: Option<Uuid>,
         limit: u32,
     ) -> Result<Vec<DueCompany>>;
+
+    /// Makes `registry` due now for each of `companies` that was enriched before (one never
+    /// enriched is due anyway, as new): a delta feed said its record changed (issue #49).
+    /// Other registries keep their due time. At most [`crate::FEED_BATCH_MAX`] companies;
+    /// unknown ids are skipped. Returns how many were made due.
+    async fn mark_due(&self, companies: &[Uuid], registry: &str) -> Result<u64>;
+}
+
+/// Registry delta feeds (ADR 0002 section 6, issue #49): one instance per cluster pulls each
+/// feed, under a lease on the feed's row, and keeps the feed's cursor there for the next run
+/// (on this instance or another).
+#[async_trait]
+pub trait FeedStore: Send + Sync {
+    /// Takes or renews the lease on `feed` for `ttl`. Returns `false` when another instance
+    /// holds an unexpired lease.
+    async fn lease_feed(&self, feed: &str, owner: &InstanceId, ttl: Duration) -> Result<bool>;
+
+    /// Gives the lease back. Returns whether `owner` held it.
+    async fn release_feed(&self, feed: &str, owner: &InstanceId) -> Result<bool>;
+
+    /// The feed's cursor, next run and lease holder; `None` before it was first leased.
+    async fn feed_state(&self, feed: &str) -> Result<Option<FeedState>>;
+
+    /// Stores the feed's cursor and its next run (Unix seconds), only while `owner` holds an
+    /// unexpired lease on it. Returns `false` (and writes nothing) otherwise.
+    async fn save_feed(
+        &self,
+        feed: &str,
+        owner: &InstanceId,
+        cursor: &str,
+        next_run_at: i64,
+    ) -> Result<bool>;
+
+    /// The companies owning `aliases` (company aliases such as `id:lei:<LEI>`), as
+    /// `(alias, company)`; aliases nobody owns are left out. At most
+    /// [`crate::FEED_BATCH_MAX`] aliases.
+    async fn companies_by_alias(&self, aliases: &[String]) -> Result<Vec<(String, Uuid)>>;
+
+    /// One page of the owned company aliases that start with `prefix`, in byte order after
+    /// `after`, as `(alias, company)`. At most `limit` (at most [`crate::FEED_BATCH_MAX`]).
+    async fn company_aliases(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<(String, Uuid)>>;
 }
 
 /// A complete backend: everything the service needs from its store.
@@ -308,6 +359,7 @@ pub trait Backend:
     + SketchStore
     + CacheStore
     + FreshnessStore
+    + FeedStore
     + MergeStore
     + ProposalStore
 {

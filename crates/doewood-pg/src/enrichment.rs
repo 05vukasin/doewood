@@ -8,7 +8,8 @@ use async_trait::async_trait;
 use doewood_core::InstanceId;
 use doewood_model::{
     CacheRow, CacheStore, DueCompany, DueReason, Enrichment, Error, FreshnessStore, IconRow,
-    Result, StoredIcon, due_limit, validate_cache_key, validate_registry, validate_schedule,
+    Result, StoredIcon, due_limit, validate_batch, validate_cache_key, validate_registry,
+    validate_schedule,
 };
 use tokio_postgres::GenericClient;
 use uuid::Uuid;
@@ -169,6 +170,20 @@ impl CacheStore for PgStore {
             .map_err(pg)?;
         count(n)
     }
+
+    async fn cache_invalidate(&self, registry: &str, key_prefix: &str) -> Result<u64> {
+        validate_registry(registry)?;
+        validate_cache_key(key_prefix)?;
+        let c = client(&self.pool).await?;
+        let n = c
+            .execute(
+                "DELETE FROM registry_cache WHERE registry = $1 AND starts_with(key, $2)",
+                &[&registry, &key_prefix],
+            )
+            .await
+            .map_err(pg)?;
+        Ok(n)
+    }
 }
 
 #[async_trait]
@@ -265,5 +280,26 @@ impl FreshnessStore for PgStore {
                 })
             })
             .collect()
+    }
+
+    async fn mark_due(&self, companies: &[Uuid], registry: &str) -> Result<u64> {
+        validate_registry(registry)?;
+        validate_batch(companies.len())?;
+        if companies.is_empty() {
+            return Ok(0);
+        }
+        let c = client(&self.pool).await?;
+        let n = c
+            .execute(
+                "INSERT INTO company_registry_due (company_id, registry, next_due_at) \
+                 SELECT f.company_id, $2, now() FROM company_enrichment f \
+                 WHERE f.company_id = ANY($1) \
+                 ON CONFLICT (company_id, registry) DO UPDATE SET \
+                 next_due_at = least(company_registry_due.next_due_at, EXCLUDED.next_due_at)",
+                &[&companies, &registry],
+            )
+            .await
+            .map_err(pg)?;
+        Ok(n)
     }
 }
