@@ -82,6 +82,11 @@ impl OpsState {
         self.metrics.ready.set(0);
     }
 
+    /// The registry `/metrics` serves; the API registers its metrics there.
+    pub fn registry(&self) -> &Registry {
+        &self.metrics.registry
+    }
+
     fn reason(&self) -> MutexGuard<'_, String> {
         self.reason.lock().unwrap_or_else(PoisonError::into_inner)
     }

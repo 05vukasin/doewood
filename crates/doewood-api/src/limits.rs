@@ -3,7 +3,8 @@
 //! - **Per connection** (constants: hyper and the listener take them when the server starts):
 //!   [`MAX_CONCURRENT_STREAMS`], HTTP/2 PING keepalive ([`HTTP2_KEEPALIVE_INTERVAL`],
 //!   [`HTTP2_KEEPALIVE_TIMEOUT`]), TCP keepalive ([`TCP_KEEPALIVE`]) and the connection age:
-//!   GOAWAY after [`MAX_CONNECTION_AGE`] (tonic), then closed after
+//!   GOAWAY after [`MAX_CONNECTION_AGE`] give or take 10% ([`Jitter`], drawn per connection,
+//!   so clients that connected together do not all reconnect together), then closed after
 //!   [`MAX_CONNECTION_AGE_GRACE`] more ([`Aged`]), so long-lived clients reconnect and spread
 //!   over the replicas.
 //! - **Per call** (runtime settings, `ConfigService.SetApiSettings`, read live by [`Limited`]):
@@ -24,12 +25,16 @@ use std::time::Duration;
 
 use doewood_store::ApiSettings;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::oneshot;
 use tokio::time::Sleep;
+use tokio_stream::Stream;
 use tonic::Status;
 use tonic::body::Body;
 use tonic::codegen::http::{Request, Response};
 use tonic::codegen::{BoxFuture, Service};
 use tonic::transport::server::Connected;
+
+use crate::metrics::{ApiMetrics, OpenConnection};
 
 /// Concurrent HTTP/2 streams (calls) one connection may open; more wait in the client. hyper's
 /// own default is 200, but tonic replaces it with "unlimited" unless it is set.
@@ -42,8 +47,11 @@ pub const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 /// NAT or a load balancer that forgot them).
 pub const TCP_KEEPALIVE: Duration = Duration::from_mins(1);
 /// Age at which a connection gets GOAWAY: its client opens a new one (which a load
-/// balancer may send to another replica) for new calls.
+/// balancer may send to another replica) for new calls. Each connection gets its own age,
+/// uniformly within ±[`MAX_CONNECTION_AGE_JITTER_PERCENT`] of this.
 pub const MAX_CONNECTION_AGE: Duration = Duration::from_mins(30);
+/// How far a connection's age may be from [`MAX_CONNECTION_AGE`], in percent.
+pub const MAX_CONNECTION_AGE_JITTER_PERCENT: u32 = 10;
 /// How long calls already on an aged connection may still run (streams included) before
 /// the connection is closed.
 pub const MAX_CONNECTION_AGE_GRACE: Duration = Duration::from_mins(5);
@@ -117,11 +125,16 @@ impl Drop for InFlight {
 pub(crate) struct Limited<S> {
     inner: S,
     limits: Arc<CallLimits>,
+    metrics: Arc<ApiMetrics>,
 }
 
 impl<S> Limited<S> {
-    pub(crate) fn new(inner: S, limits: Arc<CallLimits>) -> Self {
-        Self { inner, limits }
+    pub(crate) fn new(inner: S, limits: Arc<CallLimits>, metrics: Arc<ApiMetrics>) -> Self {
+        Self {
+            inner,
+            limits,
+            metrics,
+        }
     }
 }
 
@@ -151,6 +164,7 @@ where
         let deadline = (!path.starts_with(SUMMARIZE_PREFIX)).then(|| self.limits.deadline());
         let Some(slot) = self.limits.enter() else {
             tracing::debug!(path, "call shed: too many calls in flight");
+            self.metrics.shed();
             let max = self.limits.max_in_flight.load(Ordering::Relaxed);
             return Box::pin(std::future::ready(Ok(reply(Status::unavailable(format!(
                 "the server is overloaded ({max} calls in flight); retry with backoff, \
@@ -176,20 +190,73 @@ where
     }
 }
 
-/// An accepted connection that is closed [`MAX_CONNECTION_AGE`] +
-/// [`MAX_CONNECTION_AGE_GRACE`] after it was opened: tonic sends GOAWAY at the age but would
-/// then wait for every open stream, so a `WatchProgress` would pin it forever. Reads and
-/// writes fail after the deadline, and hyper drops the connection.
+/// The source of each connection's age: a small seeded generator (splitmix64), random in
+/// the server and fixed in tests.
+#[derive(Clone, Debug)]
+pub(crate) struct Jitter(u64);
+
+impl Jitter {
+    /// A generator with a fixed seed (tests).
+    #[cfg(test)]
+    pub(crate) fn seeded(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    /// A generator seeded from the process's random hash keys.
+    pub(crate) fn random() -> Self {
+        use std::hash::BuildHasher as _;
+        Self(std::hash::RandomState::new().hash_one(0u64))
+    }
+
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    /// `age` times a factor drawn uniformly from [1 − p, 1 + p], p =
+    /// [`MAX_CONNECTION_AGE_JITTER_PERCENT`], in steps of a millionth.
+    pub(crate) fn age(&mut self, age: Duration) -> Duration {
+        const MILLION: u64 = 1_000_000;
+        let spread = u64::from(MAX_CONNECTION_AGE_JITTER_PERCENT) * MILLION / 100;
+        let factor = MILLION - spread + self.next() % (2 * spread + 1);
+        let nanos = age.as_nanos() * u128::from(factor) / u128::from(MILLION);
+        Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+    }
+}
+
+/// An accepted connection that is closed its own age + [`MAX_CONNECTION_AGE_GRACE`] after it
+/// was opened: tonic sends GOAWAY at the age but would then wait for every open stream, so a
+/// `WatchProgress` would pin it forever. Reads and writes fail after the deadline, and hyper
+/// drops the connection. Dropping it ends the connection's [`OneConnection`] stream and
+/// its count in `doewood_grpc_connections_open`.
 pub(crate) struct Aged<IO> {
     io: IO,
     close: Pin<Box<Sleep>>,
+    _open: OpenConnection,
+    _closed: oneshot::Sender<()>,
 }
 
 impl<IO> Aged<IO> {
-    pub(crate) fn new(io: IO, lifetime: Duration) -> Self {
-        Self {
+    /// The connection and the stream that yields it once to a tonic server, then ends when
+    /// the connection is closed (so that server stops too).
+    pub(crate) fn new(
+        io: IO,
+        lifetime: Duration,
+        metrics: &Arc<ApiMetrics>,
+    ) -> OneConnection<Self> {
+        let (closed, rx) = oneshot::channel();
+        let aged = Self {
             io,
             close: Box::pin(tokio::time::sleep(lifetime)),
+            _open: metrics.connection(),
+            _closed: closed,
+        };
+        OneConnection {
+            io: Some(aged),
+            closed: rx,
         }
     }
 
@@ -201,6 +268,25 @@ impl<IO> Aged<IO> {
                 "connection closed: maximum connection age and its grace period are over",
             )
         })
+    }
+}
+
+/// The incoming stream of a tonic server that serves one connection: the connection, then
+/// the end once it is closed.
+pub(crate) struct OneConnection<IO> {
+    io: Option<IO>,
+    closed: oneshot::Receiver<()>,
+}
+
+impl<IO: Unpin> Stream for OneConnection<IO> {
+    type Item = io::Result<IO>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(io) = self.io.take() {
+            return Poll::Ready(Some(Ok(io)));
+        }
+        // The sender is never used: it is dropped with the connection.
+        Pin::new(&mut self.closed).poll(cx).map(|_| None)
     }
 }
 
@@ -265,6 +351,7 @@ impl<IO: AsyncWrite + Unpin> AsyncWrite for Aged<IO> {
 mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::sync::Notify;
+    use tokio_stream::StreamExt as _;
 
     use super::*;
 
@@ -316,12 +403,14 @@ mod tests {
     async fn sheds_beyond_the_cap_and_frees_slots() {
         let release = Arc::new(Notify::new());
         let l = limits(2, 60);
+        let metrics = Arc::new(ApiMetrics::new());
         let mut svc = Limited::new(
             Held {
                 release: Arc::clone(&release),
                 delay: Duration::from_hours(1),
             },
             Arc::clone(&l),
+            Arc::clone(&metrics),
         );
         let a = tokio::spawn(svc.call(request("/doewood.v1.RecordsService/GetRecord")));
         let b = tokio::spawn(svc.call(request("/doewood.v1.SummarizeService/Summarize")));
@@ -357,6 +446,7 @@ mod tests {
         assert_eq!(code(&shed), tonic::Code::Unavailable);
         release.notify_waiters();
         assert_eq!(code(&c.await.unwrap().unwrap()), tonic::Code::Ok);
+        assert_eq!(metrics.shed_count(), 2);
     }
 
     #[tokio::test(start_paused = true)]
@@ -368,6 +458,7 @@ mod tests {
                 delay: Duration::from_secs(61),
             },
             Arc::clone(&l),
+            Arc::new(ApiMetrics::new()),
         );
         let slow = svc
             .call(request("/doewood.v1.GraphService/Neighbors"))
@@ -398,7 +489,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_aged_connection_fails_after_its_lifetime() {
         let (a, mut b) = tokio::io::duplex(64);
-        let mut aged = Aged::new(a, Duration::from_secs(10));
+        let metrics = Arc::new(ApiMetrics::new());
+        let mut conn = Aged::new(a, Duration::from_secs(10), &metrics);
+        let mut aged = conn.next().await.unwrap().unwrap();
+        assert_eq!(metrics.connections_open(), 1);
         aged.write_all(b"ping").await.unwrap();
         let mut buf = [0u8; 4];
         b.read_exact(&mut buf).await.unwrap();
@@ -415,6 +509,47 @@ mod tests {
             aged.write(b"x").await.unwrap_err().kind(),
             io::ErrorKind::TimedOut
         );
+        // The stream that handed it out ends once it is dropped, and it no longer counts.
+        let end = tokio::spawn(async move { conn.next().await.is_none() });
+        tokio::task::yield_now().await;
+        assert!(!end.is_finished());
+        drop(aged);
+        assert!(end.await.unwrap());
+        assert_eq!(metrics.connections_open(), 0);
+    }
+
+    #[test]
+    fn jitter_spreads_connection_ages_within_ten_percent() {
+        let age = MAX_CONNECTION_AGE;
+        let (low, high) = (age * 9 / 10, age * 11 / 10);
+        let mut jitter = Jitter::seeded(7);
+        let ages: Vec<Duration> = (0..1000).map(|_| jitter.age(age)).collect();
+        assert!(
+            ages.iter().all(|a| (low..=high).contains(a)),
+            "out of bounds"
+        );
+        // Spread over the whole range: each tenth of it gets a share.
+        let step = age / 50;
+        for i in 0..10 {
+            let (from, to) = (low + step * i, low + step * (i + 1));
+            let n = ages.iter().filter(|a| (from..to).contains(*a)).count();
+            assert!((50..=150).contains(&n), "tenth {i}: {n} of 1000");
+        }
+        let mut distinct = ages.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert!(distinct.len() > 990, "{} distinct ages", distinct.len());
+        // The same seed gives the same ages; another seed others.
+        let mut again = Jitter::seeded(7);
+        assert!(ages.iter().all(|a| *a == again.age(age)));
+        let mut other = Jitter::seeded(8);
+        assert_ne!(
+            ages[..10],
+            (0..10).map(|_| other.age(age)).collect::<Vec<_>>()[..]
+        );
+        // The random seed differs between generators.
+        let draws = |mut j: Jitter| (0..4).map(|_| j.age(age)).collect::<Vec<_>>();
+        assert_ne!(draws(Jitter::random()), draws(Jitter::random()));
     }
 
     #[test]

@@ -20,6 +20,7 @@ use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 
+use crate::metrics::{ApiMetrics, IconOutcome};
 use crate::summarize::BoxFuture;
 
 /// The path of the route.
@@ -67,15 +68,27 @@ pub trait Icons: Send + Sync {
 }
 
 /// The router of `GET /icons/{domain}`. Without `icons` every domain is a miss.
-pub(crate) fn router(icons: Option<Arc<dyn Icons>>) -> Router {
-    Router::new().route(ICONS_PATH, get(icon)).with_state(icons)
+pub(crate) fn router(icons: Option<Arc<dyn Icons>>, metrics: Arc<ApiMetrics>) -> Router {
+    Router::new()
+        .route(ICONS_PATH, get(icon))
+        .with_state((icons, metrics))
 }
 
-async fn icon(State(icons): State<Option<Arc<dyn Icons>>>, Path(domain): Path<String>) -> Response {
+type IconState = (Option<Arc<dyn Icons>>, Arc<ApiMetrics>);
+
+async fn icon(State((icons, metrics)): State<IconState>, Path(domain): Path<String>) -> Response {
     let answer = match icons {
         Some(icons) => icons.icon(domain).await,
         None => IconAnswer::Missing,
     };
+    metrics.icon(match &answer {
+        IconAnswer::Found { content_type, .. } if ICON_CONTENT_TYPES.contains(content_type) => {
+            IconOutcome::Found
+        }
+        IconAnswer::Found { .. } | IconAnswer::Missing => IconOutcome::Missing,
+        IconAnswer::Invalid(_) => IconOutcome::Invalid,
+        IconAnswer::Busy => IconOutcome::Busy,
+    });
     respond(answer)
 }
 

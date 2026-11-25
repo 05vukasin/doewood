@@ -183,6 +183,17 @@ fn serve_starts_with_nothing_configured() {
     );
     assert_eq!(status, 200);
     assert!(body.contains("grpc-status:0"), "{body}");
+    // The call is on the ops port's /metrics.
+    let (_, metrics) = get(addr, "/metrics");
+    for line in [
+        "doewood_grpc_calls_total{code=\"OK\",method=\"doewood.v1.ConfigService/ListSources\"} 1",
+        "doewood_grpc_call_duration_seconds_count{method=\"doewood.v1.ConfigService/ListSources\"} 1",
+        "doewood_grpc_calls_in_flight{method=\"doewood.v1.ConfigService/ListSources\"} 0",
+        "doewood_grpc_connections_total 1",
+        "doewood_grpc_shed_total 0",
+    ] {
+        assert!(metrics.lines().any(|l| l == line), "{line} in {metrics}");
+    }
     // The S3 webhook is on the ops server.
     let (status, _) = post(
         addr,
