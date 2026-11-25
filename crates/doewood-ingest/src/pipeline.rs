@@ -18,10 +18,18 @@
 //!   state (the ETag guard of `finish_object`).
 //! - **Deleted objects** end their `located_at` edge; the document stays, with its other
 //!   locations.
+//! - **Bounded analysis.** A file is hashed once, on a blocking thread. Its analysis has one
+//!   deadline (quail's engine, hedgehog's read and normalizer, [`Analyzer::analyze_hashed`]),
+//!   and a watchdog of the file's time cap plus [`IngestConfig::watchdog_grace`] backs it up
+//!   for a step that does not stop on time: the file fails, and the worker goes on while the
+//!   analysis finishes on its thread (nothing can stop it from outside). Each worker leaves at
+//!   most [`MAX_OVERRUNS`] such analyses behind; one more and it waits for the oldest to end
+//!   before taking the next file, so stuck analyses cannot pile up files in memory.
 //! - **Shutdown** lets every worker finish the file in hand; pending objects stay pending.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -36,7 +44,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::analyze::{Analyzer, AnalyzerConfig, Outcome};
+use crate::analyze::{Analysis, Analyzer, AnalyzerConfig, Outcome, content_hash};
 use crate::facts::DocFacts;
 use crate::graph::{GraphWriter, SimilarityConfig};
 
@@ -53,6 +61,8 @@ const SWEEP_PAGE: usize = 256;
 const REPROCESS_PAGE: usize = 500;
 /// Reprocess jobs remembered for `WatchReprocess`.
 const MAX_JOBS: usize = 100;
+/// Analyses past the watchdog a worker may leave running while it takes the next files.
+pub const MAX_OVERRUNS: usize = 1;
 
 /// How ingest runs.
 #[derive(Clone, Debug)]
@@ -69,6 +79,9 @@ pub struct IngestConfig {
     pub sweep_interval: Duration,
     /// How progress is polled while a reprocess job runs.
     pub reprocess_poll: Duration,
+    /// How long past the file's time cap (`Limits::timeout_cap`) the watchdog waits before it
+    /// gives up on an analysis and fails the file.
+    pub watchdog_grace: Duration,
     /// `similar_to` edges.
     pub similarity: SimilarityConfig,
     /// The engine.
@@ -88,6 +101,7 @@ impl IngestConfig {
             retry_base: Duration::from_secs(2),
             sweep_interval: Duration::from_secs(30),
             reprocess_poll: Duration::from_millis(500),
+            watchdog_grace: Duration::from_mins(1),
             similarity: SimilarityConfig::default(),
             analyzer: AnalyzerConfig {
                 workers: jobs,
@@ -329,6 +343,11 @@ struct Inner {
     on_llm_queued: Arc<dyn Fn(SourceId) + Send + Sync>,
     writer: Mutex<Option<(usize, Arc<GraphWriter>)>>,
     inflight: Mutex<HashSet<(SourceId, String)>>,
+    /// Analyses on a blocking thread now, overruns included, and their files' bytes.
+    analyzing: Arc<Analyzing>,
+    /// Runs on the blocking thread before each analysis (tests stall it there).
+    #[cfg(test)]
+    hook: Option<Hook>,
     sweep_now: Notify,
     jobs: Mutex<HashMap<Uuid, watch::Sender<ReprocessStatus>>>,
     started: Instant,
@@ -353,7 +372,50 @@ pub struct Stats {
     /// `party` edges written to the survivor of a merge that committed after the match
     /// (issue #48).
     pub redirected: u64,
+    /// Analyses the watchdog gave up on (their files failed; each ran on until it returned).
+    pub overruns: u64,
 }
+
+/// Analyses running on blocking threads, and the bytes of their files.
+#[derive(Debug, Default)]
+struct Analyzing {
+    files: AtomicUsize,
+    bytes: AtomicU64,
+}
+
+/// One analysis counted in [`Analyzing`] until it is dropped, on its blocking thread, when the
+/// analysis returns (with its file's bytes already freed).
+struct Counted {
+    of: Arc<Analyzing>,
+    bytes: u64,
+}
+
+impl Counted {
+    fn new(of: &Arc<Analyzing>, bytes: usize) -> Self {
+        let bytes = bytes as u64;
+        of.files.fetch_add(1, Ordering::SeqCst);
+        of.bytes.fetch_add(bytes, Ordering::SeqCst);
+        Self {
+            of: Arc::clone(of),
+            bytes,
+        }
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.of.files.fetch_sub(1, Ordering::SeqCst);
+        self.of.bytes.fetch_sub(self.bytes, Ordering::SeqCst);
+    }
+}
+
+/// A worker's analyses that overran the watchdog and still run (each awaited by a task that
+/// logs when it ends), oldest first.
+type Overruns = VecDeque<JoinHandle<()>>;
+
+/// Called with the key on the blocking thread before an analysis.
+#[cfg(test)]
+type Hook = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// What woke the dispatcher.
 enum Wake {
@@ -405,6 +467,9 @@ impl Ingest {
                 on_llm_queued: parts.on_llm_queued,
                 writer: Mutex::new(None),
                 inflight: Mutex::new(HashSet::new()),
+                analyzing: Arc::default(),
+                #[cfg(test)]
+                hook: None,
                 sweep_now: Notify::new(),
                 jobs: Mutex::new(HashMap::new()),
                 started: Instant::now(),
@@ -594,7 +659,24 @@ impl Ingest {
         rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Job>>>,
         mut shutdown: watch::Receiver<bool>,
     ) {
+        let mut overruns = Overruns::new();
         loop {
+            // Too many analyses left running: wait for the oldest before taking more work.
+            overruns.retain(|h| !h.is_finished());
+            while overruns.len() > MAX_OVERRUNS {
+                let Some(oldest) = overruns.pop_front() else {
+                    break;
+                };
+                info!(
+                    running = overruns.len() + 1,
+                    "ingest worker waits for an overrun analysis to end"
+                );
+                tokio::select! {
+                    biased;
+                    _ = shutdown.wait_for(|s| *s) => return,
+                    _ = oldest => {}
+                }
+            }
             let job = {
                 let mut rx = rx.lock().await;
                 tokio::select! {
@@ -606,7 +688,7 @@ impl Ingest {
             let Some(job) = job else { return };
             match job {
                 Job::Ingest { source, key, etag } => {
-                    self.run_ingest(source, &key, etag.as_deref(), &mut shutdown)
+                    self.run_ingest(source, &key, etag.as_deref(), &mut shutdown, &mut overruns)
                         .await;
                     lock(&self.inner.inflight).remove(&(source, key));
                     (self.inner.on_change)(source);
@@ -626,6 +708,7 @@ impl Ingest {
         key: &str,
         etag: Option<&str>,
         shutdown: &mut watch::Receiver<bool>,
+        overruns: &mut Overruns,
     ) {
         // Already through (a duplicate event, a stale sweep page): nothing to do.
         let (k, e) = (key.to_owned(), etag.map(str::to_owned));
@@ -640,7 +723,7 @@ impl Ingest {
             let Some(backend) = self.backend(shutdown).await else {
                 return; // shutdown: stays pending
             };
-            let result = self.ingest_once(&backend, source, key).await;
+            let result = self.ingest_once(&backend, source, key, overruns).await;
             let (k, e) = (key.to_owned(), etag.map(str::to_owned));
             let outcome = match result {
                 Ok(Some(outcome)) => outcome,
@@ -690,6 +773,7 @@ impl Ingest {
         backend: &Arc<dyn Backend>,
         id: SourceId,
         key: &str,
+        overruns: &mut Overruns,
     ) -> Result<Option<IngestOutcome>, IngestError> {
         // The runtime settings are read per file, so a change applies without a restart.
         let (source, settings) = self
@@ -706,7 +790,7 @@ impl Ingest {
             key: key.to_owned(),
         };
         let name = key.rsplit('/').next().unwrap_or(key).to_owned();
-        let blake3 = Blake3(*blake3::hash(&bytes).as_bytes());
+        let (bytes, blake3) = hash(bytes).await?;
         // Content already stored with the current step versions: reuse its record.
         let stored = backend
             .get_record(&blake3)
@@ -716,22 +800,7 @@ impl Ingest {
             let outcome = stored_outcome(&r.body);
             (r.body, outcome)
         } else {
-            let analyzer = Arc::clone(&self.inner.analyzer);
-            let k = key.to_owned();
-            let limit = analyzer.limits().timeout_cap() + Duration::from_mins(1);
-            let task = tokio::task::spawn_blocking(move || analyzer.analyze(bytes, &k));
-            let a = match tokio::time::timeout(limit, task).await {
-                Ok(Ok(a)) => a,
-                Ok(Err(e)) => {
-                    return Err(IngestError::permanent(format!("analysis panicked: {e}")));
-                }
-                Err(_) => {
-                    return Err(IngestError::permanent(format!(
-                        "analysis did not finish within {}s",
-                        limit.as_secs()
-                    )));
-                }
-            };
+            let a = self.analyze(bytes, blake3, key, overruns).await?;
             lock(&self.inner.stats).analyzed += 1;
             backend.put_record(&a.blake3, &a.body, &a.versions).await?;
             (a.body, a.outcome)
@@ -781,6 +850,56 @@ impl Ingest {
             Outcome::Unsupported => IngestOutcome::Skipped { blake3 },
             Outcome::Failed(error) => IngestOutcome::Failed { error, attempts: 1 },
         }))
+    }
+
+    /// Analyzes one file on a blocking thread, under the watchdog. Past it the file fails as
+    /// before, and the analysis, which nothing can stop from outside, is added to `overruns`
+    /// (the worker bounds those): its bytes are freed, and a `WARN` logged, when it returns.
+    async fn analyze(
+        &self,
+        bytes: Vec<u8>,
+        blake3: Blake3,
+        key: &str,
+        overruns: &mut Overruns,
+    ) -> Result<Analysis, IngestError> {
+        let analyzer = Arc::clone(&self.inner.analyzer);
+        let limit = analyzer.limits().timeout_cap() + self.inner.config.watchdog_grace;
+        let counted = Counted::new(&self.inner.analyzing, bytes.len());
+        let k = key.to_owned();
+        #[cfg(test)]
+        let hook = self.inner.hook.clone();
+        let mut task = tokio::task::spawn_blocking(move || {
+            let _counted = counted;
+            #[cfg(test)]
+            if let Some(h) = hook {
+                h(&k);
+            }
+            analyzer.analyze_hashed(bytes, blake3, &k)
+        });
+        let started = Instant::now();
+        match tokio::time::timeout(limit, &mut task).await {
+            Ok(Ok(a)) => Ok(a),
+            Ok(Err(e)) => Err(IngestError::permanent(format!("analysis panicked: {e}"))),
+            Err(_) => {
+                lock(&self.inner.stats).overruns += 1;
+                let key = key.to_owned();
+                let analyzing = Arc::clone(&self.inner.analyzing);
+                overruns.push_back(tokio::spawn(async move {
+                    let _ = task.await;
+                    warn!(
+                        key,
+                        ran = ?started.elapsed(),
+                        analyzing = analyzing.files.load(Ordering::SeqCst),
+                        analyzing_bytes = analyzing.bytes.load(Ordering::SeqCst),
+                        "an analysis the watchdog gave up on has ended; its memory is free"
+                    );
+                }));
+                Err(IngestError::permanent(format!(
+                    "analysis did not finish within {}s",
+                    limit.as_secs()
+                )))
+            }
+        }
     }
 
     /// Ends the location of a deleted object, with retries.
@@ -992,6 +1111,17 @@ impl Ingest {
 }
 
 /// How a stored record ended, for content reused without analysis.
+/// The file's hash, on a blocking thread: a full pass over up to the size cap would stall
+/// the runtime thread (and the API and the other workers on it).
+pub(crate) async fn hash(bytes: Vec<u8>) -> Result<(Vec<u8>, Blake3), IngestError> {
+    tokio::task::spawn_blocking(move || {
+        let blake3 = content_hash(&bytes);
+        (bytes, blake3)
+    })
+    .await
+    .map_err(|e| IngestError::permanent(format!("hashing panicked: {e}")))
+}
+
 fn stored_outcome(body: &Json) -> Outcome {
     if body["status"]["state"] == "failed" {
         return Outcome::Failed(
@@ -1009,9 +1139,243 @@ fn stored_outcome(body: &Json) -> Outcome {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Condvar;
+
+    use doewood_core::MasterKey;
+    use doewood_store::{NewSource, ObjectChange, SeenObject, Standalone};
     use serde_json::json;
 
     use super::*;
+
+    /// Objects by key.
+    #[derive(Default)]
+    struct Objects(Mutex<HashMap<String, Vec<u8>>>);
+
+    #[async_trait]
+    impl Fetch for Objects {
+        async fn fetch(&self, _source: &Source, key: &str) -> Result<Vec<u8>, IngestError> {
+            lock(&self.0)
+                .get(key)
+                .cloned()
+                .ok_or_else(|| IngestError::permanent("no such key"))
+        }
+    }
+
+    /// Holds the analyses of some keys until released: a step that does not stop on time.
+    #[derive(Default)]
+    struct Gate {
+        held: Mutex<HashSet<String>>,
+        changed: Condvar,
+    }
+
+    impl Gate {
+        fn wait(&self, key: &str) {
+            let mut held = lock(&self.held);
+            let until = Instant::now() + Duration::from_mins(1);
+            while held.contains(key) && Instant::now() < until {
+                held = self
+                    .changed
+                    .wait_timeout(held, Duration::from_millis(50))
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+        }
+
+        fn release(&self, key: &str) {
+            lock(&self.held).remove(key);
+            self.changed.notify_all();
+        }
+    }
+
+    struct Run {
+        ingest: Ingest,
+        store: Arc<Store>,
+        source: SourceId,
+        gate: Arc<Gate>,
+        shutdown: watch::Sender<bool>,
+        handle: IngestHandle,
+        _events: mpsc::Sender<ObjectEvent>,
+    }
+
+    /// One worker, a 300 ms file timeout and a 200 ms watchdog grace; the keys in `held`
+    /// stall on the gate. Every object is pending before the workers start, so the first
+    /// sweep queues them in key order.
+    fn run(objects: &[(&str, Vec<u8>)], held: &[&str]) -> Run {
+        let store = Arc::new(Store::open_in_memory(&MasterKey::from_bytes([9; 32])).unwrap());
+        let backend: Arc<dyn Backend> = Arc::new(Standalone::new(Arc::clone(&store)));
+        let source = store
+            .add_source(&NewSource::new("http://objects.test:9000", "docs"), None)
+            .unwrap();
+        let fetch = Objects::default();
+        let mut changes = Vec::new();
+        for (key, bytes) in objects {
+            lock(&fetch.0).insert((*key).to_owned(), bytes.clone());
+            changes.push(ObjectChange::Upsert(SeenObject {
+                key: (*key).to_owned(),
+                etag: Some(format!("{:x}", bytes.len())),
+                size: bytes.len() as u64,
+                last_modified: Some(1),
+            }));
+        }
+        store.record_objects(source, &changes, None).unwrap();
+        let mut config = IngestConfig::new(Some(1), Path::new("/nonexistent"));
+        config.watchdog_grace = Duration::from_millis(200);
+        config.analyzer.file_timeout = Duration::from_millis(300);
+        config.analyzer.ocr_models = "/nonexistent/doewood-ocr-models".into();
+        let analyzer = Arc::new(Analyzer::new(&config.analyzer).unwrap());
+        let gate = Arc::new(Gate::default());
+        lock(&gate.held).extend(held.iter().map(|k| (*k).to_owned()));
+        let (_backend_tx, backend_rx) = watch::channel(Some(backend));
+        let mut ingest = Ingest::new(IngestParts {
+            store: Arc::clone(&store),
+            backend: backend_rx,
+            fetch: Arc::new(fetch),
+            analyzer,
+            config,
+            on_change: Arc::new(|_| {}),
+            on_llm_queued: Arc::new(|_| {}),
+        });
+        let g = Arc::clone(&gate);
+        Arc::get_mut(&mut ingest.inner).unwrap().hook = Some(Arc::new(move |k| g.wait(k)));
+        let (events, events_rx) = mpsc::channel(16);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let handle = ingest.start(events_rx, shutdown_rx);
+        Run {
+            ingest,
+            store,
+            source,
+            gate,
+            shutdown,
+            handle,
+            _events: events,
+        }
+    }
+
+    impl Run {
+        fn status(&self, key: &str) -> doewood_store::IngestStatus {
+            self.store.ingest_status(self.source, key).unwrap().unwrap()
+        }
+
+        /// Analyses running and their bytes.
+        fn analyzing(&self) -> (usize, u64) {
+            let a = &self.ingest.inner.analyzing;
+            (
+                a.files.load(Ordering::SeqCst),
+                a.bytes.load(Ordering::SeqCst),
+            )
+        }
+
+        async fn until(&self, what: &str, f: impl Fn(&Self) -> bool) {
+            let until = Instant::now() + Duration::from_secs(30);
+            while !f(self) {
+                assert!(Instant::now() < until, "timed out waiting: {what}");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        async fn stop(self) {
+            self.shutdown.send_replace(true);
+            tokio::time::timeout(Duration::from_secs(10), self.handle.join())
+                .await
+                .expect("shutdown is prompt");
+        }
+    }
+
+    fn hashed(bytes: &[u8]) -> u32 {
+        let h = blake3::hash(bytes);
+        lock(&crate::analyze::HASHED)
+            .get(h.as_bytes())
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Distinct text per seed (no two tests share content: the hash spy is keyed by it).
+    fn text(seed: u64, len: usize) -> Vec<u8> {
+        let mut out = format!("seed {seed} pipeline test\n").into_bytes();
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        while out.len() < len {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let word = ["alpha", "beta", "gamma", "delta", "ugovor", "faktura"][(x % 6) as usize];
+            out.extend_from_slice(word.as_bytes());
+            out.push(if x.is_multiple_of(11) { b'\n' } else { b' ' });
+        }
+        out
+    }
+
+    /// Past the watchdog the file fails as before and the worker takes the next file at
+    /// once; the stalled analysis keeps its bytes counted until it returns, then frees them.
+    /// Each file is hashed exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_overrun_fails_its_file_and_frees_its_bytes_when_it_ends() {
+        let (stuck, next) = (text(1001, 4 << 20), text(1002, 2000));
+        let r = run(
+            &[("a-stuck.txt", stuck.clone()), ("b-next.txt", next.clone())],
+            &["a-stuck.txt"],
+        );
+        r.until("the next file is done", |r| {
+            r.status("b-next.txt").status == "done"
+        })
+        .await;
+        let s = r.status("a-stuck.txt");
+        assert_eq!(s.status, "failed");
+        assert_eq!(
+            s.last_error.as_deref(),
+            Some("analysis did not finish within 0s")
+        );
+        assert_eq!(s.attempts, 1);
+        // Moved on while the stalled analysis still holds its file.
+        assert_eq!(r.analyzing(), (1, stuck.len() as u64));
+        assert_eq!(r.ingest.stats().overruns, 1);
+        assert_eq!(r.ingest.stats().analyzed, 1);
+
+        r.gate.release("a-stuck.txt");
+        r.until("the overrun analysis ends", |r| r.analyzing() == (0, 0))
+            .await;
+        // Hashed once each: in the pipeline, not again in the analyzer.
+        assert_eq!(hashed(&stuck), 1);
+        assert_eq!(hashed(&next), 1);
+        // The record of the overrun file was never written: its status stays failed.
+        assert_eq!(r.status("a-stuck.txt").status, "failed");
+        r.stop().await;
+    }
+
+    /// A worker leaves at most one overrun behind: after a second one it waits for the
+    /// first to end before it takes another file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_worker_leaves_at_most_one_overrun_behind() {
+        let (a, b, c) = (text(2001, 1 << 20), text(2002, 1 << 20), text(2003, 2000));
+        let r = run(
+            &[
+                ("a-stuck.txt", a.clone()),
+                ("b-stuck.txt", b.clone()),
+                ("c-next.txt", c),
+            ],
+            &["a-stuck.txt", "b-stuck.txt"],
+        );
+        r.until("both stalled files failed", |r| {
+            r.status("a-stuck.txt").status == "failed" && r.status("b-stuck.txt").status == "failed"
+        })
+        .await;
+        assert_eq!(r.analyzing(), (2, (a.len() + b.len()) as u64));
+        // Well past another watchdog period: the worker is waiting, the next file is not taken.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(r.status("c-next.txt").status, "pending");
+        assert_eq!(r.analyzing().0, 2);
+
+        r.gate.release("a-stuck.txt");
+        r.until("the next file is done", |r| {
+            r.status("c-next.txt").status == "done"
+        })
+        .await;
+        assert_eq!(r.analyzing(), (1, b.len() as u64));
+        r.gate.release("b-stuck.txt");
+        r.until("every analysis ended", |r| r.analyzing() == (0, 0))
+            .await;
+        assert_eq!(r.ingest.stats().overruns, 2);
+        r.stop().await;
+    }
 
     #[test]
     fn jobs_follow_cpus_and_memory() {
