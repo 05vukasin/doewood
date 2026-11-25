@@ -51,8 +51,9 @@ object over the cap fails without a retry.
 - **OCR** (cargo feature `ocr`, on in the binary): with the model files in `DOEWOOD_OCR_MODELS`
   (default `<data>/ocr-models`), the engine runs under quail's `deep` profile and OCRs the pages
   that need it, with quail's budgets (pages read at once from the memory, or
-  `DOEWOOD_OCR_JOBS`; 45 s a page, the file timeout extended for them). Without the models it logs one `WARN`, runs `standard`, and scanned
-  pages are flagged `needs_ocr`. `--no-default-features` builds without ONNX Runtime.
+  `DOEWOOD_OCR_JOBS`; 45 s a page, the file timeout extended for them). Without the models it
+  logs one `WARN`, runs `standard`, and scanned pages are flagged `needs_ocr`.
+  `--no-default-features` builds without ONNX Runtime.
 - **Content already stored** with the current step versions is not analyzed again: a second
   copy only adds its location.
 
