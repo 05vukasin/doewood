@@ -1198,9 +1198,9 @@ impl SearchStore for PgStore {
                  FROM search_index s WHERE s.tsv @@ plainto_tsquery('simple', {p})"
             )
         };
-        let c = client(&self.pool).await?;
+        let db = client(&self.pool).await?;
         if let Some(company) = q.company {
-            let few = c
+            let few = db
                 .one(FEW_PARTIES, &[&company])
                 .await?
                 .try_get(0)
@@ -1272,7 +1272,7 @@ impl SearchStore for PgStore {
         );
         // Not cached: up to 256 shapes (one per combination of filters), user-driven and rare
         // next to the ingest statements, and a generic plan could not use the source prefix.
-        let rows = c.query(&sql, &args.refs()).await.map_err(pg)?;
+        let rows = db.query(&sql, &args.refs()).await.map_err(pg)?;
         rows.iter()
             .map(|r| {
                 Ok(SearchHit {

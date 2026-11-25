@@ -708,7 +708,7 @@ each, `origin/main` at `77524d9` before and this change after.
 
 The peak of a page of big records drops from two to 2.7 times the whole page's 37.5 MiB of
 bodies to about twice the 3 MiB budget. Walking big records takes more pages, so more
-round trips: 20 to 50 % longer in all. Small records page as before.
+round trips: 20 to 60 % longer in all. Small records page as before.
 
 ## Search by company
 
