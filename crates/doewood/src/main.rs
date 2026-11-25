@@ -62,8 +62,9 @@ enum ConfigCommand {
 fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Serve => {
+            let started = std::time::Instant::now();
             logging::init();
-            serve::main(BootstrapConfig::from_env())
+            serve::main(BootstrapConfig::from_env(), started)
         }
         Command::Version => {
             println!(

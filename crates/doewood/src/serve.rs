@@ -29,7 +29,7 @@
 
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use doewood_api::{ApiOptions, ApiParts, ApiState, Progress};
 use doewood_core::{BootstrapConfig, Loaded, MasterKey, MasterKeySource};
@@ -48,8 +48,9 @@ const API_DRAIN: Duration = Duration::from_secs(10);
 use crate::ops::{self, OpsState};
 use crate::{cleanup, enrichment, icons, ingest, shared};
 
-/// Builds the runtime and runs the service until a shutdown signal.
-pub fn main(loaded: Loaded) -> ExitCode {
+/// Builds the runtime and runs the service until a shutdown signal. `started`: when the
+/// process started, for the startup timings.
+pub fn main(loaded: Loaded, started: Instant) -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("doewood")
@@ -61,7 +62,7 @@ pub fn main(loaded: Loaded) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(run(loaded)) {
+    match runtime.block_on(run(loaded, started)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             error!(error = %message, "doewood stopped");
@@ -73,7 +74,7 @@ pub fn main(loaded: Loaded) -> ExitCode {
 // The start and stop order reads top to bottom, step by step as the module documentation lists
 // it; splitting it would only scatter that order.
 #[allow(clippy::too_many_lines)]
-async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
+async fn run(Loaded { config, warnings }: Loaded, started: Instant) -> Result<(), String> {
     info!(
         version = crate::VERSION,
         instance_id = %config.instance_id,
@@ -89,19 +90,24 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
         info!("no shared Postgres configured: running standalone");
     }
 
-    config.prepare_data_dir().map_err(|e| e.to_string())?;
-    let mut signals = Signals::register().map_err(|e| format!("signal handlers: {e}"))?;
-
     let state = Arc::new(OpsState::new(
         config.instance_id.as_str(),
         config.is_standalone(),
+        started,
     ));
+    state.step("config", started);
+    let t = Instant::now();
+    config.prepare_data_dir().map_err(|e| e.to_string())?;
+    let mut signals = Signals::register().map_err(|e| format!("signal handlers: {e}"))?;
+    state.step("data dir", t);
+    let t = Instant::now();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let listener = TcpListener::bind(config.ops_listen)
         .await
         .map_err(|e| format!("cannot bind the ops server to {}: {e}", config.ops_listen))?;
     let ops_addr = listener.local_addr().map_err(|e| e.to_string())?;
+    state.set_addr(ops_addr);
     info!(addr = %ops_addr, "ops server listening (/healthz, /readyz, /metrics)");
     let ops_server = tokio::spawn(
         axum::serve(listener, ops::router(Arc::clone(&state)))
@@ -122,9 +128,10 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
             ));
         }
     };
+    state.step("listeners", t);
 
     let store = tokio::select! {
-        store = open_store(&config) => store,
+        store = open_store(&config, &state) => store,
         signal = signals.recv() => {
             info!(signal, "shutdown requested during startup");
             let _ = shutdown_tx.send(true);
@@ -155,8 +162,8 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
         backend_tx.send_replace(Some(Arc::new(Standalone::new(Arc::clone(&store)))));
         // The value stays readable through `backend_rx`.
         drop(backend_tx);
+        // Ready once the API serves, below.
         state.set_ready();
-        info!(addr = %ops_addr, "ready");
         None
     };
 
@@ -165,7 +172,10 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
     let purging = cleanup::start(Arc::clone(&store), backend_rx.clone(), shutdown_rx.clone());
 
     let progress = Arc::new(Progress::new());
+    let t = Instant::now();
     let ingest = ingest::build(&config, &store, backend_rx.clone(), &progress).await;
+    state.step("ingest", t);
+    let t = Instant::now();
     let (ingest_tx, ingest_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     // Without ingest the receiver is dropped here, and no events are sent to it.
     let ingesting = ingest
@@ -188,6 +198,8 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
         shared,
     )
     .await;
+    state.step("enrichment and discovery", t);
+    let t = Instant::now();
     state.set_webhook(WebhookInlet::new(
         Arc::clone(&store),
         scanning.events.clone(),
@@ -223,6 +235,9 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
         tokio::spawn(async move { doewood_api::reclaim_sources(&api, shutdown).await })
     });
     let api_server = start_api(&config, api_listener, api)?;
+    state.step("api", t);
+    // Ready now in standalone mode; with Postgres, once it answers (see `shared`).
+    state.set_serving();
 
     let signal = signals.recv().await;
     info!(signal, "shutting down");
@@ -276,11 +291,15 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
     Ok(())
 }
 
-async fn open_store(config: &BootstrapConfig) -> Result<Store, String> {
+async fn open_store(config: &BootstrapConfig, state: &Arc<OpsState>) -> Result<Store, String> {
     let source = config.master_key.clone();
     let path = config.data_dir.join(STORE_FILE);
+    let state = Arc::clone(state);
     tokio::task::spawn_blocking(move || {
+        let t = Instant::now();
         let key = master_key(source)?;
+        state.step("master key", t);
+        let t = Instant::now();
         let store = Store::open(&path, &key)
             .map_err(|e| format!("cannot open the store {}: {e}", path.display()))?;
         let version = store.schema_version().map_err(|e| e.to_string())?;
@@ -290,6 +309,7 @@ async fn open_store(config: &BootstrapConfig) -> Result<Store, String> {
             readers = store.readers(),
             "store open"
         );
+        state.step("store open", t);
         Ok(store)
     })
     .await

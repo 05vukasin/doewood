@@ -151,12 +151,15 @@ impl Analyzer {
             timeout: config.file_timeout,
             ..Limits::default()
         };
+        let t = Instant::now();
         let ocr = Ocr::setup(
             &config.ocr_models,
             config.workers,
             config.ocr_jobs,
             &mut limits,
         );
+        let ocr_ms = millis(t.elapsed());
+        let t = Instant::now();
         let profile = if ocr.analyzer_ready() {
             Profile::Deep
         } else {
@@ -182,6 +185,8 @@ impl Analyzer {
             plan = %plan,
             ocr = ?ocr,
             steps = engine.plan().count(),
+            ocr_ms,
+            engine_ms = millis(t.elapsed()),
             "analyzer ready"
         );
         Ok(Self {
@@ -440,6 +445,11 @@ fn plan_fingerprint(engine: &Engine) -> String {
         Profile::Deep => "deep",
     };
     format!("{profile}:{}", &digest.as_str()[..16])
+}
+
+/// Whole milliseconds, for the log.
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// OCR, set up from doewood's model directory (not quail's environment variable).

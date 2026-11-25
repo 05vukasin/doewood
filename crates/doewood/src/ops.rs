@@ -5,9 +5,10 @@
 //! JSON over HTTP. Like the API, it has no authentication in v1 and binds to localhost by
 //! default; on Kubernetes, expose the ops port only inside the cluster.
 
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Bytes;
@@ -21,13 +22,31 @@ use doewood_s3::inlet::webhook::{self, WebhookError, WebhookInlet};
 use prometheus::{Encoder as _, Gauge, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry};
 
 /// Shared state of the ops endpoints.
+///
+/// Ready means the instance can serve: the gRPC API is serving ([`OpsState::set_serving`])
+/// and its backend is usable ([`OpsState::set_ready`]; [`OpsState::set_not_ready`] says why
+/// not). Either alone is not ready.
 pub struct OpsState {
-    ready: AtomicBool,
-    /// Why the instance is not ready, for `/readyz`.
-    reason: Mutex<String>,
+    /// Why the instance is not ready, for `/readyz`, and the two halves of ready.
+    gate: Mutex<Gate>,
     metrics: Metrics,
     /// Set once the store is open; cleared on shutdown, so the event channel can close.
     webhook: Mutex<Option<WebhookInlet>>,
+    /// When the process started, for the `startup step` and `ready` log lines.
+    started: Instant,
+    /// The ops server's address, for the `ready` log line.
+    addr: OnceLock<SocketAddr>,
+    /// Whether the first `ready` was logged.
+    announced: AtomicBool,
+}
+
+struct Gate {
+    /// The gRPC API serves.
+    serving: bool,
+    /// The backend is usable and the instance is not shutting down.
+    healthy: bool,
+    /// Why not healthy.
+    reason: String,
 }
 
 struct Metrics {
@@ -37,13 +56,40 @@ struct Metrics {
 }
 
 impl OpsState {
-    pub fn new(instance_id: &str, standalone: bool) -> Self {
+    /// `started`: when the process started (for the startup timings).
+    pub fn new(instance_id: &str, standalone: bool, started: Instant) -> Self {
         Self {
-            ready: AtomicBool::new(false),
-            reason: Mutex::new("starting".to_owned()),
+            gate: Mutex::new(Gate {
+                serving: false,
+                healthy: false,
+                reason: "starting".to_owned(),
+            }),
             metrics: Metrics::new(instance_id, standalone),
             webhook: Mutex::new(None),
+            started,
+            addr: OnceLock::new(),
+            announced: AtomicBool::new(false),
         }
+    }
+
+    /// Records the ops server's address, for the `ready` log line.
+    pub fn set_addr(&self, addr: SocketAddr) {
+        let _ = self.addr.set(addr);
+    }
+
+    /// Time since the process started.
+    pub fn since_start(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    /// Logs one startup step: how long it took (from `since`) and when it ended.
+    pub fn step(&self, step: &'static str, since: Instant) {
+        tracing::info!(
+            step,
+            took_ms = millis(since.elapsed()),
+            at_ms = millis(self.since_start()),
+            "startup step"
+        );
     }
 
     /// Starts accepting webhook notifications.
@@ -66,20 +112,41 @@ impl OpsState {
             .clone()
     }
 
-    /// Marks the instance ready for `/readyz`.
+    /// Marks the gRPC API serving: ready from here once the backend is usable.
+    pub fn set_serving(&self) {
+        let mut gate = self.gate();
+        gate.serving = true;
+        self.update(&gate);
+    }
+
+    /// Marks the backend usable: ready once the gRPC API serves too.
     pub fn set_ready(&self) {
-        let mut reason = self.reason();
-        reason.clear();
-        self.ready.store(true, Ordering::SeqCst);
-        self.metrics.ready.set(1);
+        let mut gate = self.gate();
+        gate.healthy = true;
+        gate.reason.clear();
+        self.update(&gate);
     }
 
     /// Marks the instance not ready; `/readyz` shows the reason. It must not hold a secret.
     pub fn set_not_ready(&self, why: impl Into<String>) {
-        let mut reason = self.reason();
-        *reason = why.into();
-        self.ready.store(false, Ordering::SeqCst);
-        self.metrics.ready.set(0);
+        let mut gate = self.gate();
+        gate.healthy = false;
+        gate.reason = why.into();
+        self.update(&gate);
+    }
+
+    /// Mirrors the gate into the gauge, and logs the first time the instance is ready.
+    fn update(&self, gate: &Gate) {
+        let ready = gate.serving && gate.healthy;
+        self.metrics.ready.set(i64::from(ready));
+        if ready && !self.announced.swap(true, Ordering::SeqCst) {
+            tracing::info!(
+                addr = self.addr.get().map(ToString::to_string),
+                startup_ms = millis(self.since_start()),
+                rss_mib = rss_mib(),
+                "ready"
+            );
+        }
     }
 
     /// The registry `/metrics` serves; the API registers its metrics there.
@@ -87,15 +154,40 @@ impl OpsState {
         &self.metrics.registry
     }
 
-    fn reason(&self) -> MutexGuard<'_, String> {
-        self.reason.lock().unwrap_or_else(PoisonError::into_inner)
+    fn gate(&self) -> MutexGuard<'_, Gate> {
+        self.gate.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// `None` when ready, otherwise why not.
     fn not_ready(&self) -> Option<String> {
-        let reason = self.reason();
-        (!self.ready.load(Ordering::SeqCst)).then(|| reason.clone())
+        let gate = self.gate();
+        if !gate.healthy {
+            Some(gate.reason.clone())
+        } else if !gate.serving {
+            Some("starting: the gRPC API is not serving yet".to_owned())
+        } else {
+            None
+        }
     }
+}
+
+/// Whole milliseconds, for the log.
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The process's resident memory in MiB (`VmRSS`), where `/proc` has it.
+pub fn rss_mib() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kib: u64 = status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmRSS:"))?
+        .trim()
+        .strip_suffix("kB")?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(kib.div_ceil(1024))
 }
 
 impl Metrics {
@@ -170,8 +262,8 @@ async fn healthz(State(s): State<Arc<OpsState>>) -> &'static str {
     "ok\n"
 }
 
-/// Ready: the local store is open, the shared store (when configured) answers, and the
-/// instance is not shutting down. Otherwise 503 with the reason.
+/// Ready: the local store is open, the gRPC API serves, the shared store (when configured)
+/// answers, and the instance is not shutting down. Otherwise 503 with the reason.
 async fn readyz(State(s): State<Arc<OpsState>>) -> (StatusCode, String) {
     s.metrics.requests.with_label_values(&["/readyz"]).inc();
     match s.not_ready() {
@@ -276,6 +368,47 @@ mod tests {
         (status, body)
     }
 
+    #[test]
+    fn ready_needs_the_api_serving_and_a_usable_backend() {
+        let ready = |s: &OpsState| s.metrics.ready.get();
+        // Backend first (standalone; or Postgres connecting before the API serves).
+        let s = OpsState::new("test", true, Instant::now());
+        assert_eq!(s.not_ready().as_deref(), Some("starting"));
+        s.set_ready();
+        assert_eq!(
+            s.not_ready().as_deref(),
+            Some("starting: the gRPC API is not serving yet")
+        );
+        assert_eq!(ready(&s), 0);
+        s.set_serving();
+        assert_eq!(s.not_ready(), None);
+        assert_eq!(ready(&s), 1);
+        s.set_not_ready("shutting down");
+        assert_eq!(s.not_ready().as_deref(), Some("shutting down"));
+        assert_eq!(ready(&s), 0);
+
+        // The API first (Postgres slower than the local start): the backend's reason shows.
+        let s = OpsState::new("test", false, Instant::now());
+        s.set_not_ready("connecting to the shared Postgres");
+        s.set_serving();
+        assert_eq!(
+            s.not_ready().as_deref(),
+            Some("connecting to the shared Postgres")
+        );
+        assert_eq!(ready(&s), 0);
+        s.set_ready();
+        assert_eq!(s.not_ready(), None);
+        assert_eq!(ready(&s), 1);
+        assert!(s.announced.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn rss_is_read_where_proc_has_it() {
+        if cfg!(target_os = "linux") {
+            assert!(rss_mib().is_some_and(|m| m > 0));
+        }
+    }
+
     const PUT: &str = r#"{"Records":[{"eventName":"s3:ObjectCreated:Put",
         "s3":{"bucket":{"name":"docs"},"object":{"key":"in/a.pdf","size":42,"eTag":"e1"}}}]}"#;
 
@@ -285,7 +418,7 @@ mod tests {
         let mut new = NewSource::new("http://minio:9000", "docs");
         new.prefix = "in/".into();
         let id = store.add_source(&new, None).unwrap();
-        let state = Arc::new(OpsState::new("test", true));
+        let state = Arc::new(OpsState::new("test", true, Instant::now()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(axum::serve(listener, router(Arc::clone(&state))).into_future());
