@@ -537,7 +537,8 @@ What the numbers say:
   `DOEWOOD_BENCH_BACKOFF_MS=20`, one run) a 1000-client step sheds 10 times as many calls
   (about 25,000 a second) and Postgres throughput falls to 2,252 calls/s (SQLite: 3,428): the
   refusals cost CPU (the process at 3 to 3.8 cores) that the calls then lack. Clients must
-  back off as documented; see #104.
+  back off as documented, and since #104 the server tells them how long (see
+  [Retries and shed calls](#retries-and-shed-calls-issue-104)).
 - **Memory:** 13 to 13.5 KiB per idle connection (2000 opened at once: +26 MiB, client side
   included), about 70 KiB per busy client (1000 clients with 100 streams: 160 to 210 MiB).
 - **Postgres `Search` is unstable between runs:** in one run of three `Search` took 6.9 ms
@@ -546,37 +547,10 @@ What the numbers say:
   step (2,624 to 4,402 calls/s, the database from 2.8 to 1.8 cores). The likely cause is the GIN
   index's pending list (new search rows wait there until a vacuum, and every search scans it): a
   rare-term lookup on 10,000 rows took 0.54 ms with the list full and 0.065 ms after `VACUUM`.
-  See #102.
+  Fixed in #102: see [Search and the GIN pending list](#search-and-the-gin-pending-list-issue-102).
 - The network layer is not the limit (as the io_uring research expected): the store's
   connections (SQLite) and the pool (Postgres) are, well below the HTTP/2 stack's 60,000+ requests/s on
   this machine.
-
-### Requests and limits
-
-Per doewood instance (one pod):
-
-| workload | CPU request | memory request | memory limit |
-|---|---|---|---|
-| typical: text documents, a few scans | 500m | 512 MiB | 2 GiB |
-| OCR-heavy: mostly scans | 2 to 4 (each OCR engine uses up to 4 threads) | 1.5 GiB | 4 GiB |
-
-- The chart's defaults (500m, 1 GiB, limit 4 GiB) fit both, so they are unchanged: the request
-  covers the OCR engine with one worker, the limit covers 4 workers with OCR plus a large
-  spreadsheet in flight. With a lower limit the default worker count drops (half the room under
-  the limit, 512 MiB a worker), and so does the memory budget (half the workers' plan: 768 MiB
-  with 3 workers under 4 GiB). Files over 16 MiB beyond the budget wait. A workbook over the
-  cell cap fails: each worker's share of half the room under the limit at 320 bytes a cell,
-  from 1,600,000 to 10,000,000 (2,100,000 with 3 workers under 4 GiB, 6,700,000 for a 2 GiB
-  worker; see [ingest.md](ingest.md#memory)). Set `DOEWOOD_INGEST_BUDGET_MIB` lower if big
-  PDFs or DOCX files come several at a time on a small limit. For bigger workbooks, raise the
-  memory limit or lower `DOEWOOD_INGEST_JOBS` (the cap grows with the memory per worker), or
-  set `DOEWOOD_INGEST_MAX_CELLS` with about 320 bytes a cell of room for each worker.
-- OCR throughput follows the CPU: with a 500m request an OCR-heavy pod gets only what the node
-  has spare. Plan about 1500 scanned pages an hour per instance on 4 cores, and more instances
-  (each with its own sources) rather than more workers to go faster. A second OCR engine needs a
-  memory limit of at least 10 GiB.
-- Postgres for a few instances: 256 MiB to 512 MiB of memory is enough for ingest; size
-  `shared_buffers` and the disk for the records (about 40 KiB a scanned page).
 
 ### Search and the GIN pending list (issue #102)
 
@@ -599,7 +573,7 @@ machine above, on a Docker network created with `--internal`; ranges of 3 runs:
 | `fastupdate = off` | 0 | 6,840 to 7,347 | 1.29 to 1.38 ms | 2.7 to 3.1 ms |
 
 Writing cost. `throughput` (`DOEWOOD_BENCH_JOBS=4 DOEWOOD_BENCH_FILES=2000`, test profile,
-medians of 3): 246 files/s before (238 to 249), 242 with 256 kB (240 to 250), 240 with
+medians of 3, before the fewer round trips of #103): 246 files/s before (238 to 249), 242 with 256 kB (240 to 250), 240 with
 `fastupdate = off` (238 to 250): within the noise,
 because the graph stage's round trips dominate there (see [ingest.md](ingest.md)). Inserts
 alone, `pgbench` (20 s, one run each) with 4 clients each inserting one search row per
@@ -633,7 +607,34 @@ mix of calls, release build, one 10 s run each):
 |---|---|---|---|---|
 | as docs/api.md advises: 100 ms doubling to 10 s, jitter | 5,410 | 38,722 | 47 / 100 ms | 2.2 cores |
 | a fixed 20 ms (`DOEWOOD_BENCH_BACKOFF_MS=20`) | 2,125 | 247,843 | 129 / 289 ms | 3.1 cores |
-| a fixed 20 ms, but the pushback when the server sends one | 5,185 | 49,439 | 50 / 106 ms | 2.3 cores |
+| a fixed 20 ms, but the pushback when the server sends one (`DOEWOOD_BENCH_PUSHBACK=1`) | 5,185 | 49,439 | 50 / 106 ms | 2.3 cores |
 
 A client that honours the pushback (as a gRPC client with a retry policy does) keeps
 throughput within 5% of the documented backoff, even if its own backoff is too short.
+
+### Requests and limits
+
+Per doewood instance (one pod):
+
+| workload | CPU request | memory request | memory limit |
+|---|---|---|---|
+| typical: text documents, a few scans | 500m | 512 MiB | 2 GiB |
+| OCR-heavy: mostly scans | 2 to 4 (each OCR engine uses up to 4 threads) | 1.5 GiB | 4 GiB |
+
+- The chart's defaults (500m, 1 GiB, limit 4 GiB) fit both, so they are unchanged: the request
+  covers the OCR engine with one worker, the limit covers 4 workers with OCR plus a large
+  spreadsheet in flight. With a lower limit the default worker count drops (half the room under
+  the limit, 512 MiB a worker), and so does the memory budget (half the workers' plan: 768 MiB
+  with 3 workers under 4 GiB). Files over 16 MiB beyond the budget wait. A workbook over the
+  cell cap fails: each worker's share of half the room under the limit at 320 bytes a cell,
+  from 1,600,000 to 10,000,000 (2,100,000 with 3 workers under 4 GiB, 6,700,000 for a 2 GiB
+  worker; see [ingest.md](ingest.md#memory)). Set `DOEWOOD_INGEST_BUDGET_MIB` lower if big
+  PDFs or DOCX files come several at a time on a small limit. For bigger workbooks, raise the
+  memory limit or lower `DOEWOOD_INGEST_JOBS` (the cap grows with the memory per worker), or
+  set `DOEWOOD_INGEST_MAX_CELLS` with about 320 bytes a cell of room for each worker.
+- OCR throughput follows the CPU: with a 500m request an OCR-heavy pod gets only what the node
+  has spare. Plan about 1500 scanned pages an hour per instance on 4 cores, and more instances
+  (each with its own sources) rather than more workers to go faster. A second OCR engine needs a
+  memory limit of at least 10 GiB.
+- Postgres for a few instances: 256 MiB to 512 MiB of memory is enough for ingest; size
+  `shared_buffers` and the disk for the records (about 40 KiB a scanned page).
