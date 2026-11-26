@@ -145,7 +145,7 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
   '-infinity'), id)`, the order `Neighbours` and `CompanyDocuments` page in; see
   [api.md](api.md#pages-of-neighbours-and-companydocuments)) is the current version. The
   migration drops and builds one index on `edges`, so writes to `edges` wait for the build
-  (seconds per million edges); no data changes. **Down path:** `DROP INDEX edges_by_dst;
+  (time grows with the number of edges; not measured); no data changes. **Down path:** `DROP INDEX edges_by_dst;
   CREATE INDEX edges_by_dst ON edges (dst, kind); DELETE FROM doewood_schema WHERE version
   = 10;`. The instance's own SQLite file went to schema 12 with the same index (`ifnull(valid_from,
   -2147483648)`). Schema 9 (issue #148: the `similar_to` stop band, `sketch_band_sizes`) came

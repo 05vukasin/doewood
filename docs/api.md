@@ -797,8 +797,9 @@ clients), its peak during the step.
 | Postgres, before | 48.5 / 78.6 ms | 68 MiB | 111 / 178 ms | 90 | 68 MiB |
 | Postgres, after | 1.24 / 1.98 ms | 18 MiB | 1.6 / 3.3 ms | 5,862 | 20 MiB |
 
-A client that needs every document now walks 13 pages of 1000 (or 251 of 50); each page
-costs its own size, so the walk is linear.
+A client that needs every document now walks 12 pages of 1000 (or 240 of 50), and then the
+empty page that a full last page's token leads to; each page costs its own size, so the walk
+is linear.
 
 ## Search by company
 
