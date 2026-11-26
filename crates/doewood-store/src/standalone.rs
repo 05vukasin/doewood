@@ -252,6 +252,22 @@ fn edge_from(r: EdgeRow) -> Result<StoredEdge> {
     })
 }
 
+/// The one row a write's `RETURNING` gives, with the statement then stepped to its end.
+/// `query_row` stops at the row and resets the statement, and a write that commits in that
+/// reset (autocommit) never runs SQLite's automatic checkpoint, which `sqlite3_step` starts
+/// only when a statement is done: a long run of such writes left the WAL growing without a
+/// checkpoint (1.3 million frames at 200,000 `similar_to` edges, issue #151).
+fn returning_row<T>(
+    stmt: &mut rusqlite::CachedStatement<'_>,
+    params: impl rusqlite::Params,
+    f: impl FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+    let mut rows = stmt.query(params)?;
+    let value = f(rows.next()?.ok_or(rusqlite::Error::QueryReturnedNoRows)?)?;
+    while rows.next()?.is_some() {}
+    Ok(value)
+}
+
 fn upsert_node(conn: &Connection, kind: NodeKind, key: &str, props: &Value) -> Result<Uuid> {
     let id: String = conn
         .prepare_cached(
@@ -262,7 +278,8 @@ fn upsert_node(conn: &Connection, kind: NodeKind, key: &str, props: &Value) -> R
              RETURNING id",
         )
         .and_then(|mut cached| {
-            cached.query_row(
+            returning_row(
+                &mut cached,
                 params![
                     Uuid::now_v7().to_string(),
                     kind.as_str(),
@@ -314,7 +331,8 @@ fn upsert_edge(conn: &Connection, e: &Edge) -> Result<Uuid> {
              RETURNING id",
         )
         .and_then(|mut cached| {
-            cached.query_row(
+            returning_row(
+                &mut cached,
                 params![
                     Uuid::now_v7().to_string(),
                     e.src.to_string(),
@@ -1564,6 +1582,43 @@ mod tests {
     use doewood_core::MasterKey;
 
     use super::*;
+
+    /// Single writes that return their row (`upsert_node`, `upsert_edge`) run SQLite's
+    /// automatic checkpoint (issue #151): 3,000 of each, with no checkpoint of doewood's own,
+    /// leave a WAL far under the 130 MiB and 33,000 frames they left before.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn returning_writes_let_sqlite_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(crate::STORE_FILE);
+        let mut store =
+            Store::open_with_readers(&path, &MasterKey::from_bytes([1; 32]), 2).unwrap();
+        store.wal = None;
+        let store = Arc::new(store);
+        let b = Standalone::new(Arc::clone(&store));
+        let mut nodes = Vec::new();
+        for i in 0..3000 {
+            let props = serde_json::json!({"n": i});
+            nodes.push(
+                b.upsert_node(NodeKind::Company, &format!("c{i}"), &props)
+                    .await
+                    .unwrap(),
+            );
+        }
+        for w in nodes.windows(2) {
+            let edge = Edge::new(w[0], w[1], EdgeKind::SimilarTo, EdgeSource::Document);
+            b.upsert_edge(&edge).await.unwrap();
+        }
+        let wal = std::fs::metadata(format!("{}-wal", path.display()))
+            .unwrap()
+            .len();
+        assert!(wal < 16 << 20, "WAL of {} MiB", wal >> 20);
+        // Their answers are still the rows written.
+        let again = b
+            .upsert_node(NodeKind::Company, "c7", &serde_json::json!({"n": 7}))
+            .await
+            .unwrap();
+        assert_eq!(again, nodes[7]);
+    }
 
     fn backend() -> Standalone {
         let store = Store::open_in_memory(&MasterKey::from_bytes([1; 32])).unwrap();

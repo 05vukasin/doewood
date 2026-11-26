@@ -200,6 +200,11 @@ Alerts worth setting (tune the thresholds to your traffic):
 - **Ingest results dropped:** `doewood_ingest_finish_unmatched_total` growing much faster than
   objects are changed or deleted while being ingested. Each count is a result that was not
   recorded; when its row is still pending, the next sweep ingests the object again (issue #125).
+- **Instance store WAL:** `doewood_store_wal_bytes` above a few hundred MiB for more than a few
+  minutes, or `doewood_store_wal_truncations_busy_total` growing on every try (one every 5 s).
+  The store empties its WAL when it is over 64 MiB or idle (issue #151); a WAL that stays
+  large means a read or a write holds a lock longer than the 50 ms the checkpoint waits for,
+  for example a backup tool or an `sqlite3` shell with a transaction open on the file.
 - **Template-heavy sources** (not an alert): `doewood_ingest_similar_buckets_skipped_total`
   counts band keys the `similar_to` query skipped because more than `similar_max_bucket`
   documents share them (issue #148). It grows when one template (one supplier's invoices)
@@ -1482,6 +1487,37 @@ query in the same run):
 - **The sweep over a long queue** (every key pending, as after a first scan or a
   reprocess) gained the most: the old form also read the queue index from its start for
   every page.
+
+### The instance store's WAL (issue #151)
+
+PR #150 found a WAL of 1.3 million frames (5.4 GB) after `api_load` seeded 200,000 documents,
+and every read 7 times as slow. Measured on this branch's parent (`staging` at `c87a4f4`, release
+build, 4 vCPU, 4 readers), with the WAL's size and frames read every 5 s from the file and its
+`-shm` index (`throughput` and `api_load` print them now):
+
+| | WAL at most | WAL at the end |
+|---|---|---|
+| `api_load` seeding 50,000 documents, before | 1,295 MiB, 329,610 frames | the same (never checkpointed) |
+| same, after | 5.7 MiB, about 1,000 frames | 553 frames, all in the main file |
+| `throughput`, 8,000 files, 16 `ListRecords` clients, then 60 s idle with the clients on, before | 21 MiB (reset 378 times) | 21.2 MiB, 707 frames, none in the main file |
+| same, after | 22 MiB (reset 434 times) | 0 (emptied 5 to 10 s after the last write) |
+
+- **Production ingest does not starve the checkpoint**, even with 16 API clients reading
+  without a pause: SQLite's own checkpoint resets the WAL every few hundred frames, and the WAL
+  stays near 20 MiB. Ingest's speed and the writer's lock wait are unchanged (46 and 43 files/s,
+  p99 32 and 35 ms; one run each). No read holds a transaction open: each read call is one
+  transaction inside a blocking closure, and the connection guard cannot be held across an
+  `await`.
+- **The 5.4 GB was not the readers**: it was the seed's last phase, one `similar_to` edge
+  upsert at a time. SQLite runs its automatic checkpoint only when `sqlite3_step` reports a
+  statement done, and a write read with `query_row` (its `RETURNING id`) is reset after its row
+  instead, so 50,000 such writes in a row never checkpointed. Node and edge upserts now step
+  to the end (`returning_writes_let_sqlite_checkpoint`).
+- **Idle, the WAL was never emptied**: without a write, SQLite does not checkpoint, and the
+  last frames stayed in the WAL. The checkpoint thread now empties it.
+- **The thread's cost to writes**: its PASSIVE step takes no writer lock; a TRUNCATE holds the
+  writer's lock for its wait (50 ms at most; the test's busy try took 50.3 ms) plus the copy of
+  what was left (0.2 to 0.3 ms in the tests).
 
 ### Requests and limits
 

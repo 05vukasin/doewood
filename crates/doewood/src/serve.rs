@@ -240,6 +240,9 @@ async fn run(Loaded { config, warnings }: Loaded, started: Instant) -> Result<()
     if let Err(e) = api.register_metrics(state.registry()) {
         warn!(error = %e, "the gRPC metrics could not be registered");
     }
+    if let Err(e) = cleanup::register_metrics(&store, state.registry()) {
+        warn!(error = %e, "the instance store's metrics could not be registered");
+    }
     // With a shared store, the sources are re-claimed once it answers, and only then scanned.
     let reclaiming = shared.then(|| {
         let (api, shutdown) = (api.clone(), shutdown_rx.clone());
