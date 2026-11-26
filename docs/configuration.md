@@ -240,6 +240,27 @@ the writer. When every reader
 is busy a read waits for one, never for the writer. An in-memory store (tests) has no
 readers; its reads use the writer, as before.
 
+**The WAL is kept bounded (issue #151).** SQLite's own checkpoints (after a commit that leaves
+1,000 pages in the WAL) are passive: they copy only the frames no read still needs, and the
+WAL starts over only once every frame is copied and no read is using it. With the readers busy
+without a pause, that moment may not come, and the WAL then grows without bound (checkpoint
+starvation: 5.4 GB after seeding 200,000 documents, every read 7 times as slow). So an on-disk
+store has one more connection, for checkpoints only (it writes no rows; the one writer stays
+the only writer), and a thread `doewood-wal` that every 5 s:
+
+1. runs `PRAGMA wal_checkpoint(PASSIVE)`: copies what it can, without waiting and without the
+   writer;
+2. when the `-wal` file is over 64 MiB, or nothing was written since the last pass and the WAL
+   is not empty, runs `PRAGMA wal_checkpoint(TRUNCATE)`: it waits for the reads on an older
+   snapshot to end (each read call is one short transaction; no read keeps one open across an
+   `await`), copies what is left and empties the file. It waits 50 ms at most in total for
+   SQLite's locks, then gives up until the next pass, so a write waits for it about that long
+   plus the copy of what the passive step left.
+
+An emptied WAL is logged at INFO when it was over 64 MiB (DEBUG when idle), a truncate that gave
+up at INFO. The WAL's size and the truncations are metrics (`doewood_store_wal_bytes`,
+[api.md](api.md#metrics)). The close still checkpoints and empties the WAL.
+
 **The instance's reads go first (issue #109).** When reads wait for a reader, the instance's
 own (ingest, enrichment, the scanners) get the next free one before the API's (its calls and
 the `WatchProgress` snapshot), so a flood of API reads cannot slow ingest down by holding every reader. The API

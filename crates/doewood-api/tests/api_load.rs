@@ -87,6 +87,68 @@ const WORDS: [&str; 24] = [
 /// Distinct rare terms.
 const RARE: usize = 5000;
 
+/// The instance store's WAL every 5 s, from its file and the `-shm` wal-index (issue #151):
+/// size, frames, and frames a checkpoint copied into the main file (`mxFrame`, `nBackfill`).
+struct WalWatch {
+    stop: Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<String>,
+}
+
+impl WalWatch {
+    #[allow(clippy::cast_precision_loss)]
+    fn start(wal: std::path::PathBuf) -> Self {
+        let sample = move |out: &mut String, secs: f64| {
+            use std::io::Read as _;
+            let Ok(m) = std::fs::metadata(&wal) else {
+                return;
+            };
+            let Some(stem) = wal.to_str().and_then(|w| w.strip_suffix("wal")) else {
+                return;
+            };
+            let shm = format!("{stem}shm");
+            let mut head = [0u8; 104];
+            if std::fs::File::open(shm)
+                .and_then(|mut f| f.read_exact(&mut head))
+                .is_err()
+            {
+                return;
+            }
+            let at =
+                |o: usize| u32::from_ne_bytes([head[o], head[o + 1], head[o + 2], head[o + 3]]);
+            let _ = write!(
+                out,
+                "\n  {secs:>6.0}s WAL {:>7.1} MiB, {:>8} frames, {:>8} in the main file",
+                m.len() as f64 / f64::from(1 << 20),
+                at(16),
+                at(96)
+            );
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let (started, mut out) = (Instant::now(), String::new());
+                let mut next = Duration::ZERO;
+                while !stop.load(Ordering::Relaxed) {
+                    if started.elapsed() >= next {
+                        next += Duration::from_secs(5);
+                        sample(&mut out, started.elapsed().as_secs_f64());
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                sample(&mut out, started.elapsed().as_secs_f64());
+                out
+            })
+        };
+        Self { stop, thread }
+    }
+
+    fn stop(self) -> String {
+        self.stop.store(true, Ordering::Relaxed);
+        self.thread.join().unwrap()
+    }
+}
+
 /// A rare term, scattered by `n`.
 fn rare(n: usize) -> String {
     format!("term{}", n.wrapping_mul(2_654_435_761) % RARE)
@@ -779,7 +841,12 @@ async fn api_load() {
     );
     let registry = Registry::new();
     a.state.register_metrics(&registry).unwrap();
+    let wal = WalWatch::start(dir.join(format!("{}-wal", doewood_store::STORE_FILE)));
     let seeded = Arc::new(seed(&a, &backend, docs).await);
+    println!(
+        "api_load: the instance store's WAL while seeding:{}",
+        wal.stop()
+    );
     if let Some(pg) = &pg {
         pg.analyze().await;
     }

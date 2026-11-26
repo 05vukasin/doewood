@@ -64,6 +64,7 @@ pub use store::sqs::{
     CredentialsChange, QUEUE_URL_MAX_LEN, SQS_DEFAULT_REGION, SqsInlet, SqsInletInput,
     queue_url_region, valid_queue_url,
 };
+pub use store::wal::{Checkpoint, CheckpointMode, WalPass, WalStats};
 pub use store::{
     ANALYSIS_LIMIT, DEFAULT_READERS, MAX_READERS, Optimized, SECRET_MAX_LEN, STORE_FILE, Snapshot,
     Store, default_readers, plan_readers,

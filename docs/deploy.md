@@ -200,6 +200,11 @@ Alerts worth setting (tune the thresholds to your traffic):
 - **Ingest results dropped:** `doewood_ingest_finish_unmatched_total` growing much faster than
   objects are changed or deleted while being ingested. Each count is a result that was not
   recorded; when its row is still pending, the next sweep ingests the object again (issue #125).
+- **Instance store WAL:** `doewood_store_wal_bytes` above a few hundred MiB for more than a few
+  minutes, or `doewood_store_wal_truncations_busy_total` growing on every try (one every 5 s).
+  The store empties its WAL when it is over 64 MiB or idle (issue #151); a WAL that stays
+  large means a read or a write holds a lock longer than the 50 ms the checkpoint waits for,
+  for example a backup tool or an `sqlite3` shell with a transaction open on the file.
 
 ## Sizing
 

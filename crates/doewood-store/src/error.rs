@@ -7,6 +7,9 @@ pub enum StoreError {
     /// An SQLite error.
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    /// The WAL checkpoint thread could not be started.
+    #[error("the WAL checkpoint thread did not start: {0}")]
+    Thread(std::io::Error),
     /// The file was written by a newer doewood with a schema this binary does not know.
     #[error(
         "store schema version {found} is newer than this binary's {supported}; upgrade doewood"
