@@ -123,22 +123,65 @@ fn walk(conn: &Connection, sql: &str, owner: &str, limit: i64) -> Vec<Vec<Row>> 
     pages
 }
 
+/// The query before issue #139 (no `INDEXED BY`): the same rows, but SQLite sorted every
+/// company for each page.
+fn before_139() -> String {
+    COMPANIES_DUE.replace(" INDEXED BY nodes_companies", "")
+}
+
+fn plan(conn: &Connection, sql: &str) -> String {
+    let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+    stmt.query_map(params!["me", None::<String>, 100, now()], |r| {
+        r.get::<_, String>(3)
+    })
+    .unwrap()
+    .collect::<rusqlite::Result<Vec<_>>>()
+    .unwrap()
+    .join("\n")
+}
+
 #[tokio::test]
 async fn companies_due_matches_the_query_before_issue_71() {
+    // With the planner statistics `seed` writes, then without them (a store ingest grew and
+    // nothing analysed yet).
+    for stats in [true, false] {
+        companies_due_matches(stats).await;
+    }
+}
+
+async fn companies_due_matches(stats: bool) {
     let store = Arc::new(Store::open_in_memory(&MasterKey::from_bytes([1; 32])).unwrap());
     seed(&store.conn(), 1000, true);
+    if !stats {
+        store
+            .conn()
+            .execute_batch("DELETE FROM sqlite_stat1; ANALYZE sqlite_schema;")
+            .unwrap();
+    }
+    // Issue #139: the companies in id order from the page token, no sort of them all.
+    let p = plan(&store.conn(), COMPANIES_DUE);
+    assert!(p.contains("USING COVERING INDEX nodes_companies (id>?)"), "{p}");
+    assert!(!p.contains("TEMP B-TREE FOR ORDER BY"), "{p}");
+    let before_139 = before_139();
+    if !stats {
+        // What the query did without `INDEXED BY`, as on the store of issue #139.
+        let p = plan(&store.conn(), &before_139);
+        assert!(p.contains("TEMP B-TREE FOR ORDER BY"), "{p}");
+    }
     let s = Standalone::new(Arc::clone(&store));
     for owner in ["me", "other", "third"] {
         let mut sizes = Vec::new();
         for limit in [1, 7, 100, 500] {
-            let (before, after) = {
+            let (before, before_139, after) = {
                 let conn = store.conn();
                 (
                     walk(&conn, BEFORE, owner, limit),
+                    walk(&conn, &before_139, owner, limit),
                     walk(&conn, COMPANIES_DUE, owner, limit),
                 )
             };
-            assert_eq!(before, after, "owner {owner}, limit {limit}");
+            assert_eq!(before, after, "owner {owner}, limit {limit}, stats {stats}");
+            assert_eq!(before_139, after, "owner {owner}, limit {limit}, stats {stats}");
             sizes.push(after.iter().map(Vec::len).sum::<usize>());
             let instance = InstanceId::new(owner).unwrap();
             let mut token = None;
@@ -216,14 +259,22 @@ fn companies_due_timings() {
             "first page of 100: before {:>9.2} ms  after {:>9.2} ms",
             ms[0], ms[1]
         );
-        for (label, sql) in [("before", BEFORE), ("after", COMPANIES_DUE)] {
-            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-            let plan: Vec<String> = stmt
-                .query_map(params!["me", None::<String>, 100, now()], |r| r.get(3))
-                .unwrap()
-                .collect::<rusqlite::Result<_>>()
-                .unwrap();
-            println!("--- {label}, {state}\n{}", plan.join("\n"));
+        let before_139 = before_139();
+        for (label, sql) in [("before #139", before_139.as_str()), ("after", COMPANIES_DUE)] {
+            let t = Instant::now();
+            let pages = walk(&conn, sql, "me", 100);
+            println!(
+                "a pass in pages of 100, {label}: {:.1} ms, {} pages",
+                t.elapsed().as_secs_f64() * 1000.0,
+                pages.len()
+            );
+        }
+        for (label, sql) in [
+            ("before", BEFORE),
+            ("before #139", before_139.as_str()),
+            ("after", COMPANIES_DUE),
+        ] {
+            println!("--- {label}, {state}\n{}", plan(&conn, sql));
         }
     }
 }

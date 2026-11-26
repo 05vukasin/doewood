@@ -31,12 +31,18 @@ pub(super) const DOCUMENTS: &str = "(SELECT count(DISTINCT e.src) FROM edges e J
 /// outer column in a `LIMIT`, so neither count stops at the threshold as on Postgres. `CASE`
 /// runs the tests in this order. The exact count is taken for the returned rows only. `?1` is
 /// the caller, `?2` the page token, `?3` the page size, `?4` now.
+///
+/// The companies are read through `nodes_companies` (`INDEXED BY`, issue #139): in id order
+/// from the page token, so the tests run on the candidates in that order and stop at the page
+/// size, as the `OFFSET 0` fence does on Postgres. Left to itself, SQLite 3.54 took every
+/// company from the `(kind, key)` index, ran the tests on each and sorted them all for every
+/// page, with or without `sqlite_stat1`, which made an enrichment pass quadratic.
 pub(crate) const COMPANIES_DUE: &str = "SELECT n.id, \
      (SELECT count(DISTINCT e.src) FROM edges e JOIN nodes d ON d.id = e.src \
      WHERE e.dst = n.id AND e.kind = 'party' AND d.kind = 'document' \
      AND e.state NOT IN ('retracted', 'superseded')), \
      f.documents \
-     FROM nodes n LEFT JOIN company_enrichment f ON f.company_id = n.id \
+     FROM nodes n INDEXED BY nodes_companies LEFT JOIN company_enrichment f ON f.company_id = n.id \
      WHERE n.kind = 'company' AND n.id > coalesce(?2, '') \
      AND NOT EXISTS (SELECT 1 FROM company_leases l \
      WHERE l.company_id = n.id AND l.owner <> ?1 AND l.expires_at > ?4) \
