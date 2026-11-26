@@ -16,7 +16,8 @@ LLM queue (per-source policy, concurrency cap, daily budget, on-demand `Summariz
 favicon proxy (see [docs/registries.md](docs/registries.md)), and the enrichment job that runs
 them next to ingest (registries, the decision gate, dated edges, websites and favicons; see
 [docs/enrichment.md](docs/enrichment.md)) are in. See
-[ADR 0002](docs/adr/0002-company-enrichment.md) (company identity and registries) and
+[ADR 0002](docs/adr/0002-company-enrichment.md) (company identity and registries),
+[ADR 0003](docs/adr/0003-records-as-canonical-text.md) (records as text) and
 [ADR 0001](docs/adr/0001-architecture.md).
 
 - **One binary.** It starts with no configuration at all; everything else is set at runtime
@@ -94,6 +95,10 @@ The `.proto` files compile with `protox` (pure Rust) in `doewood-api`'s build sc
 `cargo build` needs no `protoc`.
 
 ## Development
+
+Branches: `staging` is development (the default branch; every pull request goes there), `main` is
+release (fast-forwarded from `staging`; a push to it or a `v*` tag publishes the image, see
+[docs/deploy.md](docs/deploy.md#the-published-image)).
 
 The rules follow quail's: Rust 2024 on the pinned toolchain (1.97.1), clippy pedantic with
 `-D warnings`, `unsafe` denied, CI on Linux, macOS, Windows and Linux ARM, plus `cargo deny`.

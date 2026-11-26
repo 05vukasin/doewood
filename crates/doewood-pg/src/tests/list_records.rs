@@ -82,7 +82,16 @@ async fn page(
         .await
         .unwrap()
         .iter()
-        .map(|r| (r.get(0), r.get(1)))
+        .map(|r| {
+            // The current query has the text and the jsonb (schema 8); the one before only
+            // the jsonb.
+            let body = if sql == LIST_RECORDS {
+                crate::backend::stored_body(r, 1).unwrap()
+            } else {
+                crate::backend::record_text(&r.get(1)).unwrap()
+            };
+            (r.get(0), serde_json::from_str(body.get()).unwrap())
+        })
         .collect()
 }
 
