@@ -184,10 +184,12 @@ impl WebhookInlet {
 }
 
 /// Hands parsed notifications for `source` off as events: compares each record with
-/// `objects_seen`, sends the event, then records it, like a scan does. Records of another
-/// bucket, outside the prefix, already seen, or of a source that is not scanned are ignored.
-/// A failure part-way leaves the rest undone; handing the same notifications off again is
-/// safe, since what was recorded is then seen.
+/// `objects_seen`, records it and sends the event, like a scan does: a new or changed object
+/// is recorded (`pending`) before its event is sent, so the worker finds its row; a deletion
+/// is sent first, then recorded. Records of another bucket, outside the prefix, already seen,
+/// or of a source that is not scanned are ignored. A failure part-way leaves the rest undone;
+/// handing the same notifications off again is safe, since what was recorded is then seen (a
+/// pending row whose event was not sent is fed by ingest's sweep).
 pub(crate) async fn deliver(
     store: &Arc<Store>,
     events: &mpsc::Sender<ObjectEvent>,
@@ -222,20 +224,30 @@ pub(crate) async fn deliver(
         };
         let diff = Diff { key: n.key, kind };
         let change: ObjectChange = diff.change();
-        events
-            .send(ObjectEvent {
-                source,
-                key: diff.key,
-                kind: diff.kind,
-                origin,
-            })
-            .await
-            .map_err(|_| S3Error::ChannelClosed)?;
+        let event = ObjectEvent {
+            source,
+            key: diff.key,
+            kind: diff.kind,
+            origin,
+        };
         let s = Arc::clone(store);
-        blocking(move || s.record_objects(source, &[change], None)).await?;
+        let record = blocking(move || s.record_objects(source, &[change], None));
+        // As in a scan: a new or changed object's row is committed before its event is sent
+        // (issue #125), a deletion's after.
+        if matches!(event.kind, EventKind::Deleted) {
+            send(events, event).await?;
+            record.await?;
+        } else {
+            record.await?;
+            send(events, event).await?;
+        }
         outcome.emitted += 1;
     }
     Ok(outcome)
+}
+
+async fn send(events: &mpsc::Sender<ObjectEvent>, event: ObjectEvent) -> Result<(), S3Error> {
+    events.send(event).await.map_err(|_| S3Error::ChannelClosed)
 }
 
 async fn blocking<T: Send + 'static>(
@@ -399,5 +411,33 @@ mod tests {
                 .await,
             Err(WebhookError::UnknownSource(_))
         ));
+    }
+
+    /// A new object's row is committed before its event is sent (issue #125): the consumer
+    /// finds it at once.
+    #[tokio::test]
+    async fn a_row_commits_before_its_event() {
+        let store = Arc::new(Store::open_in_memory(&MasterKey::from_bytes([9; 32])).unwrap());
+        let id = store
+            .add_source(&NewSource::new("http://minio", "docs"), None)
+            .unwrap();
+        // The channel is full, so the hand-off waits until the consumer reads.
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(ObjectEvent {
+            source: id,
+            key: "earlier".into(),
+            kind: EventKind::Deleted,
+            origin: EventOrigin::Webhook,
+        })
+        .await
+        .unwrap();
+        let inlet = WebhookInlet::new(Arc::clone(&store), tx);
+        let handoff = tokio::spawn(async move { inlet.handle(id, MINIO_PUT.as_bytes()).await });
+        assert_eq!(rx.recv().await.unwrap().key, "earlier");
+        let e = rx.recv().await.unwrap();
+        assert_eq!(e.key, "in/a b.pdf");
+        let row = store.seen_object(id, &e.key).unwrap();
+        assert_eq!(row.and_then(|r| r.etag).as_deref(), Some("0123abcd"));
+        assert_eq!(handoff.await.unwrap().unwrap().emitted, 1);
     }
 }

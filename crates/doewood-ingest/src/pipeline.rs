@@ -1,9 +1,13 @@
 //! The pipeline: scanner events → fetch → analyze → store, on a pool of workers.
 //!
 //! - **The queue is durable.** `objects_seen` rows with status `pending` are the work; events
-//!   only make ingest look sooner. A sweep (at start, every [`IngestConfig::sweep_interval`],
-//!   and after a reprocess request) feeds every pending object, so a restart, an event that
-//!   raced its row's commit, or a source added while ingest was busy, are all picked up.
+//!   only make ingest look sooner. Discovery commits an object's `pending` row before it
+//!   sends the event (issue #125), so a worker always finds the row it finishes. A sweep (at
+//!   start, every [`IngestConfig::sweep_interval`], and after a reprocess request) feeds every
+//!   pending object, so a restart, a row whose event was never sent (a crash or stop between
+//!   the commit and the send), or a source added while ingest was busy, are all picked up. A
+//!   finish that matches no pending row of its version is counted
+//!   ([`Stats::finish_unmatched`], `doewood_ingest_finish_unmatched_total`).
 //! - **Backpressure.** The dispatcher hands jobs to the workers through a bounded queue and
 //!   waits while it is full, so it stops reading the scanners' bounded event channel, and the
 //!   scanners wait in turn.
@@ -419,6 +423,10 @@ pub struct Stats {
     pub redirected: u64,
     /// Analyses the watchdog gave up on (their files failed; each ran on until it returned).
     pub overruns: u64,
+    /// Finished objects whose status matched no `pending` row of that version, so the result
+    /// was not recorded: the object changed or was deleted meanwhile. (Until issue #125 an
+    /// event could also come before its row was committed; the sweep then ingested it again.)
+    pub finish_unmatched: u64,
     /// Where the workers' time went, summed over files (issue #69).
     pub time: StageTimes,
 }
@@ -663,6 +671,13 @@ impl Ingest {
         *lock(&self.inner.stats)
     }
 
+    /// Reads [`stats`](Self::stats) without keeping ingest (and its store) alive, for metrics
+    /// that outlive it; `None` once ingest is gone.
+    pub fn stats_reader(&self) -> impl Fn() -> Option<Stats> + Send + Sync + 'static {
+        let inner = Arc::downgrade(&self.inner);
+        move || inner.upgrade().map(|i| *lock(&i.stats))
+    }
+
     /// Starts the dispatcher (events and sweeps) and the workers.
     pub fn start(
         &self,
@@ -739,6 +754,7 @@ impl Ingest {
             failed = s.failed,
             analyzed = s.analyzed,
             redirected = s.redirected,
+            finish_unmatched = s.finish_unmatched,
             mib = s.bytes / (1 << 20),
             secs = self.inner.started.elapsed().as_secs(),
             time = ?s.time,
@@ -989,8 +1005,15 @@ impl Ingest {
                 .db(move |s| s.finish_object(source, &k, e.as_deref(), &outcome))
                 .await;
             lock(&self.inner.stats).time.store += t.elapsed();
-            if let Err(err) = finished {
-                warn!(source = %source, key, error = %err, "cannot record the ingest status");
+            match finished {
+                Ok(true) => {}
+                Ok(false) => {
+                    lock(&self.inner.stats).finish_unmatched += 1;
+                    debug!(source = %source, key, "no pending row to finish");
+                }
+                Err(err) => {
+                    warn!(source = %source, key, error = %err, "cannot record the ingest status");
+                }
             }
             return;
         }

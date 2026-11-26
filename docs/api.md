@@ -382,8 +382,8 @@ to do:
 
 ## Metrics
 
-The API's metrics are on the ops port's `/metrics` (Prometheus text format), next to
-`doewood_ready` and the others. gRPC-Web calls are counted like gRPC calls.
+The API's and ingest's metrics are on the ops port's `/metrics` (Prometheus text format), next
+to `doewood_ready` and the others. gRPC-Web calls are counted like gRPC calls.
 
 | metric | type | labels | what |
 |---|---|---|---|
@@ -394,6 +394,7 @@ The API's metrics are on the ops port's `/metrics` (Prometheus text format), nex
 | `doewood_grpc_connections_open` | gauge | | connections to the API port accepted and not yet closed |
 | `doewood_grpc_connections_total` | counter | | connections accepted |
 | `doewood_icons_requests_total` | counter | `outcome` | `GET /icons/{domain}`: `found`, `missing`, `invalid`, `busy` |
+| `doewood_ingest_finish_unmatched_total` | counter | | ingested objects whose status matched no `pending` row of that version, so it was not recorded: the object changed or was deleted meanwhile (issue #125). Near 0 in steady state |
 
 - `method` is the full method name, for example `doewood.v1.RecordsService/GetRecord` or
   `grpc.health.v1.Health/Check`. It comes from the fixed list of served methods; any other

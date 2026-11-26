@@ -55,8 +55,9 @@ pushes nothing; publishing the image to a registry is not set up yet.
 
 The chart in `charts/doewood` runs a `StatefulSet` (pods start in parallel; each gets its own
 `PersistentVolumeClaim` from `volumeClaimTemplates`), a headless Service naming each pod, and a
-Service for the gRPC (7443) and ops (7444) ports. The liveness probe is `/healthz`, the readiness
-probe `/readyz`. `DOEWOOD_INSTANCE_ID` is the pod name. Parallel starts against a new, empty
+Service for the gRPC (7443) and ops (7444) ports. The liveness probe is `/healthz` (every 10 s,
+6 failures), the readiness probe `/readyz` (every 2 s, 8 failures; see
+[Time to ready](#time-to-ready-issue-118) for why). `DOEWOOD_INSTANCE_ID` is the pod name. Parallel starts against a new, empty
 database are safe: one pod migrates the shared schema (and creates pgvector), the others
 wait for it and stay not ready until then (see the Migrations bullet in
 [configuration.md](configuration.md#the-shared-postgres)). Behind PgBouncer in transaction
@@ -160,6 +161,9 @@ Alerts worth setting (tune the thresholds to your traffic):
   streams, which do not count against it), and `doewood_grpc_connections_open` per pod, to
   see whether the clients spread over the replicas.
 - **Not ready:** `doewood_ready == 0` for more than a few minutes.
+- **Ingest results dropped:** `doewood_ingest_finish_unmatched_total` growing much faster than
+  objects are changed or deleted while being ingested. Each count is a result that was not
+  recorded; when its row is still pending, the next sweep ingests the object again (issue #125).
 
 ## Sizing
 
@@ -848,6 +852,78 @@ Measured with `throughput` and `api_load` as above (release build, 4 vCPU, `main
 - **Postgres is unchanged** (the readers are SQLite's). Its limit is the database's time on
   the API's pages; serving `ListRecords` without the `jsonb` round trip (stored text next to
   the `jsonb`, for example) is the next step if that load is real.
+
+### Time to ready (issue #118)
+
+How long a new instance takes from `exec` to `/readyz` answering 200, that is to serving the
+gRPC API. Each start logs one `startup step` line per step (`step`, `took_ms`, `at_ms` since
+the process started) and a `ready` line with `startup_ms` and the resident memory
+`rss_mib`; the shared Postgres's `shared Postgres store ready` line adds `connect_ms` and
+`migrate_ms`, and `analyzer ready` adds `ocr_ms` (checking the OCR models' SHA-256) and
+`engine_ms` (building the quail engine).
+
+Measured on the machine above with release builds of `36b041c` (after) and `e943d5a` (before:
+`main` plus the timings), the OCR models present, in a network namespace with only loopback,
+Postgres 17 in a container on an internal network (no TLS), nothing to ingest. Times in ms,
+the median of 3 runs unless marked; the store file in the page cache unless marked. "50k" is
+a store with 50,000 generated documents (records with 20 facts, search rows, sketches, nodes
+and 3 party edges each, 5,000 companies; 630 MiB of SQLite):
+
+| store | before | after | critical path after |
+|---|---|---|---|
+| SQLite, empty, restart | 145 | 138 | analyzer 126 (OCR check 57, engine 70) |
+| SQLite, 50k, restart | 144 | 138 | analyzer 127; store open 5 |
+| SQLite, 50k, statistics stale (1 run) | 12,896 | 109 | analyzer 102; statistics refreshed after ready (below) |
+| SQLite, 50k, statistics stale, file not cached (1 run) | 18,610 | 497 | analyzer 453; statistics refreshed after ready (below) |
+| Postgres, empty database, first start (1 run) | 145 | 481 | schema migration 424 (129 before: run to run noise on a busy machine) |
+| Postgres, 50k, restart | 145 | 132 | analyzer 122; connect + migrations 20, in parallel |
+
+- **What was cut.** `Store::open` ran `PRAGMA optimize = 0x10002`; with statistics missing or
+  stale (after a crash, an OOM kill or a bulk load, before the close-time optimize ran) it
+  analyzed whole tables: 13 s on 50k documents, 18 s when the file is not in the page cache
+  (a pod on a new node). It now runs right after the instance is ready, in the cleanup task,
+  sampled (`analysis_limit` 400) and one table at a time, with each table's pages read ahead
+  (through `dbstat`) on a connection of its own, so the writer is held only for one table's
+  `ANALYZE` over cached pages. The `instance store statistics refreshed` log line shows
+  `tables`, `took_ms`, `longest_writer_hold_ms` and the `slowest` table. The analyzer and the
+  shared Postgres's connect and migrations need nothing from the instance store and now start
+  before it opens; the readers, the prepared statements (per pooled connection, on first
+  use) and the OCR engines (on the first scanned page) were already lazy.
+
+  The refresh on the 50k store with its statistics dropped, measured with
+  `cargo test -p doewood-store --lib stale_statistics_refresh -- --ignored --nocapture`
+  (`DOEWOOD_BENCH_UNCACHED=1` drops the file from the page cache first; 1 run each; the test
+  also checks that the hot queries' plans match those of full statistics):
+
+  | refresh | cached: total / writer held | not cached: total / writer held |
+  |---|---|---|
+  | full statistics, one step (before) | 564 / 564 ms | 17.0 s / 17.0 s |
+  | `analysis_limit` 1000, one step | 100 / 100 ms | 13.3 s / 13.3 s |
+  | `analysis_limit` 400, one step | 100 / 100 ms | 16.9 s / 16.9 s |
+  | `analysis_limit` 400, a table at a time, read ahead (now) | 265 / 50 ms | 17.9 s / 68 ms |
+
+  Sampling cuts the work on cached pages, but not reading them: `ANALYZE` still reads every
+  page of every index. Reading them ahead, without the writer, is what keeps writes moving
+  (the slowest table, `sketch_bands`, takes 10 s to read uncached and 68 ms to analyze then).
+  Every hot query (pending objects, sketch candidates, record by hash, company documents,
+  neighbours, search by company and by date, object counts) keeps its plan with the sampled
+  statistics.
+- **Readiness is stricter.** Before, standalone instances reported ready as soon as the store
+  was open, about 130 ms before the gRPC API served (and with Postgres, as soon as it
+  connected). Ready now means the API serves and the backend answers.
+- **What is left:** the analyzer, about 125 ms: the SHA-256 of the 47 MB of OCR models
+  (30 to 60 ms) and building the quail engine (about 70 ms), both in quail. Without the OCR
+  models only the engine remains. Postgres's first start on an empty database migrates the
+  schema (0.1 to 0.4 s, once per database; other instances wait for it).
+- `/healthz` answers about 15 ms after `exec` (100 ms with the binary not in the page cache).
+- RSS at ready: 81 to 83 MiB in every case.
+
+Probes, from these numbers: no `initialDelaySeconds` for either probe, and no startup probe;
+an instance is ready well within a second, so the readiness period decides when a new pod
+takes traffic (on average half a period after ready). The chart's readiness probe runs every
+2 s (it ran every 5 s before) with 8 failures, about 16 s before a pod that lost Postgres is
+taken out, as before. The liveness probe stays at every 10 s with 6 failures: the process
+answers `/healthz` from the start, and a slow start never needs more.
 
 ### Requests and limits
 
