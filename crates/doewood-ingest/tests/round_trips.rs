@@ -167,7 +167,9 @@ async fn store() -> Option<(
 
 /// [`store`], through the proxy only when `proxied` (nothing is counted otherwise: the proxy
 /// itself adds time to every message).
-async fn store_via(proxied_conn: bool) -> Option<(
+async fn store_via(
+    proxied: bool,
+) -> Option<(
     Arc<dyn Backend>,
     Arc<Counts>,
     tokio_postgres::Client,
@@ -186,21 +188,21 @@ async fn store_via(proxied_conn: bool) -> Option<(
         .batch_execute(&format!("CREATE SCHEMA {schema}"))
         .await
         .unwrap();
-    let mut proxied = url::Url::parse(&url).unwrap();
-    let host = proxied.host_str().unwrap().to_owned();
-    let port = proxied.port().unwrap_or(5432);
+    let mut target = url::Url::parse(&url).unwrap();
+    let host = target.host_str().unwrap().to_owned();
+    let port = target.port().unwrap_or(5432);
     let upstream = tokio::net::lookup_host((host.as_str(), port))
         .await
         .unwrap()
         .next()
         .unwrap();
     let (addr, counts) = proxy(upstream).await;
-    if proxied_conn {
-        proxied.set_host(Some("127.0.0.1")).unwrap();
-        proxied.set_port(Some(addr.port())).unwrap();
+    if proxied {
+        target.set_host(Some("127.0.0.1")).unwrap();
+        target.set_port(Some(addr.port())).unwrap();
     }
-    let sep = if proxied.query().is_some() { '&' } else { '?' };
-    let scoped = format!("{proxied}{sep}sslmode=disable&options=-c%20search_path%3D{schema}");
+    let sep = if target.query().is_some() { '&' } else { '?' };
+    let scoped = format!("{target}{sep}sslmode=disable&options=-c%20search_path%3D{schema}");
     let pg = doewood_pg::PgStore::connect(&doewood_core::PostgresUrl::parse(&scoped).unwrap())
         .await
         .unwrap();
@@ -433,6 +435,7 @@ fn env_or(var: &str, default: u64) -> u64 {
 /// its plan on Postgres. Last, a digest of every `similar_to` edge, to compare two builds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "a measurement (issue #126); see docs/deploy.md"]
+#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
 async fn near_duplicate_corpus() {
     let docs = env_or("DOEWOOD_NEAR_DUP_DOCS", 2000);
     let (b, counts, pg): (Arc<dyn Backend>, Option<Arc<Counts>>, _) =
@@ -458,7 +461,7 @@ async fn near_duplicate_corpus() {
         Blake3::from_slice(blake3::hash(format!("near/{i}").as_bytes()).as_bytes()).unwrap()
     };
     let window = (docs / 10).max(1);
-    let (mut spent, mut similar, mut stmts, mut trips) = (Duration::ZERO, 0usize, 0u64, 0u64);
+    let (mut spent, mut similar, mut statements, mut trips) = (Duration::ZERO, 0usize, 0u64, 0u64);
     let started = Instant::now();
     println!(
         "docs | graph write ms/doc | statements/doc | round trips/doc | similar_to/doc | candidate query ms (candidates)"
@@ -483,7 +486,7 @@ async fn near_duplicate_corpus() {
         similar += stats.similar;
         if let (Some(c), Some(before)) = (&counts, before) {
             let s = c.since(before);
-            stmts += s.statements;
+            statements += s.statements;
             trips += s.round_trips;
         }
         if (i + 1) % window == 0 {
@@ -501,18 +504,17 @@ async fn near_duplicate_corpus() {
                     .len();
                 best = best.min(t.elapsed());
             }
-            #[allow(clippy::cast_precision_loss)]
             let per = |n: f64| n / window as f64;
             println!(
                 "{} | {:.2} | {:.1} | {:.1} | {:.1} | {:.2} ({found})",
                 i + 1,
                 per(spent.as_secs_f64() * 1000.0),
-                per(stmts as f64),
+                per(statements as f64),
                 per(trips as f64),
                 per(similar as f64),
                 best.as_secs_f64() * 1000.0,
             );
-            (spent, similar, stmts, trips) = (Duration::ZERO, 0, 0, 0);
+            (spent, similar, statements, trips) = (Duration::ZERO, 0, 0, 0);
         }
     }
     println!("total: {:.1} s", started.elapsed().as_secs_f64());
