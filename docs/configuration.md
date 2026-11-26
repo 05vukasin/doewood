@@ -216,6 +216,13 @@ gets what it wrote). Writes, and everything ingest and the scanners read to deci
 write (object status, pending objects, the LLM queue), stay on the writer. When every reader
 is busy a read waits for one, never for the writer. An in-memory store (tests) has no
 readers; its reads use the writer, as before.
+
+**The instance's reads go first (issue #109).** When reads wait for a reader, the instance's
+own (ingest, enrichment, the scanners) get the next free one before the API's (its calls and
+the `WatchProgress` snapshot), so a flood of API reads cannot slow ingest down by holding every reader. The API
+is not starved: while none of its reads holds a reader, the instance's reads leave it the last
+free one, so at least one API read is always going. Neither side waits for more than the reads
+already running.
 - **pgvector** is used when the server has it: doewood creates the extension (this needs a role
   allowed to) and adds `search_index.embedding`. Without it, this is logged once and search runs
   on full text only.

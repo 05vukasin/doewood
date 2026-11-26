@@ -17,8 +17,8 @@ use doewood_model::{
     LiveEdge, Located, LocationEnded, MERGE_CHAIN_MAX, Neighbour, NeighbourQuery, Node, NodeAlias,
     NodeKind, ObjectLocation, OwnedAlias, PropsPatch, PutOutcome, Record, RecordStore, Result,
     SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore, Sketch, SketchStore,
-    SourceClaim, SourceKey, StepVersions, StoredEdge, band_to_i64, merged_into, record_page_bytes,
-    records_limit, sketch_limit, validate_alias, validate_hashes, validate_node, validate_sketch,
+    SourceClaim, SourceKey, StepVersions, StoredEdge, band_to_i64, merged_into, records_limit,
+    sketch_limit, validate_alias, validate_hashes, validate_node, validate_sketch,
     versions_from_json, versions_to_json,
 };
 use rusqlite::types::Value as Sql;
@@ -32,6 +32,7 @@ use uuid::Uuid;
 
 use crate::Store;
 use crate::store::now;
+use crate::store::readers::Caller;
 use enrichment::DOCUMENTS;
 
 mod enrichment;
@@ -99,14 +100,27 @@ impl Standalone {
 
     /// Runs a pure read on one of the store's read-only connections (the writer when it has
     /// none), in one transaction: it sees what was committed when it started, and does not
-    /// wait for a write in progress.
+    /// wait for a write in progress. An API call's read gives way to the instance's own
+    /// ([`crate::api_call`]).
     async fn read<T, F>(&self, f: F) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
     {
+        self.read_then(f, Ok).await
+    }
+
+    /// [`Standalone::read`], then `then` on what it read, on the same blocking thread once
+    /// the reader is given back: work that needs no connection does not hold one.
+    async fn read_then<R, T, F, G>(&self, f: F, then: G) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<R> + Send + 'static,
+        G: FnOnce(R) -> Result<T> + Send + 'static,
+    {
         let store = Arc::clone(&self.store);
-        tokio::task::spawn_blocking(move || store.read(sql, f))
+        let caller = Caller::current();
+        tokio::task::spawn_blocking(move || caller.run(|| store.read(sql, f)).and_then(then))
             .await
             .map_err(|e| backend(format!("blocking task failed: {e}")))?
     }
@@ -581,11 +595,12 @@ impl RecordStore for Standalone {
     ) -> Result<Vec<Record>> {
         let (source, after) = (source.clone(), after.copied());
         let limit = i64::from(records_limit(limit));
-        self.read(move |conn| {
-            // `> coalesce(?4, x'')` rather than `?4 IS NULL OR ...`: the OR kept SQLite from
-            // starting the scan at the page token, so every page read the records before it
-            // (issue #13). Every hash is 32 bytes, so all are greater than the empty blob.
-            let mut stmt = conn
+        self.read_then(
+            move |conn| {
+                // `> coalesce(?4, x'')` rather than `?4 IS NULL OR ...`: the OR kept SQLite from
+                // starting the scan at the page token, so every page read the records before it
+                // (issue #13). Every hash is 32 bytes, so all are greater than the empty blob.
+                let mut stmt = conn
                 .prepare_cached(
                     "SELECT r.blake3, r.body_json, r.versions_json, r.updated_at FROM records r \
                      WHERE r.blake3 > coalesce(?4, x'') \
@@ -595,43 +610,53 @@ impl RecordStore for Standalone {
                      ORDER BY r.blake3 LIMIT ?5",
                 )
                 .map_err(sql)?;
-            let rows = stmt
-                .query_map(
-                    params![
-                        source.endpoint(),
-                        source.bucket(),
-                        source.prefix(),
-                        after.as_ref().map(|h| h.as_bytes().as_slice()),
-                        limit
-                    ],
-                    |r| {
-                        Ok((
-                            r.get::<_, Vec<u8>>(0)?,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, String>(2)?,
-                            r.get::<_, i64>(3)?,
-                        ))
-                    },
-                )
-                .map_err(sql)?;
-            // Rows are read one at a time; the page ends at the byte budget (issue #111).
-            let (mut page, mut bytes) = (Vec::new(), 0);
-            for row in rows {
-                let (h, body, versions, updated_at) = row.map_err(sql)?;
-                let record = Record {
-                    blake3: Blake3::from_slice(&h)?,
-                    body: raw_json(body)?,
-                    versions: versions_from_json(&json(&versions)?)?,
-                    updated_at,
-                };
-                bytes += record_page_bytes(&record);
-                page.push(record);
-                if bytes >= max_bytes {
-                    break;
+                let rows = stmt
+                    .query_map(
+                        params![
+                            source.endpoint(),
+                            source.bucket(),
+                            source.prefix(),
+                            after.as_ref().map(|h| h.as_bytes().as_slice()),
+                            limit
+                        ],
+                        |r| {
+                            Ok((
+                                r.get::<_, Vec<u8>>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, String>(2)?,
+                                r.get::<_, i64>(3)?,
+                            ))
+                        },
+                    )
+                    .map_err(sql)?;
+                // Rows are read one at a time; the page ends at the byte budget (issue #111),
+                // counted as `doewood_model::record_page_bytes` counts it (the body's JSON text).
+                let (mut page, mut bytes) = (Vec::new(), 0);
+                for row in rows {
+                    let row = row.map_err(sql)?;
+                    bytes += row.1.len();
+                    page.push(row);
+                    if bytes >= max_bytes {
+                        break;
+                    }
                 }
-            }
-            Ok(page)
-        })
+                Ok(page)
+            },
+            // The bodies are checked as JSON once the reader is given back: a page can hold
+            // megabytes of them (issue #109).
+            |rows| {
+                rows.into_iter()
+                    .map(|(h, body, versions, updated_at)| {
+                        Ok(Record {
+                            blake3: Blake3::from_slice(&h)?,
+                            body: raw_json(body)?,
+                            versions: versions_from_json(&json(&versions)?)?,
+                            updated_at,
+                        })
+                    })
+                    .collect()
+            },
+        )
         .await
     }
 }

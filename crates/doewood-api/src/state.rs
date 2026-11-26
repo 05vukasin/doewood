@@ -189,13 +189,13 @@ impl ApiState {
         }
     }
 
-    /// Runs a store call on a blocking thread.
+    /// Runs a store call on a blocking thread; its reads give way to the instance's own.
     pub(crate) async fn db<T: Send + 'static>(
         &self,
         f: impl FnOnce(&Store) -> Result<T, StoreError> + Send + 'static,
     ) -> Result<T, Status> {
         let store = Arc::clone(self.store());
-        tokio::task::spawn_blocking(move || f(&store))
+        tokio::task::spawn_blocking(move || doewood_store::api_call_blocking(|| f(&store)))
             .await
             .map_err(|e| error::join(&e))?
             .map_err(error::store)
