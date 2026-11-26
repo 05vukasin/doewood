@@ -70,7 +70,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Wait for MinIO
         run: |
-          for i in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             curl -sf http://127.0.0.1:9000/minio/health/live && exit 0
             sleep 1
           done
@@ -109,7 +109,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Wait for MinIO
         run: |
-          for i in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             curl -sf http://127.0.0.1:9000/minio/health/live && exit 0
             sleep 1
           done
@@ -144,7 +144,7 @@ jobs:
           docker run --rm doewood:ci version
           docker run -d --name dw -p 7444:7444 --read-only --cap-drop ALL --tmpfs /tmp \
             --tmpfs /data:uid=10001,gid=10001 doewood:ci
-          for i in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             curl -sf 127.0.0.1:7444/readyz && break
             sleep 1
           done
@@ -154,7 +154,7 @@ jobs:
           test "$(docker exec dw id -u)" = 10001
           # OCR runs with the models of the image. Ingest is set up after the store is ready
           # (reading the models takes a moment), so wait for its log line.
-          for i in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             docker logs dw 2>&1 | grep -q '"ocr":"Ready' && break
             sleep 1
           done

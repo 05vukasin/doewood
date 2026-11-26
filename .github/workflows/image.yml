@@ -62,7 +62,7 @@ jobs:
           docker run --rm doewood:smoke version
           docker run -d --name dw -p 7444:7444 --read-only --cap-drop ALL --tmpfs /tmp \
             --tmpfs /data:uid=10001,gid=10001 doewood:smoke
-          for i in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             curl -sf 127.0.0.1:7444/readyz && break
             sleep 1
           done
@@ -70,7 +70,7 @@ jobs:
           curl -sf 127.0.0.1:7444/readyz
           docker exec dw id
           test "$(docker exec dw id -u)" = 10001
-          for i in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             docker logs dw 2>&1 | grep -q '"ocr":"Ready' && break
             sleep 1
           done
@@ -149,10 +149,12 @@ jobs:
         run: |
           args=()
           while IFS= read -r tag; do [ -n "$tag" ] && args+=(-t "$tag"); done <<< "$TAGS"
+          sources=()
+          for digest in *; do sources+=("${IMAGE}@sha256:${digest}"); done
           docker buildx imagetools create "${args[@]}" \
             --annotation "index:org.opencontainers.image.source=https://github.com/05vukasin/doewood" \
             --annotation "index:org.opencontainers.image.licenses=MIT" \
-            $(printf "${IMAGE}@sha256:%s " *)
+            "${sources[@]}"
       - id: digest
         name: Read the digest
         env:
