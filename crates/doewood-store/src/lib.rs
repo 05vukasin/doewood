@@ -54,7 +54,9 @@ pub use store::ingest::{
     valid_min_jaccard, valid_similar_max_bucket, valid_summarize_max_concurrent,
 };
 pub use store::llm::{LlmCounts, LlmJob, LlmJobStatus, LlmUsage, SECONDS_PER_DAY, utc_day};
-pub use store::objects::{IngestOutcome, IngestStatus, ObjectChange, ScanCheckpoint, SeenObject};
+pub use store::objects::{
+    IngestOutcome, IngestStatus, KnownContent, ObjectChange, ScanCheckpoint, SeenObject,
+};
 pub use store::readers::{api_call, api_call_blocking};
 pub use store::sources::{
     DEFAULT_LLM_CONCURRENCY, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_SCAN_INTERVAL, LlmMode, LlmPolicy,

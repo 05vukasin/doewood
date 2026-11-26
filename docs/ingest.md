@@ -41,6 +41,17 @@ pending sweep (objects_seen)┘                                         (cap)   
 `GetObject` with the source's credentials, streamed under its size cap (512 MiB by default). An
 object over the cap fails without a retry.
 
+**Known copies** (issue #131, off by default, per source: [sources.md](sources.md#known-copies)).
+A GetObject response with a single-part ETag and no SSE-KMS or SSE-C records `(ETag, size) ->
+BLAKE3` with the object's final status, in the same transaction. On a source with
+`skip_known_copies` on, the status read before the fetch also looks up the listed ETag and size.
+When they match, a HEAD confirms the ETag, the size and the SSE type, and the stored record is
+read and checked against the running step versions. The worker then writes the location, graph
+and search as for any reused record, and the status and outcome are the record's. No GetObject,
+no hash and no analysis. Anything that does not match falls back to the normal fetch. The file's
+share of the [memory budget](#memory) is still taken by its listed size before the worker
+starts it, and freed when it is through. A HEAD is a short wait, not a download.
+
 ## Analyze
 
 - **One engine per instance**, built like the `quail` CLI builds its own
@@ -378,6 +389,11 @@ are there for enrichment, and no document merges on a fuzzy match yet.
   SQLite (and Postgres with `DOEWOOD_TEST_POSTGRES_URL`), then the records, the graph (pending
   references, companies across spellings and identifiers, `similar_to`), search, retries,
   deletes and reprocessing. `throughput` (ignored) measures files per second.
+- `tests/known_copies.rs`: a known copy is located with a HEAD and no GetObject only with the
+  source's setting on, a single-part ETag, no SSE-KMS or SSE-C on the copy and on the stored
+  original, the same size and an unchanged ETag. Its status, hash and document edges equal
+  those of a full ingest of the same bytes. `tests/minio_postgres.rs` checks the same against
+  MinIO and measures it ([Known copies, measured](#known-copies-measured)).
 - `tests/company_rows.rs` (ignored, a measurement): what each document's company props patch
   costs, for one supplier on every document against many small ones (issue #129; numbers in
   [deploy.md](deploy.md#company-rows-rewritten-by-every-document-issue-129)).

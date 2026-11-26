@@ -50,8 +50,11 @@ The comments in the `.proto` files are the reference for every field. In short:
   a restart. `paused: true` adds it without scanning.
 - The endpoint is normalized before the claim (scheme and host lowercased, the default port
   and a trailing `/` dropped), so `HTTP://MinIO:9000/` and `http://minio:9000` are one source.
-- **UpdateSource** changes the region, URL style, scan interval, size cap or credentials
-  (`clear_credentials` deletes them). The endpoint, bucket and prefix are the source's identity
+- `skip_known_copies` (off by default) records a new key whose single-part ETag and size match
+  content already stored without a GetObject. It trusts the ETag as the content's MD5; see
+  [sources.md](sources.md#known-copies).
+- **UpdateSource** changes the region, URL style, scan interval, size cap, `skip_known_copies`
+  or credentials (`clear_credentials` deletes them). The endpoint, bucket and prefix are the source's identity
   and do not change. A running scanner restarts, so new options apply at once (with a shared
   Postgres, a source that is not scanned, for example one claimed by another instance, is not
   started).
@@ -403,6 +406,8 @@ to `doewood_ready` and the others. gRPC-Web calls are counted like gRPC calls.
 | `doewood_grpc_connections_total` | counter | | connections accepted |
 | `doewood_icons_requests_total` | counter | `outcome` | `GET /icons/{domain}`: `found`, `missing`, `invalid`, `busy` |
 | `doewood_ingest_finish_unmatched_total` | counter | | ingested objects whose status matched no `pending` row of that version, so it was not recorded: the object changed or was deleted meanwhile (issue #125). Near 0 in steady state |
+| `doewood_ingest_known_copies_total` | counter | | objects recorded against content already stored, by their single-part MD5 ETag and size, without a GetObject (sources with `skip_known_copies` on, issue #131; [sources.md](sources.md#known-copies)) |
+| `doewood_ingest_known_copy_bytes_total` | counter | | the listed bytes of those objects, not fetched |
 
 - `method` is the full method name, for example `doewood.v1.RecordsService/GetRecord` or
   `grpc.health.v1.Health/Check`. It comes from the fixed list of served methods; any other

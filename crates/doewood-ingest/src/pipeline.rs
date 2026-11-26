@@ -22,6 +22,15 @@
 //!   retried with backoff, at most [`IngestConfig::max_attempts`] times; a file quail or
 //!   hedgehog cannot read is not retried. An object that changed meanwhile keeps its newer
 //!   state (the ETag guard of `finish_object`).
+//! - **Known copies** (issue #131). When a source has `skip_known_copies` on, an object
+//!   whose listed ETag is a single-part MD5 (32 hex digits, no `-<parts>`) and whose listed
+//!   size match content already hashed (`known_content`, written from every GetObject
+//!   response of a single-part object without SSE-KMS or SSE-C) is checked with a HEAD: when
+//!   it reports the same ETag and size and no SSE-KMS or SSE-C, and the content's record is
+//!   current, the location is recorded against that content as a full ingest of the same
+//!   bytes would, with no GetObject and no hash. Anything else (no HEAD, an error, another
+//!   ETag, a stale or missing record) fetches as before. Counted in
+//!   [`Stats::known_copies`] and [`Stats::known_copy_bytes`].
 //! - **Deleted objects** end their `located_at` edge; the document stays, with its other
 //!   locations.
 //! - **Bounded analysis.** A file is hashed once, on a blocking thread. Its analysis has one
@@ -49,8 +58,12 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use doewood_core::SourceId;
 use doewood_model::{Backend, Blake3, ObjectLocation};
-use doewood_s3::{ClientOptions, EventKind, ObjectEvent, S3Client, S3Config, S3Error};
-use doewood_store::{IngestOutcome, Source, SourceState, Store, StoreError};
+use doewood_s3::{
+    ClientOptions, EventKind, ObjectEvent, ObjectMeta, S3Client, S3Config, S3Error, md5_etag,
+};
+use doewood_store::{
+    IngestOutcome, IngestSettings, KnownContent, Source, SourceState, Store, StoreError,
+};
 use serde_json::value::RawValue;
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
@@ -262,11 +275,35 @@ impl From<S3Error> for IngestError {
     }
 }
 
+/// An object's bytes and what the response said about them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Fetched {
+    /// The bytes.
+    pub bytes: Vec<u8>,
+    /// The response's ETag, size and encryption; `None` when unknown.
+    pub meta: Option<ObjectMeta>,
+}
+
 /// Where object bytes come from: S3 in the service, a map in tests.
 #[async_trait]
 pub trait Fetch: Send + Sync {
     /// The object's bytes, at most the source's size cap.
     async fn fetch(&self, source: &Source, key: &str) -> Result<Vec<u8>, IngestError>;
+
+    /// [`fetch`](Self::fetch) with the response's metadata. Without it (the default) the
+    /// content is not recorded as known.
+    async fn fetch_with_meta(&self, source: &Source, key: &str) -> Result<Fetched, IngestError> {
+        Ok(Fetched {
+            bytes: self.fetch(source, key).await?,
+            meta: None,
+        })
+    }
+
+    /// The object's metadata without its bytes (`HeadObject`); `None` when it is gone or
+    /// unknown (the default), and then a known copy is fetched as any other object.
+    async fn head(&self, _source: &Source, _key: &str) -> Result<Option<ObjectMeta>, IngestError> {
+        Ok(None)
+    }
 }
 
 /// GetObject from the source's S3 endpoint, streamed under its size cap. One client per
@@ -310,9 +347,22 @@ impl S3Fetch {
 #[async_trait]
 impl Fetch for S3Fetch {
     async fn fetch(&self, source: &Source, key: &str) -> Result<Vec<u8>, IngestError> {
+        Ok(self.fetch_with_meta(source, key).await?.bytes)
+    }
+
+    async fn fetch_with_meta(&self, source: &Source, key: &str) -> Result<Fetched, IngestError> {
         let client = self.client(source).await?;
         let body = client.get_object(key, source.max_object_bytes()).await?;
-        Ok(body.bytes().await?)
+        let meta = body.meta().clone();
+        Ok(Fetched {
+            bytes: body.bytes().await?,
+            meta: Some(meta),
+        })
+    }
+
+    async fn head(&self, source: &Source, key: &str) -> Result<Option<ObjectMeta>, IngestError> {
+        let client = self.client(source).await?;
+        Ok(client.head_object(key).await?)
     }
 }
 
@@ -432,6 +482,10 @@ pub struct Stats {
     /// Band keys skipped by the `similar_to` candidate query because their bucket held more
     /// than `similar_max_bucket` documents (issue #148), summed over files.
     pub similar_buckets_skipped: u64,
+    /// Objects recorded against known content without a GetObject (issue #131).
+    pub known_copies: u64,
+    /// Their listed bytes, not fetched.
+    pub known_copy_bytes: u64,
     /// Where the workers' time went, summed over files (issue #69).
     pub time: StageTimes,
 }
@@ -920,12 +974,16 @@ impl Ingest {
             };
             match job {
                 Job::Ingest {
-                    source, key, etag, ..
+                    source,
+                    key,
+                    etag,
+                    size,
                 } => {
                     self.run_ingest(
                         source,
                         &key,
                         etag.as_deref(),
+                        size,
                         charge,
                         &mut shutdown,
                         &mut overruns,
@@ -945,11 +1003,13 @@ impl Ingest {
     /// Ingests one object version, with retries, and records how it ended. `charge` is the
     /// file's share of the memory budget (`None`: a small file), held until it returns and by
     /// its analysis until that ends.
+    #[allow(clippy::too_many_arguments)]
     async fn run_ingest(
         &self,
         source: SourceId,
         key: &str,
         etag: Option<&str>,
+        size: u64,
         charge: Option<Arc<Charge>>,
         shutdown: &mut watch::Receiver<bool>,
         overruns: &mut Overruns,
@@ -960,11 +1020,11 @@ impl Ingest {
                 return; // shutdown: stays pending
             };
             let result = self
-                .ingest_once(&backend, source, key, etag, charge.as_ref(), overruns)
+                .ingest_once(&backend, source, key, etag, size, charge.as_ref(), overruns)
                 .await;
             let (k, e) = (key.to_owned(), etag.map(str::to_owned));
-            let outcome = match result {
-                Ok(Some(outcome)) => outcome,
+            let (outcome, known) = match result {
+                Ok(Some(done)) => done,
                 Ok(None) => return, // already through, or the source is gone
                 Err(err) if err.transient && attempt < max => {
                     let delay = self.inner.config.retry_base * 4u32.saturating_pow(attempt - 1);
@@ -978,10 +1038,13 @@ impl Ingest {
                         _ = shutdown.wait_for(|s| *s) => return,
                     }
                 }
-                Err(err) => IngestOutcome::Failed {
-                    error: err.message,
-                    attempts: attempt,
-                },
+                Err(err) => (
+                    IngestOutcome::Failed {
+                        error: err.message,
+                        attempts: attempt,
+                    },
+                    None,
+                ),
             };
             {
                 let mut s = lock(&self.inner.stats);
@@ -997,7 +1060,9 @@ impl Ingest {
             let (k, e) = (key.to_owned(), etag.map(str::to_owned));
             let t = Instant::now();
             let finished = self
-                .db(move |s| s.finish_object(source, &k, e.as_deref(), &outcome))
+                .db(move |s| {
+                    s.finish_object_known(source, &k, e.as_deref(), &outcome, known.as_ref())
+                })
                 .await;
             lock(&self.inner.stats).time.store += t.elapsed();
             match finished {
@@ -1014,31 +1079,44 @@ impl Ingest {
         }
     }
 
-    /// One attempt at the version `etag`. `Ok(None)`: nothing to record, as that version is
-    /// already through (a duplicate event, a stale sweep page) or the source was removed
-    /// meanwhile.
+    /// One attempt at the version `etag`, listed with `size` bytes. `Ok(None)`: nothing to
+    /// record, as that version is already through (a duplicate event, a stale sweep page) or
+    /// the source was removed meanwhile. Else the outcome, and the content's MD5 ETag and size
+    /// when its GetObject response showed them (to record as known content).
+    #[allow(clippy::too_many_arguments)]
     async fn ingest_once(
         &self,
         backend: &Arc<dyn Backend>,
         id: SourceId,
         key: &str,
         etag: Option<&str>,
+        size: u64,
         charge: Option<&Arc<Charge>>,
         overruns: &mut Overruns,
-    ) -> Result<Option<IngestOutcome>, IngestError> {
+    ) -> Result<Option<(IngestOutcome, Option<KnownContent>)>, IngestError> {
         // The object's status, its source and the runtime settings in one read on a read-only
         // connection, so it does not wait behind the writer's commits (issue #128). The
         // settings are read per file, so a change applies without a restart. The status needs
         // no read of our own writes: `inflight` holds the key until its attempt is recorded.
+        // With known copies on, the content known under the listed ETag and size is read too.
         let t = Instant::now();
         let k = key.to_owned();
-        let (prior, source, settings) = self
+        let listed_md5 = etag.and_then(md5_etag);
+        let (prior, source, settings, known) = self
             .db(move |s| {
                 s.snapshot(|s| {
+                    let source = s.source(id)?;
+                    let known = match (&source, &listed_md5) {
+                        (Some(src), Some(md5)) if src.skip_known_copies => s
+                            .known_content(md5, size)?
+                            .map(|blake3| (md5.clone(), blake3)),
+                        _ => None,
+                    };
                     Ok((
                         s.ingest_status(id, &k)?,
-                        s.source(id)?,
+                        source,
                         s.ingest_settings()?,
+                        known,
                     ))
                 })
             })
@@ -1050,17 +1128,47 @@ impl Ingest {
         let Some(source) = source else {
             return Ok(None);
         };
-        let bytes = self.inner.fetch.fetch(&source, key).await?;
-        lock(&self.inner.stats).bytes += bytes.len() as u64;
-        t = self.stage(t, |s| &mut s.fetch);
         let location = ObjectLocation {
             endpoint: source.endpoint.clone(),
             bucket: source.bucket.clone(),
             key: key.to_owned(),
         };
         let name = key.rsplit('/').next().unwrap_or(key).to_owned();
+        if let Some((md5, blake3)) = known
+            && let Some((blake3, body, outcome)) = self
+                .known_copy(backend, &source, key, &md5, size, Blake3(blake3))
+                .await?
+        {
+            {
+                let mut s = lock(&self.inner.stats);
+                s.known_copies += 1;
+                s.known_copy_bytes += size;
+            }
+            t = self.stage(t, |s| &mut s.fetch);
+            let outcome = self
+                .write_graph(
+                    backend, &source, &location, &name, blake3, body, outcome, settings, t,
+                )
+                .await?;
+            // Nothing new about the content to record.
+            return Ok(Some((outcome, None)));
+        }
+        let fetched = self.inner.fetch.fetch_with_meta(&source, key).await?;
+        let bytes = fetched.bytes;
+        lock(&self.inner.stats).bytes += bytes.len() as u64;
+        t = self.stage(t, |s| &mut s.fetch);
+        // The MD5 ETag and size of the bytes in hand, as the response gave them.
+        let md5 = fetched
+            .meta
+            .filter(|m| m.size == bytes.len() as u64)
+            .and_then(|m| m.content_md5());
         let (bytes, blake3) = hash(bytes).await?;
         t = self.stage(t, |s| &mut s.analyze);
+        let known = md5.map(|etag| KnownContent {
+            etag,
+            size: bytes.len() as u64,
+            blake3: blake3.0,
+        });
         // Content already stored with the current step versions: reuse its record.
         let stored = backend
             .get_record(&blake3)
@@ -1080,10 +1188,76 @@ impl Ingest {
             t = self.stage(t, |s| &mut s.record);
             (a.body, a.outcome)
         };
+        let outcome = self
+            .write_graph(
+                backend, &source, &location, &name, blake3, body, outcome, settings, t,
+            )
+            .await?;
+        Ok(Some((outcome, known)))
+    }
+
+    /// The stored content a known copy is: `Some` when the object's HEAD reports the listed
+    /// MD5 ETag and `size` without SSE-KMS or SSE-C, and the record of `blake3` is current.
+    /// `None` (fetch it as any other object) otherwise, a failed HEAD included: the GetObject
+    /// that follows reports the failure.
+    async fn known_copy(
+        &self,
+        backend: &Arc<dyn Backend>,
+        source: &Source,
+        key: &str,
+        md5: &str,
+        size: u64,
+        blake3: Blake3,
+    ) -> Result<Option<(Blake3, Box<RawValue>, Outcome)>, IngestError> {
+        let head = match self.inner.fetch.head(source, key).await {
+            Ok(Some(head)) => head,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                debug!(source = %source.id, key, error = %e, "HEAD failed; fetching the object");
+                return Ok(None);
+            }
+        };
+        if head.size != size || head.content_md5().as_deref() != Some(md5) {
+            debug!(
+                source = %source.id,
+                key,
+                encryption = ?head.encryption,
+                "HEAD does not confirm a known copy; fetching the object"
+            );
+            return Ok(None);
+        }
+        let Some(record) = backend
+            .get_record(&blake3)
+            .await?
+            .filter(|r| !self.inner.analyzer.is_stale(&r.versions))
+        else {
+            return Ok(None);
+        };
+        let outcome = stored_outcome(&record.body);
+        Ok(Some((blake3, record.body, outcome)))
+    }
+
+    /// Writes the graph and search for a stored record at `location`, queues its summary if
+    /// the source's policy asks for one, and returns the object's outcome.
+    #[allow(clippy::too_many_arguments)]
+    async fn write_graph(
+        &self,
+        backend: &Arc<dyn Backend>,
+        source: &Source,
+        location: &ObjectLocation,
+        name: &str,
+        blake3: Blake3,
+        body: Box<RawValue>,
+        outcome: Outcome,
+        settings: IngestSettings,
+        t: Instant,
+    ) -> Result<IngestOutcome, IngestError> {
+        let id = source.id;
+        let key = location.key.as_str();
         let facts = DocFacts::from_record(&body);
         let stats = self
             .writer(backend)
-            .write(&blake3, &location, &facts, &name, settings)
+            .write(&blake3, location, &facts, name, settings)
             .await?;
         self.stage(t, |s| &mut s.graph);
         {
@@ -1110,6 +1284,7 @@ impl Ingest {
         // through the LLM queue, and never fails this file.
         if outcome == Outcome::Analyzed && crate::llm::has_digest(&body) {
             let (store, kind) = (Arc::clone(&self.inner.store), facts.kind.clone());
+            let source = source.clone();
             let queued = tokio::task::spawn_blocking(move || {
                 crate::llm::queue_if_wanted(&store, &source, &blake3, &body, kind.as_deref())
             })
@@ -1120,11 +1295,11 @@ impl Ingest {
             }
         }
         let blake3 = blake3.0;
-        Ok(Some(match outcome {
+        Ok(match outcome {
             Outcome::Analyzed => IngestOutcome::Done { blake3 },
             Outcome::Unsupported => IngestOutcome::Skipped { blake3 },
             Outcome::Failed(error) => IngestOutcome::Failed { error, attempts: 1 },
-        }))
+        })
     }
 
     /// Analyzes one file on a blocking thread, under the watchdog. Past it the file fails as
