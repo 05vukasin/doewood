@@ -190,7 +190,7 @@ async fn record_text_is_what_the_value_tree_wrote() {
         assert_eq!(back.body.get(), tree, "{name}");
         assert_eq!(DocFacts::from_record(&back.body), facts, "{name}");
 
-        if let Some((pg, _, _)) = &pg {
+        if let Some((pg, admin, schema)) = &pg {
             assert_eq!(
                 pg.put_record(&blake3, &body, &versions).await.unwrap(),
                 PutOutcome::Inserted,
@@ -201,10 +201,30 @@ async fn record_text_is_what_the_value_tree_wrote() {
                 PutOutcome::Unchanged,
                 "{name}"
             );
-            // jsonb keeps the value, not the text: read back, it is the tree's text again.
+            // Stored as text since schema 8 (issue #121): read back, it is the tree's text.
             let back = pg.get_record(&blake3).await.unwrap().unwrap();
             assert_eq!(back.body.get(), tree, "{name}");
             assert_eq!(DocFacts::from_record(&back.body), facts, "{name}");
+            // A row as schema 7 wrote it (jsonb, which keeps the value, not the text) reads
+            // as the same bytes, before and after its conversion to text.
+            let mut old = *blake3.as_bytes();
+            old[0] ^= 0xff;
+            admin
+                .execute(
+                    &format!(
+                        "INSERT INTO {schema}.records (blake3, record, versions) \
+                         VALUES ($1, $2::text::jsonb, '{{}}')"
+                    ),
+                    &[&old.as_slice(), &tree],
+                )
+                .await
+                .unwrap();
+            let old = doewood_model::Blake3::from_slice(&old).unwrap();
+            let back = pg.get_record(&old).await.unwrap().unwrap();
+            assert_eq!(back.body.get(), tree, "{name}, jsonb");
+            pg.convert_records().await.unwrap();
+            let back = pg.get_record(&old).await.unwrap().unwrap();
+            assert_eq!(back.body.get(), tree, "{name}, converted");
         }
     }
     if let Some((_, admin, schema)) = pg {

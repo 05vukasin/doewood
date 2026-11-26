@@ -16,11 +16,15 @@
 //!   one transaction under an advisory lock ([`MIGRATION_LOCK`]), so instances starting
 //!   together migrate once: the others wait (at most 5 minutes) and find the schema migrated.
 //!   Versions are kept in `doewood_schema`.
+//! - **Records** are stored as their canonical JSON text (schema 8, issue #121) and read back
+//!   as they are. Rows from before are converted in the background after a start (see
+//!   `convert.rs`); reads take either form meanwhile.
 //! - **pgvector** is optional: when the extension is available it is created and
 //!   `search_index.embedding` is added; otherwise this is logged and skipped, never fatal.
 
 mod backend;
 mod cached;
+mod convert;
 mod enrichment;
 mod feeds;
 mod merges;
@@ -130,6 +134,10 @@ impl PgStore {
             .map_err(|e| Error::Invalid(format!("connection pool: {e}")))?;
         let mut client = backend::client(&pool).await?;
         let (version, vector) = migrate::migrate(&mut client).await?;
+        drop(client);
+        if convert::pending(&pool).await? {
+            tokio::spawn(convert::run(pool.clone()));
+        }
         info!(
             schema = version,
             pgvector = vector,
@@ -142,6 +150,21 @@ impl PgStore {
     /// The pool's size: the most connections this instance opens to the database.
     pub fn pool_size(&self) -> usize {
         self.pool.status().max_size
+    }
+
+    /// Converts the records left from before schema 8 to text now, batch by batch, and
+    /// returns how many it converted. A start does this in the background when rows are left;
+    /// this is for tests and tools that need it done.
+    pub async fn convert_records(&self) -> Result<u64> {
+        let mut total = 0;
+        loop {
+            match convert::batch(&self.pool).await? {
+                0 if !convert::pending(&self.pool).await? => return Ok(total),
+                // Rows left that another instance is converting: wait for its batch.
+                0 => tokio::time::sleep(Duration::from_millis(10)).await,
+                n => total += n,
+            }
+        }
     }
 
     /// Whether pgvector is installed and `search_index.embedding` exists.
