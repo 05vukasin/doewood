@@ -79,7 +79,7 @@ pub struct Store {
     readers: Readers,
     cipher: Cipher,
     /// An on-disk store's checkpoint connection and thread ([`wal`], issue #151).
-    wal: Option<wal::Keeper>,
+    pub(crate) wal: Option<wal::Keeper>,
 }
 
 /// The connection a read runs on: a read-only one, or the writer when the store has none.
