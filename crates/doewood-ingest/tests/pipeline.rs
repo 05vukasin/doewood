@@ -20,7 +20,10 @@ use doewood_model::{
     Backend, Blake3, Direction, EdgeKind, EdgeState, MergeActor, MergeActorKind, NeighbourQuery,
     NodeKind, ObjectLocation, SearchQuery, SourceKey, SplitRequest,
 };
-use doewood_s3::{EventKind, EventOrigin, ObjectEvent, ObjectVersion};
+use doewood_s3::{
+    EventKind, EventOrigin, ListPage, ListRequest, ListedObject, Lister, ObjectEvent,
+    ObjectVersion, S3Error, ScanOptions, Scanner,
+};
 use doewood_store::{NewSource, ObjectChange, SeenObject, Standalone, Store};
 use tokio::sync::{mpsc, watch};
 
@@ -892,6 +895,86 @@ async fn shutdown_leaves_unfinished_work_pending() {
         .unwrap();
     assert_eq!(s.status, "pending");
     assert!(s.attempts >= 1);
+}
+
+/// A bucket in memory, listed like S3 (the token is the last key of the previous page).
+#[derive(Default)]
+struct MemBucket {
+    objects: Vec<ListedObject>,
+}
+
+impl Lister for MemBucket {
+    async fn list(&self, req: ListRequest<'_>) -> Result<ListPage, S3Error> {
+        let after = req.continuation_token.or(req.start_after);
+        let rest: Vec<_> = self
+            .objects
+            .iter()
+            .filter(|o| o.key.starts_with(req.prefix) && after.is_none_or(|a| o.key.as_str() > a))
+            .collect();
+        let objects: Vec<_> = rest
+            .iter()
+            .take(req.max_keys)
+            .map(|o| (*o).clone())
+            .collect();
+        let next_continuation_token =
+            (rest.len() > objects.len()).then(|| objects.last().unwrap().key.clone());
+        Ok(ListPage {
+            objects,
+            next_continuation_token,
+        })
+    }
+}
+
+/// The real scanner's first pass, on a bucket in memory: each object is fetched and ingested
+/// once, and every finish matches its pending row. Issue #125: the scanner sent a chunk's
+/// events before it committed the chunk's rows, so a worker that finished first matched no
+/// row, and the sweep ingested the object a second time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scan_pass_ingests_each_object_once() {
+    let n = 300;
+    let store = Arc::new(Store::open_in_memory(&MasterKey::from_bytes([12; 32])).unwrap());
+    let backend: Arc<dyn Backend> = Arc::new(Standalone::new(Arc::clone(&store)));
+    let h = Harness::start(Arc::clone(&store), backend, 4, Duration::from_millis(10));
+    let mut bucket = MemBucket::default();
+    for i in 0..n {
+        let key = format!("scan/{i:04}.txt");
+        let bytes = format!("Dopis {i}: {}", common::prose(i as u64, 40)).into_bytes();
+        bucket.objects.push(ListedObject {
+            key: key.clone(),
+            etag: Some(format!("e{i}")),
+            size: bytes.len() as u64,
+            last_modified: Some(1),
+        });
+        h.fetch.put(&key, bytes);
+    }
+    let source = store.source(h.source).unwrap().unwrap();
+    let scanner = Scanner::new(
+        Arc::clone(&store),
+        &source,
+        h.events.clone(),
+        ScanOptions::default(),
+    );
+    let (_stop_tx, mut stop) = watch::channel(false);
+    let started = std::time::Instant::now();
+    let pass = scanner.pass(&bucket, &mut stop).await.unwrap();
+    assert_eq!(pass.new, n as u64);
+    h.settle().await;
+    let secs = started.elapsed().as_secs_f64();
+    // A few sweeps: anything left to ingest again would be picked up now.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    h.settle().await;
+    let stats = h.ingest.stats();
+    let reads = h.fetch.reads.lock().unwrap().clone();
+    let twice = reads.values().filter(|&&r| r > 1).count();
+    println!(
+        "scan pass: {n} objects in {secs:.2}s; finishes unmatched {}, objects read more than \
+         once {twice}, done {}, skipped {}",
+        stats.finish_unmatched, stats.done, stats.skipped
+    );
+    assert_eq!(reads.len(), n);
+    assert_eq!((stats.finish_unmatched, twice), (0, 0));
+    assert_eq!(stats.done + stats.skipped, n as u64);
+    h.stop().await;
 }
 
 /// The `similar_to` threshold is the runtime setting in the instance store, read for every

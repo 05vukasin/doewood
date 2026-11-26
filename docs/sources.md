@@ -86,8 +86,11 @@ rows (up to 1000) at a time. A bucket with millions of keys never sits in memory
 **Checkpoints.** After each step, the scanner commits the row changes and the last key compared
 (`scan_checkpoints`) in one transaction. A restart or a failed pass resumes from that key with
 `StartAfter`, in the same pass. Continuation tokens are used between pages but not persisted,
-because servers expire them. Events are sent before they are committed, so delivery is at least
-once: a crash in between sends them again.
+because servers expire them. Delivery is at least once. A new or changed object's `pending` row
+is committed before its event is sent, so the worker that gets the event finds the row (issue
+#125); a crash or a stop in between leaves the row pending, and ingest's sweep picks it up. A
+deleted object leaves no pending row, so its event is sent before the commit: a crash in
+between sends it again. The webhook and SQS inlets use the same order for each notification.
 
 A listing that is not in key order is refused (the source goes to `error`), since it cannot be
 compared with the stored rows. Every general-purpose S3 implementation lists in order.

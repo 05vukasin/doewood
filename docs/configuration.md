@@ -274,7 +274,7 @@ every variable, with secrets redacted, and every warning. It creates nothing.
 |---|---|
 | `/healthz` | `200 ok` while the process runs |
 | `/readyz` | `200 ready` once the store is open; `503` before that and during shutdown |
-| `/metrics` | Prometheus text: `doewood_build_info`, `doewood_ready`, `doewood_start_time_seconds`, `doewood_ops_requests_total` |
+| `/metrics` | Prometheus text: `doewood_build_info`, `doewood_ready`, `doewood_start_time_seconds`, `doewood_ops_requests_total`, `doewood_ingest_finish_unmatched_total` |
 | `POST /events/s3/{source_id}` | MinIO / S3 event notifications for a source (see [api.md](api.md#event-webhook)) |
 
 On SIGTERM or SIGINT, doewood reports not ready, stops its servers (the gRPC API gets up to 10 s

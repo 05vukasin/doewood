@@ -2,7 +2,7 @@
 //! configuration, its reprocess jobs offered to the API, and the LLM queue with on-demand
 //! summaries.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use doewood_api::{
@@ -18,6 +18,9 @@ use doewood_ingest::{
 use doewood_model::Backend;
 use doewood_s3::ClientOptions;
 use doewood_store::Store;
+use prometheus::core::{Collector, Desc};
+use prometheus::proto::MetricFamily;
+use prometheus::{IntCounter, Registry};
 use tokio::sync::watch;
 use tracing::{error, info};
 use uuid::Uuid;
@@ -96,6 +99,53 @@ pub async fn build(
         on_llm_queued: Arc::new(move |_source: SourceId| queue.notify()),
     });
     Some((ingest, summaries))
+}
+
+/// Registers ingest's metrics on the ops port's registry: `doewood_ingest_finish_unmatched_total`
+/// (issue #125), read from [`Ingest::stats`] when `/metrics` is scraped. The registry does not
+/// keep ingest (and so the store) alive.
+pub fn register_metrics(ingest: &Ingest, registry: &Registry) -> prometheus::Result<()> {
+    let stats = ingest.stats_reader();
+    let unmatched = StatCounter::new(
+        "doewood_ingest_finish_unmatched_total",
+        "Finished objects whose status matched no pending row of that version (changed or \
+         deleted meanwhile, or an event ahead of its row).",
+        move || stats().map_or(0, |s| s.finish_unmatched),
+    )?;
+    registry.register(Box::new(unmatched))
+}
+
+/// A counter that follows a count kept elsewhere, read when it is collected.
+struct StatCounter<F> {
+    counter: IntCounter,
+    read: F,
+    /// Collections one at a time, so that a count is added once.
+    sync: Mutex<()>,
+}
+
+impl<F: Fn() -> u64 + Send + Sync> StatCounter<F> {
+    fn new(name: &str, help: &str, read: F) -> prometheus::Result<Self> {
+        Ok(Self {
+            counter: IntCounter::new(name, help)?,
+            read,
+            sync: Mutex::new(()),
+        })
+    }
+}
+
+impl<F: Fn() -> u64 + Send + Sync> Collector for StatCounter<F> {
+    fn desc(&self) -> Vec<&Desc> {
+        self.counter.desc()
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        let _one = self.sync.lock().unwrap_or_else(PoisonError::into_inner);
+        let (now, shown) = ((self.read)(), self.counter.get());
+        if now > shown {
+            self.counter.inc_by(now - shown);
+        }
+        self.counter.collect()
+    }
 }
 
 /// On-demand summaries and the queue's wake-up, as the API sees them.
@@ -218,11 +268,39 @@ fn view(s: &ReprocessStatus) -> ReprocessView {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use doewood_core::BootstrapConfig;
     use doewood_ingest::sheet;
+    use prometheus::{Encoder as _, Registry, TextEncoder};
 
-    use super::ingest_config;
+    use super::{StatCounter, ingest_config};
+
+    #[test]
+    fn a_stat_counter_follows_its_count() {
+        let count = Arc::new(AtomicU64::new(0));
+        let c = Arc::clone(&count);
+        let registry = Registry::new();
+        let counter = StatCounter::new("doewood_test_total", "A test count.", move || {
+            c.load(Ordering::SeqCst)
+        })
+        .unwrap();
+        registry.register(Box::new(counter)).unwrap();
+        let text = || {
+            let mut out = Vec::new();
+            TextEncoder::new()
+                .encode(&registry.gather(), &mut out)
+                .unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        assert!(text().contains("doewood_test_total 0"), "{}", text());
+        count.store(3, Ordering::SeqCst);
+        assert!(text().contains("doewood_test_total 3"));
+        assert!(text().contains("# TYPE doewood_test_total counter"));
+        // Read twice, added once.
+        assert!(text().contains("doewood_test_total 3"));
+    }
 
     fn config(env: &[(&str, &str)]) -> BootstrapConfig {
         let env: Vec<(String, OsString)> = env
