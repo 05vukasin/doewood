@@ -204,7 +204,8 @@ What the numbers say:
   1, at most 4, each with `cpus / engines` threads (at most 4). On 7.6 GiB, and under any limit
   below 10 GiB, that is 1 engine with 4 threads (`ocr: Ready { jobs: 1, threads: 4 }` in the
   `ingest started` log line). It uses about 2.7 of the 4 cores (6.3 CPU seconds a page).
-  `DOEWOOD_INGEST_JOBS` sets the file workers, not the engines.
+  `DOEWOOD_INGEST_JOBS` sets the file workers, not the engines; `DOEWOOD_OCR_JOBS` sets the
+  engines (see [OCR per page](#ocr-per-page)).
 - **Throughput:** about 0.42 pages/s (1500 pages an hour) on 4 vCPU. More workers did not help
   single-page scans; for 20-page scans 4 workers gave 0.66 pages/s (and a third less CPU time),
   3 workers (the default under a 4 GiB limit) 0.49, and 1 or 2 workers 0.43. This held in all
@@ -218,6 +219,62 @@ What the numbers say:
   16.5 MiB), a 20-page one about 100 KiB. Growth to 50,000 records was not measured.
 - **MinIO** used 600 to 1300 MiB, most of it page cache; its anonymous memory was 250 to 490
   MiB.
+
+### OCR per page
+
+Issue #116: `crates/doewood-ingest/tests/ocr_profile.rs` (ignored; how to run it is in its
+header). In process, release build, quail `62108d4`, the server above, single runs. The pages
+are made as in #63 (invented invoice text, Helvetica 11 pt, about 1550 characters, 300 DPI
+8-bit gray, Flate, image-only, about 240 KiB a page), so OCR reads the embedded scan: no render
+and no 300 DPI retry. 12 pages a row unless stated. CPU is the process's user + system time;
+"cores busy" is its mean over the run, sampled every 250 ms.
+
+Where one page's time goes (one engine, 4 ONNX Runtime threads, warm):
+
+| stage | per page |
+|---|---|
+| parse the PDF and inflate the scan | 6 ms |
+| quail's OCR engine | 1.80 s, 5.2 CPU s (2.9 cores) |
+| of which page orientation | under 0.1 s (within the noise) |
+| of which text detection (and the image copies) | 0.50 s (a blank page of the same size) |
+| of which line orientation | under 0.1 s (within the noise) |
+| of which recognition (one line at a time) and the rest | about 1.3 s |
+| every other step of the record (`item.lines`, `sketch.*`, `text.*`, ...) | about 12 ms |
+
+A new engine loads in 0.25 s; its first page takes 2.0 s and grows the RSS by about 420 MiB
+(ONNX Runtime's arenas), which then stays.
+
+Engines and threads (`DOEWOOD_OCR_JOBS`; threads are 4 / jobs):
+
+| run | OCR jobs x threads | pages/s | CPU s a page | cores busy | peak RSS |
+|---|---|---|---|---|---|
+| engines alone, warm | 1 x 4 (the default here) | 0.53 | 5.45 | 2.90 | 757 MiB |
+| same | 2 x 2 | 0.77 | 4.49 | 3.47 | 1300 MiB |
+| same | 4 x 1 | 1.07 | 3.62 | 3.85 | 2379 MiB |
+| analyzer, 1 worker | 1 x 4 (default) | 0.52 | 5.43 | 2.83 | 745 MiB |
+| analyzer, 4 workers | 1 x 4 (default) | 0.53 | 5.44 | 2.90 | 886 MiB |
+| same | 2 x 2 (`DOEWOOD_OCR_JOBS=2`) | 0.71 | 4.87 | 3.43 | 1401 MiB |
+| same | 4 x 1 (`DOEWOOD_OCR_JOBS=4`) | 0.98 | 3.82 | 3.73 | 2376 MiB |
+
+The analyzer rows include each engine's cold first page.
+
+- **OCR is the whole cost of a scan:** 99.3 % of the record's step time is `ocr.pages`, and
+  recognition is about three quarters of that. Page and line orientation cost almost nothing.
+- **One engine leaves cores idle.** Recognition runs one short text line at a time, and 4
+  intra-op threads keep only 2.9 cores busy. With 4 workers the other workers wait for the one
+  OCR permit (`ocr.pages` then counts the wait: 6.5 s a page against 1.9 s with 1 worker), so
+  more workers do not help.
+- **More engines with fewer threads are faster on the same cores:** 2 x 2 reads 1.3 to 1.45
+  times as many pages a second, 4 x 1 1.85 to 2 times as many, with a third less CPU a page. The
+  cost is memory: about 0.55 GiB more per engine. The text is byte-identical (`same_output`:
+  every engine output for 1, 2 and 4 threads, and the records without timings for 1 and 4
+  workers and 1, 2 and 4 jobs).
+- **What to set:** the default stays quail's plan (one engine per GiB of 20 % of the total
+  memory, so one below 10 GiB). Set `DOEWOOD_OCR_JOBS=2` where a pod has room for about 1.5
+  GiB of OCR (the chart's 4 GiB limit has), and 4 only with about 2.5 GiB for OCR and 4 cores;
+  jobs above the workers are not used.
+- The single-page and 20-page runs of #63 above all ran with one engine; their 0.42 to 0.66
+  pages/s include the store, S3 and the pipeline, which this in-process test leaves out.
 
 ### Big spreadsheets at once (issue #67)
 

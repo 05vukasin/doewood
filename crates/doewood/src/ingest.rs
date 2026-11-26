@@ -163,7 +163,7 @@ fn forward(mut from: watch::Receiver<ReprocessStatus>) -> watch::Receiver<Reproc
 }
 
 /// Ingest's configuration: sized from the CPUs and memory, with the bootstrap overrides
-/// (`DOEWOOD_INGEST_BUDGET_MIB`, `DOEWOOD_INGEST_MAX_CELLS`) on top.
+/// (`DOEWOOD_INGEST_BUDGET_MIB`, `DOEWOOD_INGEST_MAX_CELLS`, `DOEWOOD_OCR_JOBS`) on top.
 fn ingest_config(config: &BootstrapConfig) -> IngestConfig {
     let mut ingest_config = IngestConfig::new(config.ingest_jobs, &config.ocr_models);
     if let Some(bytes) = config.ingest_budget_bytes {
@@ -172,6 +172,7 @@ fn ingest_config(config: &BootstrapConfig) -> IngestConfig {
     if let Some(cells) = config.ingest_max_cells {
         ingest_config.analyzer.sheet_max_cells = cells;
     }
+    ingest_config.analyzer.ocr_jobs = config.ocr_jobs;
     ingest_config
 }
 
@@ -225,9 +226,12 @@ mod tests {
             ("DOEWOOD_INGEST_JOBS", "2"),
             ("DOEWOOD_INGEST_BUDGET_MIB", "64"),
             ("DOEWOOD_INGEST_MAX_CELLS", "20000000"),
+            ("DOEWOOD_OCR_JOBS", "2"),
         ]));
         assert_eq!(set.memory_budget, 64 << 20);
         assert_eq!(set.analyzer.sheet_max_cells, 20_000_000);
+        assert_eq!(set.analyzer.ocr_jobs, Some(2));
+        assert_eq!(auto.analyzer.ocr_jobs, None);
         // An invalid value warns (see doewood-core) and leaves the automatic cap.
         let bad = ingest_config(&config(&[
             ("DOEWOOD_INGEST_JOBS", "2"),
