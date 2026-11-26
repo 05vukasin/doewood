@@ -825,20 +825,41 @@ and 3 party edges each, 5,000 companies; 630 MiB of SQLite):
 |---|---|---|---|
 | SQLite, empty, restart | 145 | 138 | analyzer 126 (OCR check 57, engine 70) |
 | SQLite, 50k, restart | 144 | 138 | analyzer 127; store open 5 |
-| SQLite, 50k, statistics stale (1 run) | 12,896 | 109 | analyzer 102; statistics refreshed after ready in 0.6 s |
-| SQLite, 50k, statistics stale, file not cached (1 run) | 18,610 | 497 | analyzer 453; statistics refreshed after ready in 17 s |
+| SQLite, 50k, statistics stale (1 run) | 12,896 | 109 | analyzer 102; statistics refreshed after ready (below) |
+| SQLite, 50k, statistics stale, file not cached (1 run) | 18,610 | 497 | analyzer 453; statistics refreshed after ready (below) |
 | Postgres, empty database, first start (1 run) | 145 | 481 | schema migration 424 (129 before: run to run noise on a busy machine) |
 | Postgres, 50k, restart | 145 | 132 | analyzer 122; connect + migrations 20, in parallel |
 
 - **What was cut.** `Store::open` ran `PRAGMA optimize = 0x10002`; with statistics missing or
   stale (after a crash, an OOM kill or a bulk load, before the close-time optimize ran) it
   analyzed whole tables: 13 s on 50k documents, 18 s when the file is not in the page cache
-  (a pod on a new node). It now runs right after the instance is ready, in the cleanup task:
-  the writer waits meanwhile (reads use the read-only connections), and the results are the
-  same. The analyzer and the shared Postgres's connect and migrations need nothing from the
-  instance store and now start before it opens; the readers, the prepared statements
-  (per pooled connection, on first use) and the OCR engines (on the first scanned page) were
-  already lazy.
+  (a pod on a new node). It now runs right after the instance is ready, in the cleanup task,
+  sampled (`analysis_limit` 400) and one table at a time, with each table's pages read ahead
+  (through `dbstat`) on a connection of its own, so the writer is held only for one table's
+  `ANALYZE` over cached pages. The `instance store statistics refreshed` log line shows
+  `tables`, `took_ms`, `longest_writer_hold_ms` and the `slowest` table. The analyzer and the
+  shared Postgres's connect and migrations need nothing from the instance store and now start
+  before it opens; the readers, the prepared statements (per pooled connection, on first
+  use) and the OCR engines (on the first scanned page) were already lazy.
+
+  The refresh on the 50k store with its statistics dropped, measured with
+  `cargo test -p doewood-store --lib stale_statistics_refresh -- --ignored --nocapture`
+  (`DOEWOOD_BENCH_UNCACHED=1` drops the file from the page cache first; 1 run each; the test
+  also checks that the hot queries' plans match those of full statistics):
+
+  | refresh | cached: total / writer held | not cached: total / writer held |
+  |---|---|---|
+  | full statistics, one step (before) | 564 / 564 ms | 17.0 s / 17.0 s |
+  | `analysis_limit` 1000, one step | 100 / 100 ms | 13.3 s / 13.3 s |
+  | `analysis_limit` 400, one step | 100 / 100 ms | 16.9 s / 16.9 s |
+  | `analysis_limit` 400, a table at a time, read ahead (now) | 265 / 50 ms | 17.9 s / 68 ms |
+
+  Sampling cuts the work on cached pages, but not reading them: `ANALYZE` still reads every
+  page of every index. Reading them ahead, without the writer, is what keeps writes moving
+  (the slowest table, `sketch_bands`, takes 10 s to read uncached and 68 ms to analyze then).
+  Every hot query (pending objects, sketch candidates, record by hash, company documents,
+  neighbours, search by company and by date, object counts) keeps its plan with the sampled
+  statistics.
 - **Readiness is stricter.** Before, standalone instances reported ready as soon as the store
   was open, about 130 ms before the gRPC API served (and with Postgres, as soon as it
   connected). Ready now means the API serves and the backend answers.

@@ -180,12 +180,15 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
 
 `doewood.sqlite` runs in WAL mode with `synchronous = NORMAL`, and a `journal_size_limit` of
 64 MiB: after a large transaction the `-wal` file shrinks back to that at the next checkpoint.
-Its writer connection keeps up to 128 prepared statements. Right after the start (once the
-instance is ready, not before: issue #118) it runs `PRAGMA optimize = 0x10002` in the
-background, and the hourly cache purge task runs `PRAGMA optimize`, so the planner statistics
-follow tables that grow from empty to millions of rows. On a store closed cleanly (the close
-optimizes too) there is nothing to do; after a crash or a bulk load it analyzes whole tables,
-about 13 s at 50,000 documents, while the writer waits (reads use the read-only connections). Schema 10 (issues
+Its writer connection keeps up to 128 prepared statements and samples at most 400 rows an
+index in `ANALYZE` (`analysis_limit`; same plans as full statistics, issue #118). Right after
+the start (once the instance is ready, not before) it refreshes the planner statistics of every
+table that needs it, as `PRAGMA optimize = 0x10002` would, one table at a time: each table's
+pages are read first on a connection of its own, then the writer is held for that table's
+`ANALYZE` only (at most about 70 ms at 50,000 documents, even with the file not in the page
+cache). The hourly cache purge task runs `PRAGMA optimize`, so the planner statistics follow
+tables that grow from empty to millions of rows. On a store closed cleanly (the close
+optimizes too) there is nothing to do. Schema 10 (issues
 #72 and #73) keeps per-source status counters of `objects_seen` and `llm_jobs`
 (`object_counts`, `llm_job_counts`, updated by triggers in the same transaction), adds an
 index for a source's newest failed summary, and drops `objects_seen_by_status`, which held the

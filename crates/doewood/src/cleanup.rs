@@ -50,10 +50,13 @@ pub async fn optimize(store: &Arc<Store>) {
 /// store (issue #118).
 pub async fn optimize_all(store: &Arc<Store>) {
     let store = Arc::clone(store);
-    let t = std::time::Instant::now();
+    let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
     match tokio::task::spawn_blocking(move || store.optimize_all()).await {
-        Ok(Ok(())) => info!(
-            took_ms = u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX),
+        Ok(Ok(done)) => info!(
+            tables = done.tables,
+            took_ms = ms(done.took),
+            longest_writer_hold_ms = ms(done.longest_hold),
+            slowest = done.slowest.as_deref(),
             "instance store statistics refreshed"
         ),
         Ok(Err(e)) => warn!(error = %e, "PRAGMA optimize failed; retried at the next interval"),

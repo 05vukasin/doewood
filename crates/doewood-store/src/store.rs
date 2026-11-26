@@ -1,8 +1,8 @@
 use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use doewood_core::MasterKey;
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
@@ -38,6 +38,10 @@ const JOURNAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
 
 /// Prepared statements kept per connection.
 pub(crate) const STATEMENT_CACHE: usize = 128;
+
+/// Rows `ANALYZE` samples per index (`PRAGMA analysis_limit`; SQLite advises 100 to 1000):
+/// measured for issue #118, the same plans for the hot queries as full statistics.
+pub const ANALYSIS_LIMIT: i64 = 400;
 
 /// Read-only connections of an on-disk store when none are asked for: one per CPU, at most
 /// this many (see [`plan_readers`]).
@@ -210,8 +214,10 @@ impl Store {
         // Migrations run with foreign keys off (see `migrate`); they are on from here.
         migrate::migrate(&mut conn)?;
         conn.pragma_update(None, "foreign_keys", true)?;
-        // The planner statistics are refreshed after the open, not here
-        // ([`Store::optimize_all`]): on a big store with stale statistics that takes seconds.
+        // ANALYZE samples at most this many rows an index (SQLite's advice for
+        // `PRAGMA optimize`): a fifth of the time at 50,000 documents, the same plans (issue
+        // #118). The statistics are refreshed after the open, not here ([`Store::optimize_all`]).
+        conn.pragma_update(None, "analysis_limit", ANALYSIS_LIMIT)?;
         let store = Self {
             conn: Mutex::new(conn),
             readers: Readers::default(),
@@ -398,16 +404,54 @@ impl Store {
     }
 
     /// Refreshes the query planner's statistics of every table that needs it, also those no
-    /// query used yet on this connection (`PRAGMA optimize = 0x10002`: SQLite's advice for a
-    /// long-lived connection after it opens, then [`Store::optimize`] every few hours).
+    /// query used yet on this connection: what `PRAGMA optimize = 0x10002` does (SQLite's
+    /// advice for a long-lived connection after it opens, then [`Store::optimize`] every few
+    /// hours), one table at a time.
     ///
-    /// It analyzes whole tables whose statistics are missing or stale: nothing on a store
-    /// closed cleanly (the close optimizes), about 13 s at 50,000 documents after a crash or a
-    /// bulk load. The binary runs it once right after the start, in the background, so the
-    /// instance is ready without waiting for it (issue #118).
-    pub fn optimize_all(&self) -> Result<(), StoreError> {
-        self.conn().execute_batch("PRAGMA optimize = 0x10002;")?;
-        Ok(())
+    /// On a store closed cleanly (the close optimizes) there is nothing to do. After a crash or
+    /// a bulk load the tables are analyzed: sampled ([`ANALYSIS_LIMIT`]), but every page of
+    /// their indexes is still read, which takes seconds when the file is not in the page cache
+    /// (17 s at 50,000 documents). So each table's pages are read first on a connection of its
+    /// own, without the writer, and the writer is held for one table's `ANALYZE` at a time,
+    /// over pages then cached (issue #118). The binary runs it once right after the start, in
+    /// the background, so the instance is ready without waiting for it.
+    pub fn optimize_all(&self) -> Result<Optimized, StoreError> {
+        let started = Instant::now();
+        // Mask 0x10003: what 0x10002 would run, one `ANALYZE` per line, without running it.
+        let (statements, path) = {
+            let conn = self.conn();
+            let statements = conn
+                .prepare("PRAGMA optimize = 0x10003")?
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            (statements, conn.path().map(PathBuf::from))
+        };
+        let mut done = Optimized::default();
+        // An in-memory store has nothing to read ahead.
+        let warm = match &path {
+            Some(p) if !p.as_os_str().is_empty() => Some(open_reader(p)?),
+            _ => None,
+        };
+        for statement in statements {
+            let Some(table) = analyzed_table(&statement) else {
+                continue;
+            };
+            let t = Instant::now();
+            if let Some(warm) = &warm {
+                read_ahead(warm, table);
+            }
+            let ahead = t.elapsed();
+            let t = Instant::now();
+            self.conn().execute_batch(&statement)?;
+            done.steps.push((table.to_owned(), ahead, t.elapsed()));
+            if t.elapsed() >= done.longest_hold {
+                done.longest_hold = t.elapsed();
+                done.slowest = Some(table.to_owned());
+            }
+            done.tables += 1;
+        }
+        done.took = started.elapsed();
+        Ok(done)
     }
 
     /// Refreshes the query planner's statistics where they are stale (`PRAGMA optimize`);
@@ -433,6 +477,62 @@ impl Store {
     #[cfg(test)]
     pub(crate) fn raw(&self) -> MutexGuard<'_, Connection> {
         self.conn()
+    }
+}
+
+/// What [`Store::optimize_all`] did.
+#[derive(Clone, Debug, Default)]
+pub struct Optimized {
+    /// Tables analyzed.
+    pub tables: usize,
+    /// The longest the writer was held, for one table.
+    pub longest_hold: Duration,
+    /// That table.
+    pub slowest: Option<String>,
+    /// Each table analyzed: its read ahead (without the writer) and its `ANALYZE`.
+    pub steps: Vec<(String, Duration, Duration)>,
+    /// The whole refresh.
+    pub took: Duration,
+}
+
+/// The table of a statement `PRAGMA optimize` lists: `ANALYZE "main"."records"`.
+fn analyzed_table(statement: &str) -> Option<&str> {
+    statement
+        .strip_prefix("ANALYZE \"main\".\"")?
+        .strip_suffix('"')
+        .filter(|t| !t.contains('"'))
+}
+
+/// Reads every page of the b-trees `ANALYZE` reads for `table` on `conn` (through `dbstat`),
+/// so they are in the page cache when the writer analyzes it: each index, and the table's own
+/// b-tree when it has no index or is a WITHOUT ROWID table (its primary key). A plain
+/// `count(*)` would not do: SQLite counts on the smallest b-tree only. Only a read ahead: a
+/// failure costs nothing but time.
+fn read_ahead(conn: &Connection, table: &str) {
+    let without_rowid: bool = conn
+        .query_row(
+            "SELECT wr FROM pragma_table_list WHERE schema = 'main' AND name = ?1",
+            [table],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    // A WITHOUT ROWID table's primary key is the table's own b-tree.
+    let mut btrees: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_index_list(?1) WHERE NOT (?2 AND origin = 'pk')")
+        .and_then(|mut stmt| {
+            stmt.query_map(params![table, without_rowid], |r| r.get(0))?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap_or_default();
+    if without_rowid || btrees.is_empty() {
+        btrees.push(table.to_owned());
+    }
+    for name in btrees {
+        let _ = conn.query_row(
+            "SELECT count(*) FROM dbstat WHERE name = ?1",
+            [&name],
+            |r| r.get::<_, i64>(0),
+        );
     }
 }
 
@@ -508,7 +608,7 @@ mod tests {
     }
 
     /// The open leaves stale planner statistics alone (issue #118: seconds on a big store);
-    /// `optimize_all` refreshes them.
+    /// `optimize_all` refreshes them, a table at a time, sampled.
     #[test]
     fn statistics_are_refreshed_after_the_open_not_during_it() {
         let tmp = tempfile::tempdir().unwrap();
@@ -548,8 +648,21 @@ mod tests {
         }
         let store = Store::open(&path, &key(1)).unwrap();
         assert_eq!(stats(&store), 0, "the open analyzed");
-        store.optimize_all().unwrap();
+        let limit: i64 = store
+            .conn()
+            .query_row("PRAGMA analysis_limit", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(limit, ANALYSIS_LIMIT);
+        let done = store.optimize_all().unwrap();
         assert!(stats(&store) > 0, "not analyzed");
+        assert!(done.tables > 0, "{done:?}");
+        // The analyzed tables are not analyzed again.
+        let again = store.optimize_all().unwrap();
+        assert!(again.tables < done.tables, "{again:?} after {done:?}");
+        assert!(
+            again.steps.iter().all(|(t, _, _)| t != "records"),
+            "{again:?}"
+        );
     }
 
     #[test]
