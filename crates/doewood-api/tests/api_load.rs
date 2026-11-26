@@ -851,11 +851,12 @@ async fn api_load() {
     if let Some(pg) = &pg {
         pg.analyze().await;
     }
-    // The seeding's WAL into the main file (issue #140). Seeding's concurrent writes leave a
-    // WAL that was never reset (1.3 million frames, 5.4 GB, at 200,000 documents), and with
-    // no write after it no automatic checkpoint ends it: the steps then measured readers
-    // looking their pages up in it (Search 31 against 9.5 ms at 10 clients). `serve`'s next
-    // write checkpoints it.
+    // The seeding's WAL into the main file (issue #140), so every step starts from the same
+    // state. Before issue #151 seeding left a WAL that was never reset (1.3 million frames,
+    // 5.4 GB, at 200,000 documents: its last phase, the `similar_to` edges one at a time,
+    // never ran SQLite's automatic checkpoint), and the steps measured readers looking their
+    // pages up in it (Search 31 against 9.5 ms at 10 clients). Now the store's own checkpoints
+    // keep it small, and this finds little left.
     let t = Instant::now();
     let (frames, done) = a.store.checkpoint().unwrap();
     println!(

@@ -5,8 +5,9 @@
 //! over from its beginning (and `journal_size_limit` shrinks the file) only once every frame
 //! is copied and no reader reads from it. With the read-only connections busy without a pause
 //! (concurrent writers and reads, or a steady API load), that moment may not come: the WAL
-//! then grows without bound and every read looks its pages up in it (checkpoint starvation;
-//! 5.4 GB after seeding 200,000 documents, reads 7 times as slow, PR #150).
+//! then grows without bound and every read looks its pages up in it (checkpoint starvation).
+//! A WAL of 5.4 GB made reads 7 times as slow (issue #140; that one came from writes that
+//! skipped SQLite's checkpoint, see `returning_row` in the standalone backend).
 //!
 //! So an on-disk store keeps one more connection, for checkpoints only, and a thread that
 //! every [`INTERVAL`] makes one pass ([`Store::checkpoint_wal`]):

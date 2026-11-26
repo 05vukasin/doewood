@@ -245,7 +245,7 @@ readers; its reads use the writer, as before.
 1,000 pages in the WAL) are passive: they copy only the frames no read still needs, and the
 WAL starts over only once every frame is copied and no read is using it. With the readers busy
 without a pause, that moment may not come, and the WAL then grows without bound (checkpoint
-starvation: 5.4 GB after seeding 200,000 documents, every read 7 times as slow). So an on-disk
+starvation); a large WAL makes every read slower (7 times at 5.4 GB, issue #140). So an on-disk
 store has one more connection, for checkpoints only (it writes no rows; the one writer stays
 the only writer), and a thread `doewood-wal` that every 5 s:
 
@@ -258,7 +258,11 @@ the only writer), and a thread `doewood-wal` that every 5 s:
    SQLite's locks, then gives up until the next pass, so a write waits for it about that long
    plus the copy of what the passive step left.
 
-An emptied WAL is logged at INFO when it was over 64 MiB (DEBUG when idle), a truncate that gave
+Writes that return their row (`INSERT ... RETURNING`, such as a node's or an edge's upsert) are
+stepped to their end: SQLite runs its automatic checkpoint only when a statement is done, and
+reading the one row and resetting the statement skipped it, so a long run of single node or
+edge upserts never checkpointed (this, not the readers, left the 5.4 GB). An emptied WAL is
+logged at INFO when it was over 64 MiB (DEBUG when idle), a truncate that gave
 up at INFO. The WAL's size and the truncations are metrics (`doewood_store_wal_bytes`,
 [api.md](api.md#metrics)). The close still checkpoints and empties the WAL.
 
