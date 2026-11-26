@@ -14,7 +14,10 @@
 -- form, class 1685550946, "dwsb"; the key is folded to 31 bits, so two bands may share a lock,
 -- which only makes one wait), in key order, before it reads or writes the size. Under the lock
 -- no other transaction is changing that bucket, and each statement below takes a new snapshot
--- (READ COMMITTED), so the count read when a row is made sees every committed document.
+-- (READ COMMITTED), so the count read when a row is made sees every committed document. A
+-- statement with more than 64 bands (a bulk insert, or a delete of many records) takes one
+-- exclusive lock on the whole class (key -1) instead, so it never needs a lock per band; the
+-- others hold that key shared while they take their bands' locks.
 CREATE FUNCTION sketch_band_lock_key(band bigint) RETURNS integer LANGUAGE sql IMMUTABLE
     PARALLEL SAFE RETURN ((band # (band >> 32)) & 2147483647)::integer;
 
@@ -22,9 +25,14 @@ CREATE OR REPLACE FUNCTION sketch_bands_added() RETURNS trigger LANGUAGE plpgsql
 DECLARE
     k integer;
 BEGIN
-    FOR k IN SELECT DISTINCT sketch_band_lock_key(band) FROM added ORDER BY 1 LOOP
-        PERFORM pg_advisory_xact_lock(1685550946, k);
-    END LOOP;
+    IF (SELECT count(DISTINCT band) FROM added) > 64 THEN
+        PERFORM pg_advisory_xact_lock(1685550946, -1);
+    ELSE
+        PERFORM pg_advisory_xact_lock_shared(1685550946, -1);
+        FOR k IN SELECT DISTINCT sketch_band_lock_key(band) FROM added ORDER BY 1 LOOP
+            PERFORM pg_advisory_xact_lock(1685550946, k);
+        END LOOP;
+    END IF;
     INSERT INTO sketch_band_sizes AS z (band, docs)
         SELECT a.band,
                CASE WHEN EXISTS (SELECT 1 FROM sketch_band_sizes s WHERE s.band = a.band)
@@ -42,9 +50,14 @@ CREATE OR REPLACE FUNCTION sketch_bands_removed() RETURNS trigger LANGUAGE plpgs
 DECLARE
     k integer;
 BEGIN
-    FOR k IN SELECT DISTINCT sketch_band_lock_key(band) FROM removed ORDER BY 1 LOOP
-        PERFORM pg_advisory_xact_lock(1685550946, k);
-    END LOOP;
+    IF (SELECT count(DISTINCT band) FROM removed) > 64 THEN
+        PERFORM pg_advisory_xact_lock(1685550946, -1);
+    ELSE
+        PERFORM pg_advisory_xact_lock_shared(1685550946, -1);
+        FOR k IN SELECT DISTINCT sketch_band_lock_key(band) FROM removed ORDER BY 1 LOOP
+            PERFORM pg_advisory_xact_lock(1685550946, k);
+        END LOOP;
+    END IF;
     UPDATE sketch_band_sizes z SET docs = z.docs - r.n
         FROM (SELECT band, count(*) AS n FROM removed GROUP BY band) r WHERE z.band = r.band;
     RETURN NULL;

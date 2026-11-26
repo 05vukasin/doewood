@@ -1393,7 +1393,8 @@ Where the WAL of one document goes, default settings (`max_wal_size` 1 GB,
   sketch inserted about 29 rows and index entries on random pages, 15% of the WAL. Since
   schema 10 a bucket gets its row when its second document arrives, with the exact count
   (the triggers take a transaction advisory lock per band, in order, so documents adding the
-  same new band at once are counted exactly); a bucket of one has none, which the candidate
+  same new band at once are counted exactly; a statement of more than 64 bands, such as a
+  delete of many records, takes one lock for all bands instead); a bucket of one has none, which the candidate
   query reads as small (`similar_max_bucket` is at least 10). The bands, the edges and every
   row the API reads are the same. The rows of single documents an older schema wrote stay,
   with their exact count (at 200k: 2.0 million rows, 220 MB; a store started on schema 10

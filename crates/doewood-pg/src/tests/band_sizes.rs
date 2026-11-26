@@ -91,6 +91,10 @@ async fn only_shared_buckets_have_a_size() {
             .filter(|(b, _)| *b >= 100)
             .collect::<Vec<_>>()
     );
+    // A sketch of more than 64 bands takes the lock of the whole class: the same counts.
+    let wide: Vec<u64> = (100..300).collect();
+    s.put_sketch(&hash(5), &[5], &wide).await.unwrap();
+    assert!(sizes(&c).await.contains(&(100, 39)));
     // Deleting the records cascades to their bands and the sizes follow.
     c.execute(
         "DELETE FROM records WHERE blake3 = ANY($1)",
@@ -101,7 +105,7 @@ async fn only_shared_buckets_have_a_size() {
     .await
     .unwrap();
     let got = sizes(&c).await;
-    assert!(got.contains(&(100, 18)), "{got:?}");
+    assert!(got.contains(&(100, 19)), "{got:?}");
     for (band, docs) in counted(&c).await {
         assert!(got.contains(&(band, docs)), "{band}: {docs} in {got:?}");
     }
