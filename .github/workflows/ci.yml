@@ -1,7 +1,9 @@
 name: ci
+# Full CI on every PR into staging (development) or main (release), and on pushes to both.
+# Publishing the image is image.yml's job, from main and v* tags only.
 on:
-  push: { branches: [main] }
-  pull_request:
+  push: { branches: [staging, main] }
+  pull_request: { branches: [staging, main] }
 jobs:
   check:
     strategy:
@@ -116,6 +118,13 @@ jobs:
       - run: |
           cargo test -p doewood-ingest --test minio_postgres -- --nocapture 2>&1 | tee test.log
           ! grep -q "are not both set: skipped" test.log
+  # Lint the workflows themselves (ci.yml and image.yml).
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" --workdir /repo rhysd/actionlint:1.7.7 -color
   # The container image (Dockerfile) and the Helm chart (charts/doewood). Built, never pushed.
   image:
     runs-on: ubuntu-latest
