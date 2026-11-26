@@ -195,7 +195,7 @@ every page (`ocr.page` facts on every page, about 1500 characters a page, mean c
 | text PDF, 150 pages (490 KiB, 344k characters) | default | 0.7 s | | 37 MiB (35) | 91 MiB |
 | XLSX, 120,000 rows x 8 columns (7.6 MiB, 960k cells) | default | 7.5 s | | 380 MiB (297) | 82 MiB |
 | DOCX, 20 MiB (1.3M characters, 7 embedded images) | default | 0.8 s | | 68 MiB (65) | 82 MiB |
-| 50,000 small text documents | | not measured | | | |
+| 50,000 and 200,000 small documents | default (4) | see [below](#50000-to-200000-documents-issue-127) | 144 and 101 files/s (SQLite), 329 and 256 (Postgres) | | |
 | enrichment pass with mocked registries | | not measured | | | |
 
 The earlier measurement without OCR (2000 small text PDF, DOCX, TXT and XLSX files): doewood
@@ -220,7 +220,8 @@ What the numbers say:
   ordinary files; a large spreadsheet is the most expensive file seen (380 MiB for 960k cells).
 - **Postgres** stayed below 160 MiB in every run (20 to 40 MiB anon, the rest page cache). A
   scanned single-page record adds about 40 KiB to the database (200 records: 9 MiB empty to
-  16.5 MiB), a 20-page one about 100 KiB. Growth to 50,000 records was not measured.
+  16.5 MiB), a 20-page one about 100 KiB. Small text documents take about 18 KiB each at
+  50,000 and 200,000 documents (see [below](#50000-to-200000-documents-issue-127)).
 - **MinIO** used 600 to 1300 MiB, most of it page cache; its anonymous memory was 250 to 490
   MiB.
 
@@ -592,6 +593,7 @@ DOEWOOD_TEST_POSTGRES_URL=postgres://... cargo test --release -p doewood-api --t
 ```
 
 (`DOEWOOD_BENCH_CLIENTS=10,100,500,1000`, `DOEWOOD_BENCH_SECS`, `DOEWOOD_BENCH_DOCS`,
+`DOEWOOD_BENCH_COMPANIES`,
 `DOEWOOD_BENCH_PER_CONN`, `DOEWOOD_BENCH_WATCH_PCT`, `DOEWOOD_BENCH_IDLE`,
 `DOEWOOD_BENCH_ONLY=<method>`, `DOEWOOD_BENCH_BACKOFF_MS`, `DOEWOOD_BENCH_DB_CPU_STAT`: see the
 file's header.)
@@ -1050,6 +1052,120 @@ two test binaries run alternately, 3 runs each):
 - **The writer's lock wait is unchanged** within noise (a trivial writer call every
   millisecond; slightly higher mean, as more files a second commit more finishes). The
   writer now serves only writes on this path.
+
+### 50,000 to 200,000 documents (issue #127)
+
+`scale` in `crates/doewood-ingest/tests/pipeline.rs` (ignored; its header lists the phases
+and knobs) grows one store in runs of a few minutes: `throughput`'s mix of PDF, DOCX, TXT and
+XLSX, except that every 20th file is a near-duplicate of one of 50 template texts and only
+every 16th file names the one big buyer (the other contracts name a buyer of their own). At
+200,000 files that is 39,372 companies, one with 12,504 documents, and 997,834 edges
+(about 0.75 million of them `similar_to` between near-duplicates). The instance store is a
+file with 4 readers, as `serve` opens it; the shared store is that file (SQLite) or Postgres
+17.12 (`pgvector/pgvector:pg17`, default settings, `pg_stat_statements`) on an `--internal`
+Docker network; ingest calls nothing outside the process. Release build of `main` at
+`e47c815` plus the measurement code, the 4 vCPU server above, one run per row (each
+ingest row is the 5,000 files ending at that size). The 10k column is the same run (ingest)
+or the same session (`api_load`).
+
+```
+DOEWOOD_SCALE_DIR=<dir> DOEWOOD_SCALE_TO=50000 cargo test --release -p doewood-ingest \
+  --test pipeline -- --ignored --nocapture --exact scale          # repeat until it has them
+DOEWOOD_SCALE_DIR=<dir> DOEWOOD_SCALE_PHASE=analyze|sweep|scan|due|api ...   # then measure
+DOEWOOD_SCALE_DIR=<dir> cargo test -p doewood-store --lib scale_store_sizes -- --ignored --nocapture
+```
+
+| | SQLite 10k | 50k | 200k | Postgres 10k | 50k | 200k |
+|---|---|---|---|---|---|---|
+| ingest, files/s (4 workers) | 187 | 144 | 101 | 379 | 329 | 256 |
+| same, without the near-duplicates (at 200k) | | | 169 | | | 385 |
+| graph and search per file | 9.7 ms | 15.2 ms | 24.0 ms | 5.6 ms | 7.6 ms | 10.9 ms |
+| record per file | 4.4 ms | 4.8 ms | 6.8 ms | 1.9 ms | 1.7 ms | 1.7 ms |
+| store size (b-trees / schema) | | 1,206 MiB | 5,085 MiB | | 812 MiB | 3,440 MiB |
+| per document | | 24.7 KiB | 26.0 KiB | | 16.6 KiB | 17.6 KiB |
+| instance store writer: lock wait during ingest, mean / p99 | 2.1 / 33 ms | 2.2 / 35 ms | 2.5 / 35 ms | 0.03 / 0.2 ms | 0.03 / 0.2 ms | 0.03 / 0.2 ms |
+| SQLite WAL during ingest: at most / resets per 1,000 files | 4 MiB / 83 | 5 MiB / 93 | 6 MiB / 113 | | | |
+| Postgres WAL per document (the 25,000 files up to that size) | | | | 26 KB (25k) | 30 KB | 109 KB |
+| ingest sweep, nothing pending / `object_counts` | | 0.03 / 0.007 ms | 0.01 / 0.003 ms | | 0.03 / 0.007 ms | 0.02 / 0.004 ms |
+| unchanged scan pass over every key | | (see below) | 7.6 to 8.3 s | | 0.46 to 0.50 s | 6.7 to 6.9 s |
+| writer lock wait during the scan, mean | | | 18 ms | | 3.6 ms | 16 ms |
+| `companies_due`, first page of 100 | | 51 ms | 235 ms | | 10 ms | 86 ms |
+| an enrichment pass of `companies_due` pages (registries off) | | 2.5 s, 94 pages | 41.6 s, 375 pages | | 0.28 s | 1.1 s |
+| `ListRecords`, one client (page of 100) | | 12.8 ms | 9.7 ms | | 66 ms | 69 ms |
+| `Search`, a word in a quarter of the documents | | 17 ms | 71 ms | | 10 ms | 112 ms |
+| `Search`, the big company's name | | 8.8 ms | 34 ms | | 6.1 ms | 20 ms |
+| `GetNode` / `Neighbours` (`similar_to`) | | 0.36 / 1.1 ms | 0.34 / 2.1 ms | | 0.37 / 1.4 ms | 0.59 / 2.7 ms |
+| `CompanyDocuments`, the big company | | 29 ms (3,129) | 150 ms (12,504) | | 24 ms (3,129) | 153 ms (12,504) |
+| `api_load` 10 clients: calls/s, p99 | 5,898, 4.6 ms | 3,140, 10.5 ms | 508, 72 ms | 5,060, 7.2 ms | 4,606, 7.6 ms | 3,525, 9.5 ms |
+| `api_load` 100 clients: calls/s, p99 | 5,645, 68 ms | 2,955, 129 ms | 472, 714 ms | 5,277, 34 ms | 5,017, 33 ms | 3,196, 53 ms |
+| `api_load` 10 clients, `Search` p50 / `GetNode` p50 | 2.0 / 0.7 ms | 5.0 / 1.1 ms | 38.7 / 4.1 ms | 1.6 / 0.8 ms | 2.0 / 0.8 ms | 3.7 / 0.8 ms |
+| `serve` on the store (210k): RSS at ready / after its first pass / after 3 min idle | | | 80 / 129 / 117 MiB | | | 80 / 103 / 103 MiB |
+
+The single-client API rows are medians of 11 calls through the API on the `scale` store
+(`DOEWOOD_SCALE_PHASE=api`), on SQLite without planner statistics (ingest never refreshed
+them; after `analyze`, as `serve` does once it is ready, the 210k store answered within 30%
+of these, and `companies_due` was as slow); `api_load` seeds its own store (10, 50 or 200 thousand documents
+of about 1 KiB, one company per 20, `DOEWOOD_BENCH_CLIENTS=10,100 DOEWOOD_BENCH_IDLE=0`).
+`serve` ran the release binary on the 210k store with every registry, feed and the favicon
+fallback switched off (`DOEWOOD_SCALE_PHASE=offline`), in a network namespace with only
+loopback (SQLite) or the database container's (Postgres); its first enrichment pass marked
+the 39,372 companies enriched with nothing found (90 s on SQLite, 55 s on Postgres). The
+Postgres server itself used 213 MiB at 50k and 349 MiB at 200k (`docker stats`, page cache
+included).
+
+Where the bytes are, per document (50k, then 200k):
+
+| | SQLite | Postgres |
+|---|---|---|
+| records (Postgres: TOAST included) | 18.6 / 18.6 KiB | 8.7 / 8.7 KiB |
+| `sketch_bands` (17.6 bands a document) and `sketches` | 2.2 / 2.2 KiB | 3.4 / 3.4 KiB |
+| `edges` | 1.3 / 2.7 KiB | 1.1 / 2.1 KiB |
+| `nodes` and `node_aliases` | 1.3 / 1.3 KiB | 1.5 / 1.5 KiB |
+| search (`search_index` and the FTS tables / the GIN index) | 0.8 / 0.8 KiB | 1.4 / 1.4 KiB |
+| `locations` and `objects_seen` | 0.5 / 0.5 KiB | 0.5 / 0.5 KiB (`objects_seen` is in the instance store) |
+
+What the numbers say:
+
+- **Store size is linear** except `edges`: the near-duplicates link to every earlier copy of
+  their template until `similar_to`'s candidate cap (100), so their edges grow with the
+  square of a template's copies up to the cap (from 49 to 100 a near-duplicate here). Plan
+  about 26 KiB a small document on SQLite and 18 KiB on Postgres, plus the disk the WAL needs.
+- **Ingest slows as the store grows, mostly because of the near-duplicates.** Without them
+  Postgres ingests at 200k as fast as at the start (385 against 390 files/s), SQLite at 169
+  against 228. Each near-duplicate compares itself with and writes an edge to each of
+  up to 100 candidates; before #126 that cost 2 round trips per candidate. With #126 (merged
+  during this measurement) Postgres at 210k ran 328 files/s with them and 401 without (graph
+  stage 7.0 against 5.2 ms a file), against 248 and 385 before. The cost is bounded by the
+  candidate cap, so it stops growing once a template has 100 copies (about 100k files
+  here). SQLite's record and graph stages also grow by about 40% from 5k to 200k without
+  them (deeper b-trees, a 5 GiB file over a 2 MiB page cache per connection).
+- **The ingest sweep and the progress counts do not grow**: the sweep reads only pending rows
+  and `object_counts` is kept by triggers.
+- **An unchanged scan pass grows with the square of the keys** (0.5 s at 50k, 7 to 8 s at
+  200k, CPU-bound): each chunk's `seen_objects` scans the source's keys from the first one.
+  Issue #138. (The SQLite 50k pass, 1.0 to 1.5 s, was measured with a test bucket that was
+  itself quadratic; the Postgres run's 50k pass uses the same instance store code.)
+- **SQLite's `companies_due` sorts every company for each page**, so an enrichment pass is
+  quadratic in the companies (41.6 s for 37,497); Postgres stays linear (1.1 s). Issue #139.
+- **SQLite `Search` slows faster than its matches grow** under load: `api_load` at 200k
+  serves 508 calls/s, a tenth of 10k, and every call waits behind the searches. One search
+  costs its matches on both stores (every match is ranked before the page is taken); on
+  Postgres the common-word search went from 10 to 112 ms when `search_index` (206 MiB)
+  outgrew the default 128 MB of shared buffers. Issue #140. Give Postgres `shared_buffers`
+  of at least the search index's size for big corpora.
+- **Postgres's WAL per document grows** from 26 KB to 109 KB (full-page images after each
+  checkpoint over indexes keyed by hashes and random ids; half the checkpoints were
+  requested by `max_wal_size` 1 GB). Issue #141.
+- **`CompanyDocuments` returns every document of the company** (12,504 nodes, 150 ms on
+  either store): linear, but unbounded; pagination is #112.
+- **`ListRecords`, `GetNode` and `Neighbours` do not grow** beyond their result size; Postgres
+  `ListRecords` is its `jsonb` round trip (#121).
+- **Memory does not follow the store**: an idle instance on the 210k store holds 100 to 120
+  MiB (SQLite reads through its 2 MiB page cache per connection and the OS page cache; the
+  writer and readers do not map the file), about 20 to 40 MiB more than at ready, after one
+  enrichment pass over every company.
+- **SQLite's WAL stays small** (4 to 6 MiB at most, a checkpoint resetting it about every
+  10 files) at every size; the writer's lock wait is flat at about 2 ms mean and 35 ms p99.
 
 ### Requests and limits
 

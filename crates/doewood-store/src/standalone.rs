@@ -42,6 +42,8 @@ mod proposals;
 #[cfg(test)]
 mod read_paths;
 #[cfg(test)]
+mod scale;
+#[cfg(test)]
 mod search_company;
 #[cfg(test)]
 mod search_scale;
