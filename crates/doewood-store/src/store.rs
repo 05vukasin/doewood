@@ -708,6 +708,7 @@ mod tests {
                 "edges",
                 "favicons",
                 "jobs",
+                "known_content",
                 "llm_job_counts",
                 "llm_jobs",
                 "llm_usage",
@@ -781,7 +782,8 @@ mod tests {
                 "state_reason",
                 "scan_interval_s",
                 "created_at",
-                "updated_at"
+                "updated_at",
+                "skip_known_copies"
             ]
         );
         assert_eq!(

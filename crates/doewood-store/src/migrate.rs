@@ -64,6 +64,11 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("migrations/0012_graph_pages.sql"),
         fk_check: FkCheck::Skip,
     },
+    // A column with a default and a new empty table without foreign keys.
+    Migration {
+        sql: include_str!("migrations/0013_known_copies.sql"),
+        fk_check: FkCheck::Skip,
+    },
 ];
 
 /// The schema version this binary writes.

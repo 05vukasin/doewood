@@ -281,6 +281,9 @@ pub struct NewSource {
     pub state: SourceState,
     /// Which documents get an LLM summary.
     pub llm_policy: LlmPolicy,
+    /// Record a new key whose MD5 ETag and size match stored content against it without a
+    /// GetObject (off by default; it trusts the ETag, see `docs/sources.md`).
+    pub skip_known_copies: bool,
 }
 
 impl NewSource {
@@ -296,6 +299,7 @@ impl NewSource {
             scan_interval: DEFAULT_SCAN_INTERVAL,
             state: SourceState::Active,
             llm_policy: LlmPolicy::default(),
+            skip_known_copies: false,
         }
     }
 
@@ -359,6 +363,8 @@ pub struct SourcePatch {
     pub max_object_bytes: Option<Option<u64>>,
     /// The LLM policy.
     pub llm_policy: Option<LlmPolicy>,
+    /// Whether known copies skip the fetch.
+    pub skip_known_copies: Option<bool>,
 }
 
 /// How many objects of a source are in each ingest status (`objects_seen.status`).
@@ -410,6 +416,9 @@ pub struct Source {
     pub scan_interval: Duration,
     /// Which documents get an LLM summary.
     pub llm_policy: LlmPolicy,
+    /// Whether a new key whose single-part MD5 ETag and size match stored content is recorded
+    /// against it without a GetObject (off by default).
+    pub skip_known_copies: bool,
     /// When it was added (Unix seconds).
     pub created_at: i64,
     /// When it last changed (Unix seconds).
@@ -446,6 +455,7 @@ impl Source {
         let policy: String = r.get("policy_json")?;
         let sqs: Option<String> = r.get("sqs_json")?;
         let sqs_credentials: bool = r.get("sqs_credentials")?;
+        let skip_known_copies: bool = r.get("skip_known_copies")?;
         Ok((|| {
             Ok(Self {
                 id: id
@@ -466,6 +476,7 @@ impl Source {
                 llm_policy: LlmPolicy::from_json(&serde_json::from_str(&policy).map_err(
                     |_| StoreError::InvalidSource("stored LLM policy is not JSON".to_owned()),
                 )?)?,
+                skip_known_copies,
                 created_at,
                 updated_at,
                 sqs: sqs
@@ -591,7 +602,7 @@ fn credentials_secret_name(id: SourceId) -> String {
 /// `sqs/<id>`): every query reads `FROM sources`.
 const SOURCE_COLUMNS: &str = "id, endpoint, bucket, prefix, region, url_style, \
     credentials_secret, max_object_bytes, policy_json, state, state_reason, scan_interval_s, \
-    created_at, updated_at, \
+    created_at, updated_at, skip_known_copies, \
     (SELECT value_json FROM settings WHERE key = 'sqs_inlet/' || sources.id) AS sqs_json, \
     EXISTS (SELECT 1 FROM secrets WHERE name = 'sqs/' || sources.id) AS sqs_credentials";
 
@@ -625,7 +636,8 @@ impl Store {
         tx.prepare_cached(
             "INSERT INTO sources (id, endpoint, bucket, prefix, region, url_style, \
              credentials_secret, max_object_bytes, state, scan_interval_s, created_at, updated_at, \
-             policy_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?12)",
+             policy_json, skip_known_copies) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?12, ?13)",
         )
         .and_then(|mut cached| {
             cached.execute(params![
@@ -641,6 +653,7 @@ impl Store {
                 interval,
                 now,
                 source.llm_policy.to_json().to_string(),
+                source.skip_known_copies,
             ])
         })?;
         if let Some((name, nonce, ct)) = &sealed {
@@ -779,6 +792,7 @@ impl Store {
         let interval = patch.scan_interval.unwrap_or(current.scan_interval);
         let max = patch.max_object_bytes.unwrap_or(current.max_object_bytes);
         let policy = patch.llm_policy.clone().unwrap_or(current.llm_policy);
+        let skip_known_copies = patch.skip_known_copies.unwrap_or(current.skip_known_copies);
         check_options(interval, max)?;
         policy.validate()?;
         let max = max
@@ -789,7 +803,8 @@ impl Store {
             .map_err(|_| StoreError::InvalidSource("scan interval too large".to_owned()))?;
         tx.prepare_cached(
             "UPDATE sources SET region = ?2, url_style = ?3, scan_interval_s = ?4, \
-             max_object_bytes = ?5, policy_json = ?6, updated_at = ?7 WHERE id = ?1",
+             max_object_bytes = ?5, policy_json = ?6, updated_at = ?7, skip_known_copies = ?8 \
+             WHERE id = ?1",
         )
         .and_then(|mut cached| {
             cached.execute(params![
@@ -799,7 +814,8 @@ impl Store {
                 interval,
                 max,
                 policy.to_json().to_string(),
-                now()
+                now(),
+                skip_known_copies
             ])
         })?;
         let updated = tx.query_row(&select, [id.to_string()], Source::from_row)??;
@@ -1104,6 +1120,10 @@ mod tests {
             .unwrap();
         let got = store.source(id).unwrap().unwrap();
         assert_eq!(got.llm_policy, LlmPolicy::default());
+        assert!(
+            !got.skip_known_copies,
+            "known copies are fetched by default"
+        );
         let policy = LlmPolicy {
             mode: LlmMode::Kinds(vec!["invoice".into(), "contract".into()]),
             concurrency: 4,
@@ -1115,8 +1135,10 @@ mod tests {
             scan_interval: Some(Duration::from_secs(30)),
             max_object_bytes: Some(Some(10)),
             llm_policy: Some(policy.clone()),
+            skip_known_copies: Some(true),
         };
         let got = store.update_source(id, &patch).unwrap();
+        assert!(got.skip_known_copies);
         assert_eq!(got.region(), "eu-1");
         assert_eq!(got.url_style, UrlStyle::VirtualHost);
         assert_eq!(got.scan_interval, Duration::from_secs(30));
@@ -1140,6 +1162,7 @@ mod tests {
         );
         let same = store.update_source(id, &SourcePatch::default()).unwrap();
         assert_eq!(same.llm_policy, policy);
+        assert!(same.skip_known_copies);
         for bad in [
             SourcePatch {
                 scan_interval: Some(Duration::ZERO),

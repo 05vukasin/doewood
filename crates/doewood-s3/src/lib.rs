@@ -26,8 +26,8 @@ mod scanner;
 mod sigv4;
 
 pub use client::{
-    ClientOptions, ListPage, ListRequest, ListedObject, ObjectBody, ObjectMeta, S3Client, S3Config,
-    http_client,
+    ClientOptions, Encryption, ListPage, ListRequest, ListedObject, ObjectBody, ObjectMeta,
+    S3Client, S3Config, http_client, md5_etag,
 };
 pub use discovery::{Discovery, DiscoveryOptions, EVENT_CHANNEL_CAPACITY};
 pub use error::S3Error;

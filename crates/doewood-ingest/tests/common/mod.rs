@@ -13,7 +13,8 @@ use std::io::{Cursor, Write};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use doewood_ingest::{Fetch, IngestError};
+use doewood_ingest::{Fetch, Fetched, IngestError};
+use doewood_s3::{Encryption, ObjectMeta};
 use doewood_store::Source;
 use lopdf::content::{Content, Operation};
 use lopdf::{Document, Object, Stream, dictionary};
@@ -30,11 +31,44 @@ pub struct MemFetch {
     pub held: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
     /// Reads per key.
     pub reads: Mutex<HashMap<String, u32>>,
+    /// The ETag and encryption responses report per key; a key without has no metadata.
+    pub meta: Mutex<HashMap<String, (String, Encryption)>>,
+    /// HEADs per key.
+    pub heads: Mutex<HashMap<String, u32>>,
 }
 
 impl MemFetch {
     pub fn put(&self, key: &str, bytes: Vec<u8>) {
         self.objects.lock().unwrap().insert(key.to_owned(), bytes);
+    }
+
+    /// Puts `key` with the ETag and encryption its responses report.
+    pub fn put_with(&self, key: &str, bytes: Vec<u8>, etag: &str, encryption: Encryption) {
+        self.put(key, bytes);
+        self.meta
+            .lock()
+            .unwrap()
+            .insert(key.to_owned(), (etag.to_owned(), encryption));
+    }
+
+    fn meta_of(&self, key: &str) -> Option<ObjectMeta> {
+        let (etag, encryption) = self.meta.lock().unwrap().get(key).cloned()?;
+        let size = self.objects.lock().unwrap().get(key)?.len() as u64;
+        Some(ObjectMeta {
+            size,
+            etag: Some(etag),
+            last_modified: None,
+            content_type: None,
+            encryption,
+        })
+    }
+
+    pub fn reads_of(&self, key: &str) -> u32 {
+        self.reads.lock().unwrap().get(key).copied().unwrap_or(0)
+    }
+
+    pub fn heads_of(&self, key: &str) -> u32 {
+        self.heads.lock().unwrap().get(key).copied().unwrap_or(0)
     }
 
     /// Holds every read of `key` until the returned gate gets a permit (one per read).
@@ -79,6 +113,24 @@ impl Fetch for MemFetch {
                 message: "S3 GetObject failed: HTTP 404 NoSuchKey".into(),
                 transient: false,
             })
+    }
+
+    async fn fetch_with_meta(&self, source: &Source, key: &str) -> Result<Fetched, IngestError> {
+        let bytes = self.fetch(source, key).await?;
+        Ok(Fetched {
+            bytes,
+            meta: self.meta_of(key),
+        })
+    }
+
+    async fn head(&self, _source: &Source, key: &str) -> Result<Option<ObjectMeta>, IngestError> {
+        *self
+            .heads
+            .lock()
+            .unwrap()
+            .entry(key.to_owned())
+            .or_default() += 1;
+        Ok(self.meta_of(key))
     }
 }
 

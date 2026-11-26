@@ -13,6 +13,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use doewood_store::{S3Credentials, Source, UrlStyle};
 use jiff::Timestamp;
+use reqwest::header::HeaderName;
 use rusty_s3::actions::ListObjectsV2;
 use rusty_s3::{Bucket, Credentials, S3Action};
 use tracing::debug;
@@ -127,6 +128,65 @@ pub struct ObjectMeta {
     pub last_modified: Option<i64>,
     /// `Content-Type`.
     pub content_type: Option<String>,
+    /// Its server-side encryption, from the `x-amz-server-side-encryption*` headers.
+    pub encryption: Encryption,
+}
+
+impl ObjectMeta {
+    /// The ETag, lowercased, when it is the MD5 of the content as S3 defines it: a single-part
+    /// upload (32 hex digits; a multipart ETag ends in `-<parts>`) that does not use SSE-KMS or
+    /// SSE-C (their ETag is not an MD5). `None` otherwise. Whether the store really computes
+    /// it this way is not checked: see `docs/sources.md`, "Known copies".
+    pub fn content_md5(&self) -> Option<String> {
+        self.encryption
+            .keeps_md5_etag()
+            .then_some(self.etag.as_deref())
+            .flatten()
+            .and_then(md5_etag)
+    }
+}
+
+/// `etag` lowercased if it has the shape of a single-part upload's MD5 (32 hex digits, so no
+/// `-<parts>` suffix).
+pub fn md5_etag(etag: &str) -> Option<String> {
+    (etag.len() == 32 && etag.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| etag.to_ascii_lowercase())
+}
+
+/// An object's server-side encryption, as its response headers say.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Encryption {
+    /// No `x-amz-server-side-encryption` header: not encrypted, or a store that does not say.
+    #[default]
+    None,
+    /// SSE-S3 (`AES256`): a single-part ETag is still the MD5 of the content.
+    S3,
+    /// SSE-KMS (`aws:kms`, `aws:kms:dsse`).
+    Kms,
+    /// SSE-C: a customer-provided key (`x-amz-server-side-encryption-customer-algorithm`).
+    CustomerKey,
+    /// Another value: treated as unknown.
+    Other,
+}
+
+impl Encryption {
+    /// From the `x-amz-server-side-encryption` and `...-customer-algorithm` header values.
+    pub fn from_headers(sse: Option<&str>, customer_algorithm: Option<&str>) -> Self {
+        if customer_algorithm.is_some() {
+            return Self::CustomerKey;
+        }
+        match sse.map(str::trim) {
+            None | Some("") => Self::None,
+            Some(v) if v.eq_ignore_ascii_case("AES256") => Self::S3,
+            Some(v) if v.to_ascii_lowercase().starts_with("aws:kms") => Self::Kms,
+            Some(_) => Self::Other,
+        }
+    }
+
+    /// Whether a single-part upload's ETag is the MD5 of its content: no SSE, or SSE-S3.
+    pub fn keeps_md5_etag(self) -> bool {
+        matches!(self, Self::None | Self::S3)
+    }
 }
 
 /// An S3 client for one bucket.
@@ -453,6 +513,13 @@ fn meta(resp: &reqwest::Response) -> ObjectMeta {
             .and_then(|v| jiff::fmt::rfc2822::parse(&v).ok())
             .map(|z| z.timestamp().as_second()),
         content_type: header(reqwest::header::CONTENT_TYPE),
+        encryption: Encryption::from_headers(
+            header(HeaderName::from_static("x-amz-server-side-encryption")).as_deref(),
+            header(HeaderName::from_static(
+                "x-amz-server-side-encryption-customer-algorithm",
+            ))
+            .as_deref(),
+        ),
     }
 }
 
@@ -632,6 +699,54 @@ mod tests {
         assert_eq!(
             e.to_string(),
             "S3 ListObjectsV2 failed: HTTP 503 SlowDown: Please reduce your request rate."
+        );
+    }
+
+    #[test]
+    fn only_single_part_etags_without_kms_or_customer_keys_are_md5() {
+        let meta = |etag: &str, encryption| ObjectMeta {
+            size: 3,
+            etag: Some(etag.to_owned()),
+            last_modified: None,
+            content_type: None,
+            encryption,
+        };
+        let md5 = "D41D8CD98F00B204E9800998ECF8427E";
+        let lower = Some(md5.to_ascii_lowercase());
+        assert_eq!(meta(md5, Encryption::None).content_md5(), lower);
+        assert_eq!(meta(md5, Encryption::S3).content_md5(), lower);
+        for e in [Encryption::Kms, Encryption::CustomerKey, Encryption::Other] {
+            assert_eq!(meta(md5, e).content_md5(), None, "{e:?}");
+        }
+        // Multipart, and anything that is not 32 hex digits.
+        for etag in [
+            "d41d8cd98f00b204e9800998ecf8427e-2",
+            "d41d8cd98f00b204e9800998ecf8427",
+            "z41d8cd98f00b204e9800998ecf8427e",
+            "",
+        ] {
+            assert_eq!(meta(etag, Encryption::None).content_md5(), None, "{etag}");
+        }
+        assert_eq!(Encryption::from_headers(None, None), Encryption::None);
+        assert_eq!(
+            Encryption::from_headers(Some("AES256"), None),
+            Encryption::S3
+        );
+        assert_eq!(
+            Encryption::from_headers(Some("aws:kms"), None),
+            Encryption::Kms
+        );
+        assert_eq!(
+            Encryption::from_headers(Some("aws:kms:dsse"), None),
+            Encryption::Kms
+        );
+        assert_eq!(
+            Encryption::from_headers(None, Some("AES256")),
+            Encryption::CustomerKey
+        );
+        assert_eq!(
+            Encryption::from_headers(Some("rot13"), None),
+            Encryption::Other
         );
     }
 }

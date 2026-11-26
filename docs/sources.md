@@ -50,11 +50,50 @@ Wasabi.
 | credentials | none (unsigned) | Access key id, secret key and an optional session token. Write-only. |
 | scan interval | 300 s | Time from the end of one pass to the start of the next. |
 | object size cap | 512 MiB | GetObject refuses larger objects (by `Content-Length`, and while streaming). |
+| skip known copies | off | Record a new key whose single-part ETag and size match content already stored without fetching it. Trusts the ETag as the content's MD5: see [Known copies](#known-copies). |
 
 Requests time out (10 s to connect, 60 s for a listing or HEAD, 60 s without data on a GetObject
 body) and are retried with exponential backoff and full jitter on 429, 5xx, `SlowDown`,
 `RequestTimeout` and transport errors (6 attempts, `Retry-After` honoured). Presigned URLs carry
 the signature and any session token, so they are never logged and never part of an error.
+
+## Known copies
+
+`skip_known_copies` (`AddSource`, `UpdateSource`; `--skip-known-copies` for
+`doewood dev add-source`) is off by default. With it on, a copy of content doewood already
+stored (the same file under another key, in this source or another one) is not downloaded
+again (issue #131):
+
+- Every GetObject response of a single-part object without SSE-KMS or SSE-C records its ETag
+  and size against the content's BLAKE3 hash (the instance store's `known_content` table,
+  schema 13), whatever the source's setting.
+- When a source has the setting on, a pending object whose listed ETag is 32 hex digits (no
+  `-<parts>` suffix, so not a multipart upload) and whose listed size match such a row gets a
+  HEAD. Only when the HEAD reports the same ETag and size, and no SSE-KMS
+  (`x-amz-server-side-encryption: aws:kms` or `aws:kms:dsse`) and no SSE-C
+  (`x-amz-server-side-encryption-customer-algorithm`), and the content's record is current,
+  is the location recorded against that content, with the graph and search a full ingest of
+  the same bytes would write. There is no GetObject and no hash. SSE-S3 (`AES256`) keeps the
+  MD5 ETag and is allowed.
+- Anything else fetches the object as before: no row, another size, a multipart ETag, SSE-KMS
+  or SSE-C, another SSE value, a failed HEAD (an SSE-C object's HEAD without its key fails),
+  an ETag that changed since the listing, or a record that is gone or older than the running
+  step versions.
+- The SSE type comes from the HEAD and GetObject headers. Listings do not carry it, so the
+  HEAD is required. A store that sends no SSE header is taken as unencrypted. A store that
+  does not report the SSE type is unknown, so its objects are never skipped.
+
+**The trust assumption.** This takes the ETag for the MD5 of the content, as S3 defines it for
+single-part uploads without SSE-KMS or SSE-C. MD5 is broken for collisions: **anyone who can
+write to the bucket can make two different files with the same MD5 and size**, upload one where
+doewood ingests it, then upload the other as a "copy". The copy is then recorded as the first
+file's content, with its record, parties and search text. Turn the setting on only for buckets
+whose writers you trust. doewood does not check that a store really computes MD5 ETags. A store
+that computes them another way never matches, unless its ETags collide with real MD5s.
+
+Each skipped fetch is counted in `doewood_ingest_known_copies_total`, and its listed bytes in
+`doewood_ingest_known_copy_bytes_total` ([api.md](api.md#metrics)). The existing check that
+skips a key whose ETag has not changed works with the setting off too.
 
 ## States
 

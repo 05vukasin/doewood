@@ -227,8 +227,9 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
 migration can rebuild a table others reference). Before a migration commits it checks the
 foreign keys it could break, as the runner declares per migration (issue #159): every table
 for one that rebuilds a table, deletes rows or moves data (schemas 1 to 10); only the tables
-it fills for one that writes into new tables (schema 11); none for one that only builds
-indexes (schema 12). A violation rolls the migration back and the instance does not start.
+it fills for one that writes into new tables (schema 11); none for one that writes no
+rows and rebuilds nothing (schema 12, an index; schema 13, a column with a default and a new
+table). A violation rolls the migration back and the instance does not start.
 A test holds each migration to its declaration.
 
 `doewood.sqlite` runs in WAL mode with `synchronous = NORMAL`, and a `journal_size_limit` of
@@ -245,7 +246,10 @@ optimizes too) there is nothing to do. Schema 10 (issues
 #72 and #73) keeps per-source status counters of `objects_seen` and `llm_jobs`
 (`object_counts`, `llm_job_counts`, updated by triggers in the same transaction), adds an
 index for a source's newest failed summary, and drops `objects_seen_by_status`, which held the
-same entries as `objects_seen_pending`.
+same entries as `objects_seen_pending`. Schema 13 (issue #131) adds the per-source
+`skip_known_copies` option and the `known_content` table (MD5 ETag and size to BLAKE3, one row
+per distinct content, written with each object's final status); see
+[sources.md](sources.md#known-copies).
 
 **Read-only connections (issue #83).** Every write goes through the one writer connection,
 behind a mutex: there is exactly one writer (ADR 0001). Next to it, an on-disk store opens
@@ -354,7 +358,7 @@ every variable, with secrets redacted, and every warning. It creates nothing.
 |---|---|
 | `/healthz` | `200 ok` while the process runs |
 | `/readyz` | `200 ready` once the store is open; `503` before that and during shutdown |
-| `/metrics` | Prometheus text: `doewood_build_info`, `doewood_ready`, `doewood_start_time_seconds`, `doewood_ops_requests_total`, `doewood_ingest_finish_unmatched_total` |
+| `/metrics` | Prometheus text: `doewood_build_info`, `doewood_ready`, `doewood_start_time_seconds`, `doewood_ops_requests_total`, `doewood_ingest_finish_unmatched_total`, `doewood_ingest_known_copies_total`, `doewood_ingest_known_copy_bytes_total` |
 | `POST /events/s3/{source_id}` | MinIO / S3 event notifications for a source (see [api.md](api.md#event-webhook)) |
 
 On SIGTERM or SIGINT, doewood reports not ready, stops its servers (the gRPC API gets up to 10 s

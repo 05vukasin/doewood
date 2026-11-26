@@ -99,6 +99,7 @@ pub(crate) fn source(s: &Source, owner: &InstanceId, running: Running) -> pb::So
             .sqs
             .as_ref()
             .map(|i| sqs_inlet(i, running.inlet, running.inlet_stats)),
+        skip_known_copies: s.skip_known_copies,
     }
 }
 

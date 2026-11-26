@@ -35,7 +35,7 @@ pub use llm::{
     SystemClock,
 };
 pub use pipeline::{
-    Fetch, Ingest, IngestConfig, IngestError, IngestHandle, IngestParts, ReprocessState,
+    Fetch, Fetched, Ingest, IngestConfig, IngestError, IngestHandle, IngestParts, ReprocessState,
     ReprocessStatus, S3Fetch, StageTimes, Stats, default_jobs,
 };
 pub use route::{Route, SheetFormat};

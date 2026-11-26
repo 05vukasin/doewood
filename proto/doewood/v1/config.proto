@@ -129,6 +129,11 @@ message AddSourceRequest {
   LlmPolicy llm_policy = 9;
   // Add the source paused instead of scanning it.
   bool paused = 10;
+  // Off by default. A new key whose single-part ETag (the content's MD5) and size match
+  // content already stored is recorded against it without a GetObject. This trusts the
+  // ETag: anyone who can write to the bucket can make an MD5 collision (docs/sources.md,
+  // "Known copies").
+  bool skip_known_copies = 11;
 }
 
 message Source {
@@ -160,6 +165,8 @@ message Source {
   int64 updated_at = 16;
   // Its SQS event inlet; unset when it has none.
   SqsInlet sqs_inlet = 17;
+  // Whether known copies skip the GetObject (see AddSourceRequest).
+  bool skip_known_copies = 18;
 }
 
 // A source's SQS event inlet.
@@ -230,6 +237,8 @@ message UpdateSourceRequest {
   S3Credentials credentials = 6;
   // Deletes the stored credentials: the bucket is then read anonymously.
   bool clear_credentials = 7;
+  // Unset keeps the setting (see AddSourceRequest).
+  optional bool skip_known_copies = 8;
 }
 
 message PauseSourceRequest {

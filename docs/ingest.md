@@ -41,6 +41,17 @@ pending sweep (objects_seen)┘                                         (cap)   
 `GetObject` with the source's credentials, streamed under its size cap (512 MiB by default). An
 object over the cap fails without a retry.
 
+**Known copies** (issue #131, off by default, per source: [sources.md](sources.md#known-copies)).
+A GetObject response with a single-part ETag and no SSE-KMS or SSE-C records `(ETag, size) ->
+BLAKE3` with the object's final status, in the same transaction. On a source with
+`skip_known_copies` on, the status read before the fetch also looks up the listed ETag and size.
+When they match, a HEAD confirms the ETag, the size and the SSE type, and the stored record is
+read and checked against the running step versions. The worker then writes the location, graph
+and search as for any reused record, and the status and outcome are the record's. No GetObject,
+no hash and no analysis. Anything that does not match falls back to the normal fetch. The file's
+share of the [memory budget](#memory) is still taken by its listed size before the worker
+starts it, and freed when it is through. A HEAD is a short wait, not a download.
+
 ## Analyze
 
 - **One engine per instance**, built like the `quail` CLI builds its own
@@ -379,6 +390,11 @@ are there for enrichment, and no document merges on a fuzzy match yet.
   SQLite (and Postgres with `DOEWOOD_TEST_POSTGRES_URL`), then the records, the graph (pending
   references, companies across spellings and identifiers, `similar_to`), search, retries,
   deletes and reprocessing. `throughput` (ignored) measures files per second.
+- `tests/known_copies.rs`: a known copy is located with a HEAD and no GetObject only with the
+  source's setting on, a single-part ETag, no SSE-KMS or SSE-C on the copy and on the stored
+  original, the same size and an unchanged ETag. Its status, hash and document edges equal
+  those of a full ingest of the same bytes. `tests/minio_postgres.rs` checks the same against
+  MinIO and measures it ([Known copies, measured](#known-copies-measured)).
 - `tests/company_rows.rs` (ignored, a measurement): what each document's company props patch
   costs, for one supplier on every document against many small ones (issue #129; numbers in
   [deploy.md](deploy.md#company-rows-rewritten-by-every-document-issue-129)).
@@ -501,3 +517,20 @@ DOEWOOD_BENCH_ROWS=200000 cargo test -p doewood-ingest --test pipeline -- --igno
 | after (one deadline per file) | 1.8 s | 1548 MiB | `failed`: `sheet.read@1: file refused: reading took longer than the time limit` |
 
 The RSS before the run (574 MiB) is the test's own copies of the files.
+
+## Known copies, measured
+
+`known_copies_skip_the_get_object` in `tests/minio_postgres.rs` (issue #131), release build,
+MinIO and Postgres in containers on an internal Docker network, 2 workers. One 256 MiB object
+is ingested first, then a second source with 8 copies of it under new keys
+(`DOEWOOD_KNOWN_COPIES=8 DOEWOOD_KNOWN_COPIES_MIB=256`). Times run from starting the copies'
+scanner to the last copy being through (scan, HEAD or GetObject, hash, graph):
+
+| `skip_known_copies` | GetObject bytes | time | known copies |
+|---|---|---|---|
+| off | 2048 MiB | 2.01 s | 0 |
+| on | 0 MiB | 0.11 s | 8 |
+
+With the setting on, each copy costs one HEAD and one record read. With it off, each copy is a
+full download and hash, and its 256 MiB share of the memory budget is held for that time. Both
+runs end with the same statuses, hashes and `located_at` locations.
