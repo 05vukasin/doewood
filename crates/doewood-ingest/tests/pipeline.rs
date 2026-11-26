@@ -1244,8 +1244,31 @@ async fn throughput() {
 
 /// File `i` of the `scale` corpus: [`bench_file`]'s mix, except that every 20th file is a
 /// near-duplicate TXT, three words changed in one of 50 template texts (Jaccard well above
-/// the 0.8 of `similar_to`).
+/// the 0.8 of `similar_to`), and that only every fourth contract names the one big buyer:
+/// the others name a buyer of their own, so the corpus has many companies (quail reads one
+/// party, the buyer with the contract's PIB, from these contracts).
 fn scale_file(i: usize) -> (String, Vec<u8>) {
+    if i % 4 == 0 && i % 16 != 0 {
+        let pib = common::pib(&format!("{:08}", 10_000_000 + i));
+        let body = common::prose(i as u64, 300);
+        // A capitalized word of its own per contract.
+        let mut name = String::from("K");
+        let mut n = i;
+        while n > 0 {
+            name.push(char::from(b'a' + u8::try_from(n % 26).unwrap()));
+            n /= 26;
+        }
+        let pdf = common::pdf(
+            &[
+                &format!("UGOVOR br. {i}/26"),
+                &format!("Dobavljac: Firma {i} d.o.o. Beograd, PIB {pib}"),
+                &format!("Narucilac: {name} Grupa a.d. Novi Sad"),
+                &body[..90],
+            ],
+            "Ugovor",
+        );
+        return (format!("bench/{i}.pdf"), pdf);
+    }
     if i % 20 != 19 {
         return bench_file(i);
     }
