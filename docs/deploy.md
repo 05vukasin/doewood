@@ -501,7 +501,9 @@ Postgres 17 on an idle server, a page of 100 by key (median of 3 rounds of 17 pa
   converted it reads from its jsonb, with the same bytes; a changed record is converted when it
   is written. The log shows `converting stored records to text` (about every 10,000 rows) and
   `stored records converted to text`. Space of the old jsonb is reused after autovacuum (a
-  `VACUUM FULL records` gives it back to the disk, but locks the table).
+  `VACUUM FULL records` gives it back to the disk, but locks the table). The decision is
+  [ADR 0003](adr/0003-records-as-canonical-text.md); the down path is in
+  [configuration.md](configuration.md#the-shared-postgres).
 
 ### The instance store's read-only connections (issue #83)
 

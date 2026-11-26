@@ -30,7 +30,8 @@ models are reached through APIs; and the service builds and starts with no envir
 All instances share **one** Postgres database. It holds:
 
 - **records:** each quail/hedgehog record as JSON, keyed by the file's BLAKE3 (JSONB until
-  shared schema 8; since then its canonical JSON text, which reads cost far less, issue #121);
+  shared schema 8; since then its compressed canonical JSON text: see
+  [ADR 0003](0003-records-as-canonical-text.md));
 - **the graph:** typed `node` and `edge` tables (see 7), behind a `GraphStore` trait so that a
   Neo4j backend can be added later if deep traversals ever matter;
 - **source claims:** a unique `(endpoint, bucket, prefix)` row owned by an instance id. A second

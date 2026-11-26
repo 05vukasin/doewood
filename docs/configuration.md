@@ -150,7 +150,15 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
   shows `converting stored records to text` and then `stored records converted to text`. As
   with every schema, older instances refuse it and cannot read the converted rows, so **all
   instances are upgraded together** (below). The instance's own SQLite file is unchanged. See
-  [deploy.md](deploy.md#records-as-text-on-postgres-issue-121). **Schema 7** (issue #102: the
+  [deploy.md](deploy.md#records-as-text-on-postgres-issue-121) and
+  [ADR 0003](adr/0003-records-as-canonical-text.md). **Down path** (by hand, with every
+  instance stopped): `UPDATE records SET record = body::jsonb WHERE record IS NULL` (in
+  batches of a few thousand rows by `blake3` on a big table), then
+  `DROP INDEX records_body_pending; ALTER TABLE records DROP COLUMN body, ALTER COLUMN record
+  SET NOT NULL; DELETE FROM doewood_schema WHERE version = 8;`, then start the older binary.
+  An older binary that meets schema 8 refuses it and stays not ready. If the down path is
+  skipped and the schema row is deleted anyway, the older binary fails to read every converted
+  row, because its `record` is NULL. **Schema 7** (issue #102: the
   search index `search_tsv` gets `gin_pending_list_limit = 256` kB, and its pending list is
   merged once; no table or data changed, see
   [deploy.md](deploy.md#search-and-the-gin-pending-list-issue-102)) was the one before.
