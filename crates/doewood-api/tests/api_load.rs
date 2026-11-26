@@ -21,7 +21,8 @@
 //! `DOEWOOD_BENCH_PER_CONN` (clients per connection, default 1), `DOEWOOD_BENCH_WATCH_PCT`
 //! (watchers as a percentage of the clients, on connections of their own, default 10),
 //! `DOEWOOD_BENCH_SECS` (seconds per step, default 10), `DOEWOOD_BENCH_DOCS` (documents
-//! seeded, default 10000), `DOEWOOD_BENCH_IDLE` (idle connections, default 2000),
+//! seeded, default 10000), `DOEWOOD_BENCH_COMPANIES` (companies the documents are spread over,
+//! default one per 20 documents), `DOEWOOD_BENCH_IDLE` (idle connections, default 2000),
 //! `DOEWOOD_BENCH_ONLY` (one method by name, for example `Search`, instead of the mix).
 //!
 //! `DOEWOOD_BENCH_POOL` sets the Postgres pool's size (default as `serve`).
@@ -188,8 +189,8 @@ fn hash(i: usize) -> Blake3 {
 }
 
 /// `docs` documents under `in/` of one source, each with a record (about 1 KiB), a location, a
-/// search row, a `party` edge to one of `docs / 20` companies and a `similar_to` edge to the
-/// one before it; and 19 more sources, for `ListSources`.
+/// search row, a `party` edge to one of `docs / 20` companies (`DOEWOOD_BENCH_COMPANIES`)
+/// and a `similar_to` edge to the one before it; and 19 more sources, for `ListSources`.
 #[allow(clippy::too_many_lines)]
 async fn seed(a: &Instance, backend: &Arc<dyn Backend>, docs: usize) -> Seeded {
     let started = Instant::now();
@@ -201,7 +202,8 @@ async fn seed(a: &Instance, backend: &Arc<dyn Backend>, docs: usize) -> Seeded {
         source.get_or_insert(id);
     }
     let source = source.unwrap();
-    let ncompanies = (docs / 20).max(1);
+    // `DOEWOOD_BENCH_COMPANIES`: fewer companies make each one bigger (issue #127).
+    let ncompanies = env("DOEWOOD_BENCH_COMPANIES", docs / 20).clamp(1, docs);
     let mut companies = Vec::with_capacity(ncompanies);
     for c in 0..ncompanies {
         let id = backend
