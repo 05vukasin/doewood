@@ -192,7 +192,8 @@ The record is the quail record JSON, keyed by BLAKE3, with step versions: one pe
 The record is written as JSON text straight from quail's record (`doewood_model::canonical`),
 with no `serde_json::Value` tree in between: compact, object keys sorted, byte for byte the text
 the tree wrote before issue #98. Both stores take and return that text (`Record::body` is a
-`RawValue`; SQLite keeps it as it is, Postgres as jsonb and gives it back in the same form), and
+`RawValue`; both keep it as it is: SQLite in `body_json`, Postgres in `records.body` since
+shared schema 8, issue #121), and
 readers deserialize only what they use: `DocFacts` reads the facts it needs into quail values
 and skips the rest as text, the outcome of a stored record reads `format` and `status` only.
 Numbers are in [Sizing, Records](deploy.md#records).
