@@ -408,6 +408,9 @@ to `doewood_ready` and the others. gRPC-Web calls are counted like gRPC calls.
 | `doewood_ingest_finish_unmatched_total` | counter | | ingested objects whose status matched no `pending` row of that version, so it was not recorded: the object changed or was deleted meanwhile (issue #125). Near 0 in steady state |
 | `doewood_ingest_known_copies_total` | counter | | objects recorded against content already stored, by their single-part MD5 ETag and size, without a GetObject (sources with `skip_known_copies` on, issue #131; [sources.md](sources.md#known-copies)) |
 | `doewood_ingest_known_copy_bytes_total` | counter | | the listed bytes of those objects, not fetched |
+| `doewood_store_wal_bytes` | gauge | | size of the instance store's WAL file (`doewood.sqlite-wal`); emptied when over 64 MiB or idle (issue #151, [configuration.md](configuration.md#the-instance-store)) |
+| `doewood_store_wal_truncations_total` | counter | | checkpoints that emptied the instance store's WAL |
+| `doewood_store_wal_truncations_busy_total` | counter | | such checkpoints that gave up after their 50 ms wait for a read or a write; the next try is 5 s later |
 
 - `method` is the full method name, for example `doewood.v1.RecordsService/GetRecord` or
   `grpc.health.v1.Health/Check`. It comes from the fixed list of served methods; any other
