@@ -55,7 +55,9 @@ fn scale_store_sizes() {
     println!("table | rows | table MiB | indexes MiB | bytes a record");
     for (table, (t, i)) in tables {
         let count: Option<i64> = conn
-            .query_row(&format!("SELECT count(*) FROM \"{table}\""), [], |r| r.get(0))
+            .query_row(&format!("SELECT count(*) FROM \"{table}\""), [], |r| {
+                r.get(0)
+            })
             .ok();
         println!(
             "{table} | {} | {:.1} | {:.1} | {:.0}",

@@ -1095,10 +1095,8 @@ fn bench_file(i: usize) -> (String, Vec<u8>) {
         ),
         2 => (
             format!("bench/{i}.txt"),
-            format!(
-                "INVOICE No. INV-{i}\nSupplier: Vendor {i} LLC\n{body}\nTotal: EUR {i}.50\n"
-            )
-            .into_bytes(),
+            format!("INVOICE No. INV-{i}\nSupplier: Vendor {i} LLC\n{body}\nTotal: EUR {i}.50\n")
+                .into_bytes(),
         ),
         _ => (
             format!("bench/{i}.xlsx"),
@@ -1124,8 +1122,8 @@ fn bench_file(i: usize) -> (String, Vec<u8>) {
 /// `DOEWOOD_BENCH_READERS=n` puts the instance store in a file with `n` read-only connections
 /// (0: on disk, every read on the writer) and times a `ListRecords` page every millisecond
 /// while ingest runs (from `DOEWOOD_BENCH_READ_CLIENTS` clients at once, default 1;
-/// `DOEWOOD_BENCH_POOL` sets the Postgres pool's size; it prints the pages' size and the
-/// largest the WAL grew). Besides files/s it prints where the workers' time went
+/// `DOEWOOD_BENCH_POOL` sets the Postgres pool's size; it prints the pages' size, the
+/// largest the WAL grew and how often a checkpoint reset it). Besides files/s it prints where the workers' time went
 /// ([`doewood_ingest::StageTimes`]: the company lock's wait and hold among them) and, on
 /// Postgres with `pg_stat_statements` loaded, the statements per file and the costliest
 /// statements.
@@ -1247,7 +1245,7 @@ async fn throughput() {
 /// the others name a buyer of their own, so the corpus has many companies (quail reads one
 /// party, the buyer with the contract's PIB, from these contracts).
 fn scale_file(i: usize) -> (String, Vec<u8>) {
-    if i % 4 == 0 && i % 16 != 0 {
+    if i.is_multiple_of(4) && !i.is_multiple_of(16) {
         let pib = common::pib(&format!("{:08}", 10_000_000 + i));
         let body = common::prose(i as u64, 300);
         // A capitalized word of its own per contract.
@@ -1316,6 +1314,7 @@ fn scale_file(i: usize) -> (String, Vec<u8>) {
 #[ignore = "a measurement (issue #127); see docs/deploy.md"]
 #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
 async fn scale() {
+    use std::io::Write as _;
     let var = |name: &str| std::env::var(name).ok().and_then(|v| v.parse().ok());
     let dir = PathBuf::from(std::env::var("DOEWOOD_SCALE_DIR").expect("DOEWOOD_SCALE_DIR"));
     std::fs::create_dir_all(&dir).unwrap();
@@ -1362,7 +1361,11 @@ async fn scale() {
     let wal = dir.join(format!("{}-wal", doewood_store::STORE_FILE));
     println!(
         "scale: {phase}, {} backend, {} files so far, store readers {}",
-        if admin.is_some() { "postgres" } else { "sqlite" },
+        if admin.is_some() {
+            "postgres"
+        } else {
+            "sqlite"
+        },
         keys.len(),
         store.readers()
     );
@@ -1410,7 +1413,7 @@ async fn scale() {
                 let secs = t.elapsed().as_secs_f64();
                 let time = h.ingest.stats().time;
                 let ms = |a: Duration, b: Duration| {
-                    (a - b).as_secs_f64() * 1e3 / (next - at) as f64
+                    a.saturating_sub(b).as_secs_f64() * 1e3 / (next - at) as f64
                 };
                 println!(
                     "scale: files {at}..{next}: {:.0} files/s; per file: store {:.2} ms, record \
@@ -1422,7 +1425,6 @@ async fn scale() {
                     ms(time.company_lock_wait, before.company_lock_wait),
                     ms(time.company_lock_hold, before.company_lock_hold),
                 );
-                use std::io::Write as _;
                 for (k, d) in &files {
                     writeln!(out, "{k}\t{}", d.len()).unwrap();
                 }
@@ -1449,7 +1451,9 @@ async fn scale() {
                 let t = std::time::Instant::now();
                 let mut after: Option<String> = None;
                 loop {
-                    let page = store.pending_objects(source, after.as_deref(), 256).unwrap();
+                    let page = store
+                        .pending_objects(source, after.as_deref(), 256)
+                        .unwrap();
                     after = page.last().map(|o| o.key.clone());
                     if page.len() < 256 {
                         break;
@@ -1544,7 +1548,9 @@ async fn scale() {
             );
         }
         "offline" => {
-            use doewood_store::{EnrichmentSettingsPatch, FeedSwitchesPatch, RegistrySwitchesPatch};
+            use doewood_store::{
+                EnrichmentSettingsPatch, FeedSwitchesPatch, RegistrySwitchesPatch,
+            };
             let off = Some(false);
             store
                 .set_enrichment_settings(&EnrichmentSettingsPatch {
@@ -1574,7 +1580,7 @@ async fn scale() {
 }
 
 /// The `api` phase of [`scale`].
-#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 async fn scale_api(
     store: &Arc<Store>,
     backend: &Arc<dyn Backend>,
