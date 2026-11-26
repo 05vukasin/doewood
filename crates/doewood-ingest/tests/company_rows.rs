@@ -1,7 +1,8 @@
 //! What every document's company props patch costs (issue #129). Each party of each document
-//! patches its company's props (`GraphWriter::update_company`), and the patch always changes
-//! the row, because `matches` gets the document's entry. A supplier on most documents is
-//! therefore one row rewritten for every document.
+//! patches its company's props (`GraphWriter::update_company`). Until issue #129 the patch
+//! always changed the row, because a `matches` list got the document's entry, so a supplier on
+//! most documents was one row rewritten for every document; now the match is on the `party`
+//! edge only, and a known company's patch usually writes nothing.
 //!
 //! `company_rows` (ignored; a measurement) writes a corpus through `GraphWriter` straight into
 //! the store, without files or analysis: `hot`, where one supplier is a party of every
@@ -10,8 +11,12 @@
 //! file over the run, the busiest company's props size, and on Postgres the WAL, the `nodes`
 //! row versions and dead tuples and the compare-and-set retries (from `pg_stat_statements`,
 //! when loaded); on SQLite the bytes the process wrote (`wchar` in `/proc/self/io`). Then it
-//! times the company patch alone on the busiest and on a small company, with and without the
-//! `matches` entry.
+//! times the company patch alone on the busiest and on a small company, with and without a
+//! `matches` entry (as before issue #129, and as now), and on Postgres what reading the last 20
+//! `party` edges of the busiest company costs (deriving `matches` on read).
+//!
+//! `a_stored_matches_list_goes_with_the_next_document` (not ignored) checks that a list an
+//! earlier version stored is removed.
 //!
 //! SQLite always (a store file under the temp dir); Postgres when `DOEWOOD_TEST_POSTGRES_URL`
 //! is set (a schema of its own). `DOEWOOD_BENCH_DOCS` documents per corpus (default 10,000),
@@ -395,6 +400,39 @@ async fn patch_alone(t: &Target, id: Uuid, name: &str, pib_n: usize, with_matche
     )
 }
 
+/// What deriving a company's `matches` from its `party` edges on read would cost: the last 20
+/// live party edges (newest id first; ids are UUIDv7), timed over 200 reads with the indexes as
+/// they are, then with an index on `(dst, kind, id)`, which is dropped again.
+async fn last_matches(admin: &tokio_postgres::Client, schema: &str, company: Uuid) -> String {
+    let query = format!(
+        "SELECT e.props, e.evidence FROM {schema}.edges e \
+         WHERE e.dst = $1 AND e.kind = 'party' AND e.state NOT IN ('retracted', 'superseded') \
+         ORDER BY e.id DESC LIMIT 20"
+    );
+    let time = async || {
+        let stmt = admin.prepare(&query).await.unwrap();
+        admin.query(&stmt, &[&company]).await.unwrap();
+        let start = Instant::now();
+        for _ in 0..200 {
+            admin.query(&stmt, &[&company]).await.unwrap();
+        }
+        ms(start.elapsed() / 200)
+    };
+    let now = time().await;
+    admin
+        .batch_execute(&format!(
+            "CREATE INDEX edges_by_dst_id ON {schema}.edges (dst, kind, id); ANALYZE {schema}.edges"
+        ))
+        .await
+        .unwrap();
+    let indexed = time().await;
+    admin
+        .batch_execute(&format!("DROP INDEX {schema}.edges_by_dst_id"))
+        .await
+        .unwrap();
+    format!("{now:.3} ms (indexes as they are), {indexed:.3} ms with (dst, kind, id)")
+}
+
 async fn measure(t: &Target, corpus: &'static str, docs: usize, instances: usize, jobs: usize) {
     let pg_before = match &t.pg {
         Some((admin, schema)) => {
@@ -487,6 +525,10 @@ async fn measure(t: &Target, corpus: &'static str, docs: usize, instances: usize
             sizes.get::<_, i64>(1) / 1024,
             sizes.get::<_, i64>(2) / 1024
         );
+        println!(
+            "the busiest company's last 20 party edges, read: {}",
+            last_matches(admin, schema, busy).await
+        );
     }
     let (name, pib_n) = if corpus == "hot" {
         ("Glavni Dobavljac d.o.o.", BUSY)
@@ -495,8 +537,12 @@ async fn measure(t: &Target, corpus: &'static str, docs: usize, instances: usize
     };
     for with_matches in [true, false] {
         println!(
-            "patch alone, {} `matches`: {}",
-            if with_matches { "with" } else { "without" },
+            "patch alone, {}: {}",
+            if with_matches {
+                "with a `matches` entry (before #129)"
+            } else {
+                "without (now)"
+            },
             patch_alone(t, busy, name, pib_n, with_matches).await
         );
     }
@@ -531,5 +577,45 @@ async fn company_rows() {
                 None => println!("{PG_VAR} is not set: Postgres not measured"),
             }
         }
+    }
+}
+
+/// A `matches` list an earlier version stored on a company goes with the company's next
+/// document, and none is written again (issue #129). SQLite, and Postgres when
+/// `DOEWOOD_TEST_POSTGRES_URL` is set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stored_matches_list_goes_with_the_next_document() {
+    let mut targets = vec![Target::sqlite()];
+    if let Some(url) = var(PG_VAR) {
+        targets.push(Target::postgres(&url).await);
+    }
+    for t in targets {
+        let b = &t.backend;
+        let writer = GraphWriter::new(Arc::clone(b), SimilarityConfig::default());
+        let record = doewood_model::canonical::to_canonical(&json!({})).unwrap();
+        for i in 0..2 {
+            let h = hash("strip", i);
+            b.put_record(&h, &record, &StepVersions::new())
+                .await
+                .unwrap();
+            writer
+                .write(&h, &at("strip", i), &facts(true, i), "x.pdf", 0.8)
+                .await
+                .unwrap();
+            let busy = company(b.as_ref(), BUSY).await;
+            let props = b.node(busy).await.unwrap().unwrap().props;
+            assert!(props.get("matches").is_none(), "{}: {props}", t.name);
+            assert_eq!(props["ids"]["rs_pib"][0], pib(BUSY).value, "{}", t.name);
+            if i == 0 {
+                // As an earlier version left it.
+                b.update_props(
+                    busy,
+                    &PropsPatch::new().set(&["matches"], json!([{"document": "old"}])),
+                )
+                .await
+                .unwrap();
+            }
+        }
+        t.finish().await;
     }
 }
