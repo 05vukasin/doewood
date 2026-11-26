@@ -55,8 +55,9 @@ pushes nothing; publishing the image to a registry is not set up yet.
 
 The chart in `charts/doewood` runs a `StatefulSet` (pods start in parallel; each gets its own
 `PersistentVolumeClaim` from `volumeClaimTemplates`), a headless Service naming each pod, and a
-Service for the gRPC (7443) and ops (7444) ports. The liveness probe is `/healthz`, the readiness
-probe `/readyz`. `DOEWOOD_INSTANCE_ID` is the pod name. Parallel starts against a new, empty
+Service for the gRPC (7443) and ops (7444) ports. The liveness probe is `/healthz` (every 10 s,
+6 failures), the readiness probe `/readyz` (every 2 s, 8 failures; see
+[Time to ready](#time-to-ready-issue-118) for why). `DOEWOOD_INSTANCE_ID` is the pod name. Parallel starts against a new, empty
 database are safe: one pod migrates the shared schema (and creates pgvector), the others
 wait for it and stay not ready until then (see the Migrations bullet in
 [configuration.md](configuration.md#the-shared-postgres)). Behind PgBouncer in transaction
@@ -746,6 +747,57 @@ page of 100 every millisecond; 1 run each):
   4 cores are the limit. With 32 such clients and 2 readers, 2000 files did not finish in
   10 minutes. 8 clients asking for 100 records every millisecond is far more than
   the API usually sees, but nothing gives ingest's reads priority yet; see #109.
+
+### Time to ready (issue #118)
+
+How long a new instance takes from `exec` to `/readyz` answering 200, that is to serving the
+gRPC API. Each start logs one `startup step` line per step (`step`, `took_ms`, `at_ms` since
+the process started) and a `ready` line with `startup_ms` and the resident memory
+`rss_mib`; the shared Postgres's `shared Postgres store ready` line adds `connect_ms` and
+`migrate_ms`, and `analyzer ready` adds `ocr_ms` (checking the OCR models' SHA-256) and
+`engine_ms` (building the quail engine).
+
+Measured on the machine above with release builds of `36b041c` (after) and `e943d5a` (before:
+`main` plus the timings), the OCR models present, in a network namespace with only loopback,
+Postgres 17 in a container on an internal network (no TLS), nothing to ingest. Times in ms,
+the median of 3 runs unless marked; the store file in the page cache unless marked. "50k" is
+a store with 50,000 generated documents (records with 20 facts, search rows, sketches, nodes
+and 3 party edges each, 5,000 companies; 630 MiB of SQLite):
+
+| store | before | after | critical path after |
+|---|---|---|---|
+| SQLite, empty, restart | 145 | 138 | analyzer 126 (OCR check 57, engine 70) |
+| SQLite, 50k, restart | 144 | 138 | analyzer 127; store open 5 |
+| SQLite, 50k, statistics stale (1 run) | 12,896 | 109 | analyzer 102; statistics refreshed after ready in 0.6 s |
+| SQLite, 50k, statistics stale, file not cached (1 run) | 18,610 | 497 | analyzer 453; statistics refreshed after ready in 17 s |
+| Postgres, empty database, first start (1 run) | 145 | 481 | schema migration 424 (129 before: run to run noise on a busy machine) |
+| Postgres, 50k, restart | 145 | 132 | analyzer 122; connect + migrations 20, in parallel |
+
+- **What was cut.** `Store::open` ran `PRAGMA optimize = 0x10002`; with statistics missing or
+  stale (after a crash, an OOM kill or a bulk load, before the close-time optimize ran) it
+  analyzed whole tables: 13 s on 50k documents, 18 s when the file is not in the page cache
+  (a pod on a new node). It now runs right after the instance is ready, in the cleanup task:
+  the writer waits meanwhile (reads use the read-only connections), and the results are the
+  same. The analyzer and the shared Postgres's connect and migrations need nothing from the
+  instance store and now start before it opens; the readers, the prepared statements
+  (per pooled connection, on first use) and the OCR engines (on the first scanned page) were
+  already lazy.
+- **Readiness is stricter.** Before, standalone instances reported ready as soon as the store
+  was open, about 130 ms before the gRPC API served (and with Postgres, as soon as it
+  connected). Ready now means the API serves and the backend answers.
+- **What is left:** the analyzer, about 125 ms: the SHA-256 of the 47 MB of OCR models
+  (30 to 60 ms) and building the quail engine (about 70 ms), both in quail. Without the OCR
+  models only the engine remains. Postgres's first start on an empty database migrates the
+  schema (0.1 to 0.4 s, once per database; other instances wait for it).
+- `/healthz` answers about 15 ms after `exec` (100 ms with the binary not in the page cache).
+- RSS at ready: 81 to 83 MiB in every case.
+
+Probes, from these numbers: no `initialDelaySeconds` for either probe, and no startup probe;
+an instance is ready well within a second, so the readiness period decides when a new pod
+takes traffic (on average half a period after ready). The chart's readiness probe runs every
+2 s (it ran every 5 s before) with 8 failures, about 16 s before a pod that lost Postgres is
+taken out, as before. The liveness probe stays at every 10 s with 6 failures: the process
+answers `/healthz` from the start, and a slow start never needs more.
 
 ### Requests and limits
 
