@@ -192,7 +192,10 @@ impl Target {
                 .unwrap();
         }
         if let Some(dir) = self.dir {
-            std::fs::remove_dir_all(dir).unwrap();
+            // Best effort: on Windows the store's files can still be open (a clone of the
+            // backend or the store's close running on another thread), and an open file
+            // cannot be removed there. The directory is a temp dir either way.
+            let _ = std::fs::remove_dir_all(dir);
         }
     }
 }
