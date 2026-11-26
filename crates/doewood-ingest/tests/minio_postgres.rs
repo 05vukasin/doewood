@@ -289,7 +289,7 @@ fn opaque(seed: u64, len: usize) -> Vec<u8> {
 /// Prints the GetObject bytes and time of the copies' phase for both (a measurement with
 /// `DOEWOOD_KNOWN_COPIES` copies of `DOEWOOD_KNOWN_COPIES_MIB` MiB; default 3 of 2 MiB).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
 async fn known_copies_skip_the_get_object() {
     let Some(env) = env() else { return };
     let var = |name: &str, default: usize| {
@@ -330,7 +330,7 @@ async fn known_copies_skip_the_get_object() {
         bucket,
         creds,
     };
-    let bytes = opaque(nanos as u64, size);
+    let bytes = opaque(u64::try_from(nanos % u128::from(u64::MAX)).unwrap(), size);
     tb.put("a/original.bin", bytes.clone()).await;
     for i in 0..copies {
         tb.put(&format!("b/copy-{i:03}.bin"), bytes.clone()).await;
@@ -359,7 +359,7 @@ async fn known_copies_skip_the_get_object() {
         let add = |prefix: &str, skip_known_copies: bool| {
             let mut s = NewSource::new(&env.endpoint, &name);
             s.prefix = prefix.into();
-            s.scan_interval = Duration::from_secs(3600);
+            s.scan_interval = Duration::from_hours(1);
             s.skip_known_copies = skip_known_copies;
             store.add_source(&s, Some(&s3_creds)).unwrap()
         };

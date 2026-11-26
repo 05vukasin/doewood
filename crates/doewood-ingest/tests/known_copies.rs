@@ -108,7 +108,7 @@ impl Run {
         }
     }
 
-    /// What a key ended as, and its document's located_at locations and other edges, without
+    /// What a key ended as, and its document's `located_at` locations and other edges, without
     /// ids or times: equal for a known copy and a full ingest of the same bytes.
     async fn state(&self, source: SourceId, key: &str) -> (String, Blake3, Vec<String>) {
         let st = self.store.ingest_status(source, key).unwrap().unwrap();
