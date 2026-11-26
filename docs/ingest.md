@@ -228,7 +228,11 @@ Numbers are in [Sizing, Records](deploy.md#records).
     company owns is refused and noted as a conflict, never moved. Fuzzy steps are not taken here;
     nothing merges on a fuzzy match.
   - The `party` edge has quail's role and confidence, the match step, its reliability and the
-    evidence (mentions, identifiers); the company keeps its names, identifiers and matches.
+    evidence (mentions, identifiers); the company keeps its names and identifiers. How each
+    document matched is on its `party` edge only (issue #129): the company props no longer
+    keep a `matches` list, which changed with every document and so rewrote the company's row
+    for every party. Ingest removes a `matches` list stored by an earlier version the next
+    time it patches that company.
   - Ingest never merges two company nodes. When a party's identifier and its name point at
     different companies, the identifier's company gets the party and nothing merges: two
     conflicting high-precision hits are for review (ADR 0002 section 1.6), never an automatic
@@ -262,8 +266,8 @@ Numbers are in [Sizing, Records](deploy.md#records).
 ## Company props
 
 Ingest and the enrichment job write the same company nodes, each only its own keys (ingest:
-`name`, `key`, `legal_form`, `jurisdiction`, `names`, `quail_keys`, `ids.<kind>`,
-`matches`; the document's `format`, `title`, `kind` and `numbers`). A writer never reads,
+`name`, `key`, `legal_form`, `jurisdiction`, `names`, `quail_keys`, `ids.<kind>`; the
+document's `format`, `title`, `kind` and `numbers`). A writer never reads,
 changes and writes back the whole props: it sends a `PropsPatch` (set, set if missing, remove,
 add to a capped set, push to a capped list replacing the same entry) to
 `GraphStore::update_props`, which applies it to the props as stored, with the node row locked,

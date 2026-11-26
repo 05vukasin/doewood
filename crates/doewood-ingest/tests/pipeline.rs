@@ -671,10 +671,8 @@ async fn scenario(store: Arc<Store>, shared: &Shared) {
     );
     let acme_node = b.node(acme.node.id).await.unwrap().unwrap();
     assert_eq!(acme_node.props["ids"]["rs_pib"][0], p1.as_str(), "{name}");
-    assert!(
-        acme_node.props["matches"].as_array().unwrap().len() >= 3,
-        "{name}"
-    );
+    // How each document matched is on its `party` edge, not on the company (issue #129).
+    assert!(acme_node.props.get("matches").is_none(), "{name}");
     let docs = b.company_documents(acme.node.id).await.unwrap();
     assert_eq!(docs.len(), 3, "{name}: contract, amendment, invoice");
 

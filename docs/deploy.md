@@ -1020,9 +1020,51 @@ other instance and were applied again (one more read and write each).
   throughput a single instance loses. On SQLite it is about 3% of the bytes written and about
   4% of the lock hold. In a real ingest the graph stage is 40 to 58% of a worker's time (see
   [Ingest on Postgres](#ingest-on-postgres-issue-69)), so the gain there is smaller.
-- Writing `matches` only when something else changed, or keeping it elsewhere, changes the
-  stored props that `GetNode` returns: an owner decision (issue #129). The patch already
-  writes nothing when it changes nothing, on both stores.
+- **Since then the company keeps no `matches` list** (the owner's decision on issue #129):
+  how each document matched is on its `party` edge only (see below).
+
+#### Without `matches` (issue #129)
+
+The match step, alias, confidence and conflicts of each document were already on its `party`
+edge (`props.match`, the document in `evidence`), so the company's list was a copy that
+nothing read. Ingest no longer writes it, and removes a list an earlier version stored the
+next time it patches that company (a remove that changes nothing on a company without one).
+No migration: companies that get no new document keep their old list until they do. While
+older and newer instances run side by side, the older ones add the list back and the newer
+ones remove it: the rows are written as often as before, nothing is lost.
+
+Deriving the list on read instead (the last 20 live `party` edges of the company, for
+`GetNode`) was measured too: 4.4 to 7.8 ms per read for the busiest company (10,000 edges)
+with today's indexes, which find all its party edges and sort them, against about 0.3 ms
+for reading the node. An index on `edges (dst, kind, id)` makes it 0.2 to 0.35 ms, but needs
+a new shared schema (every instance upgraded together) and one more store call per
+`GetNode`; `Neighbours` (in, `party`) already lists the same edges. So the list was dropped,
+not derived ([api.md](api.md#records-graph-and-search)).
+
+`company_rows`, `hot` corpus, the same machine and settings as above, `staging` at `c87a4f4`
+before and this change after, back to back, one run each (lock and graph stage are means
+over the run):
+
+| | documents/s | graph stage per document | lock held per document | written per document | `nodes` row versions per document | props compare-and-set writes, retried |
+|---|---|---|---|---|---|---|
+| SQLite, before | 231 | 17.1 ms | 4.31 ms | 314 KB (process) | | |
+| SQLite, after | 275 | 14.4 ms | 3.61 ms | 300 KB | | |
+| Postgres, before | 94 | 41.7 ms | 10.60 ms | 13.3 KB WAL | 2.99 | 30,000, 0 |
+| Postgres, after | 114 | 34.2 ms | 8.73 ms | 9.2 KB WAL | 0.99 | 10,021, 0 |
+| Postgres, 2 instances, before | 226 | 17.0 ms | 8.79 ms | 13.2 KB WAL | 2.99 | 30,555, 555 |
+| Postgres, 2 instances, after | 271 | 14.0 ms | 7.34 ms | 9.1 KB WAL | 0.98 | 10,021, 0 |
+
+- **Each known company's patch now writes nothing**: 10,021 props writes for 10,000
+  documents instead of 30,000 (the documents' own props, and the 21 companies' first
+  ones), one `nodes` row version per document instead of three, and 30 to 31% less WAL. The
+  busiest company's props are 188 bytes instead of 3.7 KB.
+- **The company lock is held 16 to 18% less** (the patch is a read only, 0.3 ms instead of
+  1.3 ms on Postgres), and in this graph-only run, where the lock is the limit, 19 to 21%
+  more documents a second on both stores. A real ingest gains less (the graph stage is 40 to
+  58% of a worker's time).
+- **Two instances no longer retry** a busy company's patch: 555 retries before, 0 after.
+- The `spread` corpus was not run again: its companies are mostly new, and their first patch
+  writes as before.
 
 ### Ingest's reads before the API's (issue #109)
 
