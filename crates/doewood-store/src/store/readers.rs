@@ -111,6 +111,32 @@ fn wait<'a>(cv: &Condvar, pool: MutexGuard<'a, Pool>) -> MutexGuard<'a, Pool> {
     cv.wait(pool).unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Which waiting reads to wake: decided under the pool's lock, sent after it is released, so
+/// a woken read does not at once wait for that lock.
+struct Wake {
+    instance: bool,
+    api: bool,
+}
+
+impl Wake {
+    /// A waiting read of each kind that may take a free connection now.
+    fn of(pool: &Pool) -> Self {
+        Self {
+            instance: pool.instance_waiting > 0 && pool.instance_may_take(),
+            api: pool.api_waiting > 0 && pool.api_may_take(),
+        }
+    }
+
+    fn send(self, readers: &Readers) {
+        if self.instance {
+            readers.instance.notify_one();
+        }
+        if self.api {
+            readers.api.notify_one();
+        }
+    }
+}
+
 impl Readers {
     pub(crate) fn new(idle: Vec<Connection>) -> Self {
         let count = idle.len();
@@ -151,7 +177,9 @@ impl Readers {
         }
         let conn = pool.idle.pop().expect("a free connection");
         // A wakeup may have gone to a read that had been woken already: pass it on.
-        self.wake(&pool);
+        let wake = Wake::of(&pool);
+        drop(pool);
+        wake.send(self);
         conn
     }
 
@@ -162,17 +190,9 @@ impl Readers {
         if caller == Caller::Api {
             pool.api_held -= 1;
         }
-        self.wake(&pool);
-    }
-
-    /// Wakes a waiting read of each kind that may take a free connection now.
-    fn wake(&self, pool: &Pool) {
-        if pool.instance_waiting > 0 && pool.instance_may_take() {
-            self.instance.notify_one();
-        }
-        if pool.api_waiting > 0 && pool.api_may_take() {
-            self.api.notify_one();
-        }
+        let wake = Wake::of(&pool);
+        drop(pool);
+        wake.send(self);
     }
 
     /// The idle connections, when nothing holds one any more (closing the store).
