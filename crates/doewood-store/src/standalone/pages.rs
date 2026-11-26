@@ -38,9 +38,10 @@ struct Arm {
 }
 
 /// The neighbour query: `UNION ALL` of index ranges, one per direction and, after a cursor,
-/// one for the rest of the cursor's kind and one for the kinds after it. Each range is in the
-/// order of its index, so with a `limit` each stops after `limit` rows and the merge reads
-/// at most a few pages. Columns: the edge (0 to 10), the node (11 to 14), the sort key (15).
+/// two for the rest of the cursor's kind (its day, then later days) and one for the kinds
+/// after it. Each range is read in the order of its index, so with a `limit` each stops after
+/// `limit` rows and the merge sorts at most a page per range. Columns: the edge (0 to 10), the
+/// node (11 to 14), the sort key (15). `None` when no range can match.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn neighbours_sql(
     q: &NeighbourQuery,
