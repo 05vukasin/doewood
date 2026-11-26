@@ -18,7 +18,9 @@ use doewood_api::pb::search_service_client::SearchServiceClient;
 use doewood_api::pb::summarize_service_client::SummarizeServiceClient;
 use doewood_api::pb::{self, progress_update::Kind};
 use doewood_api::{ReprocessPhase, ReprocessView, Reprocessor};
-use doewood_model::{Blake3, Edge, EdgeKind, EdgeSource, NodeKind, ObjectLocation, SearchDoc};
+use doewood_model::{
+    Blake3, Edge, EdgeKind, EdgeSource, EdgeState, NodeKind, ObjectLocation, SearchDoc,
+};
 use doewood_s3::{EventKind, EventOrigin, ObjectEvent, ObjectVersion};
 use serde_json::json;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -1529,6 +1531,128 @@ async fn records_graph_and_search() {
                 "offset",
             ],
         );
+        a.stop().await;
+        shared.drop_schema().await;
+    }
+}
+
+/// `Neighbours` and `CompanyDocuments` read the node only when the query finds nothing (issue
+/// #124): a missing node is still `NOT_FOUND`, a node with nothing to list an empty list, and
+/// a non-company `INVALID_ARGUMENT`, whether or not it has edges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn neighbours_and_company_documents_tell_missing_from_empty() {
+    for shared in Shared::all().await {
+        let name = shared.name;
+        let a = Instance::start("inst-a", Some(shared.backend.clone())).await;
+        let mut graph = GraphServiceClient::new(a.channel().await);
+        let be = &shared.backend;
+        let company = |key: &'static str| async move {
+            be.upsert_node(NodeKind::Company, key, &json!({"name": key}))
+                .await
+                .unwrap()
+        };
+        let (lone, retracted, husk, survivor) = (
+            company("e124-lone").await,
+            company("e124-retracted").await,
+            company("e124-husk").await,
+            company("e124-survivor").await,
+        );
+        let doc = |n: u8| async move {
+            be.upsert_node(NodeKind::Document, &hash(n).to_hex(), &json!({}))
+                .await
+                .unwrap()
+        };
+        let (party_doc, bare_doc, gone_doc, husk_doc) =
+            (doc(124).await, doc(125).await, doc(126).await, doc(127).await);
+        be.upsert_edge(&Edge::new(
+            party_doc,
+            survivor,
+            EdgeKind::Party,
+            EdgeSource::Document,
+        ))
+        .await
+        .unwrap();
+        be.upsert_edge(
+            &Edge::new(gone_doc, retracted, EdgeKind::Party, EdgeSource::Document)
+                .with_state(EdgeState::Retracted),
+        )
+        .await
+        .unwrap();
+        be.upsert_edge(&Edge::new(
+            husk_doc,
+            husk,
+            EdgeKind::Party,
+            EdgeSource::Document,
+        ))
+        .await
+        .unwrap();
+        graph
+            .merge_companies(pb::MergeCompaniesRequest {
+                survivor_id: survivor.to_string(),
+                absorbed_id: husk.to_string(),
+                evidence_json: r#"[{"source": "manual", "note": "test"}]"#.into(),
+            })
+            .await
+            .unwrap();
+
+        let neighbours = |id: uuid::Uuid, direction: pb::Direction| {
+            let mut g = graph.clone();
+            async move {
+                g.neighbours(pb::NeighboursRequest {
+                    node_id: id.to_string(),
+                    direction: direction as i32,
+                    ..pb::NeighboursRequest::default()
+                })
+                .await
+                .map(|r| r.into_inner().neighbours.len())
+            }
+        };
+        let documents = |id: uuid::Uuid| {
+            let mut g = graph.clone();
+            async move {
+                g.company_documents(pb::CompanyDocumentsRequest {
+                    company_id: id.to_string(),
+                })
+                .await
+                .map(|r| r.into_inner().documents.len())
+            }
+        };
+
+        // A node that does not exist.
+        let missing = uuid::Uuid::now_v7();
+        let err = neighbours(missing, pb::Direction::Both).await.unwrap_err();
+        assert_eq!(err.code(), Code::NotFound, "{name}: {err:?}");
+        let err = documents(missing).await.unwrap_err();
+        assert_eq!(err.code(), Code::NotFound, "{name}: {err:?}");
+
+        // Nodes that exist with nothing to list: no edges at all, edges only the other way,
+        // only an inactive edge, or a merged-away company whose edges moved to the survivor.
+        for (id, direction) in [
+            (lone, pb::Direction::Both),
+            (bare_doc, pb::Direction::Both),
+            (party_doc, pb::Direction::In),
+            (retracted, pb::Direction::Both),
+        ] {
+            assert_eq!(
+                neighbours(id, direction).await.unwrap(),
+                0,
+                "{name}: {id} {direction:?}"
+            );
+        }
+        for id in [lone, retracted, husk] {
+            assert_eq!(documents(id).await.unwrap(), 0, "{name}: {id}");
+        }
+        assert_eq!(documents(survivor).await.unwrap(), 2, "{name}");
+        assert_eq!(
+            neighbours(party_doc, pb::Direction::Out).await.unwrap(),
+            1,
+            "{name}"
+        );
+
+        // Not a company: a document with a `party` edge out, and one with no edges.
+        for id in [party_doc, bare_doc] {
+            invalid(&documents(id).await.unwrap_err(), &["company_id"]);
+        }
         a.stop().await;
         shared.drop_schema().await;
     }
