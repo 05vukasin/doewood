@@ -48,8 +48,43 @@ docker run --rm doewood:dev config check
 
 Keep the master key: the store refuses to start with a different one.
 
-CI (`image` job) builds the image, runs this smoke test, and lints and renders the chart. It
-pushes nothing; publishing the image to a registry is not set up yet.
+CI (`image` job) builds the image, runs this smoke test, and lints and renders the chart, on every
+pull request and every push to `staging` and `main`. It pushes nothing.
+
+### The published image
+
+`.github/workflows/image.yml` publishes the image to GitHub Container Registry as
+`ghcr.io/05vukasin/doewood`, only from the release branch `main` and from `vX.Y.Z` tags (never
+from `staging` or a pull request). Each platform (linux/amd64, linux/arm64) is built on its own
+runner, smoke-tested as above, and pushed; the two are joined into one multi-platform image.
+
+| pushed from | tags |
+|---|---|
+| a push to `main` | `edge`, `sha-<short commit>` |
+| a tag `vX.Y.Z` | `X.Y.Z`, `X.Y`, `latest` |
+
+```sh
+docker pull ghcr.io/05vukasin/doewood:edge
+docker run --rm ghcr.io/05vukasin/doewood:edge version
+```
+
+Pin a digest (`ghcr.io/05vukasin/doewood@sha256:...`) or a version tag in production; `edge`
+moves with every push to `main`.
+
+Every published image carries an SBOM and maximal build provenance (BuildKit attestations), a
+GitHub build-provenance attestation, and a keyless cosign signature. The certificate is issued by
+GitHub's OIDC provider to this workflow:
+
+```sh
+cosign verify ghcr.io/05vukasin/doewood:edge \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github.com/05vukasin/doewood/\.github/workflows/image\.yml@refs/(heads/main|tags/v.+)$'
+gh attestation verify oci://ghcr.io/05vukasin/doewood:edge --repo 05vukasin/doewood
+docker buildx imagetools inspect ghcr.io/05vukasin/doewood:edge --format '{{ json .SBOM }}'
+```
+
+In the Helm chart, set `image.repository: ghcr.io/05vukasin/doewood` and `image.tag` to a
+released version.
 
 ## Helm
 

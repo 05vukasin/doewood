@@ -1,7 +1,9 @@
 name: ci
+# Full CI on every PR into staging (development) or main (release), and on pushes to both.
+# Publishing the image is image.yml's job, from main and v* tags only.
 on:
-  push: { branches: [main] }
-  pull_request:
+  push: { branches: [staging, main] }
+  pull_request: { branches: [staging, main] }
 jobs:
   check:
     strategy:
@@ -68,7 +70,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Wait for MinIO
         run: |
-          for i in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             curl -sf http://127.0.0.1:9000/minio/health/live && exit 0
             sleep 1
           done
@@ -107,7 +109,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Wait for MinIO
         run: |
-          for i in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             curl -sf http://127.0.0.1:9000/minio/health/live && exit 0
             sleep 1
           done
@@ -116,6 +118,13 @@ jobs:
       - run: |
           cargo test -p doewood-ingest --test minio_postgres -- --nocapture 2>&1 | tee test.log
           ! grep -q "are not both set: skipped" test.log
+  # Lint the workflows themselves (ci.yml and image.yml).
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" --workdir /repo rhysd/actionlint:1.7.7 -color
   # The container image (Dockerfile) and the Helm chart (charts/doewood). Built, never pushed.
   image:
     runs-on: ubuntu-latest
@@ -135,7 +144,7 @@ jobs:
           docker run --rm doewood:ci version
           docker run -d --name dw -p 7444:7444 --read-only --cap-drop ALL --tmpfs /tmp \
             --tmpfs /data:uid=10001,gid=10001 doewood:ci
-          for i in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             curl -sf 127.0.0.1:7444/readyz && break
             sleep 1
           done
@@ -145,7 +154,7 @@ jobs:
           test "$(docker exec dw id -u)" = 10001
           # OCR runs with the models of the image. Ingest is set up after the store is ready
           # (reading the models takes a moment), so wait for its log line.
-          for i in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             docker logs dw 2>&1 | grep -q '"ocr":"Ready' && break
             sleep 1
           done
