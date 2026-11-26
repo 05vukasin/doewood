@@ -1123,7 +1123,7 @@ DOEWOOD_SCALE_DIR=<dir> cargo test -p doewood-store --lib scale_store_sizes -- -
 | SQLite WAL during ingest: at most / resets per 1,000 files | 4 MiB / 83 | 5 MiB / 93 | 6 MiB / 113 | | | |
 | Postgres WAL per document (the 25,000 files up to that size) | | | | 26 KB (25k) | 30 KB | 109 KB |
 | ingest sweep, nothing pending / `object_counts` | | 0.03 / 0.007 ms | 0.01 / 0.003 ms | | 0.03 / 0.007 ms | 0.02 / 0.004 ms |
-| unchanged scan pass over every key | | (see below) | 7.6 to 8.3 s | | 0.46 to 0.50 s | 6.7 to 6.9 s |
+| unchanged scan pass over every key (before #138; after: 0.10 to 0.16 s and 0.37 to 0.67 s) | | (see below) | 7.6 to 8.3 s | | 0.46 to 0.50 s | 6.7 to 6.9 s |
 | writer lock wait during the scan, mean | | | 18 ms | | 3.6 ms | 16 ms |
 | `companies_due`, first page of 100 | | 51 ms | 235 ms | | 10 ms | 86 ms |
 | an enrichment pass of `companies_due` pages (registries off) | | 2.5 s, 94 pages | 41.6 s, 375 pages | | 0.28 s | 1.1 s |
@@ -1177,10 +1177,11 @@ What the numbers say:
   them (deeper b-trees, a 5 GiB file over a 2 MiB page cache per connection).
 - **The ingest sweep and the progress counts do not grow**: the sweep reads only pending rows
   and `object_counts` is kept by triggers.
-- **An unchanged scan pass grows with the square of the keys** (0.5 s at 50k, 7 to 8 s at
-  200k, CPU-bound): each chunk's `seen_objects` scans the source's keys from the first one.
-  Issue #138. (The SQLite 50k pass, 1.0 to 1.5 s, was measured with a test bucket that was
-  itself quadratic; the Postgres run's 50k pass uses the same instance store code.)
+- **An unchanged scan pass grew with the square of the keys** (0.5 s at 50k, 7 to 8 s at
+  200k, CPU-bound): each chunk's `seen_objects` scanned the source's keys from the first one.
+  (The SQLite 50k pass, 1.0 to 1.5 s, was measured with a test bucket that was itself
+  quadratic; the Postgres run's 50k pass uses the same instance store code.) Fixed in #138:
+  the pass is now linear, see [below](#key-ranges-of-objects_seen-issue-138).
 - **SQLite's `companies_due` sorts every company for each page**, so an enrichment pass is
   quadratic in the companies (41.6 s for 37,497); Postgres stays linear (1.1 s). Issue #139.
 - **SQLite `Search` slows faster than its matches grow** under load: `api_load` at 200k
@@ -1202,6 +1203,40 @@ What the numbers say:
   enrichment pass over every company.
 - **SQLite's WAL stays small** (4 to 6 MiB at most, a checkpoint resetting it about every
   10 files) at every size; the writer's lock wait is flat at about 2 ms mean and 35 ms p99.
+
+### Key ranges of `objects_seen` (issue #138)
+
+`seen_objects` (the scanner's comparison of a listing page with the stored rows),
+`pending_objects` (the ingest sweep) and `ingested_objects` (reprocessing) wrote an optional
+bound as `(?2 IS NULL OR key > ?2)`. That form kept SQLite from using the bound as a range on
+the primary key (or the queue index `objects_seen_pending`): every page read the source's
+keys from the first one and filtered them, so walking a source page by page was quadratic in
+its keys. Each query now has one SQL text per combination of bounds, and its plan starts at
+the bound (`SEARCH objects_seen USING PRIMARY KEY (source_id=? AND key>? AND key<?)`; the
+sweep `USING INDEX objects_seen_pending (source_id=? AND status=? AND key>?)`). Tests check
+the plans and compare the pages with the former queries. The Postgres store has no
+`objects_seen` (the instance store is SQLite with either shared store), so nothing changes
+there.
+
+Measured with `scale`'s `scan` phase (release build, the 4 vCPU server above, a `keys.tsv`
+of `bench/` and `near/` keys and an instance store holding only those rows; the second pass
+of each run is the unchanged one) and with `keyset_pass` in
+`crates/doewood-store/src/store/objects.rs` (ignored; the store reads alone, old and new
+query in the same run):
+
+| | 50,000 keys | 200,000 keys |
+|---|---|---|
+| unchanged scan pass (`scale`), before | 0.41 s (CPU 0.43 s) | 6.57 s (CPU 6.86 s) |
+| same, after | 0.10 to 0.16 s (CPU 0.10 to 0.12 s) | 0.37 to 0.67 s (CPU 0.34 to 0.46 s) |
+| `seen_objects` pages of a pass (`keyset_pass`), old / new | 117 to 119 / 16 to 23 ms | 1,899 to 2,039 / 60 to 62 ms |
+| `pending_objects` pages over a full queue, old / new | 502 to 503 / 31 to 32 ms | 8,789 to 8,838 / 128 to 132 ms |
+
+- **The pass is linear now**: four times the keys cost about four times the time, where
+  they cost 16 times before. (The first pass of a run is the slower figure: a cold page
+  cache.)
+- **The sweep over a long queue** (every key pending, as after a first scan or a
+  reprocess) gained the most: the old form also read the queue index from its start for
+  every page.
 
 ### Requests and limits
 
