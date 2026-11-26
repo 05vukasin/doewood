@@ -948,29 +948,18 @@ impl Ingest {
         shutdown: &mut watch::Receiver<bool>,
         overruns: &mut Overruns,
     ) {
-        // Already through (a duplicate event, a stale sweep page): nothing to do.
-        let (k, e) = (key.to_owned(), etag.map(str::to_owned));
-        let t = Instant::now();
-        let status = self.db(move |s| s.ingest_status(source, &k)).await;
-        lock(&self.inner.stats).time.store += t.elapsed();
-        if let Ok(Some(st)) = status
-            && st.etag == e
-            && st.status != "pending"
-        {
-            return;
-        }
         let max = self.inner.config.max_attempts.max(1);
         for attempt in 1..=max {
             let Some(backend) = self.backend(shutdown).await else {
                 return; // shutdown: stays pending
             };
             let result = self
-                .ingest_once(&backend, source, key, charge.as_ref(), overruns)
+                .ingest_once(&backend, source, key, etag, charge.as_ref(), overruns)
                 .await;
             let (k, e) = (key.to_owned(), etag.map(str::to_owned));
             let outcome = match result {
                 Ok(Some(outcome)) => outcome,
-                Ok(None) => return, // the source is gone
+                Ok(None) => return, // already through, or the source is gone
                 Err(err) if err.transient && attempt < max => {
                     let delay = self.inner.config.retry_base * 4u32.saturating_pow(attempt - 1);
                     debug!(source = %source, key, attempt, error = %err, ?delay, "retrying");
@@ -1019,21 +1008,39 @@ impl Ingest {
         }
     }
 
-    /// One attempt. `Ok(None)`: the source was removed meanwhile.
+    /// One attempt at the version `etag`. `Ok(None)`: nothing to record, as that version is
+    /// already through (a duplicate event, a stale sweep page) or the source was removed
+    /// meanwhile.
     async fn ingest_once(
         &self,
         backend: &Arc<dyn Backend>,
         id: SourceId,
         key: &str,
+        etag: Option<&str>,
         charge: Option<&Arc<Charge>>,
         overruns: &mut Overruns,
     ) -> Result<Option<IngestOutcome>, IngestError> {
-        // The runtime settings are read per file, so a change applies without a restart.
+        // The object's status, its source and the runtime settings in one read on a read-only
+        // connection, so it does not wait behind the writer's commits (issue #128). The
+        // settings are read per file, so a change applies without a restart. The status needs
+        // no read of our own writes: `inflight` holds the key until its attempt is recorded.
         let t = Instant::now();
-        let (source, settings) = self
-            .db(move |s| Ok((s.source(id)?, s.ingest_settings()?)))
+        let k = key.to_owned();
+        let (prior, source, settings) = self
+            .db(move |s| {
+                s.snapshot(|s| {
+                    Ok((
+                        s.ingest_status(id, &k)?,
+                        s.source(id)?,
+                        s.ingest_settings()?,
+                    ))
+                })
+            })
             .await?;
         let mut t = self.stage(t, |s| &mut s.store);
+        if prior.is_some_and(|st| st.etag.as_deref() == etag && st.status != "pending") {
+            return Ok(None);
+        }
         let Some(source) = source else {
             return Ok(None);
         };
