@@ -249,13 +249,11 @@ fn view(s: &ReprocessStatus) -> ReprocessView {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
-
-    use doewood_core::BootstrapConfig;
-    use doewood_ingest::sheet;
-
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use doewood_core::BootstrapConfig;
+    use doewood_ingest::sheet;
     use prometheus::{Encoder as _, Registry, TextEncoder};
 
     use super::{StatCounter, ingest_config};
