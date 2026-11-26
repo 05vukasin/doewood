@@ -49,6 +49,10 @@ pub struct AddSource {
     /// Add the source paused (not scanned).
     #[arg(long)]
     paused: bool,
+    /// Record new keys whose single-part MD5 ETag and size match stored content without
+    /// fetching them (trusts the ETag; see docs/sources.md, "Known copies").
+    #[arg(long)]
+    skip_known_copies: bool,
 }
 
 impl AddSource {
@@ -87,6 +91,7 @@ impl AddSource {
                 .map_or(0, |m| m.saturating_mul(1024 * 1024)),
             llm_policy: None,
             paused: self.paused,
+            skip_known_copies: self.skip_known_copies,
         };
         config.prepare_data_dir().map_err(|e| e.to_string())?;
         let key = crate::serve::master_key(config.master_key.clone())?;

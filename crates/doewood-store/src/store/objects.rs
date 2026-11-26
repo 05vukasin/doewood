@@ -125,6 +125,18 @@ pub struct IngestStatus {
     pub last_error: Option<String>,
 }
 
+/// Content ingest has hashed, by the MD5 ETag and size of the GetObject response that
+/// brought it (`known_content`, issue #131).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KnownContent {
+    /// The single-part ETag (the content's MD5), lowercase hex.
+    pub etag: String,
+    /// The size in bytes.
+    pub size: u64,
+    /// The content's hash.
+    pub blake3: [u8; 32],
+}
+
 /// Longest `last_error` kept, in bytes.
 const MAX_ERROR_LEN: usize = 1000;
 
@@ -237,6 +249,20 @@ impl Store {
         etag: Option<&str>,
         outcome: &IngestOutcome,
     ) -> Result<bool, StoreError> {
+        self.finish_object_known(source, key, etag, outcome, None)
+    }
+
+    /// [`finish_object`](Self::finish_object), and in the same transaction records `known`:
+    /// the content's MD5 ETag and size (whether or not a pending row matched; the pair
+    /// describes the bytes ingest hashed either way).
+    pub fn finish_object_known(
+        &self,
+        source: SourceId,
+        key: &str,
+        etag: Option<&str>,
+        outcome: &IngestOutcome,
+        known: Option<&KnownContent>,
+    ) -> Result<bool, StoreError> {
         let (status, blake3, error, attempts): (&str, Option<&[u8]>, Option<String>, Option<i64>) =
             match outcome {
                 IngestOutcome::Done { blake3 } => ("done", Some(blake3), None, None),
@@ -248,8 +274,10 @@ impl Store {
                     Some(i64::from(*attempts)),
                 ),
             };
-        let n = self
-            .conn()
+        let now = now();
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let n = tx
             .prepare_cached(
                 "UPDATE objects_seen SET status = ?4, blake3 = coalesce(?5, blake3), \
              last_error = ?6, attempts = coalesce(?7, attempts + 1), updated_at = ?8 \
@@ -264,9 +292,23 @@ impl Store {
                     blake3,
                     error,
                     attempts,
-                    now()
+                    now
                 ])
             })?;
+        if let Some(k) = known {
+            let size = i64::try_from(k.size).map_err(|_| {
+                StoreError::InvalidSource(format!("object size {} too large", k.size))
+            })?;
+            tx.prepare_cached(
+                "INSERT INTO known_content (etag, size, blake3, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT (etag, size) DO UPDATE \
+                 SET blake3 = excluded.blake3, updated_at = excluded.updated_at",
+            )
+            .and_then(|mut cached| {
+                cached.execute(params![k.etag, size, k.blake3.as_slice(), now])
+            })?;
+        }
+        tx.commit()?;
         Ok(n > 0)
     }
 
@@ -305,6 +347,11 @@ impl Store {
         key: &str,
     ) -> Result<Option<IngestStatus>, StoreError> {
         self.snapshot(|s| s.ingest_status(source, key))
+    }
+
+    /// The hash of the content recorded with this MD5 ETag (lowercase hex) and size.
+    pub fn known_content(&self, etag: &str, size: u64) -> Result<Option<[u8; 32]>, StoreError> {
+        self.snapshot(|s| s.known_content(etag, size))
     }
 
     /// Up to `limit` ingested objects (`done` or `skipped`, with their hash) with a key after
@@ -513,6 +560,19 @@ impl Snapshot<'_> {
         Ok(rows)
     }
 
+    /// The hash of the content recorded with this MD5 ETag (lowercase hex) and size.
+    pub fn known_content(&self, etag: &str, size: u64) -> Result<Option<[u8; 32]>, StoreError> {
+        let Ok(size) = i64::try_from(size) else {
+            return Ok(None);
+        };
+        let blake3: Option<Vec<u8>> = self
+            .0
+            .prepare_cached("SELECT blake3 FROM known_content WHERE etag = ?1 AND size = ?2")
+            .and_then(|mut cached| cached.query_row(params![etag, size], |r| r.get(0)))
+            .optional()?;
+        Ok(blake3.and_then(|b| b.try_into().ok()))
+    }
+
     /// An object's ingest status, deleted objects included.
     pub fn ingest_status(
         &self,
@@ -616,6 +676,46 @@ mod tests {
             size,
             last_modified: Some(1),
         }
+    }
+
+    #[test]
+    fn known_content_is_recorded_with_the_finish() {
+        let (store, id) = setup();
+        store
+            .record_objects(id, &[ObjectChange::Upsert(obj("a", 3))], None)
+            .unwrap();
+        let md5 = "900150983cd24fb0d6963f7d28e17f72";
+        assert_eq!(store.known_content(md5, 3).unwrap(), None);
+        let known = KnownContent {
+            etag: md5.into(),
+            size: 3,
+            blake3: [7; 32],
+        };
+        let done = IngestOutcome::Done { blake3: [7; 32] };
+        assert!(
+            store
+                .finish_object_known(id, "a", Some("e-a"), &done, Some(&known))
+                .unwrap()
+        );
+        assert_eq!(
+            store.ingest_status(id, "a").unwrap().unwrap().status,
+            "done"
+        );
+        assert_eq!(store.known_content(md5, 3).unwrap(), Some([7; 32]));
+        // Keyed by size too.
+        assert_eq!(store.known_content(md5, 4).unwrap(), None);
+        // Recorded even when no pending row matched (the object changed meanwhile), and the
+        // newer hash of the pair wins.
+        let newer = KnownContent {
+            blake3: [8; 32],
+            ..known
+        };
+        assert!(
+            !store
+                .finish_object_known(id, "a", Some("e-a"), &done, Some(&newer))
+                .unwrap()
+        );
+        assert_eq!(store.known_content(md5, 3).unwrap(), Some([8; 32]));
     }
 
     #[test]

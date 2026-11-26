@@ -102,7 +102,9 @@ pub async fn build(
 }
 
 /// Registers ingest's metrics on the ops port's registry: `doewood_ingest_finish_unmatched_total`
-/// (issue #125) and `doewood_ingest_similar_buckets_skipped_total` (issue #148), read from
+/// (issue #125), `doewood_ingest_similar_buckets_skipped_total` (issue #148), and
+/// `doewood_ingest_known_copies_total` with `doewood_ingest_known_copy_bytes_total` (issue
+/// #131), read from
 /// [`Ingest::stats`] when `/metrics` is scraped. The registry does not keep ingest (and so the
 /// store) alive.
 pub fn register_metrics(ingest: &Ingest, registry: &Registry) -> prometheus::Result<()> {
@@ -121,7 +123,22 @@ pub fn register_metrics(ingest: &Ingest, registry: &Registry) -> prometheus::Res
          similar_max_bucket share them (template boilerplate).",
         move || stats().map_or(0, |s| s.similar_buckets_skipped),
     )?;
-    registry.register(Box::new(skipped))
+    registry.register(Box::new(skipped))?;
+    let stats = ingest.stats_reader();
+    let copies = StatCounter::new(
+        "doewood_ingest_known_copies_total",
+        "Objects recorded against content already stored, by their single-part MD5 ETag and \
+         size, without a GetObject (sources with skip_known_copies on).",
+        move || stats().map_or(0, |s| s.known_copies),
+    )?;
+    registry.register(Box::new(copies))?;
+    let stats = ingest.stats_reader();
+    let bytes = StatCounter::new(
+        "doewood_ingest_known_copy_bytes_total",
+        "Listed bytes of the known copies, not fetched.",
+        move || stats().map_or(0, |s| s.known_copy_bytes),
+    )?;
+    registry.register(Box::new(bytes))
 }
 
 /// A counter that follows a count kept elsewhere, read when it is collected.

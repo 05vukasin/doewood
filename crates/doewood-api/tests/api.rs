@@ -104,6 +104,10 @@ async fn sources_lifecycle_and_secrets() {
     assert_eq!(added.region, "us-east-1");
     assert_eq!(added.scan_interval_seconds, 3600);
     assert_eq!(added.max_object_bytes, 512 * 1024 * 1024);
+    assert!(
+        !added.skip_known_copies,
+        "known copies are fetched by default"
+    );
     assert_eq!(added.owner_instance, "inst-a");
     assert_eq!(added.state, pb::SourceState::Active as i32);
     assert!(
@@ -162,6 +166,7 @@ async fn sources_lifecycle_and_secrets() {
                 ..creds()
             }),
             clear_credentials: false,
+            skip_known_copies: Some(true),
         })
         .await
         .unwrap()
@@ -172,6 +177,7 @@ async fn sources_lifecycle_and_secrets() {
     assert_eq!(updated.url_style, pb::UrlStyle::VirtualHost as i32);
     assert_eq!(updated.scan_interval_seconds, 1800);
     assert_eq!(updated.max_object_bytes, 1024);
+    assert!(updated.skip_known_copies);
     assert!(updated.credentials_set);
     let cleared = config(&ch)
         .update_source(pb::UpdateSourceRequest {
@@ -185,6 +191,7 @@ async fn sources_lifecycle_and_secrets() {
         .unwrap()
         .into_inner();
     assert!(!cleared.credentials_set);
+    assert!(cleared.skip_known_copies, "unset keeps the setting");
     assert_eq!(cleared.region, "us-east-1");
     assert_eq!(cleared.max_object_bytes, 512 * 1024 * 1024);
     assert!(!a.store.secret_exists(&format!("s3/{id}")).unwrap());
@@ -485,6 +492,7 @@ async fn source_validation_reports_every_field() {
                 daily_token_budget: 0,
             }),
             paused: false,
+            skip_known_copies: false,
         })
         .await
         .unwrap_err();

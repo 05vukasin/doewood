@@ -63,6 +63,7 @@ fn check_add(req: &AddSourceRequest) -> Result<(NewSource, Option<S3Credentials>
                 SourceState::Active
             },
             llm_policy,
+            skip_known_copies: req.skip_known_copies,
         },
         credentials,
     ))
@@ -148,6 +149,7 @@ fn check_update(req: &UpdateSourceRequest) -> Result<(SourceId, SourcePatch, Key
             .max_object_bytes
             .map(|b| validate::max_object_bytes(&mut v, "max_object_bytes", b)),
         llm_policy: None,
+        skip_known_copies: req.skip_known_copies,
     };
     let credentials = req
         .credentials
