@@ -8,13 +8,14 @@ use async_trait::async_trait;
 use deadpool_postgres::{GenericClient, Object, Pool, PoolError};
 use doewood_core::InstanceId;
 use doewood_model::{
-    Backend, Blake3, Candidates, ClaimStore, Direction, Edge, EdgeKind, EdgeSource, Error,
+    Backend, Blake3, Candidates, ClaimStore, Edge, EdgeCursor, EdgeKind, EdgeSource, Error,
     GraphStore, LiveEdge, Located, LocationEnded, MERGE_CHAIN_MAX, Neighbour, NeighbourQuery, Node,
-    NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PropsPatch, PutOutcome, Record, RecordStore,
-    Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore, Sketch, SketchStore,
-    SourceClaim, SourceKey, StepVersions, StoredEdge, band_to_i64, merged_into, record_page_bytes,
-    records_limit, sketch_limit, validate_alias, validate_alias_count, validate_batch_count,
-    validate_hashes, validate_node, validate_sketch, versions_from_json, versions_to_json,
+    NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PartyDocument, PropsPatch, PutOutcome, Record,
+    RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore, Sketch,
+    SketchStore, SourceClaim, SourceKey, StepVersions, StoredEdge, band_to_i64, merged_into,
+    record_page_bytes, records_limit, sketch_limit, validate_alias, validate_alias_count,
+    validate_batch_count, validate_hashes, validate_node, validate_sketch, versions_from_json,
+    versions_to_json,
 };
 use futures_util::future::try_join_all;
 use serde_json::Value;
@@ -28,6 +29,7 @@ use uuid::Uuid;
 use crate::PgStore;
 use crate::cached::Cached;
 use crate::enrichment::DOCUMENTS;
+use crate::pages;
 
 /// The documents sharing the most bands of `$1`, other than `$2`, at most `$3` (issue #74).
 /// The bands are counted and limited on `sketch_bands` alone (an index-only scan of its
@@ -200,16 +202,16 @@ pub(crate) fn parse<T: std::str::FromStr<Err = Error>>(text: &str) -> Result<T> 
 
 /// Positional parameters for SQL built at run time.
 #[derive(Default)]
-struct Args(Vec<Box<dyn ToSql + Sync + Send>>);
+pub(crate) struct Args(Vec<Box<dyn ToSql + Sync + Send>>);
 
 impl Args {
     /// Adds a value and returns its placeholder.
-    fn push(&mut self, value: impl ToSql + Sync + Send + 'static) -> String {
+    pub(crate) fn push(&mut self, value: impl ToSql + Sync + Send + 'static) -> String {
         self.0.push(Box::new(value));
         format!("${}", self.0.len())
     }
 
-    fn refs(&self) -> Vec<&(dyn ToSql + Sync)> {
+    pub(crate) fn refs(&self) -> Vec<&(dyn ToSql + Sync)> {
         self.0
             .iter()
             .map(|b| b.as_ref() as &(dyn ToSql + Sync))
@@ -905,89 +907,54 @@ impl GraphStore for PgStore {
     }
 
     async fn neighbours(&self, node: Uuid, q: &NeighbourQuery) -> Result<Vec<Neighbour>> {
-        let (at_node, other) = match q.direction {
-            Direction::Out => ("e.src = $1", "e.dst"),
-            Direction::In => ("e.dst = $1", "e.src"),
-            Direction::Both => (
-                "(e.src = $1 OR e.dst = $1)",
-                "(CASE WHEN e.src = $1 THEN e.dst ELSE e.src END)",
-            ),
-        };
-        let mut args = Args::default();
-        args.push(node);
-        let mut sql = format!(
-            "SELECT {EDGE_COLUMNS}, {NODE_COLUMNS} FROM edges e \
-             JOIN nodes n ON n.id = {other} WHERE {at_node}"
-        );
-        if !q.edge_kinds.is_empty() {
-            let kinds: Vec<String> = q.edge_kinds.iter().map(|k| k.as_str().to_owned()).collect();
-            sql.push_str(" AND e.kind = ANY(");
-            sql.push_str(&args.push(kinds));
-            sql.push(')');
-        }
-        if let Some(kind) = q.node_kind {
-            sql.push_str(" AND n.kind = ");
-            sql.push_str(&args.push(kind.as_str()));
-        }
-        if let Some(at) = q.at {
-            let p = args.push(at);
-            sql.push_str(" AND (e.valid_from IS NULL OR e.valid_from <= ");
-            sql.push_str(&p);
-            sql.push_str(") AND (e.valid_to IS NULL OR e.valid_to > ");
-            sql.push_str(&p);
-            sql.push(')');
-        }
-        if !q.include_inactive {
-            sql.push_str(" AND e.state NOT IN ('retracted', 'superseded')");
-        }
-        sql.push_str(" ORDER BY e.kind COLLATE \"C\", e.valid_from NULLS FIRST, e.id");
-        let c = client(&self.pool).await?;
-        // Cached: at most 48 shapes (direction and the four optional filters).
-        let rows = c.rows(&sql, &args.refs()).await?;
-        rows.iter()
-            .map(|r| {
-                Ok(Neighbour {
-                    edge: edge_at(r)?,
-                    node: node_at(r, 11)?,
-                })
-            })
-            .collect()
+        let mut c = client(&self.pool).await?;
+        pages::neighbours(&mut c, node, q, None).await
+    }
+
+    async fn neighbours_page(
+        &self,
+        node: Uuid,
+        q: &NeighbourQuery,
+        after: Option<&EdgeCursor>,
+        limit: u32,
+        max_bytes: usize,
+    ) -> Result<Vec<Neighbour>> {
+        let mut c = client(&self.pool).await?;
+        pages::neighbours(&mut c, node, q, Some((after, limit, max_bytes))).await
     }
 
     async fn company_documents(&self, company: Uuid) -> Result<Vec<Node>> {
-        let c = client(&self.pool).await?;
-        let rows = c
-            .rows(
-                &format!(
-                    "SELECT DISTINCT {NODE_COLUMNS}, n.key COLLATE \"C\" AS sort_key \
-                     FROM edges e JOIN nodes n ON n.id = e.src \
-                     WHERE e.dst = $1 AND e.kind = 'party' AND n.kind = 'document' \
-                     AND e.state NOT IN ('retracted', 'superseded') ORDER BY sort_key"
-                ),
-                &[&company],
-            )
-            .await?;
-        rows.iter().map(|r| node_at(r, 0)).collect()
+        let mut c = client(&self.pool).await?;
+        Ok(pages::company_documents(&mut c, company, None, None)
+            .await?
+            .into_iter()
+            .map(|d| d.node)
+            .collect())
+    }
+
+    async fn company_documents_page(
+        &self,
+        company: Uuid,
+        after: Option<&EdgeCursor>,
+        limit: u32,
+        max_bytes: usize,
+    ) -> Result<Vec<PartyDocument>> {
+        let mut c = client(&self.pool).await?;
+        pages::company_documents(&mut c, company, after, Some((limit, max_bytes))).await
     }
 
     async fn company_documents_first(&self, company: Uuid, limit: u32) -> Result<Vec<Node>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let c = client(&self.pool).await?;
-        let rows = c
-            .rows(
-                &format!(
-                    "SELECT {NODE_COLUMNS} FROM (SELECT DISTINCT n.id, n.key COLLATE \"C\" AS sort_key \
-                     FROM edges e JOIN nodes n ON n.id = e.src \
-                     WHERE e.dst = $1 AND e.kind = 'party' AND n.kind = 'document' \
-                     AND e.state NOT IN ('retracted', 'superseded') \
-                     ORDER BY sort_key LIMIT $2) t JOIN nodes n ON n.id = t.id ORDER BY t.sort_key"
-                ),
-                &[&company, &i64::from(limit)],
-            )
-            .await?;
-        rows.iter().map(|r| node_at(r, 0)).collect()
+        let mut c = client(&self.pool).await?;
+        Ok(
+            pages::company_documents(&mut c, company, None, Some((limit, usize::MAX)))
+                .await?
+                .into_iter()
+                .map(|d| d.node)
+                .collect(),
+        )
     }
 
     async fn company_document_count(&self, company: Uuid) -> Result<u64> {

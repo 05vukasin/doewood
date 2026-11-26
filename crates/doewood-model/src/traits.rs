@@ -15,11 +15,11 @@ use uuid::Uuid;
 
 use crate::{
     Blake3, CacheRow, Candidates, DismissRequest, Dismissal, DismissalQuery, DueCompany, Edge,
-    Enrichment, FeedState, IconRow, LiveEdge, Located, LocationEnded, MergeEntry, MergeQuery,
-    MergeRequest, Neighbour, NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation, OwnedAlias,
-    Proposal, ProposalQuery, ProposalRequest, PropsPatch, PutOutcome, Record, ResolveRequest,
-    Result, SearchDoc, SearchHit, SearchQuery, Sketch, SourceClaim, SourceKey, SplitRequest,
-    StepVersions, UndoOutcome, UndoRequest,
+    EdgeCursor, Enrichment, FeedState, IconRow, LiveEdge, Located, LocationEnded, MergeEntry,
+    MergeQuery, MergeRequest, Neighbour, NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation,
+    OwnedAlias, PartyDocument, Proposal, ProposalQuery, ProposalRequest, PropsPatch, PutOutcome,
+    Record, ResolveRequest, Result, SearchDoc, SearchHit, SearchQuery, Sketch, SourceClaim,
+    SourceKey, SplitRequest, StepVersions, UndoOutcome, UndoRequest,
 };
 
 /// quail and hedgehog records, keyed by BLAKE3.
@@ -138,12 +138,40 @@ pub trait GraphStore: Send + Sync {
     /// chain fails with [`crate::Error::Precondition`].
     async fn upsert_live_edge(&self, edge: &Edge) -> Result<LiveEdge>;
 
-    /// The edges at a node and the nodes at their other ends, ordered by edge kind, then
-    /// `valid_from` (undated first), then edge id.
+    /// The edges at a node and the nodes at their other ends, ordered by edge kind (its name),
+    /// then `valid_from` (undated first), then edge id ([`crate::EdgeCursor`]).
     async fn neighbours(&self, node: Uuid, query: &NeighbourQuery) -> Result<Vec<Neighbour>>;
 
-    /// The documents with a live `party` edge to the company, ordered by key.
+    /// A page of [`GraphStore::neighbours`] (issue #112): the neighbours after `after` in that
+    /// order, at most `limit` of them (0 means 50, at most [`crate::RECORDS_MAX_LIMIT`]),
+    /// ending early with the neighbour that reaches `max_bytes`
+    /// ([`crate::neighbour_page_bytes`]). The page starts at `after` in the edge indexes; it
+    /// never reads the neighbours before it.
+    async fn neighbours_page(
+        &self,
+        node: Uuid,
+        query: &NeighbourQuery,
+        after: Option<&EdgeCursor>,
+        limit: u32,
+        max_bytes: usize,
+    ) -> Result<Vec<Neighbour>>;
+
+    /// The documents with a live `party` edge to the company, each once, in the order of
+    /// their first such edge: by its `valid_from` (undated first), then its id
+    /// ([`crate::EdgeCursor`]; issue #112).
     async fn company_documents(&self, company: Uuid) -> Result<Vec<Node>>;
+
+    /// A page of [`GraphStore::company_documents`]: the documents whose first live `party`
+    /// edge comes after `after`, at most `limit` (as for [`GraphStore::neighbours_page`]),
+    /// ending early with the one that reaches `max_bytes` ([`crate::node_page_bytes`]). The
+    /// page starts at `after` in the company's party edges.
+    async fn company_documents_page(
+        &self,
+        company: Uuid,
+        after: Option<&EdgeCursor>,
+        limit: u32,
+        max_bytes: usize,
+    ) -> Result<Vec<PartyDocument>>;
 
     /// The first `limit` of [`GraphStore::company_documents`], in the same order (issue #75:
     /// internal callers that read a bounded sample).

@@ -458,6 +458,7 @@ async fn call(ch: &Channel, seeded: &Seeded, n: usize) -> (usize, Result<(), ton
                     node_kind: pb::NodeKind::Document as i32,
                     at: String::new(),
                     include_inactive: false,
+                    ..Default::default()
                 })
                 .await
                 .map(drop),
@@ -467,6 +468,7 @@ async fn call(ch: &Channel, seeded: &Seeded, n: usize) -> (usize, Result<(), ton
             GraphServiceClient::new(ch.clone())
                 .company_documents(pb::CompanyDocumentsRequest {
                     company_id: company.to_string(),
+                    ..Default::default()
                 })
                 .await
                 .map(drop),

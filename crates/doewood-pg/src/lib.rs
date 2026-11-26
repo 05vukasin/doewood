@@ -29,6 +29,7 @@ mod enrichment;
 mod feeds;
 mod merges;
 mod migrate;
+mod pages;
 mod proposals;
 #[cfg(test)]
 mod tests;
