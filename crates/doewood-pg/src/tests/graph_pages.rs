@@ -227,7 +227,10 @@ async fn graph_pages_start_at_their_token() {
         let sql = neighbours_sql(&incoming, after, Some(50), &mut args).unwrap();
         let p = explain(&sql, &args.refs()).await;
         assert!(p.contains("Index Scan using edges_by_dst"), "{p}");
-        assert!(!p.contains("Sort"), "{p}");
+        // Each range is read in index order up to its limit; only the merge above the ranges
+        // may sort, at most a page of rows each.
+        let ranges = p.split_once("->  Limit").map_or(p.as_str(), |(_, r)| r);
+        assert!(!ranges.contains("Sort"), "{p}");
         if after.is_some() {
             assert!(
                 p.contains("ROW(COALESCE(valid_from, '-infinity'::date), id) > ROW("),
