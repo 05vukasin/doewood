@@ -1169,7 +1169,8 @@ fn bench_file(i: usize) -> (String, Vec<u8>) {
 /// (0: on disk, every read on the writer) and times a `ListRecords` page every millisecond
 /// while ingest runs (from `DOEWOOD_BENCH_READ_CLIENTS` clients at once, default 1;
 /// `DOEWOOD_BENCH_POOL` sets the Postgres pool's size; it prints the pages' size, the
-/// largest the WAL grew and how often a checkpoint reset it). Besides files/s it prints
+/// largest the WAL grew, how often a checkpoint reset it and its size every 5 s;
+/// `DOEWOOD_BENCH_IDLE_SECS` keeps the reads going that long after ingest). Besides files/s it prints
 /// where the workers' time went ([`doewood_ingest::StageTimes`]: the company lock's wait and
 /// hold among them) and, on
 /// Postgres with `pg_stat_statements` loaded, the statements per file and the costliest
@@ -1234,11 +1235,22 @@ async fn throughput() {
     h.settle().await;
     let secs = started.elapsed().as_secs_f64();
     let cpu = bench::cpu_seconds() - cpu;
-    let wait = probe.stop();
     let reads = match reads {
         Some(r) => r.stop().await,
         None => "-".into(),
     };
+    // `DOEWOOD_BENCH_IDLE_SECS`: the read clients go on that long after ingest, with no
+    // writes (issue #151: whether the WAL returns to empty, and the reads' latency then).
+    let idle: usize = var("DOEWOOD_BENCH_IDLE_SECS").unwrap_or(0);
+    if idle > 0 && readers.is_some() {
+        let r = bench::ReadProbe::start(api.addr, h.source, read_clients);
+        tokio::time::sleep(Duration::from_secs(idle as u64)).await;
+        println!(
+            "throughput: idle {idle}s after ingest: ListRecords from {read_clients} clients {}",
+            r.stop().await
+        );
+    }
+    let wait = probe.stop();
     let messages = api.stop().await;
     let c = store.object_counts(h.source).unwrap();
     let time = h.ingest.stats().time;
@@ -1925,11 +1937,60 @@ mod bench {
     }
 
     /// Times a trivial store call every millisecond: what it waits for the lock. With the
-    /// store on disk, also the largest size its WAL file reached, and how many times a
-    /// checkpoint reset it (the checkpoint sequence number in the WAL header, bytes 12 to 15).
+    /// store on disk, also the largest size its WAL file reached, how many times a
+    /// checkpoint reset it (the checkpoint sequence number in the WAL header, bytes 12 to 15)
+    /// and, every [`SAMPLE`], the WAL's size and frames ([`WalSample`], issue #151).
     pub struct Probe {
         stop: Arc<AtomicBool>,
-        thread: std::thread::JoinHandle<(Vec<Duration>, u64, u32)>,
+        thread: std::thread::JoinHandle<(Vec<Duration>, u64, u32, Vec<WalSample>)>,
+    }
+
+    /// How often [`Probe`] samples the WAL.
+    const SAMPLE: Duration = Duration::from_secs(5);
+
+    /// The WAL at one moment: its file's size, the frames in it and how many of them a
+    /// checkpoint has copied into the main file (read from the `-shm` wal-index, without
+    /// touching the store: `mxFrame` of its header and `nBackfill` of its checkpoint info).
+    #[derive(Clone, Copy, Debug)]
+    pub struct WalSample {
+        pub secs: f64,
+        pub bytes: u64,
+        pub frames: u32,
+        pub backfilled: u32,
+    }
+
+    impl WalSample {
+        pub fn read(wal: &std::path::Path, secs: f64) -> Option<Self> {
+            use std::io::Read as _;
+            let bytes = std::fs::metadata(wal).ok()?.len();
+            let shm = format!("{}shm", wal.to_str()?.strip_suffix("wal")?);
+            let mut head = [0u8; 104];
+            std::fs::File::open(shm).ok()?.read_exact(&mut head).ok()?;
+            let at =
+                |o: usize| u32::from_ne_bytes([head[o], head[o + 1], head[o + 2], head[o + 3]]);
+            Some(Self {
+                secs,
+                bytes,
+                frames: at(16),
+                backfilled: at(96),
+            })
+        }
+    }
+
+    /// One line per sample: seconds, WAL MiB, frames, frames backfilled.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn timeline(samples: &[WalSample]) -> String {
+        samples.iter().fold(String::new(), |mut out, s| {
+            let _ = write!(
+                out,
+                "\n  {:>6.0}s WAL {:>6.1} MiB, {:>8} frames, {:>8} in the main file",
+                s.secs,
+                s.bytes as f64 / f64::from(1 << 20),
+                s.frames,
+                s.backfilled
+            );
+            out
+        })
     }
 
     /// The WAL header's checkpoint sequence number, when the file has a header.
@@ -1948,7 +2009,18 @@ mod bench {
                 std::thread::spawn(move || {
                     let (mut waits, mut wal_max, mut resets) = (Vec::new(), 0, 0);
                     let mut seq = None;
+                    let (started, mut samples) = (Instant::now(), Vec::new());
+                    let mut next = Duration::ZERO;
                     while !stop.load(Ordering::Relaxed) {
+                        if let Some(w) = wal.as_ref()
+                            && started.elapsed() >= next
+                        {
+                            next += SAMPLE;
+                            if let Some(s) = WalSample::read(w, started.elapsed().as_secs_f64()) {
+                                println!("wal:{}", timeline(&[s]));
+                                samples.push(s);
+                            }
+                        }
                         let t = Instant::now();
                         store.schema_version().unwrap();
                         waits.push(t.elapsed());
@@ -1965,7 +2037,10 @@ mod bench {
                         }
                         std::thread::sleep(Duration::from_millis(1));
                     }
-                    (waits, wal_max, resets)
+                    if let Some(w) = wal.as_ref() {
+                        samples.extend(WalSample::read(w, started.elapsed().as_secs_f64()));
+                    }
+                    (waits, wal_max, resets, samples)
                 })
             };
             Self { stop, thread }
@@ -1974,11 +2049,12 @@ mod bench {
         /// Mean, 99th percentile and maximum; the WAL's largest size and its resets.
         pub fn stop(self) -> String {
             self.stop.store(true, Ordering::Relaxed);
-            let (waits, wal_max, resets) = self.thread.join().unwrap();
+            let (waits, wal_max, resets, samples) = self.thread.join().unwrap();
             format!(
-                "{}, WAL at most {} MiB, reset {resets} times",
+                "{}, WAL at most {} MiB, reset {resets} times{}",
                 stats(waits),
-                wal_max >> 20
+                wal_max >> 20,
+                timeline(&samples[samples.len().saturating_sub(1)..])
             )
         }
     }

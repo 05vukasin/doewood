@@ -1355,6 +1355,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tracing",
  "uuid",
  "zeroize",
 ]

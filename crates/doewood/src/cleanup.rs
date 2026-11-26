@@ -1,13 +1,18 @@
 //! The cache purge (ADR 0002 sections 2 and 5): the backend never returns an expired registry
 //! answer or icon, and this task deletes them, a minute after the start and then every hour.
 //! With a shared store every instance runs it; the delete is idempotent. The same task
-//! refreshes the instance store's query planner statistics (`PRAGMA optimize`).
+//! refreshes the instance store's query planner statistics (`PRAGMA optimize`). The instance
+//! store's WAL is kept bounded by the store itself (its checkpoint thread, issue #151); its
+//! metrics are registered here.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use doewood_model::Backend;
 use doewood_store::Store;
+use prometheus::core::{Collector, Desc};
+use prometheus::proto::MetricFamily;
+use prometheus::{IntGauge, Registry};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -90,6 +95,56 @@ pub fn start(
     })
 }
 
+/// Registers the instance store's WAL metrics on the ops port's registry (issue #151), read
+/// when `/metrics` is scraped: `doewood_store_wal_bytes`, and the checkpoint thread's
+/// `doewood_store_wal_truncations_total` and `doewood_store_wal_truncations_busy_total`. The
+/// registry does not keep the store alive.
+pub fn register_metrics(store: &Arc<Store>, registry: &Registry) -> prometheus::Result<()> {
+    let read = |f: fn(&Store) -> u64| {
+        let store = Arc::downgrade(store);
+        move || Weak::upgrade(&store).map_or(0, |s| f(&s))
+    };
+    let bytes = StatGauge {
+        gauge: IntGauge::new(
+            "doewood_store_wal_bytes",
+            "Size of the instance store's WAL file (doewood.sqlite-wal), in bytes.",
+        )?,
+        read: read(|s| s.wal_stats().bytes),
+    };
+    let truncated = crate::ingest::StatCounter::new(
+        "doewood_store_wal_truncations_total",
+        "TRUNCATE checkpoints that emptied the instance store's WAL (over 64 MiB, or idle).",
+        read(|s| s.wal_stats().truncated),
+    )?;
+    let busy = crate::ingest::StatCounter::new(
+        "doewood_store_wal_truncations_busy_total",
+        "TRUNCATE checkpoints that gave up after their 50 ms wait for a read or write; retried \
+         5 s later.",
+        read(|s| s.wal_stats().busy),
+    )?;
+    registry.register(Box::new(bytes))?;
+    registry.register(Box::new(truncated))?;
+    registry.register(Box::new(busy))
+}
+
+/// A gauge that follows a value kept elsewhere, read when it is collected.
+struct StatGauge<F> {
+    gauge: IntGauge,
+    read: F,
+}
+
+impl<F: Fn() -> u64 + Send + Sync> Collector for StatGauge<F> {
+    fn desc(&self) -> Vec<&Desc> {
+        self.gauge.desc()
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        self.gauge
+            .set(i64::try_from((self.read)()).unwrap_or(i64::MAX));
+        self.gauge.collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use doewood_core::MasterKey;
@@ -128,5 +183,46 @@ mod tests {
             .await
             .expect("stops")
             .unwrap();
+    }
+
+    #[test]
+    fn the_wal_metrics_follow_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            Store::open(
+                &dir.path().join(doewood_store::STORE_FILE),
+                &MasterKey::from_bytes([9; 32]),
+            )
+            .unwrap(),
+        );
+        let registry = Registry::new();
+        register_metrics(&store, &registry).unwrap();
+        // The value of the metric `name`, from the text format.
+        let value = |name: &str| -> u64 {
+            let mut text = Vec::new();
+            prometheus::Encoder::encode(
+                &prometheus::TextEncoder::new(),
+                &registry.gather(),
+                &mut text,
+            )
+            .unwrap();
+            String::from_utf8(text)
+                .unwrap()
+                .lines()
+                .find_map(|l| l.strip_prefix(name)?.strip_prefix(' ')?.parse().ok())
+                .expect(name)
+        };
+        store
+            .set_setting("x", &serde_json::json!("y".repeat(10_000)))
+            .unwrap();
+        assert!(value("doewood_store_wal_bytes") > 0);
+        store.checkpoint_wal().unwrap();
+        store.checkpoint_wal().unwrap();
+        assert_eq!(value("doewood_store_wal_bytes"), 0);
+        assert_eq!(value("doewood_store_wal_truncations_total"), 1);
+        assert_eq!(value("doewood_store_wal_truncations_busy_total"), 0);
+        drop(store);
+        // The registry does not keep the store alive.
+        assert_eq!(value("doewood_store_wal_truncations_total"), 1);
     }
 }

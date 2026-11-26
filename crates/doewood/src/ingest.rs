@@ -125,7 +125,7 @@ pub fn register_metrics(ingest: &Ingest, registry: &Registry) -> prometheus::Res
 }
 
 /// A counter that follows a count kept elsewhere, read when it is collected.
-struct StatCounter<F> {
+pub(crate) struct StatCounter<F> {
     counter: IntCounter,
     read: F,
     /// Collections one at a time, so that a count is added once.
@@ -133,7 +133,7 @@ struct StatCounter<F> {
 }
 
 impl<F: Fn() -> u64 + Send + Sync> StatCounter<F> {
-    fn new(name: &str, help: &str, read: F) -> prometheus::Result<Self> {
+    pub(crate) fn new(name: &str, help: &str, read: F) -> prometheus::Result<Self> {
         Ok(Self {
             counter: IntCounter::new(name, help)?,
             read,
