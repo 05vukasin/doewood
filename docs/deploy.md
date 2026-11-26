@@ -410,7 +410,8 @@ Big files: 200 small documents (PDF, DOCX, TXT, XLSX) plus a 120k-row XLSX, a 19
 
 The same big-file run (204 records, `f8c6e3a`, Postgres 17). Sizes are the compact JSON a
 record is stored as (SQLite stores this text as it is, in `records.body_json`; a separate SQLite
-run was not made) and what Postgres stores in `records.record` (`pg_column_size`, TOASTed).
+run was not made) and what Postgres stored in `records.record` (`pg_column_size`, TOASTed;
+jsonb until schema 8, text since, see [below](#records-as-text-on-postgres-issue-121)).
 
 | record | JSON, median | JSON, largest | Postgres stored, median |
 |---|---|---|---|
@@ -445,13 +446,68 @@ run was not made) and what Postgres stores in `records.record` (`pg_column_size`
   *Write* is building the stored text (before: the tree, then its text); *held* is what stays
   while the graph and search are written (before: the tree). *Read* is a SQLite record read and
   `DocFacts` (before: the tree, and every fact read into a quail value). The write peak is a
-  scratch buffer per nesting level for objects whose keys do not come sorted. Postgres still
-  reads jsonb into a `Value` and writes the canonical text from it (the tree is dropped before
-  the record is returned).
+  scratch buffer per nesting level for objects whose keys do not come sorted. Postgres read
+  jsonb into a `Value` and wrote the canonical text from it until schema 8; it now stores
+  and returns the text as SQLite does (issue #121).
 - **TOAST:** jsonb is 1.28 times the JSON text before compression; `pglz` (the default) stores
   37 % of the text (2.08 MB for these 204 records, 12.7 KB a record with the index). `lz4`
   stored 9 % more (2.27 MB) but wrote the records 45 % faster (98 against 179 ms) and read them
-  13 % faster. Not worth a change for space; the default stays.
+  13 % faster. Not worth a change for space; the default stayed for jsonb. Since schema 8 the
+  record is text, and its column uses lz4 (below).
+
+### Records as text on Postgres (issue #121)
+
+Until schema 8 Postgres kept a record as jsonb. Every read turned it back into text on the
+server (jsonb's binary wire format is that text too, so reading it binary or as `::text`
+costs the same), and doewood parsed that text into a `Value` and wrote the canonical text
+again. Under heavy API reads this was 92-95 % of the database's time. Since schema 8 the
+canonical text that ingest writes is stored as it is (`records.body`) and sent back
+unchanged; only `fact_texts` (the enrichment's e-mail domains) looks inside a record, and it
+parses `body` as jsonb on the fly, as SQLite parses `body_json` (0.16 ms a record).
+
+Measured on the ~1,840 records of a `throughput` run (about 15.5 KB of canonical JSON each),
+Postgres 17 on an idle server, a page of 100 by key (median of 3 rounds of 17 pages):
+
+| stored as | database time per page | stored per record (column / table with index) | server time to store a record |
+|---|---|---|---|
+| jsonb (before) | 12.5 ms | 6,730 / 8,481 bytes | 0.48 ms (parse and pglz) |
+| jsonb, read as `record::text` | 13.5 ms | same | same |
+| text, pglz | 3.6 ms | 5,486 / 6,473 bytes | 0.24 ms |
+| **text, lz4 (chosen)** | **2.4 ms** | 5,996 / 7,065 bytes | 0.05 ms |
+| jsonb and text side by side | as text | 13,752 bytes (table) | both |
+
+- **Text, not jsonb next to it:** no query needs jsonb's operators often enough to store the
+  record twice; lz4 is chosen for its reads and writes, at 9 % more space than pglz and still
+  17 % less than the jsonb was. A server built without lz4 keeps pglz (the migration notes it).
+- **Same bytes out:** the stored text is the canonical text, so the API returns what it did.
+  Two values where jsonb did not give the text back now come back as written, as on SQLite:
+  `-0.0` (jsonb's numeric has no negative zero, so it read as `0.0`) and numbers near
+  `f64::MAX` (jsonb wrote them as 309 digits, which doewood could not read back). A record
+  with `\u0000` is still refused, as jsonb refused it, so every stored record parses as jsonb.
+- **Under load** (`throughput`, release, 2000 files, 4 workers, 4 readers, 8 clients asking
+  for a `ListRecords` page of 100 every millisecond; `main` `056e4b2` once, this change twice):
+
+  | | files/s | `ListRecords`: pages / DB time per page / mean | all DB time | record upsert, DB |
+  |---|---|---|---|---|
+  | before (jsonb) | 60 | 2,725 / 25.3 ms / 95 ms | 73.3 s (94 % `ListRecords`) | 0.66 ms |
+  | after (text, lz4) | 110, 114 | 3,889-3,927 / 5.3-7.5 ms / 33-35 ms | 23.6-32.6 s | 0.18-0.19 ms |
+
+  Ingest runs 1.9 times as fast while the API reads 43 % more pages, each in a third of the
+  time. What is left of a page's database time is reading and decompressing 1.5 MB.
+- **Upgrade:** the migration adds `body`, makes `record` nullable and adds the partial
+  index `records_body_pending` (the rows still to convert), so it takes seconds even on a big
+  table, though the index build reads the table once under the migration's lock. **All
+  instances are upgraded together**: an older instance refuses schema 8, and it could not read
+  a converted row. After a start, an instance converts the rows from before in the background:
+  100 rows per transaction, taken with `FOR UPDATE SKIP LOCKED` (instances share the work), a
+  20 ms pause between batches, the text the reads gave before, `updated_at` untouched. It is
+  resumable: a stop or a failure loses nothing, and the next start goes on. Until a row is
+  converted it reads from its jsonb, with the same bytes; a changed record is converted when it
+  is written. The log shows `converting stored records to text` (about every 10,000 rows) and
+  `stored records converted to text`. Space of the old jsonb is reused after autovacuum (a
+  `VACUUM FULL records` gives it back to the disk, but locks the table). The decision is
+  [ADR 0003](adr/0003-records-as-canonical-text.md); the down path is in
+  [configuration.md](configuration.md#the-shared-postgres).
 
 ### The instance store's read-only connections (issue #83)
 
@@ -992,8 +1048,9 @@ Measured with `throughput` and `api_load` as above (release build, 4 vCPU, `main
   run to run noise. (A first version woke the waiting reads while still holding the pool's
   lock: 7% fewer calls/s at 100 clients. They are now woken after it is released.)
 - **Postgres is unchanged** (the readers are SQLite's). Its limit is the database's time on
-  the API's pages; serving `ListRecords` without the `jsonb` round trip (stored text next to
-  the `jsonb`, for example) is the next step if that load is real.
+  the API's pages, the `jsonb` turned back into text. Since schema 8 records are stored as
+  text and the same load runs at 110 to 114 files/s
+  ([records as text](#records-as-text-on-postgres-issue-121)).
 
 ### Time to ready (issue #118)
 
@@ -1131,8 +1188,8 @@ DOEWOOD_SCALE_DIR=<dir> cargo test -p doewood-store --lib scale_store_sizes -- -
 | ingest sweep, nothing pending / `object_counts` | | 0.03 / 0.007 ms | 0.01 / 0.003 ms | | 0.03 / 0.007 ms | 0.02 / 0.004 ms |
 | unchanged scan pass over every key (before #138; after: 0.10 to 0.16 s and 0.37 to 0.67 s) | | (see below) | 7.6 to 8.3 s | | 0.46 to 0.50 s | 6.7 to 6.9 s |
 | writer lock wait during the scan, mean | | | 18 ms | | 3.6 ms | 16 ms |
-| `companies_due`, first page of 100 | | 51 ms | 235 ms | | 10 ms | 86 ms |
-| an enrichment pass of `companies_due` pages (registries off) | | 2.5 s, 94 pages | 41.6 s, 375 pages | | 0.28 s | 1.1 s |
+| `companies_due`, first page of 100 (SQLite before #139) | | 14 ms (51) | 55 ms (235) | | 10 ms | 86 ms |
+| an enrichment pass of `companies_due` pages (registries off; SQLite before #139) | | 0.12 s (2.5 s), 94 pages | 0.35 to 0.4 s (41.6 s), 375 pages | | 0.28 s | 1.1 s |
 | `ListRecords`, one client (page of 100) | | 12.8 ms | 9.7 ms | | 66 ms | 69 ms |
 | `Search`, a word in a quarter of the documents | | 17 ms | 71 ms | | 10 ms | 112 ms |
 | `Search`, the big company's name | | 8.8 ms | 34 ms | | 6.1 ms | 20 ms |
@@ -1146,7 +1203,7 @@ DOEWOOD_SCALE_DIR=<dir> cargo test -p doewood-store --lib scale_store_sizes -- -
 The single-client API rows are medians of 11 calls through the API on the `scale` store
 (`DOEWOOD_SCALE_PHASE=api`), on SQLite without planner statistics (ingest never refreshed
 them; after `analyze`, as `serve` does once it is ready, the 210k store answered within 30%
-of these, and `companies_due` was as slow); `api_load` seeds its own store (10, 50 or 200 thousand documents
+of these, and `companies_due` before #139 was as slow); `api_load` seeds its own store (10, 50 or 200 thousand documents
 of about 1 KiB, one company per 20, `DOEWOOD_BENCH_CLIENTS=10,100 DOEWOOD_BENCH_IDLE=0`).
 `serve` ran the release binary on the 210k store with every registry, feed and the favicon
 fallback switched off (`DOEWOOD_SCALE_PHASE=offline`), in a network namespace with only
@@ -1188,14 +1245,21 @@ What the numbers say:
   (The SQLite 50k pass, 1.0 to 1.5 s, was measured with a test bucket that was itself
   quadratic; the Postgres run's 50k pass uses the same instance store code.) Fixed in #138:
   the pass is now linear, see [below](#key-ranges-of-objects_seen-issue-138).
-- **SQLite's `companies_due` sorts every company for each page**, so an enrichment pass is
-  quadratic in the companies (41.6 s for 37,497); Postgres stays linear (1.1 s). Issue #139.
+- **SQLite's `companies_due` sorted every company for each page**, so an enrichment pass was
+  quadratic in the companies (41.6 s for 37,497); Postgres stays linear (1.1 s). Since #139
+  it reads the companies through `nodes_companies` from the page token: a pass is linear,
+  0.12 s at 50k and 0.35 to 0.4 s at 200k (the first page, 55 ms, holds the big company's
+  12,504 documents). With the store's pages out of the OS page cache (other jobs on the
+  server) the 200k pass took 4 to 8.5 s, nearly all of it disk reads (about 1 s of CPU);
+  the query before took 39 to 42 s either way. Measured on a store grown again to 200k
+  with the #127 code (`b1718f6`) plus the change, the old and new query on the same store
+  (docs/enrichment.md).
 - **SQLite `Search` slows faster than its matches grow** under load: `api_load` at 200k
   serves 508 calls/s, a tenth of 10k, and every call waits behind the searches. One search
   costs its matches on both stores (every match is ranked before the page is taken); on
   Postgres the common-word search went from 10 to 112 ms when `search_index` (206 MiB)
-  outgrew the default 128 MB of shared buffers. Issue #140. Give Postgres `shared_buffers`
-  of at least the search index's size for big corpora.
+  outgrew the default 128 MB of shared buffers. Issue #140: see
+  [Search on a big corpus](#search-on-a-big-corpus-issue-140).
 - **Postgres's WAL per document grows** from 26 KB to 109 KB (full-page images after each
   checkpoint over indexes keyed by hashes and random ids; half the checkpoints were
   requested by `max_wal_size` 1 GB). Issue #141.
@@ -1209,6 +1273,109 @@ What the numbers say:
   enrichment pass over every company.
 - **SQLite's WAL stays small** (4 to 6 MiB at most, a checkpoint resetting it about every
   10 files) at every size; the writer's lock wait is flat at about 2 ms mean and 35 ms p99.
+
+### Search on a big corpus (issue #140)
+
+Issue #127 found SQLite's `Search` under `api_load` 7.7 times slower at 200,000 documents than
+at 50,000, and the other calls queueing behind it on the 4 readers; and on Postgres a
+common-word search went from 10 to 112 ms once `search_index` outgrew the 128 MB of shared
+buffers. Three causes, measured with `api_load` (as in #127: release build, 10 s a step,
+`DOEWOOD_BENCH_CLIENTS=10,100 DOEWOOD_BENCH_IDLE=0`, one company per 20 documents) and
+`text_search_timings` (one search at a time on one reader of a store on disk, seeded by SQL
+with `api_load`'s documents, where every 4th also has `quarter` and up to 12 more words, so a
+word in a quarter of the documents scores by length; medians and p99 of 3 runs of 40 queries,
+5 for the common words), on the 4 vCPU server above; "before" is `main` at `b1718f6`,
+"after" this change, Postgres 17.12
+(`pgvector/pgvector:pg17`) on an `--internal` Docker network:
+
+```
+DOEWOOD_BENCH_DOCS=200000 cargo test --release -p doewood-store --lib text_search_timings \
+  -- --ignored --nocapture
+```
+
+**1. `api_load`'s own seeding (SQLite).** Seeding 200,000 documents left a WAL of 1.3 million
+frames (5.4 GB; 330,000 frames at 50,000) that was never reset, and as `api_load` then only
+reads, no automatic checkpoint ever ended it: every page the readers read was looked up in
+it. `api_load` now checkpoints the instance store after seeding (`Store::checkpoint`), as
+`serve`'s next write would. That alone is most of the 7.7x:
+
+| SQLite `api_load` | 10 clients: calls/s | `Search` p50 / p99 | `GetNode` p50 | 100 clients: calls/s | p99 |
+|---|---|---|---|---|---|
+| 50,000, before | 3,047 | 5.1 / 12.4 ms | 1.3 ms | 2,881 | 131 ms |
+| 50,000, after | 3,875 | 4.0 / 9.6 ms | 1.0 ms | 3,604 | 105 ms |
+| 200,000, before | 505 | 36.7 / 71.8 ms | 6.9 ms | 456 | 732 ms |
+| 200,000, the new query only (no checkpoint) | 582 | 31.3 / 67.9 ms | 6.3 ms | 531 | 598 ms |
+| 200,000, after | 1,753 | 9.5 / 23.9 ms | 2.1 ms | 1,811 | 200 ms |
+
+From 50,000 to 200,000 documents `Search` now takes 2.4 times as long, less than its matches
+grow (4 times).
+
+**2. Every match was read and sorted (SQLite).** A search scored each match with `bm25`,
+joined it to its `search_index` row and sorted all of them by score, date and hash before the
+page was taken. A search on words alone now joins only the matches that can reach the page
+(see [api.md](api.md#search-on-words-alone)); the results are the same, ties included.
+One search at a time:
+
+| SQLite, one search, p50 / p99 | 50,000: before | after | 200,000: before | after |
+|---|---|---|---|---|
+| a rare term (`api_load`; 200 / 800 matches) | 0.51 / 0.71 ms | 0.46 / 0.71 ms | 2.47 / 2.85 ms | 2.37 / 3.46 ms |
+| a word and a rare term (`api_load`; 168 / 668) | 1.80 / 2.44 ms | 1.76 / 2.29 ms | 7.23 / 7.69 ms | 7.02 / 10.47 ms |
+| a word in a quarter of the documents (12,500 / 50,000) | 14.7 / 22.8 ms | 8.4 / 8.9 ms | 61.6 / 74.3 ms | 36.0 / 43.5 ms |
+| a word in 5 of 6 documents (41,667 / 166,667) | 29.4 / 33.4 ms | 27.0 / 42.1 ms | 113.5 / 117.0 ms | 111.0 / 118.5 ms |
+
+The gain is the rows not read; where most matches tie on the score (`api_load`'s documents
+are all the same length, and a word in most documents adds almost nothing to the score), the
+ties are read as before. What stays is linear in the matches, and
+cannot go without changing the ranking:
+
+- `bm25` scores every match (its column sizes and positions) before the best can be known.
+- `bm25`'s IDF counts every document containing each word, once per search, whatever the
+  page: about 5 ms per search for a word in 5 of 6 of 200,000 documents. This is most of
+  "a word and a rare term".
+
+**3. Postgres ranks every match too.** `ts_rank` reads each match's `tsv` from its heap row,
+so a word in many documents reads most of `search_index`: a word in a quarter of the rows or
+more is a parallel sequential scan of the whole table (28,572 blocks at 200,000
+`api_load` documents: 223 MB of heap, 44 MB of indexes, 36 MB of them `search_tsv`); a rare
+term is a bitmap scan of its own rows. The page, ties included, needs every match ranked, so
+Postgres runs as before. `api_load` on Postgres (default settings, 128 MB of shared buffers):
+
+| Postgres `api_load` | 10 clients: calls/s | `Search` p50 / p99 | 100 clients: calls/s | p99 |
+|---|---|---|---|---|
+| 50,000 | 4,630 | 2.0 / 4.6 ms | 4,833 | 34 ms |
+| 200,000 | 3,537 | 3.7 / 9.3 ms | 3,318 | 52 ms |
+
+One search at a time on the same documents in a table of their own (`EXPLAIN (ANALYZE,
+BUFFERS)` of `PgStore::search`'s query, after a restart, 2 to 3 sessions of 3 runs; first
+run, then the others):
+
+| Postgres, 200,000 documents | 128 MB shared buffers | 1 GB |
+|---|---|---|
+| a rare term (800 matches) | 8 to 12, then 0.7 to 1.3 ms (804 blocks, hits once read) | 2.7, then 0.6 to 1.4 ms |
+| a word in a quarter of the documents | 441 to 500, then 32 to 49 ms (28,476 blocks read each time) | 112, then 53 to 66 ms (all hits) |
+| a word in 5 of 6 documents | 35 to 42 ms (28,188 blocks read each time) | 60 to 72 ms (all hits) |
+
+Sizing:
+
+- A sequential scan of a table bigger than a quarter of `shared_buffers` reads through a
+  small ring of buffers, so with the default 128 MB a common-word search never caches
+  `search_index` in shared buffers: it reads the whole table again each time (28,000 blocks
+  here, #127's 25,000 at 200,000 documents). From the OS page cache that is cheap (32 to 49
+  ms here, ranking 50,000 rows included); the first search after a restart took 441 to 500 ms, and
+  #127's 112 ms on a store of 3.4 GB is in line with reads the page cache did not hold.
+- So plan the database host's memory, shared buffers and page cache together, for at least
+  the search table and its indexes:
+  `SELECT pg_size_pretty(pg_table_size('search_index') + pg_indexes_size('search_index'))`
+  (about 1.4 KiB a document with small documents, #127). A container memory limit counts
+  the page cache.
+- Bigger shared buffers are not a fix for common words: with 1 GB (more than four times the
+  table) the scan found every block in shared buffers and was still slower here (53 to 72
+  against 32 to 49 ms), as the cost is ranking the matches. Rare terms are as fast either way.
+
+What would make a common-word search cost its page rather than its matches is a change to the
+ranking, for the owner to decide (see the PR of #140): for example rank only a bounded set of
+candidates (the newest N matches, or the first N by an index order) and say so in the API, or
+keep per-word document counts so SQLite need not count them at every search.
 
 ### Key ranges of `objects_seen` (issue #138)
 

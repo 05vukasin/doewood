@@ -22,7 +22,7 @@ use serde_json::value::RawValue;
 use time::Date;
 use tokio_postgres::Row;
 use tokio_postgres::error::SqlState;
-use tokio_postgres::types::{Json, ToSql};
+use tokio_postgres::types::ToSql;
 use uuid::Uuid;
 
 use crate::PgStore;
@@ -57,9 +57,12 @@ pub(crate) const SKETCH_CANDIDATES_WITHIN: &str = "WITH big AS MATERIALIZED (\
 /// The `value.v` strings of the facts named `$2` in the records `$1` (`RecordStore::fact_texts`).
 /// A `facts` that is not an array has no facts; a fact that is not an object, or whose key or
 /// `value.v` is not a string, is left out.
+/// The record is parsed from its text (`body`, schema 8), as SQLite parses its `body_json`; a
+/// row not converted yet has its `record`.
 const FACT_TEXTS: &str = "SELECT r.blake3, f->'value'->>'v' FROM records r \
-     CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(r.record->'facts') = 'array' \
-     THEN r.record->'facts' ELSE '[]'::jsonb END) f \
+     CROSS JOIN LATERAL (SELECT coalesce(r.record, r.body::jsonb) AS doc) d \
+     CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(d.doc->'facts') = 'array' \
+     THEN d.doc->'facts' ELSE '[]'::jsonb END) f \
      WHERE r.blake3 = ANY($1) AND f->'key' = to_jsonb($2::text) \
      AND jsonb_typeof(f->'value'->'v') = 'string'";
 
@@ -71,8 +74,8 @@ const FACT_TEXTS: &str = "SELECT r.blake3, f->'value'->>'v' FROM records r \
 /// The prefix is matched in the "C" collation, so a selective prefix becomes a range scan of
 /// `locations_by_key_c` (issue #27); `starts_with` gives the same answer in any collation.
 /// Never cached: a generic plan would lose both bounds (see `cached.rs`).
-pub(crate) const LIST_RECORDS: &str = "SELECT r.blake3, r.record, r.versions, extract(epoch FROM r.updated_at)::bigint \
-     FROM records r WHERE ($4::bytea IS NULL OR r.blake3 > $4) \
+pub(crate) const LIST_RECORDS: &str = "SELECT r.blake3, r.body, r.record, r.versions, \
+     extract(epoch FROM r.updated_at)::bigint FROM records r WHERE ($4::bytea IS NULL OR r.blake3 > $4) \
      AND EXISTS (SELECT 1 FROM locations l WHERE l.blake3 = r.blake3 \
      AND l.endpoint = $1 AND l.bucket = $2 AND starts_with(l.object_key COLLATE \"C\", $3) \
      AND ($4::bytea IS NULL OR l.blake3 > $4)) \
@@ -86,6 +89,18 @@ pub(crate) const FEW_PARTIES: &str = "WITH lim AS (SELECT greatest(1000, \
      (SELECT reltuples::bigint FROM pg_class WHERE oid = 'search_index'::regclass) / 4) AS n) \
      SELECT (SELECT count(*) FROM (SELECT 1 FROM edges WHERE dst = $1 AND kind = 'party' \
      LIMIT (SELECT n FROM lim)) x) < (SELECT n FROM lim)";
+
+/// [`RecordStore::put_record`]: `$1` the hash, `$2` the canonical text, `$3` the versions. The
+/// text is stored as it is (schema 8, issue #121): canonical text compares equal as text when
+/// the record is unchanged. A row from before schema 8 that is not converted yet is compared
+/// as jsonb, as it was written; a changed one is converted on the way.
+const PUT_RECORD: &str = "INSERT INTO records (blake3, body, versions) VALUES ($1, $2, $3) \
+     ON CONFLICT (blake3) DO UPDATE SET body = EXCLUDED.body, record = NULL, \
+     versions = EXCLUDED.versions, updated_at = now() \
+     WHERE CASE WHEN records.body IS NULL THEN records.record IS DISTINCT FROM EXCLUDED.body::jsonb \
+     ELSE records.body IS DISTINCT FROM EXCLUDED.body END \
+     OR records.versions IS DISTINCT FROM EXCLUDED.versions \
+     RETURNING (xmax = 0) AS inserted";
 
 /// The rows of the first batch [`LIST_RECORDS`] reads from its portal.
 const LIST_RECORDS_BATCH: usize = 8;
@@ -536,13 +551,46 @@ async fn source_owner(c: &impl GenericClient, key: &SourceKey) -> Result<Option<
     .transpose()
 }
 
-/// A stored record as the canonical text the stores return (#98). jsonb's own text has other
-/// spacing and key order, so it goes through a `Value`, as the record did before.
-fn record_text(record: &Value) -> Result<Box<RawValue>> {
+/// A stored record as the canonical text the stores return (#98), from the row's `body` and
+/// `record` columns at `at` and `at + 1`. Since schema 8 the text is stored as it was written
+/// (`body`) and sent as it is (issue #121). A row from before that the background conversion
+/// has not reached yet has only `record` (jsonb), whose own text has other spacing and key
+/// order, so it goes through a `Value`, as before.
+pub(crate) fn stored_body(row: &Row, at: usize) -> Result<Box<RawValue>> {
+    let stored = |e: String| Error::Backend {
+        backend: "postgres",
+        message: format!("stored record: {e}"),
+    };
+    if let Some(text) = row.try_get::<_, Option<String>>(at).map_err(pg)? {
+        return RawValue::from_string(text).map_err(|e| stored(e.to_string()));
+    }
+    let record: Option<Value> = row.try_get(at + 1).map_err(pg)?;
+    let record = record.ok_or_else(|| stored("neither body nor record is set".to_owned()))?;
+    record_text(&record)
+}
+
+/// The canonical text of a jsonb `record` (rows from before schema 8).
+pub(crate) fn record_text(record: &Value) -> Result<Box<RawValue>> {
     doewood_model::canonical::to_canonical(record).map_err(|e| Error::Backend {
         backend: "postgres",
         message: format!("stored record: {e}"),
     })
+}
+
+/// Whether the JSON text holds the escape `\u0000`. Postgres's jsonb cannot hold that
+/// character, and records were jsonb before schema 8: such a record is refused as it was
+/// then, so `fact_texts` can parse every stored body.
+fn has_nul_escape(text: &str) -> bool {
+    let mut rest = text.as_bytes();
+    while let Some(at) = rest.iter().position(|&b| b == b'\\') {
+        let escape = &rest[at + 1..];
+        if escape.starts_with(b"u0000") {
+            return true;
+        }
+        // Past the escaped character, so `\\` is not read as the start of another escape.
+        rest = escape.get(1..).unwrap_or_default();
+    }
+    false
 }
 
 #[async_trait]
@@ -553,19 +601,20 @@ impl RecordStore for PgStore {
         body: &RawValue,
         versions: &StepVersions,
     ) -> Result<PutOutcome> {
+        if has_nul_escape(body.get()) {
+            return Err(Error::Backend {
+                backend: "postgres",
+                message: "22P05: unsupported Unicode escape sequence (\\u0000 in a record)"
+                    .to_owned(),
+            });
+        }
         let c = client(&self.pool).await?;
         let row = c
             .opt(
-                "INSERT INTO records (blake3, record, versions) VALUES ($1, $2, $3) \
-                 ON CONFLICT (blake3) DO UPDATE SET record = EXCLUDED.record, \
-                 versions = EXCLUDED.versions, updated_at = now() \
-                 WHERE records.record IS DISTINCT FROM EXCLUDED.record \
-                 OR records.versions IS DISTINCT FROM EXCLUDED.versions \
-                 RETURNING (xmax = 0) AS inserted",
+                PUT_RECORD,
                 &[
                     &blake3.as_bytes().as_slice(),
-                    // The text as it is: jsonb parses it on the server.
-                    &Json(body),
+                    &body.get(),
                     &versions_to_json(versions),
                 ],
             )
@@ -580,7 +629,7 @@ impl RecordStore for PgStore {
     async fn get_record(&self, blake3: &Blake3) -> Result<Option<Record>> {
         let c = client(&self.pool).await?;
         c.opt(
-            "SELECT record, versions, extract(epoch FROM updated_at)::bigint FROM records \
+            "SELECT body, record, versions, extract(epoch FROM updated_at)::bigint FROM records \
              WHERE blake3 = $1",
             &[&blake3.as_bytes().as_slice()],
         )
@@ -588,9 +637,9 @@ impl RecordStore for PgStore {
         .map(|r| {
             Ok(Record {
                 blake3: *blake3,
-                body: record_text(&r.try_get(0).map_err(pg)?)?,
-                versions: versions_from_json(&r.try_get::<_, Value>(1).map_err(pg)?)?,
-                updated_at: r.try_get(2).map_err(pg)?,
+                body: stored_body(&r, 0)?,
+                versions: versions_from_json(&r.try_get::<_, Value>(2).map_err(pg)?)?,
+                updated_at: r.try_get(3).map_err(pg)?,
             })
         })
         .transpose()
@@ -683,9 +732,9 @@ impl RecordStore for PgStore {
             for r in &rows {
                 let record = Record {
                     blake3: Blake3::from_slice(r.try_get::<_, &[u8]>(0).map_err(pg)?)?,
-                    body: record_text(&r.try_get(1).map_err(pg)?)?,
-                    versions: versions_from_json(&r.try_get::<_, Value>(2).map_err(pg)?)?,
-                    updated_at: r.try_get(3).map_err(pg)?,
+                    body: stored_body(r, 1)?,
+                    versions: versions_from_json(&r.try_get::<_, Value>(3).map_err(pg)?)?,
+                    updated_at: r.try_get(4).map_err(pg)?,
                 };
                 bytes += record_page_bytes(&record);
                 page.push(record);

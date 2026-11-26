@@ -1,4 +1,4 @@
--- doewood shared store, schema 8: the size of every LSH band bucket (issue #148). A new table
+-- doewood shared store, schema 9: the size of every LSH band bucket (issue #148). A new table
 -- and triggers; no data changes. Older instances refuse this schema, so every instance is
 -- upgraded together.
 

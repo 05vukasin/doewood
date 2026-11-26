@@ -74,6 +74,28 @@ is still linear in the companies (a few index probes each, about 10 index entrie
 `edges_by_dst` per company); keeping a live document count per company at write time would
 make it a range scan on due times, at the cost of a schema change.
 
+**SQLite pages (issue #139).** On a store grown by ingest (many document and location nodes,
+with or without planner statistics) SQLite took every company from the `(kind, key)` index,
+ran the tests on each and sorted them all for every page, so one pass in pages of 100 grew
+with the square of the companies. The query now reads the companies through the partial
+index `nodes_companies` (`INDEXED BY`): in id order from the page token, stopping at the page
+size, as the fence does on Postgres. A page costs its own companies and their tests, and a
+pass is linear. No schema change. The comparison test also runs without statistics, checks
+the plan (`nodes_companies`, no sort for the `ORDER BY`) and compares with the query before
+this change. The pass on the `scale` store (docs/deploy.md, "50,000 to 200,000 documents"):
+
+| documents | companies | first page, before / after | a pass in pages of 100, before / after |
+|---|---|---|---|
+| 50,000 | 9,372 | 51 / 14 ms | 2.4 s / 0.12 s (94 pages) |
+| 200,000 | 37,497 | 218 / 55 ms | 39.2 to 39.7 s / 0.35 to 0.4 s (375 pages) |
+
+The first page holds the big company (12,504 documents), whose exact count is most of that
+page. At 200k with the store's pages out of the OS page cache the new pass took 4 to 8.5 s,
+nearly all of it disk reads (about 1 s of CPU): the exact counts read each party edge and
+its document. After `analyze` (planner statistics as `serve` refreshes them) the plan is
+the same (`INDEXED BY` fixes it); the passes measured then were of the cold kind, 7.2 and
+7.7 s.
+
 **Shutdown.** The pass stops taking companies; those in flight get 10 seconds, then are
 dropped (their leases expire and they are enriched again later).
 
