@@ -221,6 +221,12 @@ async fn s3_put_to_postgres_record() {
         .collect();
     formats.sort();
     assert_eq!(formats, ["pdf", "xlsx"]);
+    // A record is stored before its graph and search: wait until both objects are through.
+    let deadline = tokio::time::Instant::now() + Duration::from_mins(2);
+    while store.object_counts(id).unwrap().done < 2 {
+        assert!(tokio::time::Instant::now() < deadline, "not through");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     let company = pg
         .alias(NodeKind::Company, &format!("id:rs_pib:{p1}"))
         .await
