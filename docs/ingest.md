@@ -15,8 +15,17 @@ pending sweep (objects_seen)┘                                         (cap)   
 
 - **Durable.** The work is the `objects_seen` rows with status `pending`. Events only make ingest
   look sooner. A sweep feeds every pending object at start, every 30 s, and after a reprocess
-  request, so a restart, an event that raced the scanner's commit, or a source added while ingest
-  was busy are all picked up.
+  request, so a restart, a row whose event was never sent, or a source added while ingest was
+  busy are all picked up.
+- **Event order.** The scanner (per chunk) and the webhook and SQS inlets (per notification)
+  commit a new or changed object's `pending` row before they send its event, so a worker always
+  finds the row it finishes. Deletes are sent before their commit (they leave no pending row
+  for the sweep). Until issue #125 every event went first: a worker that finished before the
+  commit matched no row, its result was dropped, and the next sweep ingested the file again
+  (272 of 300 files in the `a_scan_pass_ingests_each_object_once` test, with a 16-event
+  channel; 0 of 3000 with the service's 1024-event channel and in-memory fetches). A finish
+  that matches no pending row of its version (the object changed or was deleted meanwhile) is
+  counted in `doewood_ingest_finish_unmatched_total`.
 - **Bounded, with backpressure.** The dispatcher hands jobs to the workers through a queue of
   twice the workers and waits while it is full. It then stops reading the scanners' event channel
   (1024 events), and the scanners wait in turn.

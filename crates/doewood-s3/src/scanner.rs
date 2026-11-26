@@ -9,11 +9,16 @@
 //!
 //! - a key only listed is `New`, a key in both whose ETag or size differs is `Changed`, and a
 //!   stored key the listing skipped over is `Deleted`;
-//! - each step sends its events to the bounded channel (waiting while it is full), then commits
-//!   the row changes **and** the checkpoint (the last key compared) in one transaction.
+//! - each step sends its `Deleted` events to the bounded channel (waiting while it is full),
+//!   commits the row changes **and** the checkpoint (the last key compared) in one transaction,
+//!   then sends its `New` and `Changed` events.
 //!
 //! Memory stays bounded by one page plus one chunk, however many keys the bucket holds. Events
-//! are delivered at least once: a crash between sending and committing sends them again.
+//! are delivered at least once. A new or changed object's `pending` row is committed before its
+//! event is sent, so a worker that finishes it at once finds the row (issue #125); a crash or a
+//! stop between the commit and the send leaves the row pending, and ingest's sweep feeds it.
+//! A deleted object has no pending row for the sweep, so its event goes before the commit: a
+//! crash between the two sends it again.
 //!
 //! # Resuming
 //!
@@ -348,30 +353,48 @@ impl Scanner {
             next = end;
 
             let changes: Vec<ObjectChange> = diffs.iter().map(Diff::change).collect();
-            for d in diffs {
-                match d.kind {
-                    crate::EventKind::New(_) => stats.new += 1,
-                    crate::EventKind::Changed(_) => stats.changed += 1,
-                    crate::EventKind::Deleted => stats.deleted += 1,
-                }
-                let event = ObjectEvent {
-                    source: id,
-                    key: d.key,
-                    kind: d.kind,
-                    origin: EventOrigin::Scan,
-                };
-                or_stop(self.events.send(event), stop)
-                    .await?
-                    .map_err(|_| S3Error::ChannelClosed)?;
-            }
+            // Deletes have no row to wait for, and nothing else redelivers them: they go
+            // before the commit. New and changed objects go after it, so that the worker
+            // finds their `pending` row (issue #125).
+            let (deleted, upserted): (Vec<Diff>, Vec<Diff>) = diffs
+                .into_iter()
+                .partition(|d| matches!(d.kind, crate::EventKind::Deleted));
+            self.send_all(deleted, stats, stop).await?;
             cp.start_after = covered;
             let saved = cp.clone();
             self.db(move |s| s.record_objects(id, &changes, Some(&saved)))
                 .await?;
+            self.send_all(upserted, stats, stop).await?;
             if !full {
                 return Ok(());
             }
         }
+    }
+
+    /// Sends the events of `diffs`, in order, waiting while the channel is full.
+    async fn send_all(
+        &self,
+        diffs: Vec<Diff>,
+        stats: &mut PassStats,
+        stop: &mut watch::Receiver<bool>,
+    ) -> Result<(), S3Error> {
+        for d in diffs {
+            match d.kind {
+                crate::EventKind::New(_) => stats.new += 1,
+                crate::EventKind::Changed(_) => stats.changed += 1,
+                crate::EventKind::Deleted => stats.deleted += 1,
+            }
+            let event = ObjectEvent {
+                source: self.source,
+                key: d.key,
+                kind: d.kind,
+                origin: EventOrigin::Scan,
+            };
+            or_stop(self.events.send(event), stop)
+                .await?
+                .map_err(|_| S3Error::ChannelClosed)?;
+        }
+        Ok(())
     }
 
     /// Records the state a pass ended in. A pause or removal made meanwhile wins: the store
@@ -745,9 +768,67 @@ mod tests {
         assert_eq!(rx.recv().await.unwrap().key, "k0");
         stop_tx.send(true).unwrap();
         assert!(matches!(pass.await, Err(S3Error::Stopped)));
-        // Nothing past the first step was committed, and the pass is resumable.
+        // Only the first step (the first page: no stored rows yet) was committed, and the pass
+        // is resumable. Its rows after k0 are pending without an event: ingest's sweep feeds
+        // them.
         let cp = s.store.scan_checkpoint(s.source.id).unwrap().unwrap();
         assert!(cp.in_progress);
+        assert_eq!(cp.start_after.as_deref(), Some("k2"));
+        assert_eq!(s.store.live_object_count(s.source.id).unwrap(), 3);
+    }
+
+    /// A pass whose consumer looks each event's row up as it arrives: `true` when the row of
+    /// a new or changed object was already committed with the event's ETag.
+    async fn checked_pass(s: &Setup) -> Vec<(String, &'static str, bool)> {
+        let (tx, mut rx) = mpsc::channel::<ObjectEvent>(1);
+        let scanner = Scanner::new(Arc::clone(&s.store), &s.source, tx, small());
+        let (store, id) = (Arc::clone(&s.store), s.source.id);
+        let check = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(e) = rx.recv().await {
+                let row = store.seen_object(id, &e.key).unwrap();
+                let committed = match &e.kind {
+                    EventKind::New(v) | EventKind::Changed(v) => {
+                        row.is_some_and(|r| r.etag == v.etag)
+                    }
+                    EventKind::Deleted => true,
+                };
+                events.push((e.key, e.kind.name(), committed));
+            }
+            events
+        });
+        let (_stop_tx, mut stop) = watch::channel(false);
+        scanner.pass(&s.bucket, &mut stop).await.unwrap();
+        drop(scanner);
+        check.await.unwrap()
+    }
+
+    /// A new or changed object's row is committed before its event is sent, so a worker that
+    /// finishes it at once finds it pending (issue #125). The channel holds one event, and
+    /// each is looked at before the scanner runs again.
+    #[tokio::test]
+    async fn rows_commit_before_their_events() {
+        let s = setup("");
+        for i in 0..5 {
+            s.bucket.put(&format!("k{i}"), "e1", 1);
+        }
+        let events = checked_pass(&s).await;
+        assert_eq!(events.len(), 5);
+        assert!(events.iter().all(|e| e.2), "{events:?}");
+
+        s.bucket.put("k1", "e2", 1);
+        s.bucket.remove("k2");
+        s.bucket.put("k3a", "e1", 1);
+        let mut events = checked_pass(&s).await;
+        events.sort();
+        assert_eq!(
+            events,
+            [
+                ("k1".to_owned(), "changed", true),
+                ("k2".to_owned(), "deleted", true),
+                ("k3a".to_owned(), "new", true),
+            ]
+        );
     }
 
     #[tokio::test]

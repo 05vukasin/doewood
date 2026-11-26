@@ -28,6 +28,8 @@ pub struct MemFetch {
     pub flaky: Mutex<HashMap<String, u32>>,
     /// Keys whose reads wait for a permit of their gate (one permit per read).
     pub held: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
+    /// Reads per key.
+    pub reads: Mutex<HashMap<String, u32>>,
 }
 
 impl MemFetch {
@@ -49,6 +51,12 @@ impl MemFetch {
 #[async_trait]
 impl Fetch for MemFetch {
     async fn fetch(&self, _source: &Source, key: &str) -> Result<Vec<u8>, IngestError> {
+        *self
+            .reads
+            .lock()
+            .unwrap()
+            .entry(key.to_owned())
+            .or_default() += 1;
         let gate = self.held.lock().unwrap().get(key).cloned();
         if let Some(gate) = gate {
             gate.acquire().await.unwrap().forget();

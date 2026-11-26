@@ -55,8 +55,9 @@ pushes nothing; publishing the image to a registry is not set up yet.
 
 The chart in `charts/doewood` runs a `StatefulSet` (pods start in parallel; each gets its own
 `PersistentVolumeClaim` from `volumeClaimTemplates`), a headless Service naming each pod, and a
-Service for the gRPC (7443) and ops (7444) ports. The liveness probe is `/healthz`, the readiness
-probe `/readyz`. `DOEWOOD_INSTANCE_ID` is the pod name. Parallel starts against a new, empty
+Service for the gRPC (7443) and ops (7444) ports. The liveness probe is `/healthz` (every 10 s,
+6 failures), the readiness probe `/readyz` (every 2 s, 8 failures; see
+[Time to ready](#time-to-ready-issue-118) for why). `DOEWOOD_INSTANCE_ID` is the pod name. Parallel starts against a new, empty
 database are safe: one pod migrates the shared schema (and creates pgvector), the others
 wait for it and stay not ready until then (see the Migrations bullet in
 [configuration.md](configuration.md#the-shared-postgres)). Behind PgBouncer in transaction
@@ -160,6 +161,9 @@ Alerts worth setting (tune the thresholds to your traffic):
   streams, which do not count against it), and `doewood_grpc_connections_open` per pod, to
   see whether the clients spread over the replicas.
 - **Not ready:** `doewood_ready == 0` for more than a few minutes.
+- **Ingest results dropped:** `doewood_ingest_finish_unmatched_total` growing much faster than
+  objects are changed or deleted while being ingested. Each count is a result that was not
+  recorded; when its row is still pending, the next sweep ingests the object again (issue #125).
 
 ## Sizing
 
@@ -618,13 +622,14 @@ What the numbers say:
   load, against 1.7 ms at 10 clients and 57 ms at 500 without them. More clients only add
   latency, and blocking-pool threads parked on the connections' locks (one per call in
   flight: 284 threads at the cap). One call alone (one client) takes 0.2 ms (`GetNode`) to
-  1.7 ms (`ListRecords`, 100 records); `Neighbours` and `CompanyDocuments` make two store
-  calls and wait twice. More readers were the next step: see
-  [#108](#api-read-capacity-issue-108).
+  1.7 ms (`ListRecords`, 100 records); `Neighbours` and `CompanyDocuments` made two store
+  calls and waited twice (one since #124: see
+  [below](#one-store-call-for-neighbours-and-companydocuments-issue-124)). More readers were
+  the next step: see [#108](#api-read-capacity-issue-108).
 - **Postgres saturates at about 100 clients** (about 6,000 calls/s), on the pool of 16
   connections: `GetNode` is 0.8 ms at 10 clients and 13 ms at 100, nearly all of it waiting
-  for a pooled connection, and `Neighbours` and `CompanyDocuments` (two checkouts each)
-  twice that. Neither the database (1.5 to 1.8 cores) nor the process (2.2 cores) is at the
+  for a pooled connection, and `Neighbours` and `CompanyDocuments` (two checkouts each, one
+  since #124) twice that. Neither the database (1.5 to 1.8 cores) nor the process (2.2 cores) is at the
   machine's 4 cores. `ListSources` (the instance store) stays at 1 to 3 ms.
 - **Beyond the cap, shedding works**: with 500 and 1000 clients the server refuses the calls
   over 256 in flight at once (`doewood_grpc_shed_total` agreed with the clients' count within
@@ -785,6 +790,50 @@ page of 100 every millisecond; 1 run each):
   10 minutes. 8 clients asking for 100 records every millisecond is far more than
   the API usually sees; #109 (below) gives ingest's reads priority.
 
+### One store call for `Neighbours` and `CompanyDocuments` (issue #124)
+
+Both calls read the node and then ran their query: two store calls, so two waits for a
+reader (SQLite) or a pooled connection (Postgres). Now the query runs first and the node is
+read only when it finds nothing, to tell a missing node (`NOT_FOUND`) or, for
+`CompanyDocuments`, a non-company (`INVALID_ARGUMENT`) from an empty list. Its documents come
+from `party` edges, which always end at a company (ADR 0001 section 7), so a non-empty result
+needs no kind check. A call that finds something makes 1 store call instead of 2; one that
+finds nothing still makes 2. In the `api_load` mix (every seeded node has neighbours and
+every company documents) that is 100 store calls per 100 API calls instead of 130.
+
+Measured with `api_load` (release build, 10 s per step, 10,000 documents,
+`DOEWOOD_BENCH_CLIENTS=10,100 DOEWOOD_BENCH_IDLE=0`, SQLite with 4 readers and Postgres 17 on
+an `--internal` Docker network; `main` at `baf53ad` against this change, the two binaries
+run alternately; ranges over the runs):
+
+| | runs | 10 clients: calls/s | p99 | 100 clients: calls/s | p99 |
+|---|---|---|---|---|---|
+| SQLite, `Neighbours` only, before | 2 | 6,794 to 7,029 | 3.1 to 3.2 ms | 5,630 to 5,779 | 49 to 50 ms |
+| SQLite, `Neighbours` only, after | 2 | 7,275 to 9,103 | 2.9 to 3.3 ms | 5,946 to 6,407 | 52 to 56 ms |
+| SQLite, `CompanyDocuments` only, before | 2 | 7,252 to 7,785 | 3.0 to 3.1 ms | 7,325 to 7,533 | 43 to 44 ms |
+| SQLite, `CompanyDocuments` only, after | 2 | 7,879 to 8,061 | 3.2 ms | 7,559 to 7,611 | 55 to 56 ms |
+| SQLite, mix, before | 3 | 5,515 to 6,276 | 4.3 to 4.7 ms | 5,440 to 6,099 | 60 to 66 ms |
+| SQLite, mix, after | 3 | 6,157 to 6,523 | 4.3 to 4.5 ms | 5,566 to 5,751 | 67 to 69 ms |
+| Postgres, `Neighbours` only, before | 1 | 8,306 | 2.6 ms | 8,860 | 14.5 ms |
+| Postgres, `Neighbours` only, after | 1 | 9,964 | 2.4 ms | 10,435 | 13.0 ms |
+| Postgres, `CompanyDocuments` only, before | 1 | 10,541 | 1.8 ms | 9,938 | 13.3 ms |
+| Postgres, `CompanyDocuments` only, after | 1 | 12,926 | 1.7 ms | 12,839 | 10.5 ms |
+| Postgres, mix, before | 2 | 4,933 to 5,128 | 6.6 to 6.9 ms | 5,449 to 5,487 | 39 to 42 ms |
+| Postgres, mix, after | 2 | 5,194 to 5,340 | 6.5 to 6.8 ms | 5,514 to 5,664 | 30 to 32 ms |
+
+In the mix the two calls themselves got faster on both stores: p50 1.3 to 1.8 ms before,
+0.9 to 1.3 ms after at 10 clients; at 100 clients 19 to 21 ms before, 13 ms after on SQLite
+and 22 to 23 ms before, 17.5 ms after on Postgres (p99 41 to 45 ms before, 24 to 27 ms
+after).
+
+- **Postgres gains most:** 18 to 29% more calls/s for the two calls alone, 4 to 5% for the
+  mix at 10 clients, and the mix's p99 at 100 clients falls by a quarter; the pool's
+  checkouts were the wait.
+- **SQLite at 100 clients is unchanged** within the noise of these runs: the 4 readers are
+  saturated either way, so the time the two calls save goes to the other calls' queue
+  (`GetNode` p50 9 to 10 ms before, 12 to 12.5 ms after), and the p99 is a little higher. At
+  10 clients the mix is 4 to 12% faster.
+
 ### Ingest's reads before the API's (issue #109)
 
 **Why a `ListRecords` page is slow under write load.** Not the query: `EXPLAIN QUERY PLAN`
@@ -841,6 +890,78 @@ Measured with `throughput` and `api_load` as above (release build, 4 vCPU, `main
 - **Postgres is unchanged** (the readers are SQLite's). Its limit is the database's time on
   the API's pages; serving `ListRecords` without the `jsonb` round trip (stored text next to
   the `jsonb`, for example) is the next step if that load is real.
+
+### Time to ready (issue #118)
+
+How long a new instance takes from `exec` to `/readyz` answering 200, that is to serving the
+gRPC API. Each start logs one `startup step` line per step (`step`, `took_ms`, `at_ms` since
+the process started) and a `ready` line with `startup_ms` and the resident memory
+`rss_mib`; the shared Postgres's `shared Postgres store ready` line adds `connect_ms` and
+`migrate_ms`, and `analyzer ready` adds `ocr_ms` (checking the OCR models' SHA-256) and
+`engine_ms` (building the quail engine).
+
+Measured on the machine above with release builds of `36b041c` (after) and `e943d5a` (before:
+`main` plus the timings), the OCR models present, in a network namespace with only loopback,
+Postgres 17 in a container on an internal network (no TLS), nothing to ingest. Times in ms,
+the median of 3 runs unless marked; the store file in the page cache unless marked. "50k" is
+a store with 50,000 generated documents (records with 20 facts, search rows, sketches, nodes
+and 3 party edges each, 5,000 companies; 630 MiB of SQLite):
+
+| store | before | after | critical path after |
+|---|---|---|---|
+| SQLite, empty, restart | 145 | 138 | analyzer 126 (OCR check 57, engine 70) |
+| SQLite, 50k, restart | 144 | 138 | analyzer 127; store open 5 |
+| SQLite, 50k, statistics stale (1 run) | 12,896 | 109 | analyzer 102; statistics refreshed after ready (below) |
+| SQLite, 50k, statistics stale, file not cached (1 run) | 18,610 | 497 | analyzer 453; statistics refreshed after ready (below) |
+| Postgres, empty database, first start (1 run) | 145 | 481 | schema migration 424 (129 before: run to run noise on a busy machine) |
+| Postgres, 50k, restart | 145 | 132 | analyzer 122; connect + migrations 20, in parallel |
+
+- **What was cut.** `Store::open` ran `PRAGMA optimize = 0x10002`; with statistics missing or
+  stale (after a crash, an OOM kill or a bulk load, before the close-time optimize ran) it
+  analyzed whole tables: 13 s on 50k documents, 18 s when the file is not in the page cache
+  (a pod on a new node). It now runs right after the instance is ready, in the cleanup task,
+  sampled (`analysis_limit` 400) and one table at a time, with each table's pages read ahead
+  (through `dbstat`) on a connection of its own, so the writer is held only for one table's
+  `ANALYZE` over cached pages. The `instance store statistics refreshed` log line shows
+  `tables`, `took_ms`, `longest_writer_hold_ms` and the `slowest` table. The analyzer and the
+  shared Postgres's connect and migrations need nothing from the instance store and now start
+  before it opens; the readers, the prepared statements (per pooled connection, on first
+  use) and the OCR engines (on the first scanned page) were already lazy.
+
+  The refresh on the 50k store with its statistics dropped, measured with
+  `cargo test -p doewood-store --lib stale_statistics_refresh -- --ignored --nocapture`
+  (`DOEWOOD_BENCH_UNCACHED=1` drops the file from the page cache first; 1 run each; the test
+  also checks that the hot queries' plans match those of full statistics):
+
+  | refresh | cached: total / writer held | not cached: total / writer held |
+  |---|---|---|
+  | full statistics, one step (before) | 564 / 564 ms | 17.0 s / 17.0 s |
+  | `analysis_limit` 1000, one step | 100 / 100 ms | 13.3 s / 13.3 s |
+  | `analysis_limit` 400, one step | 100 / 100 ms | 16.9 s / 16.9 s |
+  | `analysis_limit` 400, a table at a time, read ahead (now) | 265 / 50 ms | 17.9 s / 68 ms |
+
+  Sampling cuts the work on cached pages, but not reading them: `ANALYZE` still reads every
+  page of every index. Reading them ahead, without the writer, is what keeps writes moving
+  (the slowest table, `sketch_bands`, takes 10 s to read uncached and 68 ms to analyze then).
+  Every hot query (pending objects, sketch candidates, record by hash, company documents,
+  neighbours, search by company and by date, object counts) keeps its plan with the sampled
+  statistics.
+- **Readiness is stricter.** Before, standalone instances reported ready as soon as the store
+  was open, about 130 ms before the gRPC API served (and with Postgres, as soon as it
+  connected). Ready now means the API serves and the backend answers.
+- **What is left:** the analyzer, about 125 ms: the SHA-256 of the 47 MB of OCR models
+  (30 to 60 ms) and building the quail engine (about 70 ms), both in quail. Without the OCR
+  models only the engine remains. Postgres's first start on an empty database migrates the
+  schema (0.1 to 0.4 s, once per database; other instances wait for it).
+- `/healthz` answers about 15 ms after `exec` (100 ms with the binary not in the page cache).
+- RSS at ready: 81 to 83 MiB in every case.
+
+Probes, from these numbers: no `initialDelaySeconds` for either probe, and no startup probe;
+an instance is ready well within a second, so the readiness period decides when a new pod
+takes traffic (on average half a period after ready). The chart's readiness probe runs every
+2 s (it ran every 5 s before) with 8 failures, about 16 s before a pod that lost Postgres is
+taken out, as before. The liveness probe stays at every 10 s with 6 failures: the process
+answers `/healthz` from the start, and a slow start never needs more.
 
 ### Requests and limits
 
