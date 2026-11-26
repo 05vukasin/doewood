@@ -1123,8 +1123,9 @@ fn bench_file(i: usize) -> (String, Vec<u8>) {
 /// (0: on disk, every read on the writer) and times a `ListRecords` page every millisecond
 /// while ingest runs (from `DOEWOOD_BENCH_READ_CLIENTS` clients at once, default 1;
 /// `DOEWOOD_BENCH_POOL` sets the Postgres pool's size; it prints the pages' size, the
-/// largest the WAL grew and how often a checkpoint reset it). Besides files/s it prints where the workers' time went
-/// ([`doewood_ingest::StageTimes`]: the company lock's wait and hold among them) and, on
+/// largest the WAL grew and how often a checkpoint reset it). Besides files/s it prints
+/// where the workers' time went ([`doewood_ingest::StageTimes`]: the company lock's wait and
+/// hold among them) and, on
 /// Postgres with `pg_stat_statements` loaded, the statements per file and the costliest
 /// statements.
 #[tokio::test(flavor = "multi_thread")]
@@ -1291,8 +1292,8 @@ fn scale_file(i: usize) -> (String, Vec<u8>) {
 ///   50,000), at most `DOEWOOD_SCALE_RUN` (default 25,000) in this run, and prints files/s
 ///   and the graph stage per 5,000 files, then the writer lock wait (a trivial call every
 ///   millisecond) and the WAL's largest size and resets (`DOEWOOD_SCALE_NEAR=0`: without
-///   the near-duplicates). The keys and sizes go to `keys.tsv`
-///   in the directory, so the next run continues where this one stopped.
+///   the near-duplicates). The keys and sizes go to `keys.tsv` in the directory, so the
+///   next run continues where this one stopped.
 /// - `sweep`: the ingest sweep's pending query over the whole source, and `object_counts`
 ///   (each progress snapshot reads it), median of 11.
 /// - `scan`: two scanner passes over a bucket listing every key unchanged, with the writer

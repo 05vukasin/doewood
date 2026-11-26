@@ -189,8 +189,8 @@ fn hash(i: usize) -> Blake3 {
 }
 
 /// `docs` documents under `in/` of one source, each with a record (about 1 KiB), a location, a
-/// search row, a `party` edge to one of `docs / 20` companies (`DOEWOOD_BENCH_COMPANIES`) and a `similar_to` edge to the
-/// one before it; and 19 more sources, for `ListSources`.
+/// search row, a `party` edge to one of `docs / 20` companies (`DOEWOOD_BENCH_COMPANIES`)
+/// and a `similar_to` edge to the one before it; and 19 more sources, for `ListSources`.
 #[allow(clippy::too_many_lines)]
 async fn seed(a: &Instance, backend: &Arc<dyn Backend>, docs: usize) -> Seeded {
     let started = Instant::now();
