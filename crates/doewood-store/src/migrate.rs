@@ -148,7 +148,7 @@ mod tests {
 
     use rusqlite::Connection;
 
-    use super::{FkCheck, MIGRATIONS, Migration, SCHEMA_VERSION, fk_violations, migrate_to, run};
+    use super::{FkCheck, MIGRATIONS, Migration, SCHEMA_VERSION, fk_violations, run};
 
     /// `sql` without comments and trigger bodies (`CREATE TRIGGER` to `END;`), upper case: the
     /// statements a migration runs itself.
@@ -311,12 +311,15 @@ mod tests {
     /// SQL, its own check and the whole-file check apart, rolled back, then as
     /// [`super::migrate`] runs it. Migrates the file: run it on a copy.
     /// `DOEWOOD_MIGRATE_DB=<file> cargo test --release -p doewood-store --lib migration_timings
-    /// -- --ignored --nocapture`. `DOEWOOD_MIGRATE_WHOLE=0` leaves the whole-file check out.
+    /// -- --ignored --nocapture`. `DOEWOOD_MIGRATE_SPLIT=0` leaves the rolled-back parts out;
+    /// `DOEWOOD_MIGRATE_ALL_WHOLE=1` migrates as before #159, every migration with the
+    /// whole-file check.
     #[test]
     #[ignore = "a measurement (issues #112, #159); see docs/configuration.md"]
     fn migration_timings() {
         let path = std::env::var("DOEWOOD_MIGRATE_DB").expect("DOEWOOD_MIGRATE_DB");
-        let whole = std::env::var("DOEWOOD_MIGRATE_WHOLE").map_or(true, |v| v != "0");
+        let split = std::env::var("DOEWOOD_MIGRATE_SPLIT").map_or(true, |v| v != "0");
+        let all_whole = std::env::var("DOEWOOD_MIGRATE_ALL_WHOLE").is_ok_and(|v| v == "1");
         let mut conn = Connection::open(path).unwrap();
         let from: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
@@ -325,7 +328,7 @@ mod tests {
             .query_row("SELECT count(*) FROM edges", [], |r| r.get(0))
             .unwrap();
         println!("schema {from}, {edges} edges");
-        for target in from + 1..=SCHEMA_VERSION {
+        for target in (from + 1..=SCHEMA_VERSION).filter(|_| split) {
             let m = MIGRATIONS[usize::try_from(target - 1).unwrap()];
             let tx = conn.transaction().unwrap();
             let t = Instant::now();
@@ -334,23 +337,36 @@ mod tests {
             let t = Instant::now();
             fk_violations(&tx, m.fk_check).unwrap();
             let own = t.elapsed().as_secs_f64();
-            let all = if whole {
-                let t = Instant::now();
-                fk_violations(&tx, FkCheck::Whole).unwrap();
-                format!(", whole-file check {:.2} s", t.elapsed().as_secs_f64())
-            } else {
-                String::new()
-            };
             println!(
-                "migration {target} ({:?}), rolled back: SQL {sql:.2} s, its check {own:.2} s{all}",
+                "migration {target} ({:?}), rolled back: SQL {sql:.2} s, its check {own:.2} s",
                 m.fk_check
             );
         }
+        let migrations: Vec<Migration> = MIGRATIONS
+            .iter()
+            .map(|m| Migration {
+                fk_check: if all_whole {
+                    FkCheck::Whole
+                } else {
+                    m.fk_check
+                },
+                ..*m
+            })
+            .collect();
+        let started = Instant::now();
         for target in from + 1..=SCHEMA_VERSION {
             let t = Instant::now();
-            migrate_to(&mut conn, target).unwrap();
-            println!("migration {target}: {:.2} s", t.elapsed().as_secs_f64());
+            run(&mut conn, &migrations, target).unwrap();
+            println!(
+                "migration {target}{}: {:.2} s",
+                if all_whole { " (whole-file check)" } else { "" },
+                t.elapsed().as_secs_f64()
+            );
         }
+        println!(
+            "schema {from} to {SCHEMA_VERSION}: {:.2} s",
+            started.elapsed().as_secs_f64()
+        );
         conn.pragma_update(None, "foreign_keys", true).unwrap();
     }
 }
