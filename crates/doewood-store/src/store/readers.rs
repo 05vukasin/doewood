@@ -2,10 +2,10 @@
 //!
 //! Reads come from two kinds of caller: the instance itself (ingest, enrichment, the
 //! scanners) and the API ([`api_call`], [`api_call_blocking`]: its calls and the
-//! `WatchProgress` snapshot). A flood of API reads
-//! must not leave ingest's reads waiting behind it, so when both wait, the instance's read
-//! gets the reader. The API is not starved either: while it holds no reader, it may take one
-//! even if instance reads wait (one at a time), and instance reads leave it the last free one.
+//! `WatchProgress` snapshot). A flood of API reads must not leave ingest's reads waiting
+//! behind it, so when both wait, the instance's read gets the reader. The API is not starved
+//! either: while it holds no reader, it may take one even if instance reads wait (one at a
+//! time), and instance reads leave it the last free one.
 
 use std::cell::Cell;
 use std::future::Future;
@@ -210,7 +210,7 @@ impl Readers {
         (pool.idle.len(), pool.instance_waiting, pool.api_waiting)
     }
 
-    /// Runs `f` on each idle connection.
+    /// Whether `f` holds for every idle connection.
     #[cfg(test)]
     pub(crate) fn each_idle(&self, f: impl Fn(&Connection) -> bool) -> bool {
         lock(&self.pool).idle.iter().all(f)
