@@ -141,8 +141,15 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
   5 minutes, then they retry with backoff) and find the schema migrated. The version is in
   the `doewood_schema` table. A database migrated by a newer doewood is
   refused (not ready) until this one is upgraded.
+- **Schema 10** (issue #141: the triggers behind `sketch_band_sizes` keep a row only for a
+  band bucket of two or more documents, which cut the WAL of ingest by 12 to 29%; new
+  functions only, no table or data changed, see
+  [deploy.md](deploy.md#postgres-wal-on-a-big-corpus-issue-141)) is the current version.
+  **Schema 9** (issue #148: the new table `sketch_band_sizes` and its triggers, filled from
+  `sketch_bands` once) was the one before. Both migrate in seconds; schema 9 reads
+  `sketch_bands` once. As with every schema, **all instances are upgraded together**.
 - **Schema 8** (issue #121: records are stored as their canonical JSON text, in the new
-  column `records.body`, lz4-compressed where the server has lz4) is the current version. The
+  column `records.body`, lz4-compressed where the server has lz4) came before that. The
   migration only adds the column, makes `records.record` (jsonb) nullable and adds a small
   partial index, so it is quick on a big table. Rows written before keep their jsonb until a
   started instance converts them in the background, in batches of 100 rows, each its own short

@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::PgStore;
 
+mod band_sizes;
 mod companies_due;
 mod list_records;
 mod read_paths;

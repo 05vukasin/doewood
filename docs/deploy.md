@@ -1334,7 +1334,8 @@ What the numbers say:
   [Search on a big corpus](#search-on-a-big-corpus-issue-140).
 - **Postgres's WAL per document grows** from 26 KB to 109 KB (full-page images after each
   checkpoint over indexes keyed by hashes and random ids; half the checkpoints were
-  requested by `max_wal_size` 1 GB). Issue #141.
+  requested by `max_wal_size` 1 GB). Issue #141: see
+  [Postgres WAL on a big corpus](#postgres-wal-on-a-big-corpus-issue-141).
 - **`CompanyDocuments` returns every document of the company** (12,504 nodes, 150 ms on
   either store): linear, but unbounded; pagination is #112.
 - **`ListRecords`, `GetNode` and `Neighbours` do not grow** beyond their result size; Postgres
@@ -1345,6 +1346,93 @@ What the numbers say:
   enrichment pass over every company.
 - **SQLite's WAL stays small** (4 to 6 MiB at most, a checkpoint resetting it about every
   10 files) at every size; the writer's lock wait is flat at about 2 ms mean and 35 ms p99.
+
+### Postgres WAL on a big corpus (issue #141)
+
+The `scale` corpus of [#127](#50000-to-200000-documents-issue-127) on Postgres 17.12
+(`pgvector/pgvector:pg17`, `--internal` Docker network, `pg_stat_statements`), release
+build, the 4 vCPU server above. The scale run prints `pg_stat_wal` and the checkpoints per
+5,000 files; the WAL was split by relation with `pg_walinspect`
+(`pg_get_wal_block_info` over the run's LSN range). `staging` at `01e09a9` (after #154)
+against this change; the 175k store was copied once and every 175k row below starts from
+that copy (25k rows: from one copy at 25k).
+
+Where the WAL of one document goes, default settings (`max_wal_size` 1 GB,
+`wal_compression` off), before this change:
+
+| | 25k to 50k | 175k to 200k |
+|---|---|---|
+| WAL per document | 38.4 KB | 147.0 KB |
+| of it full-page images | 31% | 76% |
+| checkpoints (all requested by `max_wal_size`) | 2 | 6 |
+| `sketch_bands` and its two indexes | 294 MB (30%) | 1,399 MB (38%) |
+| `sketch_band_sizes` and its index | 133 MB (14%) | 538 MB (15%) |
+| `nodes` and `nodes_kind_key` | 87 MB | 486 MB |
+| `edges` and its indexes | 86 MB | about 570 MB |
+| the record (TOAST) | 159 MB | 159 MB |
+| `search_index` and `search_tsv` | 77 MB | 167 MB |
+
+- **The growth is full-page images.** After a checkpoint the first change to a page writes
+  the whole page. A document's 32 LSH bands go to 32 random leaves of `sketch_bands_pkey`
+  (band, hash), and at 200k that index has 37,600 pages: every checkpoint rewrites most of
+  them (200,000 images, 1.16 GB, in 25,000 documents). The same holds, smaller, for the
+  other indexes on hashes and random ids (`edges_identity`, `edges_by_src`/`_by_dst` for the
+  `similar_to` edges to older documents, `nodes_kind_key`, `records_pkey`,
+  `search_index_pkey`, `locations_by_blake3`, the GIN `search_tsv`) and for `nodes`, whose
+  rows each new edge's foreign key locks (`FOR KEY SHARE` writes to the row's page). The
+  more WAL, the more checkpoints, and the more images again.
+- **Without images a document is about 25 KB** at every size (between two checkpoints:
+  26.6 KB before, 24.6 KB after this change), a third of it the record itself.
+- **What doewood changed (schema 10):** `sketch_band_sizes` (issue #148) had a row for every
+  band key, and 92% to 99.9% of the keys belong to one document: each new document with a
+  sketch inserted about 29 rows and index entries on random pages, 15% of the WAL. Since
+  schema 10 a bucket gets its row when its second document arrives, with the exact count
+  (the triggers take a transaction advisory lock per band, in order, so documents adding the
+  same new band at once are counted exactly); a bucket of one has none, which the candidate
+  query reads as small (`similar_max_bucket` is at least 10). The bands, the edges and every
+  row the API reads are the same. The rows of single documents an older schema wrote stay,
+  with their exact count (at 200k: 2.0 million rows, 220 MB; a store started on schema 10
+  does not make them).
+- **What doewood did not change:** the random-keyed indexes are what the lookups need
+  (candidates by band, documents by hash), and the stored data stays the same; no no-op
+  rewrite was left on the ingest path (`pg_stat_user_tables`: about 0.4 `node_aliases` and
+  1.2 `nodes` row versions per document, over 90% HOT).
+
+Before and after, default settings:
+
+| | before | after |
+|---|---|---|
+| 25k to 50k: WAL per document / checkpoints / files/s | 38.4 KB / 2 / 371 | 33.7 KB / 2 / 387 |
+| 175k to 200k: WAL per document / checkpoints / files/s | 147.0 KB / 6 / 329 | 104.8 KB / 4 / 340 |
+| WAL records per document | 200 to 227 | 157 to 179 |
+
+(The 175k row is the before store upgraded to schema 10: its old size rows stay. Grown with
+schema 10 from 125k on, the same window wrote 106.3 KB a document.)
+
+**Server settings for a big corpus.** Most of what is left is full-page images, so the
+server's checkpoint settings decide the WAL. With this change, from the same 175k store,
+50,000 documents (and the first checkpoint cycle after it for the last row):
+
+| server settings | WAL per document | full-page images per document | checkpoints | files/s |
+|---|---|---|---|---|
+| defaults (`max_wal_size` 1 GB, `wal_compression` off) | 115.7 KB | 14.6 | 10 requested | 345 |
+| `wal_compression = lz4` | 71.4 KB | 10.2 | 5 requested, 1 timed | 346 |
+| `lz4`, `max_wal_size = 4GB`, `checkpoint_timeout = 15min` | 35.0 KB (one cycle, 230k to 295k) | 1.5 | 1 timed, 1 requested in 125,000 files | 350 |
+
+- **Set `wal_compression = lz4`** (Postgres 15 and newer; `pglz` where the server has no
+  lz4): it compresses the images, not the data, and cost no ingest speed here. 38% less WAL.
+- **Give checkpoints room: `max_wal_size` 4 GB or more and `checkpoint_timeout` 15 min or
+  more** for a store of 100,000 documents and up. A checkpoint rewrites the hot index pages
+  once whatever happened between, so its cost per document falls with the documents between
+  two checkpoints: with 4 GB and lz4 a checkpoint came every 65,000 documents (2.3 GB of
+  WAL) and the WAL was 35 KB a document, less than a third of the default's. The disk must hold
+  `max_wal_size` of WAL (plus `wal_keep_size` and what replication slots hold), and a crash
+  recovery replays up to that much (tens of seconds per GB). With replicas or WAL archiving,
+  less WAL is less to ship and store.
+- `checkpoint_completion_target` (default 0.9) can stay. `full_page_writes` must stay on
+  (it protects against torn pages).
+- Nothing in doewood reads these settings: they are the database's, set in
+  `postgresql.conf` or with `ALTER SYSTEM` by whoever runs the server.
 
 ### Search on a big corpus (issue #140)
 

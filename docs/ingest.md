@@ -252,7 +252,8 @@ Numbers are in [Sizing, Records](deploy.md#records).
   candidate query: a bucket that large is a template's boilerplate, not similarity, and
   reading it costs a row per document in it (quadratic over a corpus of one template). The
   bucket sizes are kept in `sketch_band_sizes` by triggers on `sketch_bands` (both stores), so
-  the check is one row per band. **This changes which `similar_to` edges exist on
+  the check is one row per band (on Postgres since schema 10 only for buckets of two or more
+  documents, issue #141: a missing row is a bucket of one). **This changes which `similar_to` edges exist on
   template-heavy corpora:** once a template has more than the limit of documents, a new one
   of it is compared only through its less common bands, so it may link to fewer (or other)
   near-duplicates than the exact top 100 by shared bands; documents that share only
