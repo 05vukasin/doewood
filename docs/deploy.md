@@ -95,7 +95,8 @@ them, which suits only reads of the shared store (see [Load balancing](#load-bal
 | `extraEnv` | `[]` | more variables, for example `RUST_LOG`, `DOEWOOD_INGEST_JOBS` |
 | `service.type`, `service.grpcPort`, `service.opsPort` | `ClusterIP`, `7443`, `7444` | the Service |
 | `persistence.size`, `persistence.storageClass`, `persistence.accessModes` | `1Gi`, default class, `[ReadWriteOnce]` | each pod's volume |
-| `resources` | requests 500m CPU and 1 GiB, limit 4 GiB | measured: about 1.1 GiB at most with OCR, 0.4 GiB for a 120k-row XLSX (see [Sizing](#sizing)); the ingest jobs follow the memory limit |
+| `ocrJobs` | `2` | `DOEWOOD_OCR_JOBS`: OCR engines at once; empty for the binary's default (one below 10 GiB). 2 read 35 to 45 % more scanned pages a second than 1, same text, about 0.55 GiB more (see [OCR per page](#ocr-per-page)) |
+| `resources` | requests 500m CPU and 1638 MiB, limit 4710 MiB | one OCR engine needs about 1 GiB / 4 GiB; the second engine of `ocrJobs: 2` adds 0.6 GiB to both (see [Sizing](#sizing)); the ingest jobs follow the memory limit |
 | `podSecurityContext`, `securityContext` | non-root 10001, `fsGroup` 10001, seccomp `RuntimeDefault`, read-only root, no privilege escalation, all capabilities dropped | security |
 | `terminationGracePeriodSeconds` | `30` | shutdown time |
 | `podAnnotations`, `podLabels`, `nodeSelector`, `tolerations`, `affinity` | empty | scheduling and metadata |
@@ -276,7 +277,7 @@ The analyzer rows include each engine's cold first page.
   workers and 1, 2 and 4 jobs).
 - **What to set:** the default stays quail's plan (one engine per GiB of 20 % of the total
   memory, so one below 10 GiB). Set `DOEWOOD_OCR_JOBS=2` where a pod has room for about 1.5
-  GiB of OCR (the chart's 4 GiB limit has), and 4 only with about 2.5 GiB for OCR and 4 cores;
+  GiB of OCR (the chart does since 2026-11-26: `ocrJobs: 2`, with 0.6 GiB more request and limit), and 4 only with about 2.5 GiB for OCR and 4 cores;
   jobs above the workers are not used.
 - The single-page and 20-page runs of #63 above all ran with one engine; their 0.42 to 0.66
   pages/s include the store, S3 and the pipeline, which this in-process test leaves out.
@@ -1176,9 +1177,9 @@ Per doewood instance (one pod):
 | typical: text documents, a few scans | 500m | 512 MiB | 2 GiB |
 | OCR-heavy: mostly scans | 2 to 4 (each OCR engine uses up to 4 threads) | 1.5 GiB | 4 GiB |
 
-- The chart's defaults (500m, 1 GiB, limit 4 GiB) fit both, so they are unchanged: the request
-  covers the OCR engine with one worker, the limit covers 4 workers with OCR plus a large
-  spreadsheet in flight. With a lower limit the default worker count drops (half the room under
+- The chart's defaults (500m, 1638 MiB, limit 4710 MiB, `ocrJobs: 2`) fit both: the request
+  covers two OCR engines with one worker, the limit covers 4 workers with OCR plus a large
+  spreadsheet in flight. With `ocrJobs: ""` (one engine) 1 GiB / 4 GiB is enough. With a lower limit the default worker count drops (half the room under
   the limit, 512 MiB a worker), and so does the memory budget (half the workers' plan: 768 MiB
   with 3 workers under 4 GiB). Files over 16 MiB beyond the budget wait. A workbook over the
   cell cap fails: each worker's share of half the room under the limit at 320 bytes a cell,
