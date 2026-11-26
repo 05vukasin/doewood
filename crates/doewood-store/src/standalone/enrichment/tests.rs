@@ -160,7 +160,10 @@ async fn companies_due_matches(stats: bool) {
     }
     // Issue #139: the companies in id order from the page token, no sort of them all.
     let p = plan(&store.conn(), COMPANIES_DUE);
-    assert!(p.contains("USING COVERING INDEX nodes_companies (id>?)"), "{p}");
+    assert!(
+        p.contains("USING COVERING INDEX nodes_companies (id>?)"),
+        "{p}"
+    );
     assert!(!p.contains("TEMP B-TREE FOR ORDER BY"), "{p}");
     let before_139 = before_139();
     if !stats {
@@ -181,7 +184,10 @@ async fn companies_due_matches(stats: bool) {
                 )
             };
             assert_eq!(before, after, "owner {owner}, limit {limit}, stats {stats}");
-            assert_eq!(before_139, after, "owner {owner}, limit {limit}, stats {stats}");
+            assert_eq!(
+                before_139, after,
+                "owner {owner}, limit {limit}, stats {stats}"
+            );
             sizes.push(after.iter().map(Vec::len).sum::<usize>());
             let instance = InstanceId::new(owner).unwrap();
             let mut token = None;
@@ -260,7 +266,10 @@ fn companies_due_timings() {
             ms[0], ms[1]
         );
         let before_139 = before_139();
-        for (label, sql) in [("before #139", before_139.as_str()), ("after", COMPANIES_DUE)] {
+        for (label, sql) in [
+            ("before #139", before_139.as_str()),
+            ("after", COMPANIES_DUE),
+        ] {
             let t = Instant::now();
             let pages = walk(&conn, sql, "me", 100);
             println!(
