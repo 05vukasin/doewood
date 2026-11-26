@@ -971,7 +971,8 @@ async fn similarity_uses_the_stored_threshold() {
 /// `DOEWOOD_BENCH_READERS=n` puts the instance store in a file with `n` read-only connections
 /// (0: on disk, every read on the writer) and times a `ListRecords` page every millisecond
 /// while ingest runs (from `DOEWOOD_BENCH_READ_CLIENTS` clients at once, default 1;
-/// `DOEWOOD_BENCH_POOL` sets the Postgres pool's size). Besides files/s it prints where the workers' time went
+/// `DOEWOOD_BENCH_POOL` sets the Postgres pool's size; it prints the pages' size and the
+/// largest the WAL grew). Besides files/s it prints where the workers' time went
 /// ([`doewood_ingest::StageTimes`]: the company lock's wait and hold among them) and, on
 /// Postgres with `pg_stat_statements` loaded, the statements per file and the costliest
 /// statements.
@@ -1012,7 +1013,8 @@ async fn throughput() {
         )
     };
     let api = bench::Api::start(&store, &backend, &progress, watchers).await;
-    let probe = bench::Probe::start(&store);
+    let wal = readers.map(|_| dir.join(format!("{}-wal", doewood_store::STORE_FILE)));
+    let probe = bench::Probe::start(&store, wal);
     let read_clients: usize = var("DOEWOOD_BENCH_READ_CLIENTS").unwrap_or(1);
     let reads = readers.map(|_| bench::ReadProbe::start(api.addr, h.source, read_clients));
     let cpu = bench::cpu_seconds();
@@ -1218,35 +1220,40 @@ mod bench {
         }
     }
 
-    /// Times a trivial store call every millisecond: what it waits for the lock.
+    /// Times a trivial store call every millisecond: what it waits for the lock. With the
+    /// store on disk, also the largest size its WAL file reached.
     pub struct Probe {
         stop: Arc<AtomicBool>,
-        thread: std::thread::JoinHandle<Vec<Duration>>,
+        thread: std::thread::JoinHandle<(Vec<Duration>, u64)>,
     }
 
     impl Probe {
-        pub fn start(store: &Arc<Store>) -> Self {
+        pub fn start(store: &Arc<Store>, wal: Option<std::path::PathBuf>) -> Self {
             let stop = Arc::new(AtomicBool::new(false));
             let thread = {
                 let (store, stop) = (Arc::clone(store), Arc::clone(&stop));
                 std::thread::spawn(move || {
-                    let mut waits = Vec::new();
+                    let (mut waits, mut wal_max) = (Vec::new(), 0);
                     while !stop.load(Ordering::Relaxed) {
                         let t = Instant::now();
                         store.schema_version().unwrap();
                         waits.push(t.elapsed());
+                        if let Some(len) = wal.as_ref().and_then(|w| std::fs::metadata(w).ok()) {
+                            wal_max = wal_max.max(len.len());
+                        }
                         std::thread::sleep(Duration::from_millis(1));
                     }
-                    waits
+                    (waits, wal_max)
                 })
             };
             Self { stop, thread }
         }
 
-        /// Mean, 99th percentile and maximum.
+        /// Mean, 99th percentile and maximum; the WAL's largest size.
         pub fn stop(self) -> String {
             self.stop.store(true, Ordering::Relaxed);
-            stats(self.thread.join().unwrap())
+            let (waits, wal_max) = self.thread.join().unwrap();
+            format!("{}, WAL at most {} MiB", stats(waits), wal_max >> 20)
         }
     }
 
@@ -1254,6 +1261,7 @@ mod bench {
     pub struct ReadProbe {
         stop: Arc<AtomicBool>,
         tasks: Vec<tokio::task::JoinHandle<Vec<Duration>>>,
+        bytes: Arc<AtomicU64>,
     }
 
     impl ReadProbe {
@@ -1264,9 +1272,10 @@ mod bench {
             clients: usize,
         ) -> Self {
             let stop = Arc::new(AtomicBool::new(false));
+            let bytes = Arc::new(AtomicU64::new(0));
             let tasks = (0..clients.max(1))
                 .map(|_| {
-                    let stop = Arc::clone(&stop);
+                    let (stop, bytes) = (Arc::clone(&stop), Arc::clone(&bytes));
                     tokio::spawn(async move {
                         let channel =
                             tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
@@ -1278,32 +1287,37 @@ mod bench {
                         let mut waits = Vec::new();
                         while !stop.load(Ordering::Relaxed) {
                             let t = Instant::now();
-                            client
+                            let page = client
                                 .list_records(pb::ListRecordsRequest {
                                     source_id: source.to_string(),
                                     page_size: 100,
                                     page_token: String::new(),
                                 })
                                 .await
-                                .unwrap();
+                                .unwrap()
+                                .into_inner();
                             waits.push(t.elapsed());
+                            let body: usize = page.records.iter().map(|r| r.body_json.len()).sum();
+                            bytes.fetch_add(body as u64, Ordering::Relaxed);
                             tokio::time::sleep(Duration::from_millis(1)).await;
                         }
                         waits
                     })
                 })
                 .collect();
-            Self { stop, tasks }
+            Self { stop, tasks, bytes }
         }
 
-        /// Mean, 99th percentile and maximum.
+        /// Mean, 99th percentile and maximum, and the pages' mean size (record bodies).
         pub async fn stop(self) -> String {
             self.stop.store(true, Ordering::Relaxed);
             let mut all = Vec::new();
             for t in self.tasks {
                 all.extend(t.await.unwrap());
             }
-            stats(all)
+            let pages = all.len().max(1) as u64;
+            let kib = self.bytes.load(Ordering::Relaxed) / pages / 1024;
+            format!("{}, {kib} KiB of bodies a page", stats(all))
         }
     }
 
