@@ -1301,6 +1301,8 @@ fn scale_file(i: usize) -> (String, Vec<u8>) {
 ///   lock wait.
 /// - `due`: `companies_due` (no registries are called: only the query), the first page and a
 ///   whole pass in pages of 100, as the enrichment job reads it.
+/// - `analyze`: refreshes the planner's statistics as `serve` does once it is ready (ingest
+///   here never did; run it before the other phases to measure the plans a served store has).
 /// - `offline`: switches every registry, feed and the favicon fallback off in the instance
 ///   store, before `doewood serve` is started on the directory (idle memory).
 /// - `api`: one client through the API: `ListRecords` (the first page of 100), `Search` (a
@@ -1530,6 +1532,14 @@ async fn scale() {
                 "scale: companies_due first page {:.2} ms; a pass: {companies} companies in \
                  {pages} pages, {:.2}s, slowest page {slowest:.2} ms",
                 median(first),
+                t.elapsed().as_secs_f64()
+            );
+        }
+        "analyze" => {
+            let t = std::time::Instant::now();
+            let done = store.optimize_all().unwrap();
+            println!(
+                "scale: statistics refreshed as `serve` does after ready ({:.1}s): {done:?}",
                 t.elapsed().as_secs_f64()
             );
         }
