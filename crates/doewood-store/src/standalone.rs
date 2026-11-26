@@ -1469,7 +1469,10 @@ const TEXT_SEARCH: &str = "WITH m AS MATERIALIZED (SELECT rowid AS id, \
      LIMIT ?2 OFFSET ?3";
 
 /// The hits of a search statement: hash, title, kind, date, amount and score.
-fn search_hits(stmt: &mut rusqlite::Statement<'_>, args: impl rusqlite::Params) -> Result<Vec<SearchHit>> {
+fn search_hits(
+    stmt: &mut rusqlite::Statement<'_>,
+    args: impl rusqlite::Params,
+) -> Result<Vec<SearchHit>> {
     let rows = stmt
         .query_map(args, |r| {
             Ok((

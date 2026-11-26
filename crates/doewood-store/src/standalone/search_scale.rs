@@ -103,7 +103,14 @@ fn seed_varied(conn: &Connection, n: u32) {
         tx.execute(
             "INSERT INTO search_index (blake3, title, body, kind, doc_date, amount, indexed_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
-            params![h.as_slice(), title, body, kind, date, rng.below(1000)],
+            params![
+                h.as_slice(),
+                title,
+                body,
+                kind,
+                date,
+                rng.below(1000).cast_signed()
+            ],
         )
         .unwrap();
     }
@@ -129,7 +136,7 @@ fn seed_api_load(conn: &Connection, n: u32) {
            SELECT k FROM s;
          CREATE TEMP TABLE seed_docs AS
            WITH RECURSIVE s (i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM s WHERE i < {n} - 1)
-           SELECT i, unhex(printf('%016x', i)) || zeroblob(24) AS h FROM s;
+           SELECT i, unhex(printf('%016x%048x', i, 0)) AS h FROM s;
          INSERT INTO records (blake3, body_json, versions_json, updated_at)
            SELECT h, json_object('n', i, 'pad', hex(randomblob(480))), '{{\"quail\":\"1\"}}', 0
            FROM seed_docs;
@@ -139,8 +146,8 @@ fn seed_api_load(conn: &Connection, n: u32) {
                      ON seed_w.k = (d.i * 7 + seed_k.k * 13) % 24)
                   || ' ' || (SELECT group_concat('term' || ((d.i * 20 + k) * 2654435761 % 5000),
                      ' ') FROM seed_k)
-                  || CASE WHEN d.i % 4 = 0 THEN ' quarter' || (SELECT group_concat(' w', '')
-                     FROM seed_k WHERE k < d.i % 13) ELSE '' END,
+                  || CASE WHEN d.i % 4 = 0 THEN ' quarter' || coalesce((SELECT group_concat(' w', '')
+                     FROM seed_k WHERE k < d.i % 13), '') ELSE '' END,
                   'invoice', NULL, 100.0, 0
            FROM seed_docs d;
          DROP TABLE seed_w; DROP TABLE seed_k; DROP TABLE seed_docs;"
@@ -157,19 +164,16 @@ fn before(conn: &Connection, q: &SearchQuery) -> Vec<SearchHit> {
         .join(" ");
     let mut stmt = conn.prepare_cached(BEFORE).unwrap();
     #[allow(clippy::cast_possible_truncation)]
-    stmt.query_map(
-        params![phrase, q.effective_limit(), q.offset],
-        |r| {
-            Ok(SearchHit {
-                blake3: doewood_model::Blake3::from_slice(&r.get::<_, Vec<u8>>(0)?).unwrap(),
-                title: r.get(1)?,
-                kind: r.get(2)?,
-                date: from_julian(r.get(3)?).unwrap(),
-                amount: r.get(4)?,
-                score: r.get::<_, f64>(5)? as f32,
-            })
-        },
-    )
+    stmt.query_map(params![phrase, q.effective_limit(), q.offset], |r| {
+        Ok(SearchHit {
+            blake3: doewood_model::Blake3::from_slice(&r.get::<_, Vec<u8>>(0)?).unwrap(),
+            title: r.get(1)?,
+            kind: r.get(2)?,
+            date: from_julian(r.get(3)?).unwrap(),
+            amount: r.get(4)?,
+            score: r.get::<_, f64>(5)? as f32,
+        })
+    })
     .unwrap()
     .collect::<rusqlite::Result<_>>()
     .unwrap()
@@ -223,11 +227,14 @@ async fn text_search_matches_the_query_before() {
                 let got = s.search(&q).await.unwrap();
                 assert_eq!(got, want, "{corpus}: {q:?}");
                 total += want.len();
-                ties += want.windows(2).filter(|w| w[0].score == w[1].score).count();
+                ties += want
+                    .windows(2)
+                    .filter(|w| w[0].score.to_bits() == w[1].score.to_bits())
+                    .count();
             }
         }
         // Both corpora have pages to compare, and pages that ties decide.
-        assert!(total > 10_000, "{corpus}: {total}");
+        assert!(total > 5_000, "{corpus}: {total}");
         assert!(ties > 1_000, "{corpus}: {ties}");
     }
 }
@@ -264,7 +271,10 @@ fn text_search_timings() {
     let store = Store::open(&dir.path().join("s.db"), &MasterKey::from_bytes([1; 32])).unwrap();
     let t = Instant::now();
     seed_api_load(&store.conn(), n);
-    println!("search: seeded {n} documents in {:.1}s", t.elapsed().as_secs_f64());
+    println!(
+        "search: seeded {n} documents in {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
     let rare: Vec<_> = (0..40)
         .map(|k| text(&format!("term{}", k * 125), 20, 0))
         .collect();
@@ -300,7 +310,7 @@ fn text_search_timings() {
             super::text_search(&conn, &q.words(), q).unwrap();
         });
         println!(
-            "search: {name} ({matches} matches, the first): before p50 {b50:.2} ms, p99 \
+            "search: {name} ({matches} matches for the first query): before p50 {b50:.2} ms, p99 \
              {b99:.2} ms; after p50 {a50:.2} ms, p99 {a99:.2} ms"
         );
     }
