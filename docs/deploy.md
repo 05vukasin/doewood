@@ -1245,8 +1245,8 @@ What the numbers say:
   serves 508 calls/s, a tenth of 10k, and every call waits behind the searches. One search
   costs its matches on both stores (every match is ranked before the page is taken); on
   Postgres the common-word search went from 10 to 112 ms when `search_index` (206 MiB)
-  outgrew the default 128 MB of shared buffers. Issue #140. Give Postgres `shared_buffers`
-  of at least the search index's size for big corpora.
+  outgrew the default 128 MB of shared buffers. Issue #140: see
+  [Search on a big corpus](#search-on-a-big-corpus-issue-140).
 - **Postgres's WAL per document grows** from 26 KB to 109 KB (full-page images after each
   checkpoint over indexes keyed by hashes and random ids; half the checkpoints were
   requested by `max_wal_size` 1 GB). Issue #141.
@@ -1260,6 +1260,109 @@ What the numbers say:
   enrichment pass over every company.
 - **SQLite's WAL stays small** (4 to 6 MiB at most, a checkpoint resetting it about every
   10 files) at every size; the writer's lock wait is flat at about 2 ms mean and 35 ms p99.
+
+### Search on a big corpus (issue #140)
+
+Issue #127 found SQLite's `Search` under `api_load` 7.7 times slower at 200,000 documents than
+at 50,000, and the other calls queueing behind it on the 4 readers; and on Postgres a
+common-word search went from 10 to 112 ms once `search_index` outgrew the 128 MB of shared
+buffers. Three causes, measured with `api_load` (as in #127: release build, 10 s a step,
+`DOEWOOD_BENCH_CLIENTS=10,100 DOEWOOD_BENCH_IDLE=0`, one company per 20 documents) and
+`text_search_timings` (one search at a time on one reader of a store on disk, seeded by SQL
+with `api_load`'s documents, where every 4th also has `quarter` and up to 12 more words, so a
+word in a quarter of the documents scores by length; medians and p99 of 3 runs of 40 queries,
+5 for the common words), on the 4 vCPU server above; "before" is `main` at `b1718f6`,
+"after" this change, Postgres 17.12
+(`pgvector/pgvector:pg17`) on an `--internal` Docker network:
+
+```
+DOEWOOD_BENCH_DOCS=200000 cargo test --release -p doewood-store --lib text_search_timings \
+  -- --ignored --nocapture
+```
+
+**1. `api_load`'s own seeding (SQLite).** Seeding 200,000 documents left a WAL of 1.3 million
+frames (5.4 GB; 330,000 frames at 50,000) that was never reset, and as `api_load` then only
+reads, no automatic checkpoint ever ended it: every page the readers read was looked up in
+it. `api_load` now checkpoints the instance store after seeding (`Store::checkpoint`), as
+`serve`'s next write would. That alone is most of the 7.7x:
+
+| SQLite `api_load` | 10 clients: calls/s | `Search` p50 / p99 | `GetNode` p50 | 100 clients: calls/s | p99 |
+|---|---|---|---|---|---|
+| 50,000, before | 3,047 | 5.1 / 12.4 ms | 1.3 ms | 2,881 | 131 ms |
+| 50,000, after | 3,875 | 4.0 / 9.6 ms | 1.0 ms | 3,604 | 105 ms |
+| 200,000, before | 505 | 36.7 / 71.8 ms | 6.9 ms | 456 | 732 ms |
+| 200,000, the new query only (no checkpoint) | 582 | 31.3 / 67.9 ms | 6.3 ms | 531 | 598 ms |
+| 200,000, after | 1,753 | 9.5 / 23.9 ms | 2.1 ms | 1,811 | 200 ms |
+
+From 50,000 to 200,000 documents `Search` now takes 2.4 times as long, less than its matches
+grow (4 times).
+
+**2. Every match was read and sorted (SQLite).** A search scored each match with `bm25`,
+joined it to its `search_index` row and sorted all of them by score, date and hash before the
+page was taken. A search on words alone now joins only the matches that can reach the page
+(see [api.md](api.md#search-on-words-alone)); the results are the same, ties included.
+One search at a time:
+
+| SQLite, one search, p50 / p99 | 50,000: before | after | 200,000: before | after |
+|---|---|---|---|---|
+| a rare term (`api_load`; 200 / 800 matches) | 0.51 / 0.71 ms | 0.46 / 0.71 ms | 2.47 / 2.85 ms | 2.37 / 3.46 ms |
+| a word and a rare term (`api_load`; 168 / 668) | 1.80 / 2.44 ms | 1.76 / 2.29 ms | 7.23 / 7.69 ms | 7.02 / 10.47 ms |
+| a word in a quarter of the documents (12,500 / 50,000) | 14.7 / 22.8 ms | 8.4 / 8.9 ms | 61.6 / 74.3 ms | 36.0 / 43.5 ms |
+| a word in 5 of 6 documents (41,667 / 166,667) | 29.4 / 33.4 ms | 27.0 / 42.1 ms | 113.5 / 117.0 ms | 111.0 / 118.5 ms |
+
+The gain is the rows not read; where most matches tie on the score (`api_load`'s documents
+are all the same length, and a word in most documents adds almost nothing to the score), the
+ties are read as before. What stays is linear in the matches, and
+cannot go without changing the ranking:
+
+- `bm25` scores every match (its column sizes and positions) before the best can be known.
+- `bm25`'s IDF counts every document containing each word, once per search, whatever the
+  page: about 5 ms per search for a word in 5 of 6 of 200,000 documents. This is most of
+  "a word and a rare term".
+
+**3. Postgres ranks every match too.** `ts_rank` reads each match's `tsv` from its heap row,
+so a word in many documents reads most of `search_index`: a word in a quarter of the rows or
+more is a parallel sequential scan of the whole table (28,572 blocks at 200,000
+`api_load` documents: 223 MB of heap, 44 MB of indexes, 36 MB of them `search_tsv`); a rare
+term is a bitmap scan of its own rows. The page, ties included, needs every match ranked, so
+Postgres runs as before. `api_load` on Postgres (default settings, 128 MB of shared buffers):
+
+| Postgres `api_load` | 10 clients: calls/s | `Search` p50 / p99 | 100 clients: calls/s | p99 |
+|---|---|---|---|---|
+| 50,000 | 4,630 | 2.0 / 4.6 ms | 4,833 | 34 ms |
+| 200,000 | 3,537 | 3.7 / 9.3 ms | 3,318 | 52 ms |
+
+One search at a time on the same documents in a table of their own (`EXPLAIN (ANALYZE,
+BUFFERS)` of `PgStore::search`'s query, after a restart, 2 to 3 sessions of 3 runs; first
+run, then the others):
+
+| Postgres, 200,000 documents | 128 MB shared buffers | 1 GB |
+|---|---|---|
+| a rare term (800 matches) | 8 to 12, then 0.7 to 1.3 ms (804 blocks, hits once read) | 2.7, then 0.6 to 1.4 ms |
+| a word in a quarter of the documents | 441 to 500, then 32 to 49 ms (28,476 blocks read each time) | 112, then 53 to 66 ms (all hits) |
+| a word in 5 of 6 documents | 35 to 42 ms (28,188 blocks read each time) | 60 to 72 ms (all hits) |
+
+Sizing:
+
+- A sequential scan of a table bigger than a quarter of `shared_buffers` reads through a
+  small ring of buffers, so with the default 128 MB a common-word search never caches
+  `search_index` in shared buffers: it reads the whole table again each time (28,000 blocks
+  here, #127's 25,000 at 200,000 documents). From the OS page cache that is cheap (32 to 49
+  ms here, ranking 50,000 rows included); the first search after a restart took 441 to 500 ms, and
+  #127's 112 ms on a store of 3.4 GB is in line with reads the page cache did not hold.
+- So plan the database host's memory, shared buffers and page cache together, for at least
+  the search table and its indexes:
+  `SELECT pg_size_pretty(pg_table_size('search_index') + pg_indexes_size('search_index'))`
+  (about 1.4 KiB a document with small documents, #127). A container memory limit counts
+  the page cache.
+- Bigger shared buffers are not a fix for common words: with 1 GB (more than four times the
+  table) the scan found every block in shared buffers and was still slower here (53 to 72
+  against 32 to 49 ms), as the cost is ranking the matches. Rare terms are as fast either way.
+
+What would make a common-word search cost its page rather than its matches is a change to the
+ranking, for the owner to decide (see the PR of #140): for example rank only a bounded set of
+candidates (the newest N matches, or the first N by an index order) and say so in the API, or
+keep per-word document counts so SQLite need not count them at every search.
 
 ### Key ranges of `objects_seen` (issue #138)
 
