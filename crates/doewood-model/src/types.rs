@@ -725,6 +725,20 @@ pub fn validate_alias_count(n: usize) -> Result<(), Error> {
     Ok(())
 }
 
+/// Most keys per [`crate::GraphStore::node_ids`] call and edges per
+/// [`crate::GraphStore::upsert_edges`] call.
+pub const GRAPH_BATCH_MAX: usize = 1000;
+
+/// Refuses more than [`GRAPH_BATCH_MAX`] keys or edges in one call.
+pub fn validate_batch_count(n: usize) -> Result<(), Error> {
+    if n > GRAPH_BATCH_MAX {
+        return Err(Error::Invalid(format!(
+            "at most {GRAPH_BATCH_MAX} keys or edges per call"
+        )));
+    }
+    Ok(())
+}
+
 /// Checks an alias before it reaches a backend: the same rules as a node key.
 pub fn validate_alias(alias: &str, props: &Value) -> Result<(), Error> {
     if alias.is_empty() || alias.len() > NODE_KEY_MAX_LEN || alias.contains('\0') {

@@ -358,3 +358,60 @@ pub fn prose(seed: u64, words: usize) -> String {
     }
     out.join(" ")
 }
+
+/// Text of document `i` of a generated corpus with near-duplicates (issue #126), like the
+/// invoices of a few suppliers: four in five come from one of `templates` templates (a
+/// 300-word body that all of its documents share, under a header of their own: number, date,
+/// amount, customer), the fifth is distinct. Two documents of one template have a Jaccard
+/// estimate of about 0.9 and share most of their 32 LSH bands.
+pub fn near_duplicate_text(i: u64, templates: u64) -> String {
+    if i % 5 == 4 {
+        return prose(1_000_000 + i, 300);
+    }
+    format!(
+        "invoice number {i} dated 2026 {} {} amount {} customer {} {}",
+        i % 12 + 1,
+        i % 28 + 1,
+        i * 37 % 100_000,
+        i % 97,
+        prose(i % templates, 300)
+    )
+}
+
+/// The `MinHash` signature and LSH bands of `text`, as quail emits them.
+pub fn sketch(text: &str) -> Option<(Vec<u8>, Vec<u64>)> {
+    let m = quail_sketch::minhash::text_minhash(text)?;
+    Some((m.to_bytes(), m.bands().to_vec()))
+}
+
+/// The `similar_to` edges out of the documents `hashes`: the keys of both ends, the props
+/// and the confidence, sorted. Node and edge ids are left out: they differ between stores.
+pub async fn similar_edges(
+    b: &dyn doewood_model::Backend,
+    hashes: &[doewood_model::Blake3],
+) -> Vec<(String, String, String, u32)> {
+    use doewood_model::{Direction, EdgeKind, NeighbourQuery, NodeKind};
+    let q = NeighbourQuery {
+        direction: Direction::Out,
+        edge_kinds: vec![EdgeKind::SimilarTo],
+        ..NeighbourQuery::default()
+    };
+    let mut out = Vec::new();
+    for h in hashes {
+        let hex = h.to_hex();
+        let Some(node) = b.node_by_key(NodeKind::Document, &hex).await.unwrap() else {
+            continue;
+        };
+        for nb in b.neighbours(node.id, &q).await.unwrap() {
+            let e = nb.edge.edge;
+            out.push((
+                hex.clone(),
+                nb.node.key,
+                e.props.to_string(),
+                e.confidence.to_bits(),
+            ));
+        }
+    }
+    out.sort();
+    out
+}

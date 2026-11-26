@@ -13,10 +13,10 @@ use doewood_model::{
     NodeKind, ObjectLocation, OwnedAlias, PropsPatch, PutOutcome, Record, RecordStore, Result,
     SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore, Sketch, SketchStore,
     SourceClaim, SourceKey, StepVersions, StoredEdge, band_to_i64, merged_into, record_page_bytes,
-    records_limit, sketch_limit, validate_alias, validate_alias_count, validate_hashes,
-    validate_node, validate_sketch, versions_from_json, versions_to_json,
+    records_limit, sketch_limit, validate_alias, validate_alias_count, validate_batch_count,
+    validate_hashes, validate_node, validate_sketch, versions_from_json, versions_to_json,
 };
-use futures_util::future::try_join_all;
+use futures_util::future::{join3, try_join_all};
 use serde_json::Value;
 use serde_json::value::RawValue;
 use time::Date;
@@ -267,30 +267,49 @@ const EDGE_ON_CONFLICT: &str = "ON CONFLICT ON CONSTRAINT edges_identity DO UPDA
      valid_to = EXCLUDED.valid_to, updated_at = now() \
      RETURNING id";
 
+/// The edge upsert, `$1` the id for a new edge, `$2` to `$11` the edge.
+fn upsert_edge_sql() -> String {
+    format!(
+        "INSERT INTO edges (id, src, dst, kind, props, evidence, confidence, state, \
+         valid_from, valid_to, source) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) {EDGE_ON_CONFLICT}"
+    )
+}
+
+/// What [`edge_params`] takes besides the edge: the id for a new edge and the edge's kind,
+/// state and source as text.
+type EdgeExtra = (Uuid, &'static str, &'static str, &'static str);
+
+fn edge_extra(e: &Edge) -> EdgeExtra {
+    (
+        Uuid::now_v7(),
+        e.kind.as_str(),
+        e.state.as_str(),
+        e.source.as_str(),
+    )
+}
+
+/// The parameters of [`upsert_edge_sql`] for `e`.
+fn edge_params<'a>(e: &'a Edge, x: &'a EdgeExtra) -> [&'a (dyn ToSql + Sync); 11] {
+    [
+        &x.0,
+        &e.src,
+        &e.dst,
+        &x.1,
+        &e.props,
+        &e.evidence,
+        &e.confidence,
+        &x.2,
+        &e.valid_from,
+        &e.valid_to,
+        &x.3,
+    ]
+}
+
 async fn upsert_edge(c: &impl GenericClient, e: &Edge) -> Result<Uuid> {
     e.validate()?;
-    let row = c
-        .one(
-            &format!(
-                "INSERT INTO edges (id, src, dst, kind, props, evidence, confidence, state, \
-                 valid_from, valid_to, source) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) {EDGE_ON_CONFLICT}"
-            ),
-            &[
-                &Uuid::now_v7(),
-                &e.src,
-                &e.dst,
-                &e.kind.as_str(),
-                &e.props,
-                &e.evidence,
-                &e.confidence,
-                &e.state.as_str(),
-                &e.valid_from,
-                &e.valid_to,
-                &e.source.as_str(),
-            ],
-        )
-        .await?;
+    let x = edge_extra(e);
+    let row = c.one(&upsert_edge_sql(), &edge_params(e, &x)).await?;
     row.try_get(0).map_err(pg)
 }
 
@@ -691,9 +710,68 @@ impl GraphStore for PgStore {
         .transpose()
     }
 
+    async fn node_ids(&self, kind: NodeKind, keys: &[String]) -> Result<Vec<Option<Uuid>>> {
+        validate_batch_count(keys.len())?;
+        let mut out = vec![None; keys.len()];
+        if keys.is_empty() {
+            return Ok(out);
+        }
+        let c = client(&self.pool).await?;
+        let rows = c
+            .rows(
+                "SELECT a.ord, n.id FROM unnest($2::text[]) WITH ORDINALITY AS a(key, ord) \
+                 JOIN nodes n ON n.kind = $1 AND n.key = a.key",
+                &[&kind.as_str(), &keys],
+            )
+            .await?;
+        for r in &rows {
+            let ord: i64 = r.try_get(0).map_err(pg)?;
+            let at = usize::try_from(ord - 1).map_err(|e| bad("ordinal", e))?;
+            *out.get_mut(at).ok_or_else(|| bad("ordinal", ord))? = Some(r.try_get(1).map_err(pg)?);
+        }
+        Ok(out)
+    }
+
     async fn upsert_edge(&self, edge: &Edge) -> Result<Uuid> {
         edge.validate()?;
         upsert_edge(&client(&self.pool).await?, edge).await
+    }
+
+    async fn upsert_edges(&self, edges: &[Edge]) -> Result<Vec<Uuid>> {
+        validate_batch_count(edges.len())?;
+        for e in edges {
+            e.validate()?;
+        }
+        if edges.is_empty() {
+            return Ok(Vec::new());
+        }
+        let c = client(&self.pool).await?;
+        let st = c.prepare_cached(&upsert_edge_sql()).await.map_err(pg)?;
+        // Pipelined in one transaction (issue #126): `BEGIN`, the upserts in order and
+        // `COMMIT` go out together on this connection, one round trip and one commit for
+        // all of them. After a failed upsert the rest fail too and `COMMIT` rolls back, so
+        // nothing is written and the connection goes back to the pool outside a transaction
+        // (the `ROLLBACK` below is only a safeguard).
+        let extra: Vec<EdgeExtra> = edges.iter().map(edge_extra).collect();
+        let params: Vec<_> = edges
+            .iter()
+            .zip(&extra)
+            .map(|(e, x)| edge_params(e, x))
+            .collect();
+        let (begin, rows, commit) = join3(
+            c.batch_execute("BEGIN"),
+            try_join_all(params.iter().map(|p| c.query_one(&st, p))),
+            c.batch_execute("COMMIT"),
+        )
+        .await;
+        let done = begin.and(rows).and_then(|rows| commit.map(|()| rows));
+        match done {
+            Ok(rows) => rows.iter().map(|r| r.try_get(0).map_err(pg)).collect(),
+            Err(e) => {
+                let _ = c.batch_execute("ROLLBACK").await;
+                Err(pg(e))
+            }
+        }
     }
 
     async fn upsert_live_edge(&self, edge: &Edge) -> Result<LiveEdge> {
