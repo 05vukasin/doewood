@@ -22,6 +22,7 @@ pub(crate) mod objects;
 pub(crate) mod readers;
 pub(crate) mod sources;
 pub(crate) mod sqs;
+pub(crate) mod wal;
 
 /// Name of the store file inside the data directory.
 pub const STORE_FILE: &str = "doewood.sqlite";
@@ -77,6 +78,8 @@ pub struct Store {
     conn: Mutex<Connection>,
     readers: Readers,
     cipher: Cipher,
+    /// An on-disk store's checkpoint connection and thread ([`wal`], issue #151).
+    pub(crate) wal: Option<wal::Keeper>,
 }
 
 /// The connection a read runs on: a read-only one, or the writer when the store has none.
@@ -206,6 +209,7 @@ impl Store {
             .map(|_| open_reader(path))
             .collect::<Result<Vec<_>, _>>()?;
         store.readers = Readers::new(idle);
+        store.wal = Some(wal::Keeper::start(path)?);
         Ok(store)
     }
 
@@ -235,6 +239,7 @@ impl Store {
             conn: Mutex::new(conn),
             readers: Readers::default(),
             cipher: Cipher::new(key),
+            wal: None,
         };
         store.check_key()?;
         Ok(store)
@@ -481,6 +486,8 @@ impl Store {
 
     /// Closes the readers, then checkpoints the WAL into the main file and closes the writer.
     pub fn close(self) -> Result<(), StoreError> {
+        // The checkpoint thread first: the close's own checkpoint does not wait for it.
+        drop(self.wal);
         for reader in self.readers.into_idle() {
             reader.close().map_err(|(_, e)| StoreError::Sqlite(e))?;
         }

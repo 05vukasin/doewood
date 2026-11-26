@@ -200,6 +200,11 @@ Alerts worth setting (tune the thresholds to your traffic):
 - **Ingest results dropped:** `doewood_ingest_finish_unmatched_total` growing much faster than
   objects are changed or deleted while being ingested. Each count is a result that was not
   recorded; when its row is still pending, the next sweep ingests the object again (issue #125).
+- **Instance store WAL:** `doewood_store_wal_bytes` above a few hundred MiB for more than a few
+  minutes, or `doewood_store_wal_truncations_busy_total` growing on every try (one every 5 s).
+  The store empties its WAL when it is over 64 MiB or idle (issue #151); a WAL that stays
+  large means a read or a write holds a lock longer than the 50 ms the checkpoint waits for,
+  for example a backup tool or an `sqlite3` shell with a transaction open on the file.
 - **Template-heavy sources** (not an alert): `doewood_ingest_similar_buckets_skipped_total`
   counts band keys the `similar_to` query skipped because more than `similar_max_bucket`
   documents share them (issue #148). It grows when one template (one supplier's invoices)
@@ -1020,9 +1025,51 @@ other instance and were applied again (one more read and write each).
   throughput a single instance loses. On SQLite it is about 3% of the bytes written and about
   4% of the lock hold. In a real ingest the graph stage is 40 to 58% of a worker's time (see
   [Ingest on Postgres](#ingest-on-postgres-issue-69)), so the gain there is smaller.
-- Writing `matches` only when something else changed, or keeping it elsewhere, changes the
-  stored props that `GetNode` returns: an owner decision (issue #129). The patch already
-  writes nothing when it changes nothing, on both stores.
+- **Since then the company keeps no `matches` list** (the owner's decision on issue #129):
+  how each document matched is on its `party` edge only (see below).
+
+#### Without `matches` (issue #129)
+
+The match step, alias, confidence and conflicts of each document were already on its `party`
+edge (`props.match`, the document in `evidence`), so the company's list was a copy that
+nothing read. Ingest no longer writes it, and removes a list an earlier version stored the
+next time it patches that company (a remove that changes nothing on a company without one).
+No migration: companies that get no new document keep their old list until they do. While
+older and newer instances run side by side, the older ones add the list back and the newer
+ones remove it: the rows are written as often as before, nothing is lost.
+
+Deriving the list on read instead (the last 20 live `party` edges of the company, for
+`GetNode`) was measured too: 4.4 to 7.8 ms per read for the busiest company (10,000 edges)
+with today's indexes, which find all its party edges and sort them, against about 0.3 ms
+for reading the node. An index on `edges (dst, kind, id)` makes it 0.2 to 0.35 ms, but needs
+a new shared schema (every instance upgraded together) and one more store call per
+`GetNode`; `Neighbours` (in, `party`) already lists the same edges. So the list was dropped,
+not derived ([api.md](api.md#records-graph-and-search)).
+
+`company_rows`, `hot` corpus, the same machine and settings as above, `staging` at `c87a4f4`
+before and this change after, back to back, one run each (lock and graph stage are means
+over the run):
+
+| | documents/s | graph stage per document | lock held per document | written per document | `nodes` row versions per document | props compare-and-set writes, retried |
+|---|---|---|---|---|---|---|
+| SQLite, before | 231 | 17.1 ms | 4.31 ms | 314 KB (process) | | |
+| SQLite, after | 275 | 14.4 ms | 3.61 ms | 300 KB | | |
+| Postgres, before | 94 | 41.7 ms | 10.60 ms | 13.3 KB WAL | 2.99 | 30,000, 0 |
+| Postgres, after | 114 | 34.2 ms | 8.73 ms | 9.2 KB WAL | 0.99 | 10,021, 0 |
+| Postgres, 2 instances, before | 226 | 17.0 ms | 8.79 ms | 13.2 KB WAL | 2.99 | 30,555, 555 |
+| Postgres, 2 instances, after | 271 | 14.0 ms | 7.34 ms | 9.1 KB WAL | 0.98 | 10,021, 0 |
+
+- **Each known company's patch now writes nothing**: 10,021 props writes for 10,000
+  documents instead of 30,000 (the documents' own props, and the 21 companies' first
+  ones), one `nodes` row version per document instead of three, and 30 to 31% less WAL. The
+  busiest company's props are 188 bytes instead of 3.7 KB.
+- **The company lock is held 16 to 18% less** (the patch is a read only, 0.3 ms instead of
+  1.3 ms on Postgres), and in this graph-only run, where the lock is the limit, 19 to 21%
+  more documents a second on both stores. A real ingest gains less (the graph stage is 40 to
+  58% of a worker's time).
+- **Two instances no longer retry** a busy company's patch: 555 retries before, 0 after.
+- The `spread` corpus was not run again: its companies are mostly new, and their first patch
+  writes as before.
 
 ### Ingest's reads before the API's (issue #109)
 
@@ -1442,6 +1489,37 @@ query in the same run):
 - **The sweep over a long queue** (every key pending, as after a first scan or a
   reprocess) gained the most: the old form also read the queue index from its start for
   every page.
+
+### The instance store's WAL (issue #151)
+
+PR #150 found a WAL of 1.3 million frames (5.4 GB) after `api_load` seeded 200,000 documents,
+and every read 7 times as slow. Measured on this branch's parent (`staging` at `c87a4f4`, release
+build, 4 vCPU, 4 readers), with the WAL's size and frames read every 5 s from the file and its
+`-shm` index (`throughput` and `api_load` print them now):
+
+| | WAL at most | WAL at the end |
+|---|---|---|
+| `api_load` seeding 50,000 documents, before | 1,295 MiB, 329,610 frames | the same (never checkpointed) |
+| same, after | 5.7 MiB, about 1,000 frames | 553 frames, all in the main file |
+| `throughput`, 8,000 files, 16 `ListRecords` clients, then 60 s idle with the clients on, before | 21 MiB (reset 378 times) | 21.2 MiB, 707 frames, none in the main file |
+| same, after | 22 MiB (reset 434 times) | 0 (emptied 5 to 10 s after the last write) |
+
+- **Production ingest does not starve the checkpoint**, even with 16 API clients reading
+  without a pause: SQLite's own checkpoint resets the WAL every few hundred frames, and the WAL
+  stays near 20 MiB. Ingest's speed and the writer's lock wait are unchanged (46 and 43 files/s,
+  p99 32 and 35 ms; one run each). No read holds a transaction open: each read call is one
+  transaction inside a blocking closure, and the connection guard cannot be held across an
+  `await`.
+- **The 5.4 GB was not the readers**: it was the seed's last phase, one `similar_to` edge
+  upsert at a time. SQLite runs its automatic checkpoint only when `sqlite3_step` reports a
+  statement done, and a write read with `query_row` (its `RETURNING id`) is reset after its row
+  instead, so 50,000 such writes in a row never checkpointed. Node and edge upserts now step
+  to the end (`returning_writes_let_sqlite_checkpoint`).
+- **Idle, the WAL was never emptied**: without a write, SQLite does not checkpoint, and the
+  last frames stayed in the WAL. The checkpoint thread now empties it.
+- **The thread's cost to writes**: its PASSIVE step takes no writer lock; a TRUNCATE holds the
+  writer's lock for its wait (50 ms at most; the test's busy try took 50.3 ms) plus the copy of
+  what was left (0.2 to 0.3 ms in the tests).
 
 ### Requests and limits
 

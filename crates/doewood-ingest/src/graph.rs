@@ -7,8 +7,8 @@
 //!   normalized name with its legal form, the squashed name, and the legal-form-blind name
 //!   while exactly one company owns it. Each key is a node alias, so a lookup is one read and
 //!   the first claim wins; an identifier another company owns is refused, never moved. Every
-//!   match keeps its step, confidence and evidence, on the `party` edge and the company. Fuzzy
-//!   steps are not taken here: nothing merges on a fuzzy match.
+//!   match keeps its step, confidence and evidence on the `party` edge, and only there (issue
+//!   #129). Fuzzy steps are not taken here: nothing merges on a fuzzy match.
 //! - **Merges** (ADR 0002 section 1.8): ingest never merges two company nodes. When a party's
 //!   identifier and its name point at different companies, the identifier's company gets the
 //!   party: two conflicting high-precision hits are for review, never an automatic merge.
@@ -85,10 +85,9 @@ impl From<doewood_store::IngestSettings> for Similar {
     }
 }
 
-/// Most names, identifiers per kind and match notes a company's props keep.
+/// Most names and identifiers per kind a company's props keep.
 const MAX_NAMES: usize = 20;
 const MAX_IDS: usize = 10;
-const MAX_MATCHES: usize = 20;
 /// Most mentions cited in a party edge's evidence.
 const MAX_MENTIONS: usize = 5;
 /// Most `merged_into` hops followed from a merged-away company.
@@ -617,7 +616,7 @@ impl GraphWriter {
             self.honour_dismissals(&mut m, attached).await?;
         }
         self.claim(&mut m, name, p, hex).await?;
-        self.update_company(&m, name, p, hex).await?;
+        self.update_company(&m, name, p).await?;
         Ok((m, created))
     }
 
@@ -737,13 +736,13 @@ impl GraphWriter {
     /// Merges what this party says into the company's props, as one atomic patch of the
     /// keys ingest keeps (issue #51): the enrichment job's keys, and what another document
     /// wrote at the same moment, stay.
-    async fn update_company(
-        &self,
-        m: &Match,
-        name: &CompanyName,
-        p: &Party,
-        hex: &str,
-    ) -> Result<()> {
+    ///
+    /// How the party matched is on its `party` edge only: a list of it on the company changed
+    /// with every document, so every party rewrote its company's row (issue #129). For a
+    /// company already known the patch now usually changes nothing and writes nothing. A
+    /// `matches` list an earlier version stored is removed here, the next time the company is
+    /// patched.
+    async fn update_company(&self, m: &Match, name: &CompanyName, p: &Party) -> Result<()> {
         let mut patch = PropsPatch::new()
             .add_to_set(&["names"], json!(name.original), MAX_NAMES)
             .set_if_absent(&["name"], json!(name.original))
@@ -761,14 +760,7 @@ impl GraphWriter {
             }
             patch = patch.add_to_set(&["ids", id.kind.as_str()], json!(id.value), MAX_IDS);
         }
-        let entry = json!({
-            "step": m.step.map_or("created", LadderStep::as_str),
-            "alias": m.alias,
-            "confidence": m.confidence,
-            "document": hex,
-            "conflicts": m.conflicts,
-        });
-        patch = patch.push_capped(&["matches"], entry, &["document"], MAX_MATCHES);
+        patch = patch.remove(&["matches"]);
         self.backend.update_props(m.company, &patch).await?;
         Ok(())
     }

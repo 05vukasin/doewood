@@ -208,6 +208,11 @@ refused: the workbook has more than 1,600,000 cells ...`, and how to raise the c
   filters of the model's `NeighbourQuery` (direction, edge kinds, neighbour kind, a day the edge
   must hold on, inactive edges); **CompanyDocuments** lists the documents with a live `party`
   edge to a company.
+  - A company's props have no `matches` list since issue #129. How each document matched (the
+    ladder step, the alias, its confidence and conflicts) is in the props of its `party` edge
+    (`match`), with the document in the edge's evidence: `Neighbours` with `direction` in and
+    `edge_kinds` party lists them. A company that ingest has not patched since the upgrade can
+    still show the old stored list until its next document.
 - **Neighbours** and **CompanyDocuments** page as ListRecords does (issue #112): `page_size`
   (default 50, at most 1000; more is `INVALID_ARGUMENT`), `page_token` and `next_page_token`.
   A page also ends with the item that brings it to 3 MiB (node keys and props, and for
@@ -411,6 +416,9 @@ to `doewood_ready` and the others. gRPC-Web calls are counted like gRPC calls.
 | `doewood_grpc_connections_total` | counter | | connections accepted |
 | `doewood_icons_requests_total` | counter | `outcome` | `GET /icons/{domain}`: `found`, `missing`, `invalid`, `busy` |
 | `doewood_ingest_finish_unmatched_total` | counter | | ingested objects whose status matched no `pending` row of that version, so it was not recorded: the object changed or was deleted meanwhile (issue #125). Near 0 in steady state |
+| `doewood_store_wal_bytes` | gauge | | size of the instance store's WAL file (`doewood.sqlite-wal`); emptied when over 64 MiB or idle (issue #151, [configuration.md](configuration.md#the-instance-store)) |
+| `doewood_store_wal_truncations_total` | counter | | checkpoints that emptied the instance store's WAL |
+| `doewood_store_wal_truncations_busy_total` | counter | | such checkpoints that gave up after their 50 ms wait for a read or a write; the next try is 5 s later |
 
 - `method` is the full method name, for example `doewood.v1.RecordsService/GetRecord` or
   `grpc.health.v1.Health/Check`. It comes from the fixed list of served methods; any other
