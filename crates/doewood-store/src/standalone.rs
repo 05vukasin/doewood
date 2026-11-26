@@ -42,6 +42,8 @@ mod proposals;
 #[cfg(test)]
 mod read_paths;
 #[cfg(test)]
+mod scale;
+#[cfg(test)]
 mod search_company;
 
 /// The candidate query for `bands` band keys, then the excluded hash and the limit. As on
