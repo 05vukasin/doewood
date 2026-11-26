@@ -24,6 +24,9 @@ const CONVERT_BATCH: i64 = 100;
 /// The pause between batches, so the conversion leaves the database to the instances' work.
 const CONVERT_PAUSE: Duration = Duration::from_millis(20);
 
+/// How long to wait when every row left is locked by someone else.
+const LOCKED_PAUSE: Duration = Duration::from_secs(1);
+
 /// How long to wait before trying again when the database is unavailable.
 const RETRY: Duration = Duration::from_secs(30);
 
@@ -40,8 +43,8 @@ pub(crate) async fn pending(pool: &Pool) -> Result<bool> {
         .get(0))
 }
 
-/// Converts one batch; returns how many rows it converted (0: none left, or all that are left
-/// are being converted by another instance).
+/// Converts one batch; returns how many rows it converted (0: none left, or every row left is
+/// locked by someone else).
 pub(crate) async fn batch(pool: &Pool) -> Result<u64> {
     let mut c = client(pool).await?;
     let tx = c.transaction().await.map_err(pg)?;
@@ -87,7 +90,16 @@ pub(crate) async fn run(pool: Pool) -> u64 {
     info!("converting stored records to text (schema 8) in the background");
     loop {
         match batch(&pool).await {
-            Ok(0) => break,
+            // None left, or every row left is locked: by another instance converting it, or
+            // by a write (which converts it too). Look again until none is left.
+            Ok(0) => match pending(&pool).await {
+                Ok(false) => break,
+                Ok(true) => tokio::time::sleep(LOCKED_PAUSE).await,
+                Err(e) => {
+                    warn!(error = %e, converted = total, "record conversion stopped; the next start goes on");
+                    return total;
+                }
+            },
             Ok(n) => {
                 // A log line about every 10,000 rows.
                 if total / 10_000 != (total + n) / 10_000 {
