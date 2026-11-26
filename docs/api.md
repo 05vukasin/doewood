@@ -208,6 +208,11 @@ refused: the workbook has more than 1,600,000 cells ...`, and how to raise the c
   filters of the model's `NeighbourQuery` (direction, edge kinds, neighbour kind, a day the edge
   must hold on, inactive edges); **CompanyDocuments** lists the documents with a live `party`
   edge to a company.
+  - A company's props have no `matches` list since issue #129. How each document matched (the
+    ladder step, the alias, its confidence and conflicts) is in the props of its `party` edge
+    (`match`), with the document in the edge's evidence: `Neighbours` with `direction` in and
+    `edge_kinds` party lists them. A company that ingest has not patched since the upgrade can
+    still show the old stored list until its next document.
 - **Search** matches every word of `text` and every filter that is set (company, kind, date and
   amount ranges, source), with `limit` (up to 1000) and `offset`.
 
