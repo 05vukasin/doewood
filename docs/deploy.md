@@ -1360,7 +1360,9 @@ build, the 4 vCPU server above. The scale run prints `pg_stat_wal` and the check
 5,000 files; the WAL was split by relation with `pg_walinspect`
 (`pg_get_wal_block_info` over the run's LSN range). `staging` at `01e09a9` (after #154)
 against this change; the 175k store was copied once and every 175k row below starts from
-that copy (25k rows: from one copy at 25k).
+that copy (25k rows: from one copy at 25k). Measured before #112 rebuilt `edges_by_dst` as
+(dst, kind, valid_from, id): still keyed by the edge's end, so it takes its entries on the
+same random pages, with somewhat larger entries.
 
 Where the WAL of one document goes, default settings (`max_wal_size` 1 GB,
 `wal_compression` off), before this change:
