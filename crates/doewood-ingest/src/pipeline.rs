@@ -1657,11 +1657,17 @@ mod tests {
     /// The memory budget: a big file waits while another holds the budget, until that one's
     /// analysis really ends (here: an overrun the watchdog gave up on), while small files flow
     /// on the other worker. A file bigger than the budget takes all of it.
+    ///
+    /// Only the gate decides that `a` overruns; every other file must finish well inside the
+    /// watchdog, also on a slow, shared CI runner. So the files are small (sizes only matter
+    /// against the budget) and the watchdog is 3 s, not the 500 ms of [`run`]: with 5 MiB
+    /// for `b` and 500 ms, `b` itself overran on macOS and Windows (#119).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_big_file_waits_for_the_budget_while_small_files_flow() {
-        const MIB: usize = 1 << 20;
-        let a = text(3001, 2 * MIB);
-        let b = text(3002, 5 * MIB);
+        const KIB: usize = 1 << 10;
+        const BUDGET: usize = 384 * KIB;
+        let a = text(3001, 256 * KIB);
+        let b = text(3002, 640 * KIB);
         let small: Vec<(String, Vec<u8>)> = (0..6)
             .map(|i| (format!("c-small-{i}.txt"), text(3100 + i, 2000)))
             .collect();
@@ -1683,15 +1689,17 @@ mod tests {
             &["a-big.txt"],
             2,
             |c| {
-                c.memory_budget = 3 * MIB as u64;
-                c.small_file = 64 << 10;
+                c.memory_budget = BUDGET as u64;
+                c.small_file = 16 << 10;
+                c.analyzer.file_timeout = Duration::from_secs(1);
+                c.watchdog_grace = Duration::from_secs(2);
             },
             Some(seen),
         );
         *lock(&budget) = Some(Arc::clone(&r.ingest.inner.budget));
 
-        // a holds 2 MiB past the watchdog; b (5 MiB, more than the whole budget) waits for
-        // all of it, and the small files go through meanwhile.
+        // a holds 256 KiB past the watchdog; b (640 KiB, more than the whole budget) waits
+        // for all of it, and the small files go through meanwhile.
         r.until("a failed and the small files are done", |r| {
             r.status("a-big.txt").status == "failed"
                 && small.iter().all(|(k, _)| r.status(k).status == "done")
@@ -1703,8 +1711,10 @@ mod tests {
         assert_eq!(r.ingest.inner.budget.in_use(), a.len() as u64);
 
         r.gate.release("a-big.txt");
-        r.until("b is done", |r| r.status("b-bigger.txt").status == "done")
+        r.until("b ended", |r| r.status("b-bigger.txt").status != "pending")
             .await;
+        let s = r.status("b-bigger.txt");
+        assert_eq!(s.status, "done", "b: {:?}", s.last_error);
         r.until("every share is free", |r| {
             r.ingest.inner.budget.in_use() == 0
         })
@@ -1713,7 +1723,7 @@ mod tests {
         let at = |key: &str| charged.iter().find(|(k, _)| k == key).map(|(_, c)| *c);
         assert_eq!(at("a-big.txt"), Some(a.len() as u64));
         // b ran alone, with the whole budget; small files are never charged.
-        assert_eq!(at("b-bigger.txt"), Some(3 * MIB as u64));
+        assert_eq!(at("b-bigger.txt"), Some(BUDGET as u64));
         r.stop().await;
     }
 
