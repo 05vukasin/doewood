@@ -5,7 +5,7 @@
 //! the reason) and keeps retrying until it connects or shuts down.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use doewood_core::PostgresUrl;
 use doewood_model::Backend;
@@ -67,6 +67,7 @@ pub async fn supervise(
 ) {
     let mut backoff = Backoff::new();
     ops.set_not_ready("connecting to the shared Postgres");
+    let t = Instant::now();
     let store = loop {
         let attempt = tokio::select! {
             r = PgStore::connect(&url) => r,
@@ -102,10 +103,11 @@ pub async fn supervise(
         return;
     }
     info!(url = %url, pgvector = store.has_vector(), "shared Postgres connected");
+    ops.step("shared Postgres", t);
     let backend: Arc<dyn Backend> = Arc::new(store);
     slot.send_replace(Some(Arc::clone(&backend)));
+    // Ready now if the API serves; otherwise once it does (see `serve`).
     ops.set_ready();
-    info!("ready");
 
     let mut healthy = true;
     backoff.reset();

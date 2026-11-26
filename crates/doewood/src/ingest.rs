@@ -3,6 +3,7 @@
 //! summaries.
 
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Instant;
 
 use doewood_api::{
     BoxFuture, OnDemand, OnDemandError, OnDemandInput, OnDemandResult, Progress, ReprocessPhase,
@@ -24,20 +25,38 @@ use tokio::sync::watch;
 use tracing::{error, info};
 use uuid::Uuid;
 
-/// Builds ingest: one analyzer (quail engine, OCR when built and its models are there), the
-/// workers, and the LLM queue. `None` when the engine cannot be built; the service then runs
-/// without ingest (and without summaries).
+use crate::ops::OpsState;
+
+/// The analyzer being built, by [`start_analyzer`].
+pub type AnalyzerTask = tokio::task::JoinHandle<Result<Analyzer, String>>;
+
+/// Starts building the analyzer (quail engine, OCR when built and its models are there) on a
+/// blocking thread: checking the OCR models reads and hashes them, and the engine takes a
+/// while too. It needs nothing but the configuration, so it runs while the store opens
+/// (issue #118); [`build`] waits for it.
+pub fn start_analyzer(config: &BootstrapConfig, ops: &Arc<OpsState>) -> AnalyzerTask {
+    let analyzer_config = ingest_config(config).analyzer;
+    let ops = Arc::clone(ops);
+    tokio::task::spawn_blocking(move || {
+        let t = Instant::now();
+        let analyzer = Analyzer::new(&analyzer_config);
+        ops.step("analyzer", t);
+        analyzer
+    })
+}
+
+/// Builds ingest from the analyzer `start_analyzer` started: the workers and the LLM queue.
+/// `None` when the engine cannot be built; the service then runs without ingest (and without
+/// summaries).
 pub async fn build(
     config: &BootstrapConfig,
     store: &Arc<Store>,
     backend: watch::Receiver<Option<Arc<dyn Backend>>>,
     progress: &Arc<Progress>,
+    analyzer: AnalyzerTask,
 ) -> Option<(Ingest, Summaries)> {
     let ingest_config = ingest_config(config);
-    let analyzer_config = ingest_config.analyzer.clone();
-    // Checking the OCR models reads (and hashes) them: off the async threads.
-    let analyzer = tokio::task::spawn_blocking(move || Analyzer::new(&analyzer_config)).await;
-    let analyzer = match analyzer {
+    let analyzer = match analyzer.await {
         Ok(Ok(a)) => Arc::new(a),
         Ok(Err(e)) => {
             error!(error = %e, "the analyzer cannot be built; ingest does not run");

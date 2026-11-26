@@ -520,3 +520,256 @@ async fn read_path_timings() {
         println!("email domains, {docs:>6} documents    before {before:>8.2}  after {after:>8.2}");
     }
 }
+
+/// The plan of `sql` with `args`, one detail per line.
+fn plan_of(conn: &Connection, sql: &str, args: &[Sql]) -> String {
+    let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+    stmt.query_map(params_from_iter(args.iter()), |r| r.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+        .join(" | ")
+}
+
+/// The hot queries whose plans must not change with sampled statistics: (name, SQL, args).
+fn hot_queries() -> Vec<(&'static str, String, Vec<Sql>)> {
+    let text = |s: &str| Sql::Text(s.to_owned());
+    let company = uuid_of(1, 7);
+    let mut sketch: Vec<Sql> = bands(2500)
+        .into_iter()
+        .map(|b| Sql::Integer(band_to_i64(b)))
+        .collect();
+    sketch.push(Sql::Blob(doc_hash(2500).as_bytes().to_vec()));
+    sketch.push(Sql::Integer(100));
+    let party = "SELECT unhex(d.key) FROM edges e JOIN nodes d ON d.id = e.src \
+         WHERE e.dst = ? AND e.kind = 'party' \
+         AND e.state NOT IN ('retracted', 'superseded') AND d.kind = 'document'";
+    vec![
+        (
+            "pending_objects",
+            "SELECT key, etag, size, last_modified FROM objects_seen \
+             INDEXED BY objects_seen_pending \
+             WHERE source_id = ?1 AND status = 'pending' AND (?2 IS NULL OR key > ?2) \
+             ORDER BY key LIMIT 100"
+                .to_owned(),
+            vec![text("s"), Sql::Null],
+        ),
+        (
+            "object_counts",
+            "SELECT status, n FROM object_counts WHERE source_id = ?1".to_owned(),
+            vec![text("s")],
+        ),
+        (
+            "record by hash",
+            "SELECT body_json, versions_json FROM records WHERE blake3 = ?1".to_owned(),
+            vec![Sql::Blob(doc_hash(17).as_bytes().to_vec())],
+        ),
+        (
+            "sketch_candidates",
+            sketch_candidates_sql(bands(2500).len()),
+            sketch,
+        ),
+        (
+            "company_documents",
+            "SELECT DISTINCT n.id, n.kind, n.key, n.props_json FROM edges e \
+             JOIN nodes n ON n.id = e.src \
+             WHERE e.dst = ?1 AND e.kind = 'party' AND n.kind = 'document' \
+             AND e.state NOT IN ('retracted', 'superseded') ORDER BY n.key LIMIT ?2"
+                .to_owned(),
+            vec![text(&company), Sql::Integer(100)],
+        ),
+        (
+            "neighbours",
+            "SELECT e.id, n.id FROM edges e JOIN nodes n ON n.id = e.dst \
+             WHERE e.src = ?1 AND e.kind IN ('party')"
+                .to_owned(),
+            vec![text(&uuid_of(2, 17))],
+        ),
+        (
+            "search by company",
+            format!(
+                "SELECT s.blake3, -bm25(search_fts, 10.0, 1.0) AS score \
+                 FROM search_fts JOIN search_index s ON s.rowid = search_fts.rowid \
+                 WHERE search_fts MATCH ? AND s.blake3 IN ({party}) \
+                 ORDER BY score DESC LIMIT 20"
+            ),
+            vec![text("\"consulting\""), text(&company)],
+        ),
+        (
+            "search by date",
+            "SELECT blake3 FROM search_index WHERE kind = ?1 AND doc_date >= ?2 \
+             ORDER BY doc_date DESC LIMIT 20"
+                .to_owned(),
+            vec![text("invoice"), Sql::Integer(1_700_010_000)],
+        ),
+    ]
+}
+
+/// Issue #118: how long `Store::optimize_all` holds the writer on a store whose statistics
+/// are missing (after a crash or a bulk load), for each `analysis_limit`, and whether the hot
+/// queries keep their plans. `DOEWOOD_BENCH_DOCS` generated documents (default 50,000), with
+/// search rows and one done object each; `DOEWOOD_BENCH_UNCACHED=1` drops the store file from
+/// the page cache before each run (Linux, GNU `dd`). See docs/deploy.md, "Time to ready".
+#[test]
+#[ignore = "a measurement; run by hand"]
+#[allow(clippy::too_many_lines)]
+fn stale_statistics_refresh() {
+    let n: u64 = std::env::var("DOEWOOD_BENCH_DOCS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50_000);
+    let uncached = std::env::var("DOEWOOD_BENCH_UNCACHED").is_ok_and(|v| v == "1");
+    let dir = tempfile::tempdir().unwrap();
+    let pristine = dir.path().join("pristine.db");
+    let key = MasterKey::from_bytes([1; 32]);
+    {
+        let store = Store::open(&pristine, &key).unwrap();
+        let source = store
+            .add_source(&crate::NewSource::new("http://127.0.0.1:9", "docs"), None)
+            .unwrap()
+            .to_string();
+        let mut conn = store.conn();
+        seed(&mut conn, n, n / 10);
+        let t = now();
+        let tx = conn.transaction().unwrap();
+        {
+            let mut search = tx
+                .prepare(
+                    "INSERT INTO search_index (blake3, title, body, kind, doc_date, amount, \
+                     indexed_at) VALUES (?1, ?2, ?3, 'invoice', ?4, ?5, ?6)",
+                )
+                .unwrap();
+            let mut object = tx
+                .prepare(
+                    "INSERT INTO objects_seen (source_id, key, etag, size, blake3, status, \
+                     updated_at) VALUES (?1, ?2, 'e', 4096, ?3, ?4, ?5)",
+                )
+                .unwrap();
+            for i in 1..=n {
+                let h = doc_hash(i);
+                let key = h.as_bytes().as_slice();
+                let body = format!("Consulting services for company {}. ", i % 5000).repeat(30);
+                #[allow(clippy::cast_precision_loss, clippy::cast_possible_wrap)]
+                search
+                    .execute(params![
+                        key,
+                        format!("Invoice {i}"),
+                        body,
+                        1_700_000_000 + i as i64,
+                        (i % 5000) as f64,
+                        t
+                    ])
+                    .unwrap();
+                let status = if i % 50 == 0 { "pending" } else { "done" };
+                object
+                    .execute(params![source, format!("in/doc-{i}.pdf"), key, status, t])
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        // Statistics missing, as after a bulk load or a crash before the close optimized.
+        conn.execute_batch("DROP TABLE IF EXISTS sqlite_stat1; PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+    }
+    let mib = std::fs::metadata(&pristine).unwrap().len() >> 20;
+    println!(
+        "{n} documents, {mib} MiB, page cache: {}",
+        if uncached { "dropped" } else { "warm" }
+    );
+
+    // (label, analysis_limit, stepped): one `PRAGMA optimize = 0x10002` under the writer, as
+    // before, or `Store::optimize_all` (a table at a time, read ahead without the writer).
+    let modes = [
+        ("full, one step", 0, false),
+        ("limit 1000, one step", 1000, false),
+        ("limit 400, one step", 400, false),
+        ("limit 400, a table at a time", 400, true),
+    ];
+    let mut reference: Option<Vec<String>> = None;
+    for (label, limit, stepped) in modes {
+        let path = dir.path().join("run.db");
+        std::fs::copy(&pristine, &path).unwrap();
+        if uncached {
+            let file = path.display().to_string();
+            for args in [
+                vec![
+                    format!("of={file}"),
+                    "oflag=nocache".into(),
+                    "conv=notrunc,fdatasync".into(),
+                ],
+                vec![format!("if={file}"), "iflag=nocache".into()],
+            ] {
+                let ok = std::process::Command::new("dd")
+                    .args(&args)
+                    .args(["count=0", "status=none"])
+                    .status()
+                    .unwrap()
+                    .success();
+                assert!(ok, "dd {args:?}");
+            }
+        }
+        let store = Store::open(&path, &key).unwrap();
+        store
+            .conn()
+            .pragma_update(None, "analysis_limit", limit)
+            .unwrap();
+        let t = Instant::now();
+        let (tables, hold) = if stepped {
+            let done = store.optimize_all().unwrap();
+            for (table, ahead, hold) in &done.steps {
+                println!(
+                    "  {table:<24} read ahead {:>8.1} ms, ANALYZE {:>8.1} ms",
+                    ahead.as_secs_f64() * 1000.0,
+                    hold.as_secs_f64() * 1000.0
+                );
+            }
+            (done.tables, done.longest_hold)
+        } else {
+            store
+                .conn()
+                .execute_batch("PRAGMA optimize = 0x10002;")
+                .unwrap();
+            (0, t.elapsed())
+        };
+        let took = t.elapsed().as_secs_f64() * 1000.0;
+        let conn = store.conn();
+        let plans: Vec<String> = hot_queries()
+            .iter()
+            .map(|(_, sql, args)| plan_of(&conn, sql, args))
+            .collect();
+        println!(
+            "{label:<30}: refresh {took:>8.1} ms, writer held {:>8.1} ms at most{}",
+            hold.as_secs_f64() * 1000.0,
+            if stepped {
+                format!(" ({tables} tables)")
+            } else {
+                String::new()
+            }
+        );
+        match &reference {
+            None => {
+                for ((name, _, _), p) in hot_queries().iter().zip(&plans) {
+                    println!("  {name}: {p}");
+                }
+                reference = Some(plans);
+            }
+            Some(full) => {
+                let mut same = true;
+                for (((name, _, _), p), f) in hot_queries().iter().zip(&plans).zip(full) {
+                    if p != f {
+                        same = false;
+                        println!("  PLAN CHANGED {name}:\n    full:    {f}\n    now:     {p}");
+                    }
+                }
+                if same {
+                    println!("  every hot query keeps its plan");
+                }
+            }
+        }
+        drop(conn);
+        drop(store);
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+    }
+}
