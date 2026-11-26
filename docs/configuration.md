@@ -140,13 +140,31 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
   5 minutes, then they retry with backoff) and find the schema migrated. The version is in
   the `doewood_schema` table. A database migrated by a newer doewood is
   refused (not ready) until this one is upgraded.
-- **Schema 7** (issue #102: the search index `search_tsv` gets `gin_pending_list_limit =
-  256` kB, and its pending list is merged once) is the current version. It changes no table
-  and no data, and the instance's own SQLite file is unchanged; as with every schema, older
-  instances refuse it, so all instances are upgraded together (below). See
-  [deploy.md](deploy.md#search-and-the-gin-pending-list-issue-102). **Schema 6** (the registry
+- **Schema 8** (issue #121: records are stored as their canonical JSON text, in the new
+  column `records.body`, lz4-compressed where the server has lz4) is the current version. The
+  migration only adds the column, makes `records.record` (jsonb) nullable and adds a small
+  partial index, so it is quick on a big table. Rows written before keep their jsonb until a
+  started instance converts them in the background, in batches of 100 rows, each its own short
+  transaction (resumable: a stop loses nothing and the next start goes on; instances starting
+  together share the work); reads return the same bytes from either form meanwhile. The log
+  shows `converting stored records to text` and then `stored records converted to text`. As
+  with every schema, older instances refuse it and cannot read the converted rows, so **all
+  instances are upgraded together** (below). The instance's own SQLite file is unchanged. See
+  [deploy.md](deploy.md#records-as-text-on-postgres-issue-121) and
+  [ADR 0003](adr/0003-records-as-canonical-text.md). **Down path** (by hand, with every
+  instance stopped): `UPDATE records SET record = body::jsonb WHERE record IS NULL` (in
+  batches of a few thousand rows by `blake3` on a big table), then
+  `DROP INDEX records_body_pending; ALTER TABLE records DROP COLUMN body, ALTER COLUMN record
+  SET NOT NULL; DELETE FROM doewood_schema WHERE version = 8;`, then start the older binary.
+  An older binary that meets schema 8 refuses it and stays not ready. If the down path is
+  skipped and the schema row is deleted anyway, the older binary fails to read every converted
+  row, because its `record` is NULL. **Schema 7** (issue #102: the
+  search index `search_tsv` gets `gin_pending_list_limit = 256` kB, and its pending list is
+  merged once; no table or data changed, see
+  [deploy.md](deploy.md#search-and-the-gin-pending-list-issue-102)) was the one before.
+  **Schema 6** (the registry
   delta feeds of issue #49: the new table `registry_feeds`, one row per feed with its lease,
-  cursor and next run, and an index on company aliases in byte order) was the one before. The
+  cursor and next run, and an index on company aliases in byte order) came before that. The
   instance's own SQLite file went to schema 9 with the same table. **Schema 5** (the enrichment proposals of issue #52: the new
   table `company_proposals`, and the `merge_proposals` and `registry_proposals` lists of
   company props moved into it and removed from the props) was the one before. Its move is part of the migration: it

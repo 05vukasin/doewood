@@ -406,7 +406,8 @@ Big files: 200 small documents (PDF, DOCX, TXT, XLSX) plus a 120k-row XLSX, a 19
 
 The same big-file run (204 records, `f8c6e3a`, Postgres 17). Sizes are the compact JSON a
 record is stored as (SQLite stores this text as it is, in `records.body_json`; a separate SQLite
-run was not made) and what Postgres stores in `records.record` (`pg_column_size`, TOASTed).
+run was not made) and what Postgres stored in `records.record` (`pg_column_size`, TOASTed;
+jsonb until schema 8, text since, see [below](#records-as-text-on-postgres-issue-121)).
 
 | record | JSON, median | JSON, largest | Postgres stored, median |
 |---|---|---|---|
@@ -441,13 +442,68 @@ run was not made) and what Postgres stores in `records.record` (`pg_column_size`
   *Write* is building the stored text (before: the tree, then its text); *held* is what stays
   while the graph and search are written (before: the tree). *Read* is a SQLite record read and
   `DocFacts` (before: the tree, and every fact read into a quail value). The write peak is a
-  scratch buffer per nesting level for objects whose keys do not come sorted. Postgres still
-  reads jsonb into a `Value` and writes the canonical text from it (the tree is dropped before
-  the record is returned).
+  scratch buffer per nesting level for objects whose keys do not come sorted. Postgres read
+  jsonb into a `Value` and wrote the canonical text from it until schema 8; it now stores
+  and returns the text as SQLite does (issue #121).
 - **TOAST:** jsonb is 1.28 times the JSON text before compression; `pglz` (the default) stores
   37 % of the text (2.08 MB for these 204 records, 12.7 KB a record with the index). `lz4`
   stored 9 % more (2.27 MB) but wrote the records 45 % faster (98 against 179 ms) and read them
-  13 % faster. Not worth a change for space; the default stays.
+  13 % faster. Not worth a change for space; the default stayed for jsonb. Since schema 8 the
+  record is text, and its column uses lz4 (below).
+
+### Records as text on Postgres (issue #121)
+
+Until schema 8 Postgres kept a record as jsonb. Every read turned it back into text on the
+server (jsonb's binary wire format is that text too, so reading it binary or as `::text`
+costs the same), and doewood parsed that text into a `Value` and wrote the canonical text
+again. Under heavy API reads this was 92-95 % of the database's time. Since schema 8 the
+canonical text that ingest writes is stored as it is (`records.body`) and sent back
+unchanged; only `fact_texts` (the enrichment's e-mail domains) looks inside a record, and it
+parses `body` as jsonb on the fly, as SQLite parses `body_json` (0.16 ms a record).
+
+Measured on the ~1,840 records of a `throughput` run (about 15.5 KB of canonical JSON each),
+Postgres 17 on an idle server, a page of 100 by key (median of 3 rounds of 17 pages):
+
+| stored as | database time per page | stored per record (column / table with index) | server time to store a record |
+|---|---|---|---|
+| jsonb (before) | 12.5 ms | 6,730 / 8,481 bytes | 0.48 ms (parse and pglz) |
+| jsonb, read as `record::text` | 13.5 ms | same | same |
+| text, pglz | 3.6 ms | 5,486 / 6,473 bytes | 0.24 ms |
+| **text, lz4 (chosen)** | **2.4 ms** | 5,996 / 7,065 bytes | 0.05 ms |
+| jsonb and text side by side | as text | 13,752 bytes (table) | both |
+
+- **Text, not jsonb next to it:** no query needs jsonb's operators often enough to store the
+  record twice; lz4 is chosen for its reads and writes, at 9 % more space than pglz and still
+  17 % less than the jsonb was. A server built without lz4 keeps pglz (the migration notes it).
+- **Same bytes out:** the stored text is the canonical text, so the API returns what it did.
+  Two values where jsonb did not give the text back now come back as written, as on SQLite:
+  `-0.0` (jsonb's numeric has no negative zero, so it read as `0.0`) and numbers near
+  `f64::MAX` (jsonb wrote them as 309 digits, which doewood could not read back). A record
+  with `\u0000` is still refused, as jsonb refused it, so every stored record parses as jsonb.
+- **Under load** (`throughput`, release, 2000 files, 4 workers, 4 readers, 8 clients asking
+  for a `ListRecords` page of 100 every millisecond; `main` `056e4b2` once, this change twice):
+
+  | | files/s | `ListRecords`: pages / DB time per page / mean | all DB time | record upsert, DB |
+  |---|---|---|---|---|
+  | before (jsonb) | 60 | 2,725 / 25.3 ms / 95 ms | 73.3 s (94 % `ListRecords`) | 0.66 ms |
+  | after (text, lz4) | 110, 114 | 3,889-3,927 / 5.3-7.5 ms / 33-35 ms | 23.6-32.6 s | 0.18-0.19 ms |
+
+  Ingest runs 1.9 times as fast while the API reads 43 % more pages, each in a third of the
+  time. What is left of a page's database time is reading and decompressing 1.5 MB.
+- **Upgrade:** the migration adds `body`, makes `record` nullable and adds the partial
+  index `records_body_pending` (the rows still to convert), so it takes seconds even on a big
+  table, though the index build reads the table once under the migration's lock. **All
+  instances are upgraded together**: an older instance refuses schema 8, and it could not read
+  a converted row. After a start, an instance converts the rows from before in the background:
+  100 rows per transaction, taken with `FOR UPDATE SKIP LOCKED` (instances share the work), a
+  20 ms pause between batches, the text the reads gave before, `updated_at` untouched. It is
+  resumable: a stop or a failure loses nothing, and the next start goes on. Until a row is
+  converted it reads from its jsonb, with the same bytes; a changed record is converted when it
+  is written. The log shows `converting stored records to text` (about every 10,000 rows) and
+  `stored records converted to text`. Space of the old jsonb is reused after autovacuum (a
+  `VACUUM FULL records` gives it back to the disk, but locks the table). The decision is
+  [ADR 0003](adr/0003-records-as-canonical-text.md); the down path is in
+  [configuration.md](configuration.md#the-shared-postgres).
 
 ### The instance store's read-only connections (issue #83)
 
@@ -986,8 +1042,9 @@ Measured with `throughput` and `api_load` as above (release build, 4 vCPU, `main
   run to run noise. (A first version woke the waiting reads while still holding the pool's
   lock: 7% fewer calls/s at 100 clients. They are now woken after it is released.)
 - **Postgres is unchanged** (the readers are SQLite's). Its limit is the database's time on
-  the API's pages; serving `ListRecords` without the `jsonb` round trip (stored text next to
-  the `jsonb`, for example) is the next step if that load is real.
+  the API's pages, the `jsonb` turned back into text. Since schema 8 records are stored as
+  text and the same load runs at 110 to 114 files/s
+  ([records as text](#records-as-text-on-postgres-issue-121)).
 
 ### Time to ready (issue #118)
 
