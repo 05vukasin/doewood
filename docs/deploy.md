@@ -1342,7 +1342,9 @@ What the numbers say:
   requested by `max_wal_size` 1 GB). Issue #141: see
   [Postgres WAL on a big corpus](#postgres-wal-on-a-big-corpus-issue-141).
 - **`CompanyDocuments` returns every document of the company** (12,504 nodes, 150 ms on
-  either store): linear, but unbounded; pagination is #112.
+  either store): linear, but unbounded. Since #112 it pages (50 by default, at most 1000):
+  the first page of a 12,000-document company takes 0.4 ms on SQLite and 1.2 ms on Postgres
+  (docs/api.md, [Pages of Neighbours and CompanyDocuments](api.md#pages-of-neighbours-and-companydocuments)).
 - **`ListRecords`, `GetNode` and `Neighbours` do not grow** beyond their result size; Postgres
   `ListRecords` is its `jsonb` round trip (#121).
 - **Memory does not follow the store**: an idle instance on the 210k store holds 100 to 120
@@ -1390,16 +1392,16 @@ Where the WAL of one document goes, default settings (`max_wal_size` 1 GB,
   more WAL, the more checkpoints, and the more images again.
 - **Without images a document is about 25 KB** at every size (between two checkpoints:
   26.6 KB before, 24.6 KB after this change), a third of it the record itself.
-- **What doewood changed (schema 10):** `sketch_band_sizes` (issue #148) had a row for every
+- **What doewood changed (schema 11):** `sketch_band_sizes` (issue #148) had a row for every
   band key, and 92% to 99.9% of the keys belong to one document: each new document with a
   sketch inserted about 29 rows and index entries on random pages, 15% of the WAL. Since
-  schema 10 a bucket gets its row when its second document arrives, with the exact count
+  schema 11 a bucket gets its row when its second document arrives, with the exact count
   (the triggers take a transaction advisory lock per band, in order, so documents adding the
   same new band at once are counted exactly; a statement of more than 64 bands, such as a
   delete of many records, takes one lock for all bands instead); a bucket of one has none, which the candidate
   query reads as small (`similar_max_bucket` is at least 10). The bands, the edges and every
   row the API reads are the same. The rows of single documents an older schema wrote stay,
-  with their exact count (at 200k: 2.0 million rows, 220 MB; a store started on schema 10
+  with their exact count (at 200k: 2.0 million rows, 220 MB; a store started on schema 11
   does not make them).
 - **What doewood did not change:** the random-keyed indexes are what the lookups need
   (candidates by band, documents by hash), and the stored data stays the same; no no-op
@@ -1414,8 +1416,8 @@ Before and after, default settings:
 | 175k to 200k: WAL per document / checkpoints / files/s | 147.0 KB / 6 / 329 | 104.8 KB / 4 / 340 |
 | WAL records per document | 200 to 227 | 157 to 179 |
 
-(The 175k row is the before store upgraded to schema 10: its old size rows stay. Grown with
-schema 10 from 125k on, the same window wrote 106.3 KB a document.)
+(The 175k row is the before store upgraded to schema 11: its old size rows stay. Grown with
+schema 11 from 125k on, the same window wrote 106.3 KB a document.)
 
 **Server settings for a big corpus.** Most of what is left is full-page images, so the
 server's checkpoint settings decide the WAL. With this change, from the same 175k store,

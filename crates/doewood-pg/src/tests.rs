@@ -12,6 +12,7 @@ use crate::PgStore;
 
 mod band_sizes;
 mod companies_due;
+mod graph_pages;
 mod list_records;
 mod read_paths;
 mod record_text;

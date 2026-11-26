@@ -1,4 +1,4 @@
--- doewood shared store, schema 10: `sketch_band_sizes` keeps only the buckets of two or more
+-- doewood shared store, schema 11: `sketch_band_sizes` keeps only the buckets of two or more
 -- documents (issue #141). New trigger functions; no data changes. Older instances refuse this
 -- schema, so every instance is upgraded together.
 

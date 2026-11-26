@@ -1,4 +1,4 @@
-//! `sketch_band_sizes` since schema 10 (issue #141): a row only for a bucket of two or more
+//! `sketch_band_sizes` since schema 11 (issue #141): a row only for a bucket of two or more
 //! documents, with the bucket's exact count, also when documents add the same new band at
 //! the same moment.
 

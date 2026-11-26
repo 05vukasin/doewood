@@ -1,7 +1,10 @@
 //! `GraphService`: nodes, neighbours and a company's documents, the merge log (in
 //! `merges`) and enrichment proposals (in `proposals`).
 
-use doewood_model::{NODE_KEY_MAX_LEN, NeighbourQuery, NodeKind};
+use doewood_model::{
+    EdgeCursor, EdgeKind, NODE_KEY_MAX_LEN, NeighbourQuery, NodeKind, RECORDS_MAX_LIMIT,
+    RECORDS_PAGE_BYTES, neighbour_page_bytes, node_page_bytes, page_full, records_limit,
+};
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
@@ -25,6 +28,22 @@ impl Api {
             .map_err(error::model)?
             .ok_or_else(|| Status::not_found(format!("node {id} does not exist")))
     }
+}
+
+/// Checks `page_size` and parses `page_token` as `ListRecords` does (issue #112): at most
+/// [`RECORDS_MAX_LIMIT`], and a token from a previous page.
+fn page(v: &mut Violations, page_size: u32, page_token: &str) -> Option<EdgeCursor> {
+    if page_size > RECORDS_MAX_LIMIT {
+        v.add("page_size", format!("at most {RECORDS_MAX_LIMIT}"));
+    }
+    if page_token.is_empty() {
+        return None;
+    }
+    let parsed = page_token.parse().ok();
+    if parsed.is_none() {
+        v.add("page_token", "not a token from a previous page");
+    }
+    parsed
 }
 
 fn node_kind(v: &mut Violations, field: &str, value: i32) -> Option<NodeKind> {
@@ -110,6 +129,7 @@ impl GraphService for Api {
         }
         let node_kind = node_kind(&mut v, "node_kind", req.node_kind);
         let at = validate::date(&mut v, "at", &req.at);
+        let after = page(&mut v, req.page_size, &req.page_token);
         v.check()?;
         let Some(id) = id else {
             return Err(Status::invalid_argument("node_id: required"));
@@ -121,10 +141,11 @@ impl GraphService for Api {
             at,
             include_inactive: req.include_inactive,
         };
+        let limit = records_limit(req.page_size);
         let found = self
             .state
             .backend()?
-            .neighbours(id, &query)
+            .neighbours_page(id, &query, after.as_ref(), limit, RECORDS_PAGE_BYTES)
             .await
             .map_err(error::model)?;
         // One store call when there is something to list (issue #124): the node is read only
@@ -132,6 +153,14 @@ impl GraphService for Api {
         if found.is_empty() {
             self.node_or_404(id).await?;
         }
+        // A page that ended at its size or byte budget may have a next one; the token is the
+        // last edge's place in the order (opaque to clients).
+        let next_page_token = match found.last() {
+            Some(last) if page_full(&found, limit, RECORDS_PAGE_BYTES, neighbour_page_bytes) => {
+                EdgeCursor::of(&last.edge).to_string()
+            }
+            _ => String::new(),
+        };
         Ok(Response::new(NeighboursResponse {
             neighbours: found
                 .iter()
@@ -140,6 +169,7 @@ impl GraphService for Api {
                     node: Some(convert::node(&n.node)),
                 })
                 .collect(),
+            next_page_token,
         }))
     }
 
@@ -147,16 +177,22 @@ impl GraphService for Api {
         &self,
         request: Request<CompanyDocumentsRequest>,
     ) -> Result<Response<CompanyDocumentsResponse>, Status> {
+        let req = request.get_ref();
         let mut v = Violations::default();
-        let id = validate::uuid(&mut v, "company_id", &request.get_ref().company_id);
+        let id = validate::uuid(&mut v, "company_id", &req.company_id);
+        let after = page(&mut v, req.page_size, &req.page_token);
+        if after.is_some_and(|a| a.kind != EdgeKind::Party) {
+            v.add("page_token", "not a token from a previous page");
+        }
         v.check()?;
         let Some(id) = id else {
             return Err(Status::invalid_argument("company_id: required"));
         };
+        let limit = records_limit(req.page_size);
         let docs = self
             .state
             .backend()?
-            .company_documents(id)
+            .company_documents_page(id, after.as_ref(), limit, RECORDS_PAGE_BYTES)
             .await
             .map_err(error::model)?;
         // One store call when the company has documents (issue #124): documents come from
@@ -174,8 +210,19 @@ impl GraphService for Api {
                 v.check()?;
             }
         }
+        let next_page_token = match docs.last() {
+            Some(last)
+                if page_full(&docs, limit, RECORDS_PAGE_BYTES, |d| {
+                    node_page_bytes(&d.node)
+                }) =>
+            {
+                last.edge.to_string()
+            }
+            _ => String::new(),
+        };
         Ok(Response::new(CompanyDocumentsResponse {
-            documents: docs.iter().map(convert::node).collect(),
+            documents: docs.iter().map(|d| convert::node(&d.node)).collect(),
+            next_page_token,
         }))
     }
 

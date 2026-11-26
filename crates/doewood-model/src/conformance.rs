@@ -17,11 +17,12 @@ use uuid::Uuid;
 
 use crate::{
     Backend, Blake3, CACHE_KEY_MAX_LEN, CACHE_MAX_BODY, CacheRow, Direction, DismissRequest,
-    DismissalQuery, DueCompany, DueReason, Edge, EdgeKind, EdgeSource, EdgeState, Error, IconRow,
-    MergeActor, MergeActorKind, MergeOp, MergeQuery, MergeRequest, NeighbourQuery, Node, NodeKind,
-    ObjectLocation, OwnedAlias, ProposalKind, ProposalQuery, ProposalReason, ProposalRequest,
-    ProposalState, PropsPatch, PutOutcome, ResolveRequest, SearchDoc, SearchQuery, SourceKey,
-    SplitRequest, StepVersions, StoredEdge, StoredIcon, UndoRequest, merged_into,
+    DismissalQuery, DueCompany, DueReason, Edge, EdgeCursor, EdgeKind, EdgeSource, EdgeState,
+    Error, IconRow, MergeActor, MergeActorKind, MergeOp, MergeQuery, MergeRequest, Neighbour,
+    NeighbourQuery, Node, NodeKind, ObjectLocation, OwnedAlias, ProposalKind, ProposalQuery,
+    ProposalReason, ProposalRequest, ProposalState, PropsPatch, PutOutcome, ResolveRequest,
+    SearchDoc, SearchQuery, SourceKey, SplitRequest, StepVersions, StoredEdge, StoredIcon,
+    UndoRequest, merged_into,
 };
 
 /// Runs every check.
@@ -32,6 +33,7 @@ use crate::{
 pub async fn run<B: Backend + ?Sized>(a: &B, b: &B) {
     records(a).await;
     graph(a).await;
+    graph_pages(a).await;
     props_patches(a, b).await;
     dated_edges(a).await;
     locations(a).await;
@@ -338,8 +340,9 @@ pub async fn graph<B: Backend + ?Sized>(s: &B) {
     );
 
     let docs = s.company_documents(acme).await.unwrap();
-    let mut expected = vec![(d1, hash(11).to_hex()), (d2, hash(12).to_hex())];
-    expected.sort_by(|x, y| x.1.cmp(&y.1));
+    // In the order of their party edges: both undated, `e1` written first (ids are UUIDv7).
+    assert!(e1 < e2);
+    let expected = vec![(d1, hash(11).to_hex()), (d2, hash(12).to_hex())];
     assert_eq!(
         docs.iter()
             .map(|n| (n.id, n.key.clone()))
@@ -421,6 +424,239 @@ async fn race_writer<B: Backend + ?Sized>(s: &B, node: Uuid, who: &str, rounds: 
             .push_capped(&["seen"], json!({"who": who, "i": i}), &["who"], 10);
         s.update_props(node, &patch).await.unwrap().expect("node");
     }
+}
+
+/// The documented order of [`crate::GraphStore::neighbours`]: kind name, `valid_from`
+/// (undated first), id.
+fn neighbour_order(n: &Neighbour) -> (&'static str, Option<Date>, Uuid) {
+    (n.edge.edge.kind.as_str(), n.edge.edge.valid_from, n.edge.id)
+}
+
+/// Walks [`crate::GraphStore::neighbours_page`] to its end, `limit` and `max_bytes` a page,
+/// through the text of each page's last position (the API's page token).
+async fn walk_neighbours<B: Backend + ?Sized>(
+    s: &B,
+    node: Uuid,
+    q: &NeighbourQuery,
+    limit: u32,
+    max_bytes: usize,
+) -> Vec<Neighbour> {
+    let (mut all, mut after): (Vec<Neighbour>, Option<EdgeCursor>) = (Vec::new(), None);
+    loop {
+        let page = s
+            .neighbours_page(node, q, after.as_ref(), limit, max_bytes)
+            .await
+            .unwrap();
+        assert!(page.len() <= crate::records_limit(limit) as usize);
+        let full = crate::page_full(&page, limit, max_bytes, crate::neighbour_page_bytes);
+        all.extend(page);
+        if !full {
+            return all;
+        }
+        let text = EdgeCursor::of(&all.last().unwrap().edge).to_string();
+        after = Some(text.parse().unwrap());
+    }
+}
+
+/// Issue #112: pages of `neighbours` and `company_documents`, walked to the end, return the
+/// whole list once each, in the documented order, at every page size and byte budget, for
+/// every direction and filter.
+///
+/// # Panics
+///
+/// When the backend misbehaves.
+#[allow(clippy::too_many_lines)]
+pub async fn graph_pages<B: Backend + ?Sized>(s: &B) {
+    let co = s
+        .upsert_node(NodeKind::Company, "pages-co", &json!({"name": "Pages"}))
+        .await
+        .unwrap();
+    let parent = s
+        .upsert_node(NodeKind::Company, "pages-parent", &json!({}))
+        .await
+        .unwrap();
+    let sub = s
+        .upsert_node(NodeKind::Company, "pages-sub", &json!({}))
+        .await
+        .unwrap();
+    let mut docs = Vec::new();
+    for i in 0..23u32 {
+        let d = s
+            .upsert_node(
+                NodeKind::Document,
+                &format!("{:064x}", 0x1120_0000 + i),
+                &json!({"n": i, "pad": "x".repeat(usize::try_from(i).unwrap() * 10)}),
+            )
+            .await
+            .unwrap();
+        // Undated, or dated on one of three days, so that the order mixes both.
+        let from = match i % 4 {
+            0 => None,
+            k => Some(day(2020 + i32::try_from(k).unwrap(), 1, 1)),
+        };
+        s.upsert_edge(
+            &Edge::new(d, co, EdgeKind::Party, EdgeSource::Document)
+                .with_props(json!({"role": "buyer"}))
+                .valid(from, None),
+        )
+        .await
+        .unwrap();
+        // Some documents have a second party edge, dated earlier or later.
+        if i % 3 == 0 {
+            s.upsert_edge(
+                &Edge::new(d, co, EdgeKind::Party, EdgeSource::Registry)
+                    .with_props(json!({"role": "supplier"}))
+                    .valid(Some(day(2019 + i32::try_from(i % 5).unwrap(), 6, 1)), None),
+            )
+            .await
+            .unwrap();
+        }
+        // One retracted: it does not count, its document still does through its other edge.
+        if i == 9 {
+            s.upsert_edge(
+                &Edge::new(d, co, EdgeKind::Party, EdgeSource::Document)
+                    .with_props(json!({"role": "buyer"}))
+                    .valid(from, None)
+                    .with_state(EdgeState::Retracted),
+            )
+            .await
+            .unwrap();
+        }
+        docs.push(d);
+    }
+    // Edges of other kinds, both ways, and a document that cites another.
+    for (src, dst, kind) in [
+        (parent, co, EdgeKind::ParentOf),
+        (co, sub, EdgeKind::ParentOf),
+        (sub, co, EdgeKind::SubsidiaryOf),
+        (co, parent, EdgeKind::SubsidiaryOf),
+        (docs[1], docs[0], EdgeKind::Cites),
+    ] {
+        s.upsert_edge(&Edge::new(src, dst, kind, EdgeSource::Registry))
+            .await
+            .unwrap();
+    }
+
+    let kinds_sets: [&[EdgeKind]; 4] = [
+        &[],
+        &[EdgeKind::Party],
+        &[EdgeKind::ParentOf, EdgeKind::Party],
+        &[EdgeKind::SubsidiaryOf, EdgeKind::Cites],
+    ];
+    for node in [co, docs[0], docs[1], parent] {
+        for direction in [Direction::Out, Direction::In, Direction::Both] {
+            for kinds in kinds_sets {
+                for (node_kind, include_inactive) in [
+                    (None, false),
+                    (Some(NodeKind::Document), false),
+                    (None, true),
+                ] {
+                    let q = NeighbourQuery {
+                        direction,
+                        edge_kinds: kinds.to_vec(),
+                        node_kind,
+                        at: None,
+                        include_inactive,
+                    };
+                    let whole = s.neighbours(node, &q).await.unwrap();
+                    let mut sorted = whole.clone();
+                    sorted.sort_by(|x, y| neighbour_order(x).cmp(&neighbour_order(y)));
+                    assert_eq!(whole, sorted, "documented order, {q:?}");
+                    let ids: BTreeSet<Uuid> = whole.iter().map(|n| n.edge.id).collect();
+                    assert_eq!(ids.len(), whole.len(), "each edge once, {q:?}");
+                    for (limit, max_bytes) in [
+                        (0, usize::MAX),
+                        (1, usize::MAX),
+                        (4, usize::MAX),
+                        (1000, usize::MAX),
+                        (1000, 1),
+                    ] {
+                        let walked = walk_neighbours(s, node, &q, limit, max_bytes).await;
+                        assert_eq!(walked, whole, "{q:?}, limit {limit}, bytes {max_bytes}");
+                    }
+                }
+            }
+        }
+    }
+    let q = NeighbourQuery {
+        direction: Direction::In,
+        edge_kinds: vec![EdgeKind::Party],
+        ..NeighbourQuery::default()
+    };
+    // 23 documents, 8 with a second party edge, one edge retracted.
+    assert_eq!(s.neighbours(co, &q).await.unwrap().len(), 23 + 8 - 1);
+    // A byte budget ends a page with the neighbour that reaches it.
+    let page = s.neighbours_page(co, &q, None, 1000, 300).await.unwrap();
+    let bytes: Vec<usize> = page.iter().map(crate::neighbour_page_bytes).collect();
+    assert!(bytes.iter().sum::<usize>() >= 300);
+    assert!(bytes[..bytes.len() - 1].iter().sum::<usize>() < 300);
+    // A position past every edge, or of a kind not asked for, gives an empty page.
+    let last = EdgeCursor {
+        kind: EdgeKind::TradingNameOf,
+        valid_from: None,
+        id: Uuid::max(),
+    };
+    assert!(
+        s.neighbours_page(co, &NeighbourQuery::default(), Some(&last), 10, usize::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Company documents: each once, in the order of its first live party edge.
+    let whole = s.company_documents(co).await.unwrap();
+    let mut first: Vec<(Option<Date>, Uuid, Uuid)> = Vec::new();
+    for n in s.neighbours(co, &q).await.unwrap() {
+        if !first.iter().any(|f| f.2 == n.node.id) {
+            first.push((n.edge.edge.valid_from, n.edge.id, n.node.id));
+        }
+    }
+    assert_eq!(
+        whole.iter().map(|n| n.id).collect::<Vec<_>>(),
+        first.iter().map(|f| f.2).collect::<Vec<_>>()
+    );
+    assert_eq!(whole.len(), docs.len());
+    assert_eq!(
+        s.company_documents_first(co, 7).await.unwrap(),
+        whole[..7].to_vec()
+    );
+    for (limit, max_bytes) in [
+        (0, usize::MAX),
+        (1, usize::MAX),
+        (5, usize::MAX),
+        (1000, usize::MAX),
+        (1000, 1),
+        (1000, 400),
+    ] {
+        let (mut walked, mut after): (Vec<Node>, Option<EdgeCursor>) = (Vec::new(), None);
+        loop {
+            let page = s
+                .company_documents_page(co, after.as_ref(), limit, max_bytes)
+                .await
+                .unwrap();
+            for d in &page {
+                let f = first.iter().find(|f| f.2 == d.node.id).unwrap();
+                assert_eq!((d.edge.valid_from, d.edge.id), (f.0, f.1), "its first edge");
+                assert_eq!(d.edge.kind, EdgeKind::Party);
+            }
+            let full =
+                crate::page_full(&page, limit, max_bytes, |d| crate::node_page_bytes(&d.node));
+            if let Some(last) = page.last() {
+                after = Some(last.edge.to_string().parse().unwrap());
+            }
+            walked.extend(page.into_iter().map(|d| d.node));
+            if !full {
+                break;
+            }
+        }
+        assert_eq!(walked, whole, "limit {limit}, bytes {max_bytes}");
+    }
+    assert!(
+        s.company_documents_page(Uuid::now_v7(), None, 10, usize::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// Partial prop updates (issue #51): `ensure_node` never replaces props, a patch changes only

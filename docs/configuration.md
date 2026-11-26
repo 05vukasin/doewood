@@ -141,13 +141,30 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
   5 minutes, then they retry with backoff) and find the schema migrated. The version is in
   the `doewood_schema` table. A database migrated by a newer doewood is
   refused (not ready) until this one is upgraded.
-- **Schema 10** (issue #141: the triggers behind `sketch_band_sizes` keep a row only for a
+- **Schema 11** (issue #141: the triggers behind `sketch_band_sizes` keep a row only for a
   band bucket of two or more documents, which cut the WAL of ingest by 12 to 29%; new
-  functions only, no table or data changed, see
-  [deploy.md](deploy.md#postgres-wal-on-a-big-corpus-issue-141)) is the current version.
-  **Schema 9** (issue #148: the new table `sketch_band_sizes` and its triggers, filled from
-  `sketch_bands` once) was the one before. Both migrate in seconds; schema 9 reads
-  `sketch_bands` once. As with every schema, **all instances are upgraded together**.
+  functions only, no table or data changed, migrates in seconds, see
+  [deploy.md](deploy.md#postgres-wal-on-a-big-corpus-issue-141)) is the current version. As
+  with every schema, **all instances are upgraded together**.
+- **Schema 10** (issue #112: `edges_by_dst` is rebuilt as `(dst, kind, coalesce(valid_from,
+  '-infinity'), id)`, the order `Neighbours` and `CompanyDocuments` page in; see
+  [api.md](api.md#pages-of-neighbours-and-companydocuments)) was the one before. The
+  migration drops and builds one index on `edges`; no data changes. On the issue #127
+  `scale` store at 200,000 documents (997,834 edges, `edges` 223 MB) the build took 0.8 to
+  1.0 s. For that long the migration's transaction holds `edges` exclusively: reads and
+  writes of edges by any instance wait, other starting instances wait on the migration lock,
+  and the migrating instance is not ready until it commits. Short enough that the index is
+  not built `CONCURRENTLY` (which cannot run in the migration's transaction). **Down path:** `DROP INDEX edges_by_dst;
+  CREATE INDEX edges_by_dst ON edges (dst, kind); DELETE FROM doewood_schema WHERE version
+  = 10;`. The instance's own SQLite file went to schema 12 with the same index (`ifnull(valid_from,
+  -2147483648)`). On the same store in SQLite (a 5.0 GiB file) the index takes about 8 s, but
+  the runner's foreign key check over the whole file, which it makes before each migration
+  commits, took 70 to 310 s (mostly disk reads; it depends on how much of the file the OS has
+  cached). The migration runs when the store opens at start, so on a store this size the
+  instance starts and becomes ready 1.5 to 5.5 minutes later; nothing else uses the file
+  meanwhile. `migration_timings` in `crates/doewood-store/src/migrate.rs` (ignored) times
+  both parts on a copy of a store. Schema 9 (issue #148: the `similar_to` stop band, `sketch_band_sizes`) came
+  before it.
 - **Schema 8** (issue #121: records are stored as their canonical JSON text, in the new
   column `records.body`, lz4-compressed where the server has lz4) came before that. The
   migration only adds the column, makes `records.record` (jsonb) nullable and adds a small
