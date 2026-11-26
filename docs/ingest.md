@@ -516,3 +516,20 @@ DOEWOOD_BENCH_ROWS=200000 cargo test -p doewood-ingest --test pipeline -- --igno
 | after (one deadline per file) | 1.8 s | 1548 MiB | `failed`: `sheet.read@1: file refused: reading took longer than the time limit` |
 
 The RSS before the run (574 MiB) is the test's own copies of the files.
+
+## Known copies, measured
+
+`known_copies_skip_the_get_object` in `tests/minio_postgres.rs` (issue #131), release build,
+MinIO and Postgres in containers on an internal Docker network, 2 workers. One 256 MiB object
+is ingested first, then a second source with 8 copies of it under new keys
+(`DOEWOOD_KNOWN_COPIES=8 DOEWOOD_KNOWN_COPIES_MIB=256`). Times run from starting the copies'
+scanner to the last copy being through (scan, HEAD or GetObject, hash, graph):
+
+| `skip_known_copies` | GetObject bytes | time | known copies |
+|---|---|---|---|
+| off | 2048 MiB | 2.01 s | 0 |
+| on | 0 MiB | 0.11 s | 8 |
+
+With the setting on, each copy costs one HEAD and one record read. With it off, each copy is a
+full download and hash, and its 256 MiB share of the memory budget is held for that time. Both
+runs end with the same statuses, hashes and `located_at` locations.
