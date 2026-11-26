@@ -1026,7 +1026,7 @@ impl Ingest {
         // no read of our own writes: `inflight` holds the key until its attempt is recorded.
         let t = Instant::now();
         let k = key.to_owned();
-        let (status, source, settings) = self
+        let (prior, source, settings) = self
             .db(move |s| {
                 s.snapshot(|s| {
                     Ok((
@@ -1038,7 +1038,7 @@ impl Ingest {
             })
             .await?;
         let mut t = self.stage(t, |s| &mut s.store);
-        if status.is_some_and(|st| st.etag.as_deref() == etag && st.status != "pending") {
+        if prior.is_some_and(|st| st.etag.as_deref() == etag && st.status != "pending") {
             return Ok(None);
         }
         let Some(source) = source else {

@@ -880,6 +880,34 @@ takes traffic (on average half a period after ready). The chart's readiness prob
 taken out, as before. The liveness probe stays at every 10 s with 6 failures: the process
 answers `/healthz` from the start, and a slow start never needs more.
 
+### The instance store per file (issue #128)
+
+Each file made three blocking calls to the instance store: its ingest status, its source
+and the runtime settings, and the finish. The status was read on the writer, so it waited
+behind the scanner's `record_objects` and the other workers' `finish_object` commits. Now
+each attempt reads the status, the source and the settings in one read transaction on a
+read-only connection (an instance read, so it keeps its priority over the API's, #109); the
+settings are still read per file, and the finish stays on the writer. The other read-only
+`objects_seen` reads (`seen_objects`, `seen_object`, `live_object_count`,
+`pending_objects`, `ingested_objects`) moved to the readers too. None needs to see its own
+uncommitted writes: every write commits before it returns, and `inflight` holds a key until
+its attempt is recorded, so the status a worker reads is the committed one.
+
+Measured with `throughput` (release build, `DOEWOOD_BENCH_FILES=2000 DOEWOOD_BENCH_JOBS=4
+DOEWOOD_BENCH_READERS=4`: the store on disk with 4 readers, one API client asking for a
+`ListRecords` page of 100 every millisecond; `main` at `af345f7` against this change, the
+two test binaries run alternately, 3 runs each):
+
+| | files/s | store stage per file | writer lock wait mean / p99 | `ListRecords` mean |
+|---|---|---|---|---|
+| before | 341, 338, 341 | 1.42, 1.45, 1.46 ms (12%) | 646 to 668 us / 3.8 to 4.2 ms | 10.4 to 10.6 ms |
+| after | 354, 354, 345 | 1.00, 0.98, 1.00 ms (9%) | 685 to 710 us / 3.8 to 4.2 ms | 10.3 to 10.7 ms |
+
+- **4% more files/s** (median 354 against 341), and the store stage takes 30% less per file.
+- **The writer's lock wait is unchanged** within noise (a trivial writer call every
+  millisecond; slightly higher mean, as more files a second commit more finishes). The
+  writer now serves only writes on this path.
+
 ### Requests and limits
 
 Per doewood instance (one pod):
