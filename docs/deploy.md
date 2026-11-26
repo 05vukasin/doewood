@@ -580,13 +580,14 @@ What the numbers say:
   load, against 1.7 ms at 10 clients and 57 ms at 500 without them. More clients only add
   latency, and blocking-pool threads parked on the connections' locks (one per call in
   flight: 284 threads at the cap). One call alone (one client) takes 0.2 ms (`GetNode`) to
-  1.7 ms (`ListRecords`, 100 records); `Neighbours` and `CompanyDocuments` make two store
-  calls and wait twice. More readers were the next step: see
-  [#108](#api-read-capacity-issue-108).
+  1.7 ms (`ListRecords`, 100 records); `Neighbours` and `CompanyDocuments` made two store
+  calls and waited twice (one since #124: see
+  [below](#one-store-call-for-neighbours-and-companydocuments-issue-124)). More readers were
+  the next step: see [#108](#api-read-capacity-issue-108).
 - **Postgres saturates at about 100 clients** (about 6,000 calls/s), on the pool of 16
   connections: `GetNode` is 0.8 ms at 10 clients and 13 ms at 100, nearly all of it waiting
-  for a pooled connection, and `Neighbours` and `CompanyDocuments` (two checkouts each)
-  twice that. Neither the database (1.5 to 1.8 cores) nor the process (2.2 cores) is at the
+  for a pooled connection, and `Neighbours` and `CompanyDocuments` (two checkouts each, one
+  since #124) twice that. Neither the database (1.5 to 1.8 cores) nor the process (2.2 cores) is at the
   machine's 4 cores. `ListSources` (the instance store) stays at 1 to 3 ms.
 - **Beyond the cap, shedding works**: with 500 and 1000 clients the server refuses the calls
   over 256 in flight at once (`doewood_grpc_shed_total` agreed with the clients' count within
@@ -746,6 +747,50 @@ page of 100 every millisecond; 1 run each):
   4 cores are the limit. With 32 such clients and 2 readers, 2000 files did not finish in
   10 minutes. 8 clients asking for 100 records every millisecond is far more than
   the API usually sees; #109 (below) gives ingest's reads priority.
+
+### One store call for `Neighbours` and `CompanyDocuments` (issue #124)
+
+Both calls read the node and then ran their query: two store calls, so two waits for a
+reader (SQLite) or a pooled connection (Postgres). Now the query runs first and the node is
+read only when it finds nothing, to tell a missing node (`NOT_FOUND`) or, for
+`CompanyDocuments`, a non-company (`INVALID_ARGUMENT`) from an empty list. Its documents come
+from `party` edges, which always end at a company (ADR 0001 section 7), so a non-empty result
+needs no kind check. A call that finds something makes 1 store call instead of 2; one that
+finds nothing still makes 2. In the `api_load` mix (every seeded node has neighbours and
+every company documents) that is 100 store calls per 100 API calls instead of 130.
+
+Measured with `api_load` (release build, 10 s per step, 10,000 documents,
+`DOEWOOD_BENCH_CLIENTS=10,100 DOEWOOD_BENCH_IDLE=0`, SQLite with 4 readers and Postgres 17 on
+an `--internal` Docker network; `main` at `baf53ad` against this change, the two binaries
+run alternately; ranges over the runs):
+
+| | runs | 10 clients: calls/s | p99 | 100 clients: calls/s | p99 |
+|---|---|---|---|---|---|
+| SQLite, `Neighbours` only, before | 2 | 6,794 to 7,029 | 3.1 to 3.2 ms | 5,630 to 5,779 | 49 to 50 ms |
+| SQLite, `Neighbours` only, after | 2 | 7,275 to 9,103 | 2.9 to 3.3 ms | 5,946 to 6,407 | 52 to 56 ms |
+| SQLite, `CompanyDocuments` only, before | 2 | 7,252 to 7,785 | 3.0 to 3.1 ms | 7,325 to 7,533 | 43 to 44 ms |
+| SQLite, `CompanyDocuments` only, after | 2 | 7,879 to 8,061 | 3.2 ms | 7,559 to 7,611 | 55 to 56 ms |
+| SQLite, mix, before | 3 | 5,515 to 6,276 | 4.3 to 4.7 ms | 5,440 to 6,099 | 60 to 66 ms |
+| SQLite, mix, after | 3 | 6,157 to 6,523 | 4.3 to 4.5 ms | 5,566 to 5,751 | 67 to 69 ms |
+| Postgres, `Neighbours` only, before | 1 | 8,306 | 2.6 ms | 8,860 | 14.5 ms |
+| Postgres, `Neighbours` only, after | 1 | 9,964 | 2.4 ms | 10,435 | 13.0 ms |
+| Postgres, `CompanyDocuments` only, before | 1 | 10,541 | 1.8 ms | 9,938 | 13.3 ms |
+| Postgres, `CompanyDocuments` only, after | 1 | 12,926 | 1.7 ms | 12,839 | 10.5 ms |
+| Postgres, mix, before | 2 | 4,933 to 5,128 | 6.6 to 6.9 ms | 5,449 to 5,487 | 39 to 42 ms |
+| Postgres, mix, after | 2 | 5,194 to 5,340 | 6.5 to 6.8 ms | 5,514 to 5,664 | 30 to 32 ms |
+
+In the mix the two calls themselves got faster on both stores: p50 1.3 to 1.8 ms before,
+0.9 to 1.3 ms after at 10 clients; at 100 clients 19 to 21 ms before, 13 ms after on SQLite
+and 22 to 23 ms before, 17.5 ms after on Postgres (p99 41 to 45 ms before, 24 to 27 ms
+after).
+
+- **Postgres gains most:** 18 to 29% more calls/s for the two calls alone, 4 to 5% for the
+  mix at 10 clients, and the mix's p99 at 100 clients falls by a quarter; the pool's
+  checkouts were the wait.
+- **SQLite at 100 clients is unchanged** within the noise of these runs: the 4 readers are
+  saturated either way, so the time the two calls save goes to the other calls' queue
+  (`GetNode` p50 9 to 10 ms before, 12 to 12.5 ms after), and the p99 is a little higher. At
+  10 clients the mix is 4 to 12% faster.
 
 ### Ingest's reads before the API's (issue #109)
 
