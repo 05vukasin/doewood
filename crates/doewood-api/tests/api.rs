@@ -1562,8 +1562,12 @@ async fn neighbours_and_company_documents_tell_missing_from_empty() {
                 .await
                 .unwrap()
         };
-        let (party_doc, bare_doc, gone_doc, husk_doc) =
-            (doc(124).await, doc(125).await, doc(126).await, doc(127).await);
+        let (party_doc, bare_doc, gone_doc, husk_doc) = (
+            doc(124).await,
+            doc(125).await,
+            doc(126).await,
+            doc(127).await,
+        );
         be.upsert_edge(&Edge::new(
             party_doc,
             survivor,
