@@ -3,11 +3,14 @@
 //! the client sends (prepares are not counted), and a round trip is a send that starts while
 //! the connection has no answer outstanding (statements sent together, pipelined, are one).
 //! Runs when `DOEWOOD_TEST_POSTGRES_URL` is set, in a schema of its own.
+//!
+//! `near_duplicate_corpus` (ignored) is the measurement of issue #126 on either store.
 
 mod common;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use doewood_ingest::company::{IdKind, Identifier};
 use doewood_ingest::facts::{Cite, DocFacts, Party};
@@ -159,6 +162,19 @@ async fn store() -> Option<(
     tokio_postgres::Client,
     String,
 )> {
+    store_via(true).await
+}
+
+/// [`store`], through the proxy only when `proxied` (nothing is counted otherwise: the proxy
+/// itself adds time to every message).
+async fn store_via(
+    proxied: bool,
+) -> Option<(
+    Arc<dyn Backend>,
+    Arc<Counts>,
+    tokio_postgres::Client,
+    String,
+)> {
     let Some(url) = std::env::var(PG_VAR).ok().filter(|v| !v.trim().is_empty()) else {
         eprintln!("skipping: {PG_VAR} is not set; the Postgres variant did not run");
         return None;
@@ -172,19 +188,21 @@ async fn store() -> Option<(
         .batch_execute(&format!("CREATE SCHEMA {schema}"))
         .await
         .unwrap();
-    let mut proxied = url::Url::parse(&url).unwrap();
-    let host = proxied.host_str().unwrap().to_owned();
-    let port = proxied.port().unwrap_or(5432);
+    let mut target = url::Url::parse(&url).unwrap();
+    let host = target.host_str().unwrap().to_owned();
+    let port = target.port().unwrap_or(5432);
     let upstream = tokio::net::lookup_host((host.as_str(), port))
         .await
         .unwrap()
         .next()
         .unwrap();
     let (addr, counts) = proxy(upstream).await;
-    proxied.set_host(Some("127.0.0.1")).unwrap();
-    proxied.set_port(Some(addr.port())).unwrap();
-    let sep = if proxied.query().is_some() { '&' } else { '?' };
-    let scoped = format!("{proxied}{sep}sslmode=disable&options=-c%20search_path%3D{schema}");
+    if proxied {
+        target.set_host(Some("127.0.0.1")).unwrap();
+        target.set_port(Some(addr.port())).unwrap();
+    }
+    let sep = if target.query().is_some() { '&' } else { '?' };
+    let scoped = format!("{target}{sep}sslmode=disable&options=-c%20search_path%3D{schema}");
     let pg = doewood_pg::PgStore::connect(&doewood_core::PostgresUrl::parse(&scoped).unwrap())
         .await
         .unwrap();
@@ -393,6 +411,190 @@ async fn graph_writes_stay_under_the_round_trip_target() {
         round_trips <= ROUND_TRIPS_PER_DOC,
         "{round_trips} round trips"
     );
+    admin
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+}
+
+/// A number from the environment variable `var`, else `default`.
+fn env_or(var: &str, default: u64) -> u64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// The measurement of issue #126: `DOEWOOD_NEAR_DUP_DOCS` documents (default 2000) of
+/// [`common::near_duplicate_text`] with 4 templates, written one after the other through the
+/// graph writer, on Postgres (`DOEWOOD_TEST_POSTGRES_URL`) or, when `DOEWOOD_NEAR_DUP_SQLITE`
+/// names a directory, on a SQLite store file in it. Per tenth of the corpus: the graph write
+/// per document, statements and round trips per document (Postgres with
+/// `DOEWOOD_NEAR_DUP_COUNT` set, through the counting proxy), `similar_to` edges per
+/// document, and the candidate query alone for the last template document (best of 5), as
+/// its plan on Postgres. Last, a digest of every `similar_to` edge, to compare two builds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "a measurement (issue #126); see docs/deploy.md"]
+#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+async fn near_duplicate_corpus() {
+    let docs = env_or("DOEWOOD_NEAR_DUP_DOCS", 2000);
+    let (b, counts, pg): (Arc<dyn Backend>, Option<Arc<Counts>>, _) =
+        if let Ok(dir) = std::env::var("DOEWOOD_NEAR_DUP_SQLITE") {
+            let path = std::path::Path::new(&dir)
+                .join(format!("near-dup-{}.db", uuid::Uuid::now_v7().simple()));
+            let key = doewood_core::MasterKey::from_bytes([9; 32]);
+            let store = doewood_store::Store::open(&path, &key).unwrap();
+            println!("store: SQLite {}", path.display());
+            (
+                Arc::new(doewood_store::Standalone::new(Arc::new(store))),
+                None,
+                None,
+            )
+        } else {
+            let count = std::env::var_os("DOEWOOD_NEAR_DUP_COUNT").is_some();
+            let (b, counts, admin, schema) = store_via(count).await.expect("a store to measure");
+            println!("store: Postgres, round trips counted: {count}");
+            (b, count.then_some(counts), Some((admin, schema)))
+        };
+    let writer = GraphWriter::new(Arc::clone(&b), SimilarityConfig::default());
+    let hash = |i: u64| {
+        Blake3::from_slice(blake3::hash(format!("near/{i}").as_bytes()).as_bytes()).unwrap()
+    };
+    let window = (docs / 10).max(1);
+    let (mut spent, mut similar, mut statements, mut trips) = (Duration::ZERO, 0usize, 0u64, 0u64);
+    let started = Instant::now();
+    println!(
+        "docs | graph write ms/doc | statements/doc | round trips/doc | similar_to/doc | candidate query ms (candidates)"
+    );
+    for i in 0..docs {
+        let h = hash(i);
+        let facts = DocFacts {
+            format: "txt".into(),
+            minhash: common::sketch(&common::near_duplicate_text(i, 4)),
+            ..DocFacts::default()
+        };
+        b.put_record(&h, &empty_record(), &StepVersions::new())
+            .await
+            .unwrap();
+        let before = counts.as_ref().map(|c| c.now());
+        let t = Instant::now();
+        let stats = writer
+            .write(&h, &at(&format!("near/{i}.txt")), &facts, "x", 0.8)
+            .await
+            .unwrap();
+        spent += t.elapsed();
+        similar += stats.similar;
+        if let (Some(c), Some(before)) = (&counts, before) {
+            let s = c.since(before);
+            statements += s.statements;
+            trips += s.round_trips;
+        }
+        if (i + 1) % window == 0 {
+            // A template document, the last one written (every fifth is a distinct one).
+            let probe = (0..=i).rev().find(|j| j % 5 != 4).unwrap();
+            let (_, bands) = common::sketch(&common::near_duplicate_text(probe, 4)).unwrap();
+            let mut best = Duration::MAX;
+            let mut found = 0;
+            for _ in 0..5 {
+                let t = Instant::now();
+                found = b
+                    .sketch_candidates(&bands, &hash(probe), 100)
+                    .await
+                    .unwrap()
+                    .len();
+                best = best.min(t.elapsed());
+            }
+            let per = |n: f64| n / window as f64;
+            println!(
+                "{} | {:.2} | {:.1} | {:.1} | {:.1} | {:.2} ({found})",
+                i + 1,
+                per(spent.as_secs_f64() * 1000.0),
+                per(statements as f64),
+                per(trips as f64),
+                per(similar as f64),
+                best.as_secs_f64() * 1000.0,
+            );
+            (spent, similar, statements, trips) = (Duration::ZERO, 0, 0, 0);
+        }
+    }
+    println!("total: {:.1} s", started.elapsed().as_secs_f64());
+    if let Some((admin, schema)) = &pg {
+        let probe = (0..docs).rev().find(|j| j % 5 != 4).unwrap();
+        let (_, bands) = common::sketch(&common::near_duplicate_text(probe, 4)).unwrap();
+        let bands: Vec<i64> = bands
+            .iter()
+            .map(|b| doewood_model::band_to_i64(*b))
+            .collect();
+        admin
+            .batch_execute(&format!("SET search_path = {schema}"))
+            .await
+            .unwrap();
+        let plan = admin
+            .query(
+                "EXPLAIN (ANALYZE, BUFFERS) SELECT c.blake3, s.signature, c.shared \
+                 FROM (SELECT blake3, count(*) AS shared FROM sketch_bands \
+                 WHERE band = ANY($1) AND blake3 <> $2 \
+                 GROUP BY blake3 ORDER BY shared DESC, blake3 LIMIT 100) c \
+                 JOIN sketches s ON s.blake3 = c.blake3 ORDER BY c.shared DESC, c.blake3",
+                &[&bands, &hash(probe).as_bytes().as_slice()],
+            )
+            .await
+            .unwrap();
+        for r in plan {
+            println!("{}", r.get::<_, String>(0));
+        }
+    }
+    let hashes: Vec<Blake3> = (0..docs).map(hash).collect();
+    let edges = common::similar_edges(&*b, &hashes).await;
+    let digest = blake3::hash(format!("{edges:?}").as_bytes());
+    println!("similar_to edges: {}, digest {digest}", edges.len());
+    if let Some((admin, schema)) = pg {
+        admin
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+}
+
+/// A document with many similar ones (issue #126) costs the same round trips as one with a
+/// few: its candidates' nodes are read in one statement and its `similar_to` edges written
+/// pipelined, where before each candidate took two round trips (a node read, an edge write).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn similar_documents_take_a_fixed_number_of_round_trips() {
+    const ROUND_TRIPS_PER_DOC: u64 = 8;
+    let Some((b, counts, admin, schema)) = store().await else {
+        return;
+    };
+    let writer = GraphWriter::new(Arc::clone(&b), SimilarityConfig::default());
+    let mut seen = Vec::new();
+    // Template documents only (every fifth of `near_duplicate_text` is a distinct one).
+    for i in (0..60u64).filter(|i| i % 5 != 4) {
+        let h = Blake3::from_slice(blake3::hash(format!("trips/near/{i}").as_bytes()).as_bytes())
+            .unwrap();
+        let facts = DocFacts {
+            format: "txt".into(),
+            minhash: common::sketch(&common::near_duplicate_text(i, 1)),
+            ..DocFacts::default()
+        };
+        b.put_record(&h, &empty_record(), &StepVersions::new())
+            .await
+            .unwrap();
+        let before = counts.now();
+        let stats = writer
+            .write(&h, &at(&format!("near/{i}.txt")), &facts, "x", 0.8)
+            .await
+            .unwrap();
+        seen.push((stats.similar, counts.since(before)));
+    }
+    println!("similar_to edges, then what the write took: {seen:?}");
+    // Past the first documents, which open the pool's connections and prepare statements.
+    for (similar, s) in &seen[10..] {
+        assert!(*similar >= 10, "{similar} similar documents");
+        assert!(
+            s.round_trips <= ROUND_TRIPS_PER_DOC,
+            "{s:?} for {similar} edges"
+        );
+    }
     admin
         .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
         .await

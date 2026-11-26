@@ -238,7 +238,10 @@ Numbers are in [Sizing, Records](deploy.md#records).
 - **`similar_to`** from quail's MinHash LSH bands: candidates come from the band index (a lookup
   by band key), each confirmed by its Jaccard estimate (the runtime setting
   `similar_min_jaccard`, default 0.8, set with `ConfigService.SetIngestSettings`; it is read
-  for every file, so a change applies to the next file without a restart).
+  for every file, so a change applies to the next file without a restart). A document's
+  candidates cost the same round trips however many there are (issue #126): their Document
+  nodes are read in one statement (`GraphStore::node_ids`) and the edges written in one batch
+  (`GraphStore::upsert_edges`: one transaction, pipelined on Postgres in one round trip).
 - **Search:** title (`ref.title`, else the card's, the file's own, the file name), body (the
   summary card, the extractive summary, keywords, sheet text), kind, date and amount.
 
