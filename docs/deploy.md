@@ -688,7 +688,64 @@ page of 100 every millisecond; 1 run each):
   not help: the database (172 s executing for 2000 files, 165 s of it the API's `ListRecords` pages) and the
   4 cores are the limit. With 32 such clients and 2 readers, 2000 files did not finish in
   10 minutes. 8 clients asking for 100 records every millisecond is far more than
-  the API usually sees, but nothing gives ingest's reads priority yet; see #109.
+  the API usually sees; #109 (below) gives ingest's reads priority.
+
+### Ingest's reads before the API's (issue #109)
+
+**Why a `ListRecords` page is slow under write load.** Not the query: `EXPLAIN QUERY PLAN`
+on SQLite is a primary-key range scan of `records` with one `locations_by_blake3` lookup per
+record, and the page's statement runs in 1 to 2 ms; on Postgres `EXPLAIN (ANALYZE, BUFFERS)`
+is a merge semi join over the two indexes in 0.2 ms (201 buffers, all hits). The time is the
+record bodies: `throughput`'s records are about 15 KiB of JSON (6.6 KiB compressed in
+Postgres's TOAST), so a page of 100 carries 1.3 to 1.4 MiB. On SQLite that is copying,
+checking as JSON, encoding and sending 1.4 MiB per page (10 ms with one client, 22 ms with 8
+on 4 busy cores); `api_load`'s records are about 1 KiB, hence its 2.5 ms. On Postgres it is
+mostly the database turning 1.9 MB of `jsonb` back into text per page (19 ms on an idle
+server, `SELECT record::text` of the first 100): 22 to 26 ms of database time per page under
+this load, 92 to 95% of everything the database executed; the instance then parses each body
+into its canonical text. The WAL is not the cause (it stayed under 80 MiB). #111's byte budget (3 MiB a
+page) bounds a page; it does not shorten these.
+
+**What changed.**
+- The read-only connections serve the instance's reads first. When reads wait for a reader,
+  ingest's (and enrichment's, the scanners') get the next free one before the API's (its
+  calls and the `WatchProgress` snapshot), so they no longer queue behind a backlog of pages.
+  The API is not starved: while none of its reads holds a reader, the instance's reads leave
+  it the last free one. API calls are told apart by a task-local the call limiter sets, and a
+  thread-local on the blocking threads that run their store work.
+- Standalone `ListRecords` checks the bodies as JSON after giving its reader back, so the
+  reader is held only for the SQLite statement (same rows and byte budget as before).
+
+Measured with `throughput` and `api_load` as above (release build, 4 vCPU, `main` at
+`0f62b6a` against this branch, the two test binaries run alternately, 2 runs each; Postgres
+17 on an `--internal` Docker network):
+
+| store | API clients | readers | files/s before / after | store / graph per file before / after | WAL at most before / after |
+|---|---|---|---|---|---|
+| SQLite | 8 | 2 | 74, 76 / 110, 110 | 12.1 / 23.3 ms, 5.7 / 15.4 ms | 59 to 79 / 7 to 9 MiB |
+| SQLite | 8 | 4 | 102, 103 / 101, 103 | 6.5 / 16.8 ms, 5.8 / 17.0 ms | 35 to 66 / 6 to 9 MiB |
+| SQLite | 1 | 4 | 339, 356 / 336, 344 | 1.4 / 4.9 ms, 1.4 / 5.0 ms | 4 / 4 MiB |
+| Postgres | 8 | pool 16 | 64 / 63 (1 run each) | | |
+
+| `api_load`, SQLite, 4 readers | 10 clients | 100 clients | 500 clients |
+|---|---|---|---|
+| before (calls/s) | 5,849 to 6,117 | 5,588 to 6,345 (mean 5,838, 5 runs) | 5,326 to 5,393 |
+| after (calls/s) | 5,728 to 5,871 | 5,505 to 6,642 (mean 5,861, 5 runs) | 5,476 to 5,502 |
+
+- **With 2 readers ingest under 8 heavy API clients is 1.45 times as fast** (6 times the
+  18 files/s #108 measured, which predates #106's records as text), its store reads wait half
+  as long, and the WAL no longer grows to tens of MiB: the readers are free often enough for
+  checkpoints to complete.
+- **With one reader per CPU (4) it is unchanged at about 100 files/s**: the readers are not
+  the limit there, the 4 cores are (3.6 cores busy; the 8 clients run in the same process and
+  decode 300 pages of 1.4 MiB a second). Holding the API to fewer readers would trade its
+  throughput for ingest's; it is not done.
+- **No regression:** with one API client ingest runs as before, and `api_load` is within its
+  run to run noise. (A first version woke the waiting reads while still holding the pool's
+  lock: 7% fewer calls/s at 100 clients. They are now woken after it is released.)
+- **Postgres is unchanged** (the readers are SQLite's). Its limit is the database's time on
+  the API's pages; serving `ListRecords` without the `jsonb` round trip (stored text next to
+  the `jsonb`, for example) is the next step if that load is real.
 
 ### Requests and limits
 
