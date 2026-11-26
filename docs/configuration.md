@@ -208,15 +208,17 @@ ingest's write transactions:
   claims, proposals, the merge log and dismissals, the registry and icon caches, enrichment
   state and due companies, feed state and company aliases;
 - the instance store: sources, the `WatchProgress` snapshot (every source's counters,
-  checkpoint and LLM spend, read in one transaction), runtime settings and AI providers,
+  checkpoint and LLM spend, read in one transaction), the objects discovery has seen and
+  their ingest status (each ingest attempt reads the status, the source and the settings in
+  one transaction, issue #128), runtime settings and AI providers,
   whether a secret is set, and opening a secret for a connector (decrypted with the same
   master key; the key check at open runs on the writer before the readers open).
 
 Each read call is one transaction on one connection: it sees what was committed when it
 started, never a write still in progress. Every write commits before it returns, so a read made
 after a write returned sees it (a call that writes and then reads, such as `AddSource`, still
-gets what it wrote). Writes, and everything ingest and the scanners read to decide their next
-write (object status, pending objects, the LLM queue), stay on the writer. When every reader
+gets what it wrote). Writes, and the LLM queue's reads that decide its next write, stay on
+the writer. When every reader
 is busy a read waits for one, never for the writer. An in-memory store (tests) has no
 readers; its reads use the writer, as before.
 

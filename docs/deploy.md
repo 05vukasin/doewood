@@ -531,6 +531,44 @@ proxy that reads the wire protocol, and fails above the targets (each store call
 one round trip; the `throughput` mix is at most 15 statements and 14.5 round trips per
 document, 32.25 of each before).
 
+### Similar documents on near-duplicate corpora (issue #126)
+
+`near_duplicate_corpus` in `crates/doewood-ingest/tests/round_trips.rs` (ignored) writes a
+generated corpus through the graph writer, one document after the other: four in five
+documents come from one of 4 templates (a shared 300-word body under a header of their own,
+like the invoices of one supplier; Jaccard about 0.9, most of the 32 LSH bands shared), the
+fifth is distinct. So a template document has 100 candidates (`max_candidates`) and about 80
+`similar_to` edges on average over the corpus. Test profile, Postgres 17 in a container on
+an internal Docker network on the same machine, a SQLite store file; `main` at `baf53ad`
+against this change, back to back on a shared machine:
+
+| store | documents | graph write per document before / after | round trips per document before / after |
+|---|---|---|---|
+| Postgres | 1,200 to 3,600 | 114 to 120 / 20 to 25 ms | 166 / 7.6 |
+| SQLite | 1,200 to 4,000 | 35 to 42 / 23 to 34 ms | (one writer hop per edge / one per batch) |
+
+(Round trips counted through the proxy at 2,000 documents; the times are with a direct
+connection, since the proxy adds to every message.) The edges are the same: the digest of
+every `similar_to` edge (ends by key, props, confidence) is equal before and after on both
+stores, and `tests/similar.rs` compares the edges with the per-candidate loop of before on
+both stores in CI.
+
+What changed: `GraphStore::node_ids` reads the candidates' Document nodes in one statement
+(the few missing ones are still created one by one), and `GraphStore::upsert_edges` writes
+the edges in one transaction: pipelined on Postgres (`BEGIN`, the upserts and `COMMIT` in
+one round trip), one writer call on SQLite. A document costs 8 round trips on Postgres
+however many similar documents it has (`similar_documents_take_a_fixed_number_of_round_trips`),
+against 8 plus 2 per similar document before.
+
+**The candidate query still grows with the bucket.** It counts every `sketch_bands` row
+that shares a band, then keeps the best 100. At 10,000 documents (2,000 per template) it
+reads 53,543 index entries for one template document (`EXPLAIN (ANALYZE, BUFFERS)`: 26 ms;
+13.5 ms best of 5 from the client), against 10,400 entries at 2,000 documents: linear in the
+number of near-duplicates, so quadratic over a corpus of one template. The graph write per
+document rose from 25 ms at 2,000 documents to 31 ms at 10,000 on Postgres. A bound on the
+bucket (an LSH "stop band") would change which edges exist, so it is left to a decision
+(issue #126).
+
 ### API under many clients (issue #80)
 
 `api_load` in `crates/doewood-api/tests/api_load.rs` (ignored): an in-process API server on a
@@ -796,6 +834,66 @@ after).
   (`GetNode` p50 9 to 10 ms before, 12 to 12.5 ms after), and the p99 is a little higher. At
   10 clients the mix is 4 to 12% faster.
 
+### Company rows rewritten by every document (issue #129)
+
+Every party of every document patches its company's props (`GraphWriter::update_company`):
+`names`, `quail_keys` and `ids` are capped sets that stop changing once a company is known,
+but `matches` gets the document's entry, so the patch always changes the row and the
+compare-and-set writes it. `company_rows` in `crates/doewood-ingest/tests/company_rows.rs`
+(ignored) writes 10,000 documents of two parties each straight through `GraphWriter` (no
+files, no analysis), 4 writers on one instance, release build: `hot`, where one supplier is
+on every document and 20 buyers share the rest, against `spread`, where no company is on
+more than two documents. SQLite in a file; Postgres 17.12 (`pgvector/pgvector:pg17`,
+`pg_stat_statements` loaded) on an `--internal` Docker network on the same machine, which
+other measurements shared; one run each, `main` at `e47c815`.
+
+| | SQLite hot | SQLite spread | Postgres hot | Postgres spread |
+|---|---|---|---|---|
+| documents/s | 209 | 201 | 89 | 72 |
+| graph stage per document | 16 to 21 ms | 16 to 21 ms | 42 to 45 ms | 47 to 86 ms |
+| company lock held per document | 4.1 to 5.2 ms | 4.1 to 5.4 ms | 10.7 to 11.5 ms | 11.8 to 21.7 ms |
+| busiest company's props (text / stored) | 3,720 B | 508 B | 3,720 / 1,818 B | 508 / 620 B |
+| written per document | 313 KB (process) | 401 KB | 13.9 KB WAL | 14.6 KB WAL |
+| `nodes` row versions per document (HOT) | | | 2.98 (92%) | 2.98 (80%) |
+| `nodes` dead tuples at the end, autovacuums | | | 145, 2 | 1,338, 2 |
+| props compare-and-set writes, retried | | | 30,000, 0 | 30,000, 0 |
+
+(Ranges are over the tenths of the run; the lock and graph stage did not grow from the first
+tenth to the last. The SQLite figure is `wchar` of the process: every write of the WAL and the
+checkpoints, in pages.)
+
+The company patch alone, 1,000 times on the busiest company (`matches` full at 20), with
+the document's `matches` entry as now, and without it (the same patch for a known company,
+which changes nothing and so writes nothing):
+
+| | with `matches` | without |
+|---|---|---|
+| SQLite | 0.23 ms, 4.7 KB written | 0.14 ms, 0 |
+| Postgres | 1.56 ms, 2.0 KB WAL | 0.30 ms, 0 |
+
+Two instances on one Postgres (2 writers each, each instance its own company lock), `hot`:
+241 documents/s, and 585 of the 20,000 company patches (2.9%) found the row changed by the
+other instance and were applied again (one more read and write each).
+
+- **The row does not grow without bound.** `matches` is capped at 20 entries (and `names`
+  and `quail_keys` at 20, `ids` at 10 per kind), so the busiest company's props stop at
+  about 3.7 KB of JSON, 1.8 KB stored: inline, compressed, never TOASTed. The lock hold and
+  the graph stage per document are flat over 10,000 documents.
+- **A busy supplier costs no more than many small ones.** Each party is one row rewrite in
+  both corpora (2 per document, plus the document's own props): about 2 KB of WAL each on
+  Postgres, mostly HOT updates whose dead versions are pruned in the page. The spread corpus
+  writes slightly more, because its companies are new rows.
+- **The rewrite is still a real share.** On Postgres the two company writes are about 4 KB of
+  the 13.9 KB of WAL per document (29%), 2 of the 3 `nodes` row versions, and about 2.5 ms of
+  the 11 ms the company lock is held (the write is 1.3 ms of the patch's 1.6 ms). In this
+  graph-only run the lock is busy all the time (89 documents/s x 11.2 ms), so that is the
+  throughput a single instance loses. On SQLite it is about 3% of the bytes written and about
+  4% of the lock hold. In a real ingest the graph stage is 40 to 58% of a worker's time (see
+  [Ingest on Postgres](#ingest-on-postgres-issue-69)), so the gain there is smaller.
+- Writing `matches` only when something else changed, or keeping it elsewhere, changes the
+  stored props that `GetNode` returns: an owner decision (issue #129). The patch already
+  writes nothing when it changes nothing, on both stores.
+
 ### Ingest's reads before the API's (issue #109)
 
 **Why a `ListRecords` page is slow under write load.** Not the query: `EXPLAIN QUERY PLAN`
@@ -924,6 +1022,34 @@ takes traffic (on average half a period after ready). The chart's readiness prob
 2 s (it ran every 5 s before) with 8 failures, about 16 s before a pod that lost Postgres is
 taken out, as before. The liveness probe stays at every 10 s with 6 failures: the process
 answers `/healthz` from the start, and a slow start never needs more.
+
+### The instance store per file (issue #128)
+
+Each file made three blocking calls to the instance store: its ingest status, its source
+and the runtime settings, and the finish. The status was read on the writer, so it waited
+behind the scanner's `record_objects` and the other workers' `finish_object` commits. Now
+each attempt reads the status, the source and the settings in one read transaction on a
+read-only connection (an instance read, so it keeps its priority over the API's, #109); the
+settings are still read per file, and the finish stays on the writer. The other read-only
+`objects_seen` reads (`seen_objects`, `seen_object`, `live_object_count`,
+`pending_objects`, `ingested_objects`) moved to the readers too. None needs to see its own
+uncommitted writes: every write commits before it returns, and `inflight` holds a key until
+its attempt is recorded, so the status a worker reads is the committed one.
+
+Measured with `throughput` (release build, `DOEWOOD_BENCH_FILES=2000 DOEWOOD_BENCH_JOBS=4
+DOEWOOD_BENCH_READERS=4`: the store on disk with 4 readers, one API client asking for a
+`ListRecords` page of 100 every millisecond; `main` at `af345f7` against this change, the
+two test binaries run alternately, 3 runs each):
+
+| | files/s | store stage per file | writer lock wait mean / p99 | `ListRecords` mean |
+|---|---|---|---|---|
+| before | 341, 338, 341 | 1.42, 1.45, 1.46 ms (12%) | 646 to 668 us / 3.8 to 4.2 ms | 10.4 to 10.6 ms |
+| after | 354, 354, 345 | 1.00, 0.98, 1.00 ms (9%) | 685 to 710 us / 3.8 to 4.2 ms | 10.3 to 10.7 ms |
+
+- **4% more files/s** (median 354 against 341), and the store stage takes 30% less per file.
+- **The writer's lock wait is unchanged** within noise (a trivial writer call every
+  millisecond; slightly higher mean, as more files a second commit more finishes). The
+  writer now serves only writes on this path.
 
 ### Requests and limits
 

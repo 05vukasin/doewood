@@ -18,8 +18,8 @@ use doewood_model::{
     NodeKind, ObjectLocation, OwnedAlias, PropsPatch, PutOutcome, Record, RecordStore, Result,
     SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore, Sketch, SketchStore,
     SourceClaim, SourceKey, StepVersions, StoredEdge, band_to_i64, merged_into, records_limit,
-    sketch_limit, validate_alias, validate_hashes, validate_node, validate_sketch,
-    versions_from_json, versions_to_json,
+    sketch_limit, validate_alias, validate_batch_count, validate_hashes, validate_node,
+    validate_sketch, versions_from_json, versions_to_json,
 };
 use rusqlite::types::Value as Sql;
 use rusqlite::{
@@ -721,10 +721,56 @@ impl GraphStore for Standalone {
         .await
     }
 
+    async fn node_ids(&self, kind: NodeKind, keys: &[String]) -> Result<Vec<Option<Uuid>>> {
+        validate_batch_count(keys.len())?;
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys = keys.to_vec();
+        // One read connection for all of them (issue #126).
+        self.read(move |conn| {
+            let mut stmt = conn
+                .prepare_cached("SELECT id FROM nodes WHERE kind = ?1 AND key = ?2")
+                .map_err(sql)?;
+            keys.iter()
+                .map(|key| {
+                    stmt.query_row(params![kind.as_str(), key], |r| r.get::<_, String>(0))
+                        .optional()
+                        .map_err(sql)?
+                        .map(|id| uuid(&id))
+                        .transpose()
+                })
+                .collect()
+        })
+        .await
+    }
+
     async fn upsert_edge(&self, edge: &Edge) -> Result<Uuid> {
         edge.validate()?;
         let edge = edge.clone();
         self.run(move |conn| upsert_edge(conn, &edge)).await
+    }
+
+    async fn upsert_edges(&self, edges: &[Edge]) -> Result<Vec<Uuid>> {
+        validate_batch_count(edges.len())?;
+        for e in edges {
+            e.validate()?;
+        }
+        if edges.is_empty() {
+            return Ok(Vec::new());
+        }
+        let edges = edges.to_vec();
+        // One trip to the writer and one transaction for all of them (issue #126).
+        self.run(move |conn| {
+            let tx = conn.transaction().map_err(sql)?;
+            let ids = edges
+                .iter()
+                .map(|e| upsert_edge(&tx, e))
+                .collect::<Result<Vec<_>>>()?;
+            tx.commit().map_err(sql)?;
+            Ok(ids)
+        })
+        .await
     }
 
     async fn upsert_live_edge(&self, edge: &Edge) -> Result<LiveEdge> {

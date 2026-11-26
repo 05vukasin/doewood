@@ -161,6 +161,19 @@ pub(crate) fn read_tx<T, E>(
 /// ([`Store::snapshot`]).
 pub struct Snapshot<'a>(pub(crate) &'a Connection);
 
+impl Snapshot<'_> {
+    /// Reads a runtime setting.
+    pub fn setting(&self, key: &str) -> Result<Option<serde_json::Value>, StoreError> {
+        let text: Option<String> = self
+            .0
+            .prepare_cached("SELECT value_json FROM settings WHERE key = ?1")?
+            .query_row([key], |r| r.get(0))
+            .optional()?;
+        text.map(|t| serde_json::from_str(&t).map_err(|_| StoreError::BadSetting(key.to_owned())))
+            .transpose()
+    }
+}
+
 impl std::fmt::Debug for Store {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Store").finish_non_exhaustive()
@@ -303,14 +316,7 @@ impl Store {
 
     /// Reads a runtime setting.
     pub fn setting(&self, key: &str) -> Result<Option<serde_json::Value>, StoreError> {
-        let text: Option<String> = self.read(StoreError::from, |conn| {
-            Ok(conn
-                .prepare_cached("SELECT value_json FROM settings WHERE key = ?1")?
-                .query_row([key], |r| r.get(0))
-                .optional()?)
-        })?;
-        text.map(|t| serde_json::from_str(&t).map_err(|_| StoreError::BadSetting(key.to_owned())))
-            .transpose()
+        self.snapshot(|s| s.setting(key))
     }
 
     /// Writes a runtime setting. Secrets never go here: use [`Store::set_secret`].

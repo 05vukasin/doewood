@@ -40,6 +40,7 @@ pub async fn run<B: Backend + ?Sized>(a: &B, b: &B) {
     sketches(a).await;
     aliases(a).await;
     alias_batches(a).await;
+    graph_batches(a).await;
     claims(a, b).await;
     leases(a, b).await;
     search(a).await;
@@ -934,6 +935,92 @@ pub async fn alias_batches<B: Backend + ?Sized>(s: &B) {
             .await,
         Err(Error::Invalid(_))
     ));
+}
+
+/// [`crate::GraphStore::node_ids`] and [`crate::GraphStore::upsert_edges`] (issue #126): in
+/// order, as one call after the other; an invalid edge fails the batch before any write.
+///
+/// # Panics
+///
+/// When the backend misbehaves.
+pub async fn graph_batches<B: Backend + ?Sized>(s: &B) {
+    let kind = NodeKind::Document;
+    let keys: Vec<String> = [61, 62, 63, 64].map(|n| hash(n).to_hex()).to_vec();
+    let a = s.ensure_node(kind, &keys[0]).await.unwrap();
+    let b = s.ensure_node(kind, &keys[1]).await.unwrap();
+    let c = s.ensure_node(kind, &keys[2]).await.unwrap();
+    let asked = [&keys[0], &keys[3], &keys[1], &keys[0]].map(String::clone);
+    assert_eq!(
+        s.node_ids(kind, &asked).await.unwrap(),
+        [Some(a), None, Some(b), Some(a)]
+    );
+    assert!(
+        s.node_ids(NodeKind::Company, &asked)
+            .await
+            .unwrap()
+            .iter()
+            .all(Option::is_none)
+    );
+    assert!(s.node_ids(kind, &[]).await.unwrap().is_empty());
+    let many = vec![keys[0].clone(); crate::GRAPH_BATCH_MAX + 1];
+    assert!(matches!(
+        s.node_ids(kind, &many).await,
+        Err(Error::Invalid(_))
+    ));
+
+    let edge = |src, dst, n: i32| {
+        Edge::new(src, dst, EdgeKind::SimilarTo, EdgeSource::Document)
+            .with_props(json!({"n": n}))
+            .with_confidence(0.9)
+    };
+    let ids = s
+        .upsert_edges(&[edge(a, b, 1), edge(b, c, 2), edge(a, b, 3)])
+        .await
+        .unwrap();
+    assert_eq!(ids.len(), 3);
+    assert_ne!(ids[0], ids[1]);
+    assert_eq!(ids[0], ids[2], "same identity, same edge");
+    let out = |node| async move {
+        s.neighbours(
+            node,
+            &NeighbourQuery {
+                direction: Direction::Out,
+                edge_kinds: vec![EdgeKind::SimilarTo],
+                ..NeighbourQuery::default()
+            },
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|n| (n.edge.id, n.node.id, n.edge.edge.props))
+        .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        out(a).await,
+        [(ids[0], b, json!({"n": 3}))],
+        "the last one wins"
+    );
+    assert_eq!(out(b).await, [(ids[1], c, json!({"n": 2}))]);
+    assert_eq!(
+        s.upsert_edges(&[edge(a, b, 3)]).await.unwrap(),
+        [ids[0]],
+        "an upsert keeps the id"
+    );
+    assert!(s.upsert_edges(&[]).await.unwrap().is_empty());
+    // An invalid edge anywhere: nothing is written.
+    let bad = edge(c, a, 4).with_confidence(2.0);
+    assert!(matches!(
+        s.upsert_edges(&[edge(c, b, 5), bad]).await,
+        Err(Error::Invalid(_))
+    ));
+    assert!(out(c).await.is_empty());
+    let many = vec![edge(a, b, 3); crate::GRAPH_BATCH_MAX + 1];
+    assert!(matches!(
+        s.upsert_edges(&many).await,
+        Err(Error::Invalid(_))
+    ));
+    // A missing end fails the call.
+    assert!(s.upsert_edges(&[edge(a, Uuid::now_v7(), 6)]).await.is_err());
 }
 
 /// The LSH band index: candidates by shared bands, replacement, the excluded document.

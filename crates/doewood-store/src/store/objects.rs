@@ -102,32 +102,7 @@ impl Store {
         upto: Option<&str>,
         limit: usize,
     ) -> Result<Vec<SeenObject>, StoreError> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare_cached(
-            "SELECT key, etag, size, last_modified FROM objects_seen \
-             WHERE source_id = ?1 AND status <> 'deleted' \
-             AND (?2 IS NULL OR key > ?2) AND (?3 IS NULL OR key <= ?3) \
-             ORDER BY key LIMIT ?4",
-        )?;
-        let rows = stmt
-            .query_map(
-                params![
-                    source.to_string(),
-                    after,
-                    upto,
-                    i64::try_from(limit).unwrap_or(i64::MAX)
-                ],
-                |r| {
-                    Ok(SeenObject {
-                        key: r.get(0)?,
-                        etag: r.get(1)?,
-                        size: u64::try_from(r.get::<_, i64>(2)?).unwrap_or(0),
-                        last_modified: r.get(3)?,
-                    })
-                },
-            )?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        self.snapshot(|s| s.seen_objects(source, after, upto, limit))
     }
 
     /// One live object of a source.
@@ -136,35 +111,12 @@ impl Store {
         source: SourceId,
         key: &str,
     ) -> Result<Option<SeenObject>, StoreError> {
-        Ok(self
-            .conn()
-            .prepare_cached(
-                "SELECT key, etag, size, last_modified FROM objects_seen \
-                 WHERE source_id = ?1 AND key = ?2 AND status <> 'deleted'",
-            )
-            .and_then(|mut cached| {
-                cached.query_row(params![source.to_string(), key], |r| {
-                    Ok(SeenObject {
-                        key: r.get(0)?,
-                        etag: r.get(1)?,
-                        size: u64::try_from(r.get::<_, i64>(2)?).unwrap_or(0),
-                        last_modified: r.get(3)?,
-                    })
-                })
-            })
-            .optional()?)
+        self.snapshot(|s| s.seen_object(source, key))
     }
 
     /// The number of live objects of a source.
     pub fn live_object_count(&self, source: SourceId) -> Result<u64, StoreError> {
-        let n: i64 = self
-            .conn()
-            .prepare_cached(
-                "SELECT coalesce(sum(n), 0) FROM object_counts \
-                 WHERE source_id = ?1 AND status <> 'deleted'",
-            )?
-            .query_row([source.to_string()], |r| r.get(0))?;
-        Ok(u64::try_from(n).unwrap_or(0))
+        self.snapshot(|s| s.live_object_count(source))
     }
 
     /// Records changes and, if given, the scan checkpoint, in one transaction: a crash keeps
@@ -221,34 +173,7 @@ impl Store {
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<SeenObject>, StoreError> {
-        let conn = self.conn();
-        // The planner's statistics are averages over the statuses, so it reads the primary
-        // key in key order instead, which walks every ingested row of a mostly ingested
-        // source. The queue index reads only the pending rows, already in key order.
-        let mut stmt = conn.prepare_cached(
-            "SELECT key, etag, size, last_modified FROM objects_seen \
-             INDEXED BY objects_seen_pending \
-             WHERE source_id = ?1 AND status = 'pending' AND (?2 IS NULL OR key > ?2) \
-             ORDER BY key LIMIT ?3",
-        )?;
-        let rows = stmt
-            .query_map(
-                params![
-                    source.to_string(),
-                    after,
-                    i64::try_from(limit).unwrap_or(i64::MAX)
-                ],
-                |r| {
-                    Ok(SeenObject {
-                        key: r.get(0)?,
-                        etag: r.get(1)?,
-                        size: u64::try_from(r.get::<_, i64>(2)?).unwrap_or(0),
-                        last_modified: r.get(3)?,
-                    })
-                },
-            )?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        self.snapshot(|s| s.pending_objects(source, after, limit))
     }
 
     /// Records how ingest finished with the version `etag` of an object. Only a `pending` row
@@ -328,25 +253,7 @@ impl Store {
         source: SourceId,
         key: &str,
     ) -> Result<Option<IngestStatus>, StoreError> {
-        Ok(self
-            .conn()
-            .prepare_cached(
-                "SELECT status, etag, blake3, attempts, last_error FROM objects_seen \
-                 WHERE source_id = ?1 AND key = ?2",
-            )
-            .and_then(|mut cached| {
-                cached.query_row(params![source.to_string(), key], |r| {
-                    let blake3: Option<Vec<u8>> = r.get(2)?;
-                    Ok(IngestStatus {
-                        status: r.get(0)?,
-                        etag: r.get(1)?,
-                        blake3: blake3.and_then(|b| b.try_into().ok()),
-                        attempts: u32::try_from(r.get::<_, i64>(3)?).unwrap_or(0),
-                        last_error: r.get(4)?,
-                    })
-                })
-            })
-            .optional()?)
+        self.snapshot(|s| s.ingest_status(source, key))
     }
 
     /// Up to `limit` ingested objects (`done` or `skipped`, with their hash) with a key after
@@ -357,27 +264,7 @@ impl Store {
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<(String, [u8; 32])>, StoreError> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare_cached(
-            "SELECT key, blake3 FROM objects_seen WHERE source_id = ?1 \
-             AND status IN ('done', 'skipped') AND blake3 IS NOT NULL \
-             AND (?2 IS NULL OR key > ?2) ORDER BY key LIMIT ?3",
-        )?;
-        let rows = stmt
-            .query_map(
-                params![
-                    source.to_string(),
-                    after,
-                    i64::try_from(limit).unwrap_or(i64::MAX)
-                ],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)),
-            )?
-            .filter_map(|row| match row {
-                Ok((k, b)) => b.try_into().ok().map(|b| Ok((k, b))),
-                Err(e) => Some(Err(e)),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        self.snapshot(|s| s.ingested_objects(source, after, limit))
     }
 
     /// Puts objects back in the ingest queue (status `pending`, attempts reset). `None`
@@ -469,6 +356,176 @@ fn write_checkpoint(
 }
 
 impl Snapshot<'_> {
+    /// Up to `limit` live objects of a source with `after < key <= upto`, in key order. `None`
+    /// leaves that end open.
+    pub fn seen_objects(
+        &self,
+        source: SourceId,
+        after: Option<&str>,
+        upto: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SeenObject>, StoreError> {
+        let conn = self.0;
+        let mut stmt = conn.prepare_cached(
+            "SELECT key, etag, size, last_modified FROM objects_seen \
+             WHERE source_id = ?1 AND status <> 'deleted' \
+             AND (?2 IS NULL OR key > ?2) AND (?3 IS NULL OR key <= ?3) \
+             ORDER BY key LIMIT ?4",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    source.to_string(),
+                    after,
+                    upto,
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
+                |r| {
+                    Ok(SeenObject {
+                        key: r.get(0)?,
+                        etag: r.get(1)?,
+                        size: u64::try_from(r.get::<_, i64>(2)?).unwrap_or(0),
+                        last_modified: r.get(3)?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// One live object of a source.
+    pub fn seen_object(
+        &self,
+        source: SourceId,
+        key: &str,
+    ) -> Result<Option<SeenObject>, StoreError> {
+        Ok(self
+            .0
+            .prepare_cached(
+                "SELECT key, etag, size, last_modified FROM objects_seen \
+                 WHERE source_id = ?1 AND key = ?2 AND status <> 'deleted'",
+            )
+            .and_then(|mut cached| {
+                cached.query_row(params![source.to_string(), key], |r| {
+                    Ok(SeenObject {
+                        key: r.get(0)?,
+                        etag: r.get(1)?,
+                        size: u64::try_from(r.get::<_, i64>(2)?).unwrap_or(0),
+                        last_modified: r.get(3)?,
+                    })
+                })
+            })
+            .optional()?)
+    }
+
+    /// The number of live objects of a source.
+    pub fn live_object_count(&self, source: SourceId) -> Result<u64, StoreError> {
+        let n: i64 = self
+            .0
+            .prepare_cached(
+                "SELECT coalesce(sum(n), 0) FROM object_counts \
+                 WHERE source_id = ?1 AND status <> 'deleted'",
+            )?
+            .query_row([source.to_string()], |r| r.get(0))?;
+        Ok(u64::try_from(n).unwrap_or(0))
+    }
+
+    /// Up to `limit` objects of a source waiting for ingest (status `pending`) with a key after
+    /// `after`, in key order: the durable ingest queue. Events only make ingest look sooner.
+    pub fn pending_objects(
+        &self,
+        source: SourceId,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SeenObject>, StoreError> {
+        let conn = self.0;
+        // The planner's statistics are averages over the statuses, so it reads the primary
+        // key in key order instead, which walks every ingested row of a mostly ingested
+        // source. The queue index reads only the pending rows, already in key order.
+        let mut stmt = conn.prepare_cached(
+            "SELECT key, etag, size, last_modified FROM objects_seen \
+             INDEXED BY objects_seen_pending \
+             WHERE source_id = ?1 AND status = 'pending' AND (?2 IS NULL OR key > ?2) \
+             ORDER BY key LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    source.to_string(),
+                    after,
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
+                |r| {
+                    Ok(SeenObject {
+                        key: r.get(0)?,
+                        etag: r.get(1)?,
+                        size: u64::try_from(r.get::<_, i64>(2)?).unwrap_or(0),
+                        last_modified: r.get(3)?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// An object's ingest status, deleted objects included.
+    pub fn ingest_status(
+        &self,
+        source: SourceId,
+        key: &str,
+    ) -> Result<Option<IngestStatus>, StoreError> {
+        Ok(self
+            .0
+            .prepare_cached(
+                "SELECT status, etag, blake3, attempts, last_error FROM objects_seen \
+                 WHERE source_id = ?1 AND key = ?2",
+            )
+            .and_then(|mut cached| {
+                cached.query_row(params![source.to_string(), key], |r| {
+                    let blake3: Option<Vec<u8>> = r.get(2)?;
+                    Ok(IngestStatus {
+                        status: r.get(0)?,
+                        etag: r.get(1)?,
+                        blake3: blake3.and_then(|b| b.try_into().ok()),
+                        attempts: u32::try_from(r.get::<_, i64>(3)?).unwrap_or(0),
+                        last_error: r.get(4)?,
+                    })
+                })
+            })
+            .optional()?)
+    }
+
+    /// Up to `limit` ingested objects (`done` or `skipped`, with their hash) with a key after
+    /// `after`, in key order: what reprocessing compares with the running step versions.
+    pub fn ingested_objects(
+        &self,
+        source: SourceId,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, [u8; 32])>, StoreError> {
+        let conn = self.0;
+        let mut stmt = conn.prepare_cached(
+            "SELECT key, blake3 FROM objects_seen WHERE source_id = ?1 \
+             AND status IN ('done', 'skipped') AND blake3 IS NOT NULL \
+             AND (?2 IS NULL OR key > ?2) ORDER BY key LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    source.to_string(),
+                    after,
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)),
+            )?
+            .filter_map(|row| match row {
+                Ok((k, b)) => b.try_into().ok().map(|b| Ok((k, b))),
+                Err(e) => Some(Err(e)),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// A source's scan checkpoint; `None` before its first pass.
     pub fn scan_checkpoint(&self, source: SourceId) -> Result<Option<ScanCheckpoint>, StoreError> {
         Ok(self
@@ -627,6 +684,69 @@ mod tests {
             ["b", "c"]
         );
         assert_eq!(store.ingest_status(id, "b").unwrap().unwrap().attempts, 0);
+    }
+
+    #[test]
+    fn status_reads_do_not_wait_for_the_writer() {
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let key = MasterKey::from_bytes([3; 32]);
+        let store = Store::open_with_readers(&tmp.path().join(crate::STORE_FILE), &key, 2).unwrap();
+        let id = store
+            .add_source(&NewSource::new("http://x", "b"), None)
+            .unwrap();
+        let done = IngestOutcome::Done { blake3: [7; 32] };
+        let changes = [
+            ObjectChange::Upsert(obj("a", 1)),
+            ObjectChange::Upsert(obj("b", 1)),
+        ];
+        store.record_objects(id, &changes, None).unwrap();
+        assert!(store.finish_object(id, "b", Some("e-b"), &done).unwrap());
+        // A commit in progress holds the writer: a worker's `finish_object`, the scanner's
+        // `record_objects`.
+        let writer = store.conn();
+        writer
+            .execute_batch(
+                "BEGIN IMMEDIATE; UPDATE objects_seen SET status = 'done' WHERE key = 'a';",
+            )
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let reads = (
+                    store.ingest_status(id, "a").unwrap().unwrap().status,
+                    store.seen_object(id, "a").unwrap().is_some(),
+                    store.seen_objects(id, None, None, 10).unwrap().len(),
+                    store.live_object_count(id).unwrap(),
+                    store.pending_objects(id, None, 10).unwrap().len(),
+                    store.ingested_objects(id, None, 10).unwrap().len(),
+                    store.ingest_settings().unwrap(),
+                );
+                tx.send(reads).unwrap();
+            });
+            let reads = rx.recv_timeout(Duration::from_secs(10));
+            // Let go of the writer before failing, or the reads never end.
+            writer.execute_batch("COMMIT").unwrap();
+            drop(writer);
+            // They saw the last committed state.
+            assert_eq!(
+                reads.expect("the reads waited for the writer"),
+                (
+                    "pending".into(),
+                    true,
+                    2,
+                    2,
+                    1,
+                    1,
+                    crate::IngestSettings::default()
+                )
+            );
+        });
+        assert_eq!(
+            store.ingest_status(id, "a").unwrap().unwrap().status,
+            "done"
+        );
     }
 
     #[test]
