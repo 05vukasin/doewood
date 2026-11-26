@@ -921,7 +921,8 @@ async fn shutdown_leaves_unfinished_work_pending() {
     assert!(s.attempts >= 1);
 }
 
-/// A bucket in memory, listed like S3 (the token is the last key of the previous page).
+/// A bucket in memory, listed like S3 (the token is the last key of the previous page). The
+/// objects are in key order.
 #[derive(Default)]
 struct MemBucket {
     objects: Vec<ListedObject>,
@@ -930,18 +931,16 @@ struct MemBucket {
 impl Lister for MemBucket {
     async fn list(&self, req: ListRequest<'_>) -> Result<ListPage, S3Error> {
         let after = req.continuation_token.or(req.start_after);
-        let rest: Vec<_> = self
-            .objects
+        // A page costs its own keys, not the bucket's (the `scale` measurement lists 200k).
+        let from = after.map_or(0, |a| self.objects.partition_point(|o| o.key.as_str() <= a));
+        let mut rest = self.objects[from..]
             .iter()
-            .filter(|o| o.key.starts_with(req.prefix) && after.is_none_or(|a| o.key.as_str() > a))
-            .collect();
-        let objects: Vec<_> = rest
-            .iter()
-            .take(req.max_keys)
-            .map(|o| (*o).clone())
-            .collect();
-        let next_continuation_token =
-            (rest.len() > objects.len()).then(|| objects.last().unwrap().key.clone());
+            .filter(|o| o.key.starts_with(req.prefix));
+        let objects: Vec<_> = rest.by_ref().take(req.max_keys).cloned().collect();
+        let next_continuation_token = rest
+            .next()
+            .is_some()
+            .then(|| objects.last().unwrap().key.clone());
         Ok(ListPage {
             objects,
             next_continuation_token,
