@@ -157,13 +157,15 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
   not built `CONCURRENTLY` (which cannot run in the migration's transaction). **Down path:** `DROP INDEX edges_by_dst;
   CREATE INDEX edges_by_dst ON edges (dst, kind); DELETE FROM doewood_schema WHERE version
   = 10;`. The instance's own SQLite file went to schema 12 with the same index (`ifnull(valid_from,
-  -2147483648)`). On the same store in SQLite (a 5.0 GiB file) the index takes about 8 s, but
-  the runner's foreign key check over the whole file, which it makes before each migration
-  commits, took 70 to 310 s (mostly disk reads; it depends on how much of the file the OS has
-  cached). The migration runs when the store opens at start, so on a store this size the
-  instance starts and becomes ready 1.5 to 5.5 minutes later; nothing else uses the file
-  meanwhile. `migration_timings` in `crates/doewood-store/src/migrate.rs` (ignored) times
-  both parts on a copy of a store. Schema 9 (issue #148: the `similar_to` stop band, `sketch_band_sizes`) came
+  -2147483648)`). On the same store in SQLite (a 5.0 GiB file) the index takes about 8 s. The
+  migrations run when the store opens at start, before the instance is ready; nothing else
+  uses the file meanwhile. Before issue #159 the runner also checked every foreign key in the
+  file before each migration committed, 70 to 375 s each (mostly disk reads; it depends on how
+  much of the file the OS has cached): from schema 10 to 12 the instance was ready 6.3
+  minutes after the start (another run was still migrating when the 10-minute limit stopped it). Since #159 each
+  migration checks only what it can break (see [The instance store](#the-instance-store)), and
+  schema 10 to 12 takes 3 to 26 s on that store. `migration_timings` in
+  `crates/doewood-store/src/migrate.rs` (ignored) times them on a copy of a store. Schema 9 (issue #148: the `similar_to` stop band, `sketch_band_sizes`) came
   before it.
 - **Schema 8** (issue #121: records are stored as their canonical JSON text, in the new
   column `records.body`, lz4-compressed where the server has lz4) came before that. The
@@ -220,6 +222,14 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
   expired registry answers and icons. Every instance does it; the delete is idempotent.
 
 ### The instance store
+
+**Migrations** run in one transaction each when the file opens, with foreign keys off (so a
+migration can rebuild a table others reference). Before a migration commits it checks the
+foreign keys it could break, as the runner declares per migration (issue #159): every table
+for one that rebuilds a table, deletes rows or moves data (schemas 1 to 10); only the tables
+it fills for one that writes into new tables (schema 11); none for one that only builds
+indexes (schema 12). A violation rolls the migration back and the instance does not start.
+A test holds each migration to its declaration.
 
 `doewood.sqlite` runs in WAL mode with `synchronous = NORMAL`, and a `journal_size_limit` of
 64 MiB: after a large transaction the `-wal` file shrinks back to that at the next checkpoint.
