@@ -472,6 +472,18 @@ impl Store {
         Ok(())
     }
 
+    /// Copies the WAL into the main file and empties it (`PRAGMA wal_checkpoint(TRUNCATE)`),
+    /// waiting for readers as any write does. Returns the WAL's frames and how many of them
+    /// were already in the main file before.
+    pub fn checkpoint(&self) -> Result<(i64, i64), StoreError> {
+        let conn = self.conn();
+        let before = conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
+            Ok((r.get(1)?, r.get(2)?))
+        })?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(before)
+    }
+
     /// Closes the readers, then checkpoints the WAL into the main file and closes the writer.
     pub fn close(self) -> Result<(), StoreError> {
         // The checkpoint thread first: the close's own checkpoint does not wait for it.
@@ -716,6 +728,7 @@ mod tests {
                 "search_index",
                 "secrets",
                 "settings",
+                "sketch_band_sizes",
                 "sketch_bands",
                 "sketches",
                 "source_claims",

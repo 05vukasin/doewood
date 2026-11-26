@@ -14,8 +14,9 @@
 //! advises (100 ms doubling to 10 s, with jitter), or after a fixed
 //! `DOEWOOD_BENCH_BACKOFF_MS`; with `DOEWOOD_BENCH_PUSHBACK=1` a client waits the server's
 //! `grpc-retry-pushback-ms` instead when the refusal carries one (issue #104). Seeding is
-//! followed by `ANALYZE` (Postgres) and a 2 s warm-up that is not reported. At the end a
-//! burst of idle connections measures memory per connection.
+//! followed by `ANALYZE` (Postgres), a checkpoint of the instance store's WAL (issue #140)
+//! and a 2 s warm-up that is not reported. At the end a burst of idle connections measures
+//! memory per connection.
 //!
 //! Settings: `DOEWOOD_BENCH_CLIENTS` (comma-separated, default `10,100,500,1000`),
 //! `DOEWOOD_BENCH_PER_CONN` (clients per connection, default 1), `DOEWOOD_BENCH_WATCH_PCT`
@@ -850,6 +851,18 @@ async fn api_load() {
     if let Some(pg) = &pg {
         pg.analyze().await;
     }
+    // The seeding's WAL into the main file (issue #140). Seeding's concurrent writes leave a
+    // WAL that was never reset (1.3 million frames, 5.4 GB, at 200,000 documents), and with
+    // no write after it no automatic checkpoint ends it: the steps then measured readers
+    // looking their pages up in it (Search 31 against 9.5 ms at 10 clients). `serve`'s next
+    // write checkpoints it.
+    let t = Instant::now();
+    let (frames, done) = a.store.checkpoint().unwrap();
+    println!(
+        "api_load: instance store checkpoint: {frames} WAL frames ({done} already in the main \
+         file) in {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
     // Warm up (caches, the pool's connections and statements); not reported.
     warm_up(&a, &seeded).await;
     for clients in steps {

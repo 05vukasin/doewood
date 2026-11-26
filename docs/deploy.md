@@ -205,6 +205,10 @@ Alerts worth setting (tune the thresholds to your traffic):
   The store empties its WAL when it is over 64 MiB or idle (issue #151); a WAL that stays
   large means a read or a write holds a lock longer than the 50 ms the checkpoint waits for,
   for example a backup tool or an `sqlite3` shell with a transaction open on the file.
+- **Template-heavy sources** (not an alert): `doewood_ingest_similar_buckets_skipped_total`
+  counts band keys the `similar_to` query skipped because more than `similar_max_bucket`
+  documents share them (issue #148). It grows when one template (one supplier's invoices)
+  passes the limit; those documents then link only through their less common bands.
 
 ## Sizing
 
@@ -653,8 +657,10 @@ both stores in CI.
 
 What changed: `GraphStore::node_ids` reads the candidates' Document nodes in one statement
 (the few missing ones are still created one by one), and `GraphStore::upsert_edges` writes
-the edges in one transaction: pipelined on Postgres (`BEGIN`, the upserts and `COMMIT` in
-one round trip), one writer call on SQLite. A document costs 8 round trips on Postgres
+the edges in one transaction: one statement on Postgres (an `INSERT ... SELECT FROM unnest`
+upsert; since #148, before that the upserts were pipelined between `BEGIN` and `COMMIT`,
+which the client could split into more round trips on a busy machine), one writer call on
+SQLite. A document costs 8 round trips on Postgres
 however many similar documents it has (`similar_documents_take_a_fixed_number_of_round_trips`),
 against 8 plus 2 per similar document before.
 
@@ -663,9 +669,39 @@ that shares a band, then keeps the best 100. At 10,000 documents (2,000 per temp
 reads 53,543 index entries for one template document (`EXPLAIN (ANALYZE, BUFFERS)`: 26 ms;
 13.5 ms best of 5 from the client), against 10,400 entries at 2,000 documents: linear in the
 number of near-duplicates, so quadratic over a corpus of one template. The graph write per
-document rose from 25 ms at 2,000 documents to 31 ms at 10,000 on Postgres. A bound on the
-bucket (an LSH "stop band") would change which edges exist, so it is left to a decision
-(issue #126).
+document rose from 25 ms at 2,000 documents to 31 ms at 10,000 on Postgres. Bounded since
+issue #148, below.
+
+### Stop bands (issue #148)
+
+The same `near_duplicate_corpus` on Postgres, on this change, with the default
+`similar_max_bucket` of 1000 against 1,000,000 (no bound in practice), one run each:
+
+| documents | graph write per document, no bound / 1000 | candidate query (best of 5), no bound / 1000 | `similar_to` per document, no bound / 1000 | bands skipped per document (1000) |
+|---|---|---|---|---|
+| 3,000 | 18.1 / 17.5 ms | 9.6 / 8.0 ms | 80 / 80 | 0 |
+| 6,000 | 21.9 / 20.5 ms | 9.2 / 2.2 ms | 80 / 80 | 6 (the buckets pass 1000) |
+| 9,000 | 25.7 / 11.0 ms | 27.1 / 1.1 ms | 80 / 57 | 22 |
+| 10,000 (10,500) | 30.7 / 11.1 ms | 15.8 / 0.4 ms | 80 / 53 | 22 |
+| 15,000 | not run / 11.4 ms | not run / 1.5 ms | 52 | 22.5 |
+
+(Per window of a tenth of the corpus; the candidate query is timed for the last template
+document of the window. The machine was shared with other builds.)
+
+On SQLite (a store file, 10,000 documents, the bound at 1000) the graph write per document
+rose to 38.8 ms at 5,000 documents and came back to 20.7 ms at 10,000 (candidate query 8.1 ms
+at 5,000, 0.2 to 0.5 ms from 8,000 on); the same 22 bands per document are skipped. (The
+measurement of #126 on SQLite went from 35 to 42 ms per document between 1,200 and 4,000
+documents, still rising.)
+
+With the bound the graph write stays flat once the 4 templates pass 1000 documents each
+(about 5,000 documents): at 15,000 documents the candidate query reads 32 `sketch_band_sizes`
+rows and 128 `sketch_bands` entries (`EXPLAIN ANALYZE` 3.0 ms), against 53,543 entries and
+31 ms at 10,000 without it. The cost is fewer edges for template documents: they link only
+through the bands their template does not share with more than 1000 others (52 instead of
+80 edges per document on average over the corpus, 22 of 32 bands skipped). With the bound
+off, the edges are the same as before: the digest of every `similar_to` edge at 10,000
+documents is the one of #126 (`1cbe59b1…`).
 
 ### API under many clients (issue #80)
 
@@ -1187,8 +1223,8 @@ DOEWOOD_SCALE_DIR=<dir> cargo test -p doewood-store --lib scale_store_sizes -- -
 | ingest sweep, nothing pending / `object_counts` | | 0.03 / 0.007 ms | 0.01 / 0.003 ms | | 0.03 / 0.007 ms | 0.02 / 0.004 ms |
 | unchanged scan pass over every key (before #138; after: 0.10 to 0.16 s and 0.37 to 0.67 s) | | (see below) | 7.6 to 8.3 s | | 0.46 to 0.50 s | 6.7 to 6.9 s |
 | writer lock wait during the scan, mean | | | 18 ms | | 3.6 ms | 16 ms |
-| `companies_due`, first page of 100 | | 51 ms | 235 ms | | 10 ms | 86 ms |
-| an enrichment pass of `companies_due` pages (registries off) | | 2.5 s, 94 pages | 41.6 s, 375 pages | | 0.28 s | 1.1 s |
+| `companies_due`, first page of 100 (SQLite before #139) | | 14 ms (51) | 55 ms (235) | | 10 ms | 86 ms |
+| an enrichment pass of `companies_due` pages (registries off; SQLite before #139) | | 0.12 s (2.5 s), 94 pages | 0.35 to 0.4 s (41.6 s), 375 pages | | 0.28 s | 1.1 s |
 | `ListRecords`, one client (page of 100) | | 12.8 ms | 9.7 ms | | 66 ms | 69 ms |
 | `Search`, a word in a quarter of the documents | | 17 ms | 71 ms | | 10 ms | 112 ms |
 | `Search`, the big company's name | | 8.8 ms | 34 ms | | 6.1 ms | 20 ms |
@@ -1202,7 +1238,7 @@ DOEWOOD_SCALE_DIR=<dir> cargo test -p doewood-store --lib scale_store_sizes -- -
 The single-client API rows are medians of 11 calls through the API on the `scale` store
 (`DOEWOOD_SCALE_PHASE=api`), on SQLite without planner statistics (ingest never refreshed
 them; after `analyze`, as `serve` does once it is ready, the 210k store answered within 30%
-of these, and `companies_due` was as slow); `api_load` seeds its own store (10, 50 or 200 thousand documents
+of these, and `companies_due` before #139 was as slow); `api_load` seeds its own store (10, 50 or 200 thousand documents
 of about 1 KiB, one company per 20, `DOEWOOD_BENCH_CLIENTS=10,100 DOEWOOD_BENCH_IDLE=0`).
 `serve` ran the release binary on the 210k store with every registry, feed and the favicon
 fallback switched off (`DOEWOOD_SCALE_PHASE=offline`), in a network namespace with only
@@ -1244,14 +1280,21 @@ What the numbers say:
   (The SQLite 50k pass, 1.0 to 1.5 s, was measured with a test bucket that was itself
   quadratic; the Postgres run's 50k pass uses the same instance store code.) Fixed in #138:
   the pass is now linear, see [below](#key-ranges-of-objects_seen-issue-138).
-- **SQLite's `companies_due` sorts every company for each page**, so an enrichment pass is
-  quadratic in the companies (41.6 s for 37,497); Postgres stays linear (1.1 s). Issue #139.
+- **SQLite's `companies_due` sorted every company for each page**, so an enrichment pass was
+  quadratic in the companies (41.6 s for 37,497); Postgres stays linear (1.1 s). Since #139
+  it reads the companies through `nodes_companies` from the page token: a pass is linear,
+  0.12 s at 50k and 0.35 to 0.4 s at 200k (the first page, 55 ms, holds the big company's
+  12,504 documents). With the store's pages out of the OS page cache (other jobs on the
+  server) the 200k pass took 4 to 8.5 s, nearly all of it disk reads (about 1 s of CPU);
+  the query before took 39 to 42 s either way. Measured on a store grown again to 200k
+  with the #127 code (`b1718f6`) plus the change, the old and new query on the same store
+  (docs/enrichment.md).
 - **SQLite `Search` slows faster than its matches grow** under load: `api_load` at 200k
   serves 508 calls/s, a tenth of 10k, and every call waits behind the searches. One search
   costs its matches on both stores (every match is ranked before the page is taken); on
   Postgres the common-word search went from 10 to 112 ms when `search_index` (206 MiB)
-  outgrew the default 128 MB of shared buffers. Issue #140. Give Postgres `shared_buffers`
-  of at least the search index's size for big corpora.
+  outgrew the default 128 MB of shared buffers. Issue #140: see
+  [Search on a big corpus](#search-on-a-big-corpus-issue-140).
 - **Postgres's WAL per document grows** from 26 KB to 109 KB (full-page images after each
   checkpoint over indexes keyed by hashes and random ids; half the checkpoints were
   requested by `max_wal_size` 1 GB). Issue #141.
@@ -1265,6 +1308,109 @@ What the numbers say:
   enrichment pass over every company.
 - **SQLite's WAL stays small** (4 to 6 MiB at most, a checkpoint resetting it about every
   10 files) at every size; the writer's lock wait is flat at about 2 ms mean and 35 ms p99.
+
+### Search on a big corpus (issue #140)
+
+Issue #127 found SQLite's `Search` under `api_load` 7.7 times slower at 200,000 documents than
+at 50,000, and the other calls queueing behind it on the 4 readers; and on Postgres a
+common-word search went from 10 to 112 ms once `search_index` outgrew the 128 MB of shared
+buffers. Three causes, measured with `api_load` (as in #127: release build, 10 s a step,
+`DOEWOOD_BENCH_CLIENTS=10,100 DOEWOOD_BENCH_IDLE=0`, one company per 20 documents) and
+`text_search_timings` (one search at a time on one reader of a store on disk, seeded by SQL
+with `api_load`'s documents, where every 4th also has `quarter` and up to 12 more words, so a
+word in a quarter of the documents scores by length; medians and p99 of 3 runs of 40 queries,
+5 for the common words), on the 4 vCPU server above; "before" is `main` at `b1718f6`,
+"after" this change, Postgres 17.12
+(`pgvector/pgvector:pg17`) on an `--internal` Docker network:
+
+```
+DOEWOOD_BENCH_DOCS=200000 cargo test --release -p doewood-store --lib text_search_timings \
+  -- --ignored --nocapture
+```
+
+**1. `api_load`'s own seeding (SQLite).** Seeding 200,000 documents left a WAL of 1.3 million
+frames (5.4 GB; 330,000 frames at 50,000) that was never reset, and as `api_load` then only
+reads, no automatic checkpoint ever ended it: every page the readers read was looked up in
+it. `api_load` now checkpoints the instance store after seeding (`Store::checkpoint`), as
+`serve`'s next write would. That alone is most of the 7.7x:
+
+| SQLite `api_load` | 10 clients: calls/s | `Search` p50 / p99 | `GetNode` p50 | 100 clients: calls/s | p99 |
+|---|---|---|---|---|---|
+| 50,000, before | 3,047 | 5.1 / 12.4 ms | 1.3 ms | 2,881 | 131 ms |
+| 50,000, after | 3,875 | 4.0 / 9.6 ms | 1.0 ms | 3,604 | 105 ms |
+| 200,000, before | 505 | 36.7 / 71.8 ms | 6.9 ms | 456 | 732 ms |
+| 200,000, the new query only (no checkpoint) | 582 | 31.3 / 67.9 ms | 6.3 ms | 531 | 598 ms |
+| 200,000, after | 1,753 | 9.5 / 23.9 ms | 2.1 ms | 1,811 | 200 ms |
+
+From 50,000 to 200,000 documents `Search` now takes 2.4 times as long, less than its matches
+grow (4 times).
+
+**2. Every match was read and sorted (SQLite).** A search scored each match with `bm25`,
+joined it to its `search_index` row and sorted all of them by score, date and hash before the
+page was taken. A search on words alone now joins only the matches that can reach the page
+(see [api.md](api.md#search-on-words-alone)); the results are the same, ties included.
+One search at a time:
+
+| SQLite, one search, p50 / p99 | 50,000: before | after | 200,000: before | after |
+|---|---|---|---|---|
+| a rare term (`api_load`; 200 / 800 matches) | 0.51 / 0.71 ms | 0.46 / 0.71 ms | 2.47 / 2.85 ms | 2.37 / 3.46 ms |
+| a word and a rare term (`api_load`; 168 / 668) | 1.80 / 2.44 ms | 1.76 / 2.29 ms | 7.23 / 7.69 ms | 7.02 / 10.47 ms |
+| a word in a quarter of the documents (12,500 / 50,000) | 14.7 / 22.8 ms | 8.4 / 8.9 ms | 61.6 / 74.3 ms | 36.0 / 43.5 ms |
+| a word in 5 of 6 documents (41,667 / 166,667) | 29.4 / 33.4 ms | 27.0 / 42.1 ms | 113.5 / 117.0 ms | 111.0 / 118.5 ms |
+
+The gain is the rows not read; where most matches tie on the score (`api_load`'s documents
+are all the same length, and a word in most documents adds almost nothing to the score), the
+ties are read as before. What stays is linear in the matches, and
+cannot go without changing the ranking:
+
+- `bm25` scores every match (its column sizes and positions) before the best can be known.
+- `bm25`'s IDF counts every document containing each word, once per search, whatever the
+  page: about 5 ms per search for a word in 5 of 6 of 200,000 documents. This is most of
+  "a word and a rare term".
+
+**3. Postgres ranks every match too.** `ts_rank` reads each match's `tsv` from its heap row,
+so a word in many documents reads most of `search_index`: a word in a quarter of the rows or
+more is a parallel sequential scan of the whole table (28,572 blocks at 200,000
+`api_load` documents: 223 MB of heap, 44 MB of indexes, 36 MB of them `search_tsv`); a rare
+term is a bitmap scan of its own rows. The page, ties included, needs every match ranked, so
+Postgres runs as before. `api_load` on Postgres (default settings, 128 MB of shared buffers):
+
+| Postgres `api_load` | 10 clients: calls/s | `Search` p50 / p99 | 100 clients: calls/s | p99 |
+|---|---|---|---|---|
+| 50,000 | 4,630 | 2.0 / 4.6 ms | 4,833 | 34 ms |
+| 200,000 | 3,537 | 3.7 / 9.3 ms | 3,318 | 52 ms |
+
+One search at a time on the same documents in a table of their own (`EXPLAIN (ANALYZE,
+BUFFERS)` of `PgStore::search`'s query, after a restart, 2 to 3 sessions of 3 runs; first
+run, then the others):
+
+| Postgres, 200,000 documents | 128 MB shared buffers | 1 GB |
+|---|---|---|
+| a rare term (800 matches) | 8 to 12, then 0.7 to 1.3 ms (804 blocks, hits once read) | 2.7, then 0.6 to 1.4 ms |
+| a word in a quarter of the documents | 441 to 500, then 32 to 49 ms (28,476 blocks read each time) | 112, then 53 to 66 ms (all hits) |
+| a word in 5 of 6 documents | 35 to 42 ms (28,188 blocks read each time) | 60 to 72 ms (all hits) |
+
+Sizing:
+
+- A sequential scan of a table bigger than a quarter of `shared_buffers` reads through a
+  small ring of buffers, so with the default 128 MB a common-word search never caches
+  `search_index` in shared buffers: it reads the whole table again each time (28,000 blocks
+  here, #127's 25,000 at 200,000 documents). From the OS page cache that is cheap (32 to 49
+  ms here, ranking 50,000 rows included); the first search after a restart took 441 to 500 ms, and
+  #127's 112 ms on a store of 3.4 GB is in line with reads the page cache did not hold.
+- So plan the database host's memory, shared buffers and page cache together, for at least
+  the search table and its indexes:
+  `SELECT pg_size_pretty(pg_table_size('search_index') + pg_indexes_size('search_index'))`
+  (about 1.4 KiB a document with small documents, #127). A container memory limit counts
+  the page cache.
+- Bigger shared buffers are not a fix for common words: with 1 GB (more than four times the
+  table) the scan found every block in shared buffers and was still slower here (53 to 72
+  against 32 to 49 ms), as the cost is ranking the matches. Rare terms are as fast either way.
+
+What would make a common-word search cost its page rather than its matches is a change to the
+ranking, for the owner to decide (see the PR of #140): for example rank only a bounded set of
+candidates (the newest N matches, or the first N by an index order) and say so in the API, or
+keep per-word document counts so SQLite need not count them at every search.
 
 ### Key ranges of `objects_seen` (issue #138)
 
