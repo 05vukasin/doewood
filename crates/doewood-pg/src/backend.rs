@@ -44,10 +44,12 @@ pub(crate) const SKETCH_CANDIDATES: &str = "SELECT c.blake3, s.signature, c.shar
 
 /// [`SKETCH_CANDIDATES`] over the bands of `$1` whose bucket holds at most `$4` documents
 /// (issue #148): `big` reads one `sketch_band_sizes` row per band, and the bands left are
-/// counted as before. The first column is the number of skipped bands, on every row; with no
-/// candidate there is one row, the others NULL.
+/// counted as before. Since schema 11 a bucket of one document has no size row (issue #141),
+/// so with `$4` 0 the bands in `sketch_bands` are big too. The first column is the number of
+/// skipped bands, on every row; with no candidate there is one row, the others NULL.
 pub(crate) const SKETCH_CANDIDATES_WITHIN: &str = "WITH big AS MATERIALIZED (\
-     SELECT band FROM sketch_band_sizes WHERE band = ANY($1) AND docs > $4::bigint), \
+     SELECT band FROM sketch_band_sizes WHERE band = ANY($1) AND docs > $4::bigint \
+     UNION SELECT band FROM sketch_bands WHERE $4::bigint < 1 AND band = ANY($1)), \
      c AS (SELECT blake3, count(*) AS shared FROM sketch_bands \
      WHERE band = ANY(ARRAY(SELECT unnest($1::bigint[]) EXCEPT SELECT band FROM big)) \
      AND blake3 <> $2 \

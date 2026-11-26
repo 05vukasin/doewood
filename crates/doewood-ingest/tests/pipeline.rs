@@ -1348,7 +1348,8 @@ fn scale_file(i: usize) -> (String, Vec<u8>) {
 ///
 /// - `ingest` (the default): adds files until the corpus has `DOEWOOD_SCALE_TO` (default
 ///   50,000), at most `DOEWOOD_SCALE_RUN` (default 25,000) in this run, and prints files/s
-///   and the graph stage per 5,000 files, then the writer lock wait (a trivial call every
+///   and the graph stage per 5,000 files (on Postgres also the WAL per file, its full-page
+///   images and the checkpoints, issue #141), then the writer lock wait (a trivial call every
 ///   millisecond) and the WAL's largest size and resets (`DOEWOOD_SCALE_NEAR=0`: without
 ///   the near-duplicates). The keys and sizes go to `keys.tsv` in the directory, so the
 ///   next run continues where this one stopped.
@@ -1455,8 +1456,10 @@ async fn scale() {
                 .open(&keys_file)
                 .unwrap();
             let started = std::time::Instant::now();
+            let wal_start = scale_wal(admin.as_ref()).await;
             let mut at = from;
             while at < end {
+                let wal_before = scale_wal(admin.as_ref()).await;
                 let next = (at + 5000).min(end);
                 let files: Vec<(String, Vec<u8>)> = (at..next).map(scale_file).collect();
                 let before = h.ingest.stats().time;
@@ -1484,12 +1487,23 @@ async fn scale() {
                     ms(time.company_lock_wait, before.company_lock_wait),
                     ms(time.company_lock_hold, before.company_lock_hold),
                 );
+                if let (Some(a), Some(b)) = (wal_before, scale_wal(admin.as_ref()).await) {
+                    println!("scale: files {at}..{next}: {}", b.since(&a, next - at));
+                }
                 for (k, d) in &files {
                     writeln!(out, "{k}\t{}", d.len()).unwrap();
                 }
                 out.flush().unwrap();
                 h.fetch.objects.lock().unwrap().clear();
                 at = next;
+            }
+            if let (Some(a), Some(b)) = (wal_start, scale_wal(admin.as_ref()).await) {
+                println!(
+                    "scale: files {from}..{end}: {} (LSN {} to {})",
+                    b.since(&a, end - from),
+                    a.lsn,
+                    b.lsn
+                );
             }
             let c = store.object_counts(source).unwrap();
             println!(
@@ -1636,6 +1650,58 @@ async fn scale() {
         "api" => scale_api(&store, &backend, source, &keys).await,
         other => panic!("unknown DOEWOOD_SCALE_PHASE {other}"),
     }
+}
+
+/// The server's WAL counters (`pg_stat_wal`, `pg_stat_checkpointer`) at one moment, for the
+/// WAL per file of a `scale` run (issue #141).
+struct ScaleWal {
+    bytes: f64,
+    fpi: i64,
+    records: i64,
+    timed: i64,
+    requested: i64,
+    lsn: String,
+}
+
+impl ScaleWal {
+    /// The WAL from `before` to `self`, per file of `files`.
+    #[allow(clippy::cast_precision_loss)]
+    fn since(&self, before: &Self, files: usize) -> String {
+        let per = |v: f64| v / files as f64;
+        let fpi = self.fpi - before.fpi;
+        format!(
+            "WAL {:.1} KB per file ({:.1} MB), {:.1} records and {:.2} full-page images per \
+             file, checkpoints {} timed / {} requested",
+            per(self.bytes - before.bytes) / 1e3,
+            (self.bytes - before.bytes) / 1e6,
+            per((self.records - before.records) as f64),
+            per(fpi as f64),
+            self.timed - before.timed,
+            self.requested - before.requested,
+        )
+    }
+}
+
+/// [`ScaleWal`] now; `None` on SQLite.
+async fn scale_wal(admin: Option<&tokio_postgres::Client>) -> Option<ScaleWal> {
+    let r = admin?
+        .query_one(
+            "SELECT wal_bytes::float8, wal_fpi, wal_records, \
+             (SELECT num_timed FROM pg_stat_checkpointer), \
+             (SELECT num_requested FROM pg_stat_checkpointer), pg_current_wal_lsn()::text \
+             FROM pg_stat_wal",
+            &[],
+        )
+        .await
+        .ok()?;
+    Some(ScaleWal {
+        bytes: r.get(0),
+        fpi: r.get(1),
+        records: r.get(2),
+        timed: r.get(3),
+        requested: r.get(4),
+        lsn: r.get(5),
+    })
 }
 
 /// The `api` phase of [`scale`].
