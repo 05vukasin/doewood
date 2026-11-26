@@ -6,16 +6,21 @@
 //! 3. register the signal handlers, so a SIGTERM during startup still shuts down cleanly;
 //! 4. start the ops server (`/healthz` answers, `/readyz` says not ready) and bind the gRPC
 //!    address (both fatal when the address cannot be bound);
-//! 5. resolve the master key and open the store;
-//! 6. standalone: serve records, graph and search from the store and report ready. With
-//!    `DOEWOOD_POSTGRES_URL`: connect to the shared Postgres in the background, and report ready
-//!    once it answers. Until then the instance runs degraded: `/readyz` says why, and the
-//!    connection is retried with backoff (see [`crate::shared`]).
-//! 7. build ingest (the quail engine, with OCR when built and its models are there) and start
-//!    its workers, and start the enrichment job (ADR 0002 section 6); they wait for the backend
-//!    while the shared Postgres is not connected.
-//! 8. start one scanner per active S3 source (none configured: nothing starts), accept S3
-//!    event notifications on the ops server, and serve the gRPC API. Sources added through
+//! 5. start building the analyzer (the quail engine, with OCR when built and its models are
+//!    there) on a blocking thread, and with `DOEWOOD_POSTGRES_URL` start connecting to the
+//!    shared Postgres in the background; neither needs the store, so both run while it opens
+//!    (issue #118);
+//! 6. resolve the master key and open the store;
+//! 7. standalone: serve records, graph and search from the store. With
+//!    `DOEWOOD_POSTGRES_URL`: from the shared Postgres once it answers. Until then the instance
+//!    runs degraded: `/readyz` says why, and the connection is retried with backoff (see
+//!    [`crate::shared`]).
+//! 8. build ingest from the analyzer and start its workers, and start the enrichment job
+//!    (ADR 0002 section 6); they wait for the backend while the shared Postgres is not
+//!    connected.
+//! 9. start one scanner per active S3 source (none configured: nothing starts), accept S3
+//!    event notifications on the ops server, and serve the gRPC API; ready from here
+//!    (standalone), or once the shared Postgres answers. Sources added through
 //!    the API start scanning at once. With `DOEWOOD_POSTGRES_URL`, no scanner starts before
 //!    the shared Postgres answers: the instance then re-claims each of its sources there and
 //!    scans those it owns; a source another instance claimed is marked and not scanned (see
@@ -29,7 +34,7 @@
 
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use doewood_api::{ApiOptions, ApiParts, ApiState, Progress};
 use doewood_core::{BootstrapConfig, Loaded, MasterKey, MasterKeySource};
@@ -48,8 +53,9 @@ const API_DRAIN: Duration = Duration::from_secs(10);
 use crate::ops::{self, OpsState};
 use crate::{cleanup, enrichment, icons, ingest, shared};
 
-/// Builds the runtime and runs the service until a shutdown signal.
-pub fn main(loaded: Loaded) -> ExitCode {
+/// Builds the runtime and runs the service until a shutdown signal. `started`: when the
+/// process started, for the startup timings.
+pub fn main(loaded: Loaded, started: Instant) -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("doewood")
@@ -61,7 +67,7 @@ pub fn main(loaded: Loaded) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(run(loaded)) {
+    match runtime.block_on(run(loaded, started)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             error!(error = %message, "doewood stopped");
@@ -73,7 +79,7 @@ pub fn main(loaded: Loaded) -> ExitCode {
 // The start and stop order reads top to bottom, step by step as the module documentation lists
 // it; splitting it would only scatter that order.
 #[allow(clippy::too_many_lines)]
-async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
+async fn run(Loaded { config, warnings }: Loaded, started: Instant) -> Result<(), String> {
     info!(
         version = crate::VERSION,
         instance_id = %config.instance_id,
@@ -89,19 +95,24 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
         info!("no shared Postgres configured: running standalone");
     }
 
-    config.prepare_data_dir().map_err(|e| e.to_string())?;
-    let mut signals = Signals::register().map_err(|e| format!("signal handlers: {e}"))?;
-
     let state = Arc::new(OpsState::new(
         config.instance_id.as_str(),
         config.is_standalone(),
+        started,
     ));
+    state.step("config", started);
+    let t = Instant::now();
+    config.prepare_data_dir().map_err(|e| e.to_string())?;
+    let mut signals = Signals::register().map_err(|e| format!("signal handlers: {e}"))?;
+    state.step("data dir", t);
+    let t = Instant::now();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let listener = TcpListener::bind(config.ops_listen)
         .await
         .map_err(|e| format!("cannot bind the ops server to {}: {e}", config.ops_listen))?;
     let ops_addr = listener.local_addr().map_err(|e| e.to_string())?;
+    state.set_addr(ops_addr);
     info!(addr = %ops_addr, "ops server listening (/healthz, /readyz, /metrics)");
     let ops_server = tokio::spawn(
         axum::serve(listener, ops::router(Arc::clone(&state)))
@@ -122,9 +133,24 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
             ));
         }
     };
+    state.step("listeners", t);
+
+    // Independent of the store, so they run while it opens (issue #118): the analyzer on a
+    // blocking thread, and the shared Postgres's connect and migrations in the supervisor.
+    let analyzer = ingest::start_analyzer(&config, &state);
+    let (backend_tx, backend_rx) = watch::channel::<Option<Arc<dyn Backend>>>(None);
+    let supervisor = config.postgres_url.clone().map(|url| {
+        // Degraded until the supervisor connects; it retries for as long as it takes.
+        tokio::spawn(shared::supervise(
+            url,
+            Arc::clone(&state),
+            backend_tx.clone(),
+            shutdown_rx.clone(),
+        ))
+    });
 
     let store = tokio::select! {
-        store = open_store(&config) => store,
+        store = open_store(&config, &state) => store,
         signal = signals.recv() => {
             info!(signal, "shutdown requested during startup");
             let _ = shutdown_tx.send(true);
@@ -141,31 +167,21 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
         }
     };
 
-    // Records, graph, claims and search: the shared Postgres when configured, else this file.
-    let (backend_tx, backend_rx) = watch::channel::<Option<Arc<dyn Backend>>>(None);
-    let supervisor = if let Some(url) = config.postgres_url.clone() {
-        // Degraded until the supervisor connects; it retries for as long as it takes.
-        Some(tokio::spawn(shared::supervise(
-            url,
-            Arc::clone(&state),
-            backend_tx,
-            shutdown_rx.clone(),
-        )))
-    } else {
+    // Records, graph, claims and search: the shared Postgres when configured (the supervisor
+    // publishes it), else this file.
+    if supervisor.is_none() {
         backend_tx.send_replace(Some(Arc::new(Standalone::new(Arc::clone(&store)))));
-        // The value stays readable through `backend_rx`.
-        drop(backend_tx);
+        // Ready once the API serves, below.
         state.set_ready();
-        info!(addr = %ops_addr, "ready");
-        None
-    };
-
-    // Expired registry answers and icons are purged from the backend every hour, and the
-    // instance store's planner statistics refreshed.
-    let purging = cleanup::start(Arc::clone(&store), backend_rx.clone(), shutdown_rx.clone());
+    }
+    // The value stays readable through `backend_rx`.
+    drop(backend_tx);
 
     let progress = Arc::new(Progress::new());
-    let ingest = ingest::build(&config, &store, backend_rx.clone(), &progress).await;
+    let t = Instant::now();
+    let ingest = ingest::build(&config, &store, backend_rx.clone(), &progress, analyzer).await;
+    state.step("ingest", t);
+    let t = Instant::now();
     let (ingest_tx, ingest_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     // Without ingest the receiver is dropped here, and no events are sent to it.
     let ingesting = ingest
@@ -188,6 +204,8 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
         shared,
     )
     .await;
+    state.step("enrichment and discovery", t);
+    let t = Instant::now();
     state.set_webhook(WebhookInlet::new(
         Arc::clone(&store),
         scanning.events.clone(),
@@ -223,6 +241,13 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
         tokio::spawn(async move { doewood_api::reclaim_sources(&api, shutdown).await })
     });
     let api_server = start_api(&config, api_listener, api)?;
+    state.step("api", t);
+    // Ready now in standalone mode; with Postgres, once it answers (see `shared`).
+    state.set_serving();
+    // Expired registry answers and icons are purged from the backend every hour, and the
+    // instance store's planner statistics refreshed: first right now, after the start, as that
+    // can take seconds on a big store (issue #118).
+    let purging = cleanup::start(Arc::clone(&store), backend_rx.clone(), shutdown_rx.clone());
 
     let signal = signals.recv().await;
     info!(signal, "shutting down");
@@ -276,11 +301,15 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
     Ok(())
 }
 
-async fn open_store(config: &BootstrapConfig) -> Result<Store, String> {
+async fn open_store(config: &BootstrapConfig, state: &Arc<OpsState>) -> Result<Store, String> {
     let source = config.master_key.clone();
     let path = config.data_dir.join(STORE_FILE);
+    let state = Arc::clone(state);
     tokio::task::spawn_blocking(move || {
+        let t = Instant::now();
         let key = master_key(source)?;
+        state.step("master key", t);
+        let t = Instant::now();
         let store = Store::open(&path, &key)
             .map_err(|e| format!("cannot open the store {}: {e}", path.display()))?;
         let version = store.schema_version().map_err(|e| e.to_string())?;
@@ -290,6 +319,7 @@ async fn open_store(config: &BootstrapConfig) -> Result<Store, String> {
             readers = store.readers(),
             "store open"
         );
+        state.step("store open", t);
         Ok(store)
     })
     .await
