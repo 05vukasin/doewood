@@ -15,8 +15,17 @@ pending sweep (objects_seen)┘                                         (cap)   
 
 - **Durable.** The work is the `objects_seen` rows with status `pending`. Events only make ingest
   look sooner. A sweep feeds every pending object at start, every 30 s, and after a reprocess
-  request, so a restart, an event that raced the scanner's commit, or a source added while ingest
-  was busy are all picked up.
+  request, so a restart, a row whose event was never sent, or a source added while ingest was
+  busy are all picked up.
+- **Event order.** The scanner (per chunk) and the webhook and SQS inlets (per notification)
+  commit a new or changed object's `pending` row before they send its event, so a worker always
+  finds the row it finishes. Deletes are sent before their commit (they leave no pending row
+  for the sweep). Until issue #125 every event went first: a worker that finished before the
+  commit matched no row, its result was dropped, and the next sweep ingested the file again
+  (272 of 300 files in the `a_scan_pass_ingests_each_object_once` test, with a 16-event
+  channel; 0 of 3000 with the service's 1024-event channel and in-memory fetches). A finish
+  that matches no pending row of its version (the object changed or was deleted meanwhile) is
+  counted in `doewood_ingest_finish_unmatched_total`.
 - **Bounded, with backpressure.** The dispatcher hands jobs to the workers through a queue of
   twice the workers and waits while it is full. It then stops reading the scanners' event channel
   (1024 events), and the scanners wait in turn.
@@ -230,7 +239,10 @@ Numbers are in [Sizing, Records](deploy.md#records).
 - **`similar_to`** from quail's MinHash LSH bands: candidates come from the band index (a lookup
   by band key), each confirmed by its Jaccard estimate (the runtime setting
   `similar_min_jaccard`, default 0.8, set with `ConfigService.SetIngestSettings`; it is read
-  for every file, so a change applies to the next file without a restart).
+  for every file, so a change applies to the next file without a restart). A document's
+  candidates cost the same round trips however many there are (issue #126): their Document
+  nodes are read in one statement (`GraphStore::node_ids`) and the edges written in one batch
+  (`GraphStore::upsert_edges`: one transaction, pipelined on Postgres in one round trip).
 - **Search:** title (`ref.title`, else the card's, the file's own, the file name), body (the
   summary card, the extractive summary, keywords, sheet text), kind, date and amount.
 
@@ -349,6 +361,9 @@ are there for enrichment, and no document merges on a fuzzy match yet.
   SQLite (and Postgres with `DOEWOOD_TEST_POSTGRES_URL`), then the records, the graph (pending
   references, companies across spellings and identifiers, `similar_to`), search, retries,
   deletes and reprocessing. `throughput` (ignored) measures files per second.
+- `tests/company_rows.rs` (ignored, a measurement): what each document's company props patch
+  costs, for one supplier on every document against many small ones (issue #129; numbers in
+  [deploy.md](deploy.md#company-rows-rewritten-by-every-document-issue-129)).
 - Unit tests in `pipeline.rs` stall an analysis past the watchdog: the file fails, the worker
   goes on, the stalled analysis keeps its bytes counted until it returns and then frees them, a
   worker leaves at most one behind, and each file is hashed once. Others hold a big file past

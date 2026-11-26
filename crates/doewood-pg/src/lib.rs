@@ -34,7 +34,7 @@ mod proposals;
 mod tests;
 mod tls;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use doewood_core::PostgresUrl;
@@ -132,7 +132,11 @@ impl PgStore {
             .recycle_timeout(Some(POOL_WAIT))
             .build()
             .map_err(|e| Error::Invalid(format!("connection pool: {e}")))?;
+        let ms = |t: Instant| u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let t = Instant::now();
         let mut client = backend::client(&pool).await?;
+        let connect_ms = ms(t);
+        let t = Instant::now();
         let (version, vector) = migrate::migrate(&mut client).await?;
         drop(client);
         if convert::pending(&pool).await? {
@@ -142,6 +146,8 @@ impl PgStore {
             schema = version,
             pgvector = vector,
             pool = size.max(1),
+            connect_ms,
+            migrate_ms = ms(t),
             "shared Postgres store ready"
         );
         Ok(Self { pool, vector })

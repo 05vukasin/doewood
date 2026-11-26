@@ -1383,6 +1383,32 @@ mod tests {
         );
         assert!(p.contains("USING INDEX objects_seen_pending"), "{p}");
         assert!(!p.contains("TEMP B-TREE"), "{p}");
+        // The same with sampled statistics (issue #118).
+        let source = store
+            .add_source(&NewSource::new("http://127.0.0.1:9", "docs"), None)
+            .unwrap()
+            .to_string();
+        for i in 0..500 {
+            let status = ["pending", "done", "failed", "skipped", "deleted"][i % 5];
+            store
+                .raw()
+                .execute(
+                    "INSERT INTO objects_seen (source_id, key, size, status, updated_at) \
+                     VALUES (?1, ?2, 1, ?3, 1)",
+                    params![source, format!("k{i}"), status],
+                )
+                .unwrap();
+        }
+        assert!(store.optimize_all().unwrap().tables > 0);
+        let p = plan(
+            &store,
+            "SELECT key, etag, size, last_modified FROM objects_seen \
+             INDEXED BY objects_seen_pending \
+             WHERE source_id = ?1 AND status = 'pending' AND (?2 IS NULL OR key > ?2) \
+             ORDER BY key LIMIT 10",
+        );
+        assert!(p.contains("USING INDEX objects_seen_pending"), "{p}");
+        assert!(!p.contains("TEMP B-TREE"), "{p}");
         let indexes: i64 = store
             .raw()
             .query_row(

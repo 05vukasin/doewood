@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 
 use doewood_model::{
     Backend, Blake3, Direction, Edge, EdgeKind, EdgeSource, EdgeState, NeighbourQuery, NodeKind,
-    ObjectLocation, PENDING_REF_PREFIX, PropsPatch, Result, SearchDoc, merged_into,
+    ObjectLocation, PENDING_REF_PREFIX, PropsPatch, Result, SearchDoc, Sketch, merged_into,
 };
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -311,12 +311,28 @@ impl GraphWriter {
         let candidates = b
             .sketch_candidates(bands, blake3, self.similarity.max_candidates)
             .await?;
-        for c in candidates {
-            let score = quail_sketch::jaccard_estimate(sig, &c.signature);
-            if score < min_jaccard {
-                continue;
-            }
-            let other = document_node(&**b, &c.blake3).await?;
+        let found: Vec<(Sketch, f64)> = candidates
+            .into_iter()
+            .map(|c| {
+                let score = quail_sketch::jaccard_estimate(sig, &c.signature);
+                (c, score)
+            })
+            .filter(|(_, score)| *score >= min_jaccard)
+            .collect();
+        if found.is_empty() {
+            return Ok(());
+        }
+        // Issue #126: the candidates' Document nodes in one read (the few missing ones are
+        // created one by one), then every edge in one batch, instead of two round trips per
+        // candidate. The same edges as before, from the same reads.
+        let keys: Vec<String> = found.iter().map(|(c, _)| c.blake3.to_hex()).collect();
+        let ids = b.node_ids(NodeKind::Document, &keys).await?;
+        let mut edges = Vec::with_capacity(found.len());
+        for ((c, score), (key, id)) in found.into_iter().zip(keys.iter().zip(ids)) {
+            let other = match id {
+                Some(id) => id,
+                None => b.ensure_node(NodeKind::Document, key).await?,
+            };
             // One edge per pair, from the smaller hash to the larger.
             let (src, dst) = if *blake3 < c.blake3 {
                 (doc, other)
@@ -324,12 +340,14 @@ impl GraphWriter {
                 (other, doc)
             };
             #[allow(clippy::cast_possible_truncation)]
-            let edge = Edge::new(src, dst, EdgeKind::SimilarTo, EdgeSource::Document)
-                .with_props(json!({"score": score, "method": "minhash_lsh", "shared_bands": c.shared_bands}))
-                .with_confidence(score.clamp(0.0, 1.0) as f32);
-            b.upsert_edge(&edge).await?;
-            stats.similar += 1;
+            edges.push(
+                Edge::new(src, dst, EdgeKind::SimilarTo, EdgeSource::Document)
+                    .with_props(json!({"score": score, "method": "minhash_lsh", "shared_bands": c.shared_bands}))
+                    .with_confidence(score.clamp(0.0, 1.0) as f32),
+            );
         }
+        b.upsert_edges(&edges).await?;
+        stats.similar += edges.len();
         Ok(())
     }
 
@@ -708,14 +726,5 @@ impl GraphWriter {
         patch = patch.push_capped(&["matches"], entry, &["document"], MAX_MATCHES);
         self.backend.update_props(m.company, &patch).await?;
         Ok(())
-    }
-}
-
-/// The Document node of a stored record, created (without props) if it is missing.
-async fn document_node(b: &dyn Backend, blake3: &Blake3) -> Result<Uuid> {
-    let hex = blake3.to_hex();
-    match b.node_by_key(NodeKind::Document, &hex).await? {
-        Some(n) => Ok(n.id),
-        None => b.ensure_node(NodeKind::Document, &hex).await,
     }
 }

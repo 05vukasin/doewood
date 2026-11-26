@@ -63,6 +63,10 @@ spec:
                   name: {{ . }}
                   key: {{ $.Values.masterKey.key }}
             {{- end }}
+            {{- with .Values.ocrJobs }}
+            - name: DOEWOOD_OCR_JOBS
+              value: {{ . | quote }}
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -81,8 +85,10 @@ spec:
             httpGet:
               path: /readyz
               port: ops
-            periodSeconds: 5
-            failureThreshold: 3
+            # Ready about 0.15 s after the start (issue #118): a short period lets a new pod
+            # take traffic sooner; 8 failures keep about 16 s before it is taken out.
+            periodSeconds: 2
+            failureThreshold: 8
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           securityContext:

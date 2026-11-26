@@ -114,7 +114,6 @@ impl GraphService for Api {
         let Some(id) = id else {
             return Err(Status::invalid_argument("node_id: required"));
         };
-        self.node_or_404(id).await?;
         let query = NeighbourQuery {
             direction,
             edge_kinds,
@@ -128,6 +127,11 @@ impl GraphService for Api {
             .neighbours(id, &query)
             .await
             .map_err(error::model)?;
+        // One store call when there is something to list (issue #124): the node is read only
+        // to tell a missing node (`NOT_FOUND`) from one with no matching edges.
+        if found.is_empty() {
+            self.node_or_404(id).await?;
+        }
         Ok(Response::new(NeighboursResponse {
             neighbours: found
                 .iter()
@@ -149,21 +153,27 @@ impl GraphService for Api {
         let Some(id) = id else {
             return Err(Status::invalid_argument("company_id: required"));
         };
-        let node = self.node_or_404(id).await?;
-        if node.kind != NodeKind::Company {
-            let mut v = Violations::default();
-            v.add(
-                "company_id",
-                format!("node {id} is a {}, not a company", node.kind),
-            );
-            v.check()?;
-        }
         let docs = self
             .state
             .backend()?
             .company_documents(id)
             .await
             .map_err(error::model)?;
+        // One store call when the company has documents (issue #124): documents come from
+        // `party` edges, which always end at a company (ADR 0001 section 7), so the node is
+        // read only when there are none, to tell a missing node (`NOT_FOUND`) or a
+        // non-company (`INVALID_ARGUMENT`) from a company without documents.
+        if docs.is_empty() {
+            let node = self.node_or_404(id).await?;
+            if node.kind != NodeKind::Company {
+                let mut v = Violations::default();
+                v.add(
+                    "company_id",
+                    format!("node {id} is a {}, not a company", node.kind),
+                );
+                v.check()?;
+            }
+        }
         Ok(Response::new(CompanyDocumentsResponse {
             documents: docs.iter().map(convert::node).collect(),
         }))

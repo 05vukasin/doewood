@@ -1,9 +1,13 @@
 //! The pipeline: scanner events → fetch → analyze → store, on a pool of workers.
 //!
 //! - **The queue is durable.** `objects_seen` rows with status `pending` are the work; events
-//!   only make ingest look sooner. A sweep (at start, every [`IngestConfig::sweep_interval`],
-//!   and after a reprocess request) feeds every pending object, so a restart, an event that
-//!   raced its row's commit, or a source added while ingest was busy, are all picked up.
+//!   only make ingest look sooner. Discovery commits an object's `pending` row before it
+//!   sends the event (issue #125), so a worker always finds the row it finishes. A sweep (at
+//!   start, every [`IngestConfig::sweep_interval`], and after a reprocess request) feeds every
+//!   pending object, so a restart, a row whose event was never sent (a crash or stop between
+//!   the commit and the send), or a source added while ingest was busy, are all picked up. A
+//!   finish that matches no pending row of its version is counted
+//!   ([`Stats::finish_unmatched`], `doewood_ingest_finish_unmatched_total`).
 //! - **Backpressure.** The dispatcher hands jobs to the workers through a bounded queue and
 //!   waits while it is full, so it stops reading the scanners' bounded event channel, and the
 //!   scanners wait in turn.
@@ -419,6 +423,10 @@ pub struct Stats {
     pub redirected: u64,
     /// Analyses the watchdog gave up on (their files failed; each ran on until it returned).
     pub overruns: u64,
+    /// Finished objects whose status matched no `pending` row of that version, so the result
+    /// was not recorded: the object changed or was deleted meanwhile. (Until issue #125 an
+    /// event could also come before its row was committed; the sweep then ingested it again.)
+    pub finish_unmatched: u64,
     /// Where the workers' time went, summed over files (issue #69).
     pub time: StageTimes,
 }
@@ -663,6 +671,13 @@ impl Ingest {
         *lock(&self.inner.stats)
     }
 
+    /// Reads [`stats`](Self::stats) without keeping ingest (and its store) alive, for metrics
+    /// that outlive it; `None` once ingest is gone.
+    pub fn stats_reader(&self) -> impl Fn() -> Option<Stats> + Send + Sync + 'static {
+        let inner = Arc::downgrade(&self.inner);
+        move || inner.upgrade().map(|i| *lock(&i.stats))
+    }
+
     /// Starts the dispatcher (events and sweeps) and the workers.
     pub fn start(
         &self,
@@ -739,6 +754,7 @@ impl Ingest {
             failed = s.failed,
             analyzed = s.analyzed,
             redirected = s.redirected,
+            finish_unmatched = s.finish_unmatched,
             mib = s.bytes / (1 << 20),
             secs = self.inner.started.elapsed().as_secs(),
             time = ?s.time,
@@ -932,29 +948,18 @@ impl Ingest {
         shutdown: &mut watch::Receiver<bool>,
         overruns: &mut Overruns,
     ) {
-        // Already through (a duplicate event, a stale sweep page): nothing to do.
-        let (k, e) = (key.to_owned(), etag.map(str::to_owned));
-        let t = Instant::now();
-        let status = self.db(move |s| s.ingest_status(source, &k)).await;
-        lock(&self.inner.stats).time.store += t.elapsed();
-        if let Ok(Some(st)) = status
-            && st.etag == e
-            && st.status != "pending"
-        {
-            return;
-        }
         let max = self.inner.config.max_attempts.max(1);
         for attempt in 1..=max {
             let Some(backend) = self.backend(shutdown).await else {
                 return; // shutdown: stays pending
             };
             let result = self
-                .ingest_once(&backend, source, key, charge.as_ref(), overruns)
+                .ingest_once(&backend, source, key, etag, charge.as_ref(), overruns)
                 .await;
             let (k, e) = (key.to_owned(), etag.map(str::to_owned));
             let outcome = match result {
                 Ok(Some(outcome)) => outcome,
-                Ok(None) => return, // the source is gone
+                Ok(None) => return, // already through, or the source is gone
                 Err(err) if err.transient && attempt < max => {
                     let delay = self.inner.config.retry_base * 4u32.saturating_pow(attempt - 1);
                     debug!(source = %source, key, attempt, error = %err, ?delay, "retrying");
@@ -989,28 +994,53 @@ impl Ingest {
                 .db(move |s| s.finish_object(source, &k, e.as_deref(), &outcome))
                 .await;
             lock(&self.inner.stats).time.store += t.elapsed();
-            if let Err(err) = finished {
-                warn!(source = %source, key, error = %err, "cannot record the ingest status");
+            match finished {
+                Ok(true) => {}
+                Ok(false) => {
+                    lock(&self.inner.stats).finish_unmatched += 1;
+                    debug!(source = %source, key, "no pending row to finish");
+                }
+                Err(err) => {
+                    warn!(source = %source, key, error = %err, "cannot record the ingest status");
+                }
             }
             return;
         }
     }
 
-    /// One attempt. `Ok(None)`: the source was removed meanwhile.
+    /// One attempt at the version `etag`. `Ok(None)`: nothing to record, as that version is
+    /// already through (a duplicate event, a stale sweep page) or the source was removed
+    /// meanwhile.
     async fn ingest_once(
         &self,
         backend: &Arc<dyn Backend>,
         id: SourceId,
         key: &str,
+        etag: Option<&str>,
         charge: Option<&Arc<Charge>>,
         overruns: &mut Overruns,
     ) -> Result<Option<IngestOutcome>, IngestError> {
-        // The runtime settings are read per file, so a change applies without a restart.
+        // The object's status, its source and the runtime settings in one read on a read-only
+        // connection, so it does not wait behind the writer's commits (issue #128). The
+        // settings are read per file, so a change applies without a restart. The status needs
+        // no read of our own writes: `inflight` holds the key until its attempt is recorded.
         let t = Instant::now();
-        let (source, settings) = self
-            .db(move |s| Ok((s.source(id)?, s.ingest_settings()?)))
+        let k = key.to_owned();
+        let (prior, source, settings) = self
+            .db(move |s| {
+                s.snapshot(|s| {
+                    Ok((
+                        s.ingest_status(id, &k)?,
+                        s.source(id)?,
+                        s.ingest_settings()?,
+                    ))
+                })
+            })
             .await?;
         let mut t = self.stage(t, |s| &mut s.store);
+        if prior.is_some_and(|st| st.etag.as_deref() == etag && st.status != "pending") {
+            return Ok(None);
+        }
         let Some(source) = source else {
             return Ok(None);
         };

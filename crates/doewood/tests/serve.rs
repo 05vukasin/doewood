@@ -171,9 +171,10 @@ fn serve_starts_with_nothing_configured() {
     assert!(metrics.contains("doewood_build_info{"), "{metrics}");
     assert_eq!(get(addr, "/nope").0, 404);
 
+    let api = started_in_order(&seen, &ready);
+
     // The gRPC API answers on its own port, here over gRPC-Web (HTTP/1.1), as a browser
     // calls it: an empty ListSourcesRequest frame.
-    let api = wait_for(&rx, &mut seen, API_LISTENING);
     let api_addr: SocketAddr = api["addr"].as_str().unwrap().parse().unwrap();
     let (status, body) = post(
         api_addr,
@@ -231,6 +232,35 @@ fn serve_starts_with_nothing_configured() {
         let text = String::from_utf8(out.stdout).unwrap();
         assert!(text.contains("key file: exists"), "{text}");
     }
+}
+
+/// Checks that `ready` came only once the gRPC API listened, and that the start was timed step
+/// by step (issue #118); returns the API's `listening` line.
+fn started_in_order(seen: &[serde_json::Value], ready: &serde_json::Value) -> serde_json::Value {
+    let api = seen
+        .iter()
+        .find(|l| l["message"] == API_LISTENING)
+        .cloned()
+        .unwrap_or_else(|| panic!("ready before the gRPC API listened: {seen:#?}"));
+    let steps: Vec<&str> = seen
+        .iter()
+        .filter(|l| l["message"] == "startup step")
+        .map(|l| l["step"].as_str().unwrap())
+        .collect();
+    for step in [
+        "config",
+        "listeners",
+        "master key",
+        "store open",
+        "ingest",
+        "api",
+    ] {
+        assert!(steps.contains(&step), "{step} in {steps:?}");
+    }
+    assert!(ready["startup_ms"].is_u64(), "{ready}");
+    #[cfg(target_os = "linux")]
+    assert!(ready["rss_mib"].as_u64().unwrap() > 0, "{ready}");
+    api
 }
 
 const OPS_LISTENING: &str = "ops server listening (/healthz, /readyz, /metrics)";
@@ -410,6 +440,10 @@ fn serve_uses_postgres_when_reachable() {
     let addr: SocketAddr = listening["addr"].as_str().unwrap().parse().unwrap();
     wait_for(&rx, &mut seen, "shared Postgres connected");
     wait_for(&rx, &mut seen, "ready");
+    assert!(
+        seen.iter().any(|l| l["message"] == API_LISTENING),
+        "ready before the gRPC API listened: {seen:#?}"
+    );
     assert_eq!(get(addr, "/readyz"), (200, "ready\n".to_owned()));
     #[cfg(unix)]
     {

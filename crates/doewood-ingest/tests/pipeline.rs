@@ -20,7 +20,10 @@ use doewood_model::{
     Backend, Blake3, Direction, EdgeKind, EdgeState, MergeActor, MergeActorKind, NeighbourQuery,
     NodeKind, ObjectLocation, SearchQuery, SourceKey, SplitRequest,
 };
-use doewood_s3::{EventKind, EventOrigin, ObjectEvent, ObjectVersion};
+use doewood_s3::{
+    EventKind, EventOrigin, ListPage, ListRequest, ListedObject, Lister, ObjectEvent,
+    ObjectVersion, S3Error, ScanOptions, Scanner,
+};
 use doewood_store::{NewSource, ObjectChange, SeenObject, Standalone, Store};
 use tokio::sync::{mpsc, watch};
 
@@ -142,6 +145,30 @@ impl Harness {
         let source = store
             .add_source(&NewSource::new(ENDPOINT, BUCKET), None)
             .unwrap();
+        Self::start_on(
+            store,
+            backend,
+            jobs,
+            retry,
+            file_timeout,
+            on_change,
+            tune,
+            source,
+        )
+    }
+
+    /// [`Harness::start_tuned`] on a source the store already has.
+    #[allow(clippy::too_many_arguments)]
+    fn start_on(
+        store: Arc<Store>,
+        backend: Arc<dyn Backend>,
+        jobs: usize,
+        retry: Duration,
+        file_timeout: Option<Duration>,
+        on_change: Arc<dyn Fn(SourceId) + Send + Sync>,
+        tune: impl FnOnce(&mut IngestConfig),
+        source: SourceId,
+    ) -> Self {
         let fetch = Arc::new(MemFetch::default());
         let mut config = IngestConfig::new(Some(jobs), &PathBuf::from("/nonexistent"));
         config.retry_base = retry;
@@ -894,6 +921,85 @@ async fn shutdown_leaves_unfinished_work_pending() {
     assert!(s.attempts >= 1);
 }
 
+/// A bucket in memory, listed like S3 (the token is the last key of the previous page). The
+/// objects are in key order.
+#[derive(Default)]
+struct MemBucket {
+    objects: Vec<ListedObject>,
+}
+
+impl Lister for MemBucket {
+    async fn list(&self, req: ListRequest<'_>) -> Result<ListPage, S3Error> {
+        let after = req.continuation_token.or(req.start_after);
+        // A page costs its own keys, not the bucket's (the `scale` measurement lists 200k).
+        let from = after.map_or(0, |a| self.objects.partition_point(|o| o.key.as_str() <= a));
+        let mut rest = self.objects[from..]
+            .iter()
+            .filter(|o| o.key.starts_with(req.prefix));
+        let objects: Vec<_> = rest.by_ref().take(req.max_keys).cloned().collect();
+        let next_continuation_token = rest
+            .next()
+            .is_some()
+            .then(|| objects.last().unwrap().key.clone());
+        Ok(ListPage {
+            objects,
+            next_continuation_token,
+        })
+    }
+}
+
+/// The real scanner's first pass, on a bucket in memory: each object is fetched and ingested
+/// once, and every finish matches its pending row. Issue #125: the scanner sent a chunk's
+/// events before it committed the chunk's rows, so a worker that finished first matched no
+/// row, and the sweep ingested the object a second time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scan_pass_ingests_each_object_once() {
+    let n = 300;
+    let store = Arc::new(Store::open_in_memory(&MasterKey::from_bytes([12; 32])).unwrap());
+    let backend: Arc<dyn Backend> = Arc::new(Standalone::new(Arc::clone(&store)));
+    let h = Harness::start(Arc::clone(&store), backend, 4, Duration::from_millis(10));
+    let mut bucket = MemBucket::default();
+    for i in 0..n {
+        let key = format!("scan/{i:04}.txt");
+        let bytes = format!("Dopis {i}: {}", common::prose(i as u64, 40)).into_bytes();
+        bucket.objects.push(ListedObject {
+            key: key.clone(),
+            etag: Some(format!("e{i}")),
+            size: bytes.len() as u64,
+            last_modified: Some(1),
+        });
+        h.fetch.put(&key, bytes);
+    }
+    let source = store.source(h.source).unwrap().unwrap();
+    let scanner = Scanner::new(
+        Arc::clone(&store),
+        &source,
+        h.events.clone(),
+        ScanOptions::default(),
+    );
+    let (_stop_tx, mut stop) = watch::channel(false);
+    let started = std::time::Instant::now();
+    let pass = scanner.pass(&bucket, &mut stop).await.unwrap();
+    assert_eq!(pass.new, n as u64);
+    h.settle().await;
+    let secs = started.elapsed().as_secs_f64();
+    // A few sweeps: anything left to ingest again would be picked up now.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    h.settle().await;
+    let stats = h.ingest.stats();
+    let reads = h.fetch.reads.lock().unwrap().clone();
+    let twice = reads.values().filter(|&&r| r > 1).count();
+    println!(
+        "scan pass: {n} objects in {secs:.2}s; finishes unmatched {}, objects read more than \
+         once {twice}, done {}, skipped {}",
+        stats.finish_unmatched, stats.done, stats.skipped
+    );
+    assert_eq!(reads.len(), n);
+    assert_eq!((stats.finish_unmatched, twice), (0, 0));
+    assert_eq!(stats.done + stats.skipped, n as u64);
+    h.stop().await;
+}
+
 /// The `similar_to` threshold is the runtime setting in the instance store, read for every
 /// file: a change applies to the next file, without restarting ingest.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -961,6 +1067,51 @@ async fn similarity_uses_the_stored_threshold() {
     h.stop().await;
 }
 
+/// File `i` of `throughput`'s mix: a contract PDF (its supplier distinct, its buyer the same
+/// company in every one), an amendment DOCX citing the contract before it, an invoice TXT
+/// and a small XLSX, in turn.
+fn bench_file(i: usize) -> (String, Vec<u8>) {
+    let pib = common::pib(&format!("{:08}", 10_000_000 + i));
+    let body = common::prose(i as u64, 300);
+    match i % 4 {
+        0 => (
+            format!("bench/{i}.pdf"),
+            common::pdf(
+                &[
+                    &format!("UGOVOR br. {i}/26"),
+                    &format!("Dobavljac: Firma {i} d.o.o. Beograd, PIB {pib}"),
+                    "Narucilac: Kupac Grupa a.d. Novi Sad",
+                    &body[..90],
+                ],
+                "Ugovor",
+            ),
+        ),
+        1 => (
+            format!("bench/{i}.docx"),
+            common::docx(
+                &format!("Aneks {i}"),
+                &[&format!("ANEKS uz Ugovor br. {}/26", i - 1), &body],
+            ),
+        ),
+        2 => (
+            format!("bench/{i}.txt"),
+            format!("INVOICE No. INV-{i}\nSupplier: Vendor {i} LLC\n{body}\nTotal: EUR {i}.50\n")
+                .into_bytes(),
+        ),
+        _ => (
+            format!("bench/{i}.xlsx"),
+            common::xlsx(
+                "Data",
+                &[
+                    &["Item", "Qty"],
+                    &[&format!("Part {i}"), "3"],
+                    &["Bolts", "10"],
+                ],
+            ),
+        ),
+    }
+}
+
 /// Files per second through the whole pipeline (fetch from memory, analyze, records, graph
 /// and search) on a generated mix of PDF, DOCX, TXT and XLSX, every file distinct. The shared
 /// store is the instance's SQLite store, or Postgres (a schema of its own) when
@@ -971,9 +1122,10 @@ async fn similarity_uses_the_stored_threshold() {
 /// `DOEWOOD_BENCH_READERS=n` puts the instance store in a file with `n` read-only connections
 /// (0: on disk, every read on the writer) and times a `ListRecords` page every millisecond
 /// while ingest runs (from `DOEWOOD_BENCH_READ_CLIENTS` clients at once, default 1;
-/// `DOEWOOD_BENCH_POOL` sets the Postgres pool's size; it prints the pages' size and the
-/// largest the WAL grew). Besides files/s it prints where the workers' time went
-/// ([`doewood_ingest::StageTimes`]: the company lock's wait and hold among them) and, on
+/// `DOEWOOD_BENCH_POOL` sets the Postgres pool's size; it prints the pages' size, the
+/// largest the WAL grew and how often a checkpoint reset it). Besides files/s it prints
+/// where the workers' time went ([`doewood_ingest::StageTimes`]: the company lock's wait and
+/// hold among them) and, on
 /// Postgres with `pg_stat_statements` loaded, the statements per file and the costliest
 /// statements.
 #[tokio::test(flavor = "multi_thread")]
@@ -1021,47 +1173,7 @@ async fn throughput() {
     let mut files = Vec::with_capacity(n);
     let mut bytes = 0usize;
     for i in 0..n {
-        let pib = common::pib(&format!("{:08}", 10_000_000 + i));
-        let body = common::prose(i as u64, 300);
-        let (key, data) = match i % 4 {
-            0 => (
-                format!("bench/{i}.pdf"),
-                common::pdf(
-                    &[
-                        &format!("UGOVOR br. {i}/26"),
-                        &format!("Dobavljac: Firma {i} d.o.o. Beograd, PIB {pib}"),
-                        "Narucilac: Kupac Grupa a.d. Novi Sad",
-                        &body[..90],
-                    ],
-                    "Ugovor",
-                ),
-            ),
-            1 => (
-                format!("bench/{i}.docx"),
-                common::docx(
-                    &format!("Aneks {i}"),
-                    &[&format!("ANEKS uz Ugovor br. {}/26", i - 1), &body],
-                ),
-            ),
-            2 => (
-                format!("bench/{i}.txt"),
-                format!(
-                    "INVOICE No. INV-{i}\nSupplier: Vendor {i} LLC\n{body}\nTotal: EUR {i}.50\n"
-                )
-                .into_bytes(),
-            ),
-            _ => (
-                format!("bench/{i}.xlsx"),
-                common::xlsx(
-                    "Data",
-                    &[
-                        &["Item", "Qty"],
-                        &[&format!("Part {i}"), "3"],
-                        &["Bolts", "10"],
-                    ],
-                ),
-            ),
-        };
+        let (key, data) = bench_file(i);
         bytes += data.len();
         files.push((key, data));
     }
@@ -1126,6 +1238,486 @@ async fn throughput() {
         pg.drop_schema().await;
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// File `i` of the `scale` corpus: [`bench_file`]'s mix, except that every 20th file is a
+/// near-duplicate TXT, three words changed in one of 50 template texts (Jaccard well above
+/// the 0.8 of `similar_to`), and that only every fourth contract names the one big buyer:
+/// the others name a buyer of their own, so the corpus has many companies (quail reads one
+/// party, the buyer with the contract's PIB, from these contracts).
+fn scale_file(i: usize) -> (String, Vec<u8>) {
+    if i.is_multiple_of(4) && !i.is_multiple_of(16) {
+        let pib = common::pib(&format!("{:08}", 10_000_000 + i));
+        let body = common::prose(i as u64, 300);
+        // A capitalized word of its own per contract.
+        let mut name = String::from("K");
+        let mut n = i;
+        while n > 0 {
+            name.push(char::from(b'a' + u8::try_from(n % 26).unwrap()));
+            n /= 26;
+        }
+        let pdf = common::pdf(
+            &[
+                &format!("UGOVOR br. {i}/26"),
+                &format!("Dobavljac: Firma {i} d.o.o. Beograd, PIB {pib}"),
+                &format!("Narucilac: {name} Grupa a.d. Novi Sad"),
+                &body[..90],
+            ],
+            "Ugovor",
+        );
+        return (format!("bench/{i}.pdf"), pdf);
+    }
+    // `DOEWOOD_SCALE_NEAR=0` leaves the near-duplicates out (to see what they cost).
+    if i % 20 != 19 || std::env::var("DOEWOOD_SCALE_NEAR").is_ok_and(|v| v == "0") {
+        return bench_file(i);
+    }
+    let text = common::prose(1_000_000 + (i as u64 / 20) % 50, 600);
+    let mut words: Vec<String> = text.split(' ').map(str::to_owned).collect();
+    for (k, step) in [7, 13, 29].into_iter().enumerate() {
+        let at = (i * step + k * 200) % words.len();
+        words[at] = format!("w{i}x{k}");
+    }
+    (format!("near/{i}.txt"), words.join(" ").into_bytes())
+}
+
+/// Issue #127: the system at 50,000 to 200,000 documents. The corpus is [`scale_file`]'s, put
+/// as `throughput` puts it; the instance store is a file in `DOEWOOD_SCALE_DIR` (with one
+/// read-only connection per CPU, as `serve` opens it) and stays there between runs, and so
+/// does the shared store: SQLite (that same file), or Postgres in the schema
+/// `DOEWOOD_SCALE_PG_SCHEMA` (default `dw_scale`) when `DOEWOOD_TEST_POSTGRES_URL` is set.
+/// `DOEWOOD_SCALE_PHASE` picks what a run does, so a big store is built in runs of a few
+/// minutes and then measured:
+///
+/// - `ingest` (the default): adds files until the corpus has `DOEWOOD_SCALE_TO` (default
+///   50,000), at most `DOEWOOD_SCALE_RUN` (default 25,000) in this run, and prints files/s
+///   and the graph stage per 5,000 files, then the writer lock wait (a trivial call every
+///   millisecond) and the WAL's largest size and resets (`DOEWOOD_SCALE_NEAR=0`: without
+///   the near-duplicates). The keys and sizes go to `keys.tsv` in the directory, so the
+///   next run continues where this one stopped.
+/// - `sweep`: the ingest sweep's pending query over the whole source, and `object_counts`
+///   (each progress snapshot reads it), median of 11.
+/// - `scan`: two scanner passes over a bucket listing every key unchanged, with the writer
+///   lock wait.
+/// - `due`: `companies_due` (no registries are called: only the query), the first page and a
+///   whole pass in pages of 100, as the enrichment job reads it.
+/// - `analyze`: refreshes the planner's statistics as `serve` does once it is ready (ingest
+///   here never did; run it before the other phases to measure the plans a served store has).
+/// - `offline`: switches every registry, feed and the favicon fallback off in the instance
+///   store, before `doewood serve` is started on the directory (idle memory).
+/// - `api`: one client through the API: `ListRecords` (the first page of 100), `Search` (a
+///   word in every fourth document, and the biggest company's name), `GetNode`, `Neighbours`
+///   (`similar_to` of a near-duplicate) and `CompanyDocuments` of the biggest company (the
+///   buyer of every contract), median of 11 (`api_load` measures many clients on a store of
+///   its own).
+///
+/// `cargo test --release -p doewood-ingest --test pipeline -- --ignored --nocapture --exact scale`
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "a measurement (issue #127); see docs/deploy.md"]
+#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+async fn scale() {
+    use std::io::Write as _;
+    let var = |name: &str| std::env::var(name).ok().and_then(|v| v.parse().ok());
+    let dir = PathBuf::from(std::env::var("DOEWOOD_SCALE_DIR").expect("DOEWOOD_SCALE_DIR"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let phase = std::env::var("DOEWOOD_SCALE_PHASE").unwrap_or_else(|_| "ingest".into());
+    let file = dir.join(doewood_store::STORE_FILE);
+    let store = Arc::new(Store::open(&file, &MasterKey::from_bytes([8; 32])).unwrap());
+    let (backend, admin): (Arc<dyn Backend>, _) = match std::env::var(PG_VAR) {
+        Ok(url) if !url.trim().is_empty() => {
+            let schema =
+                std::env::var("DOEWOOD_SCALE_PG_SCHEMA").unwrap_or_else(|_| "dw_scale".into());
+            let (admin, conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+                .await
+                .unwrap();
+            tokio::spawn(conn);
+            admin
+                .batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
+                .await
+                .unwrap();
+            let sep = if url.contains('?') { '&' } else { '?' };
+            let scoped = format!("{url}{sep}options=-c%20search_path%3D{schema}");
+            let url = doewood_core::PostgresUrl::parse(&scoped).unwrap();
+            let pg = doewood_pg::PgStore::connect_with_pool(&url, doewood_pg::default_pool_size())
+                .await
+                .unwrap();
+            (Arc::new(pg), Some(admin))
+        }
+        _ => (Arc::new(Standalone::new(Arc::clone(&store))), None),
+    };
+    let source = match store.sources().unwrap().first() {
+        Some(s) => s.id,
+        None => store
+            .add_source(&NewSource::new(ENDPOINT, BUCKET), None)
+            .unwrap(),
+    };
+    let keys_file = dir.join("keys.tsv");
+    let keys: Vec<(String, u64)> = std::fs::read_to_string(&keys_file)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let (k, n) = l.split_once('\t')?;
+            Some((k.to_owned(), n.parse().ok()?))
+        })
+        .collect();
+    let wal = dir.join(format!("{}-wal", doewood_store::STORE_FILE));
+    println!(
+        "scale: {phase}, {} backend, {} files so far, store readers {}",
+        if admin.is_some() {
+            "postgres"
+        } else {
+            "sqlite"
+        },
+        keys.len(),
+        store.readers()
+    );
+    let median = |mut v: Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    match phase.as_str() {
+        "ingest" => {
+            let to: usize = var("DOEWOOD_SCALE_TO").unwrap_or(50_000);
+            let run: usize = var("DOEWOOD_SCALE_RUN").unwrap_or(25_000);
+            let jobs = doewood_ingest::default_jobs();
+            let h = Harness::start_on(
+                Arc::clone(&store),
+                Arc::clone(&backend),
+                jobs,
+                Duration::from_millis(10),
+                None,
+                Arc::new(|_| {}),
+                |_| {},
+                source,
+            );
+            let probe = bench::Probe::start(&store, Some(wal));
+            let (from, end) = (keys.len(), to.min(keys.len() + run));
+            let mut out = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&keys_file)
+                .unwrap();
+            let started = std::time::Instant::now();
+            let mut at = from;
+            while at < end {
+                let next = (at + 5000).min(end);
+                let files: Vec<(String, Vec<u8>)> = (at..next).map(scale_file).collect();
+                let before = h.ingest.stats().time;
+                let t = std::time::Instant::now();
+                for chunk in files.chunks(64) {
+                    let batch: Vec<(&str, Vec<u8>, bool)> = chunk
+                        .iter()
+                        .map(|(k, d)| (k.as_str(), d.clone(), true))
+                        .collect();
+                    h.put(&batch).await;
+                }
+                h.settle().await;
+                let secs = t.elapsed().as_secs_f64();
+                let time = h.ingest.stats().time;
+                let ms = |a: Duration, b: Duration| {
+                    a.saturating_sub(b).as_secs_f64() * 1e3 / (next - at) as f64
+                };
+                println!(
+                    "scale: files {at}..{next}: {:.0} files/s; per file: store {:.2} ms, record \
+                     {:.2} ms, graph {:.2} ms (company lock wait {:.2}, held {:.2})",
+                    (next - at) as f64 / secs,
+                    ms(time.store, before.store),
+                    ms(time.record, before.record),
+                    ms(time.graph, before.graph),
+                    ms(time.company_lock_wait, before.company_lock_wait),
+                    ms(time.company_lock_hold, before.company_lock_hold),
+                );
+                for (k, d) in &files {
+                    writeln!(out, "{k}\t{}", d.len()).unwrap();
+                }
+                out.flush().unwrap();
+                h.fetch.objects.lock().unwrap().clear();
+                at = next;
+            }
+            let c = store.object_counts(source).unwrap();
+            println!(
+                "scale: {} files in {:.1}s; store lock wait {}; done {}, skipped {}, failed {}",
+                end - from,
+                started.elapsed().as_secs_f64(),
+                probe.stop(),
+                c.done,
+                c.skipped,
+                c.failed
+            );
+            h.stop().await;
+        }
+        "sweep" => {
+            let mut sweep = Vec::new();
+            let mut counts = Vec::new();
+            for _ in 0..11 {
+                let t = std::time::Instant::now();
+                let mut after: Option<String> = None;
+                loop {
+                    let page = store
+                        .pending_objects(source, after.as_deref(), 256)
+                        .unwrap();
+                    after = page.last().map(|o| o.key.clone());
+                    if page.len() < 256 {
+                        break;
+                    }
+                }
+                sweep.push(t.elapsed().as_secs_f64() * 1e3);
+                let t = std::time::Instant::now();
+                store.object_counts(source).unwrap();
+                counts.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            println!(
+                "scale: sweep (nothing pending) {:.3} ms; object_counts {:.3} ms",
+                median(sweep),
+                median(counts)
+            );
+        }
+        "scan" => {
+            let mut bucket = MemBucket::default();
+            for (k, n) in &keys {
+                bucket.objects.push(ListedObject {
+                    key: k.clone(),
+                    etag: Some(format!("{n:x}")),
+                    size: *n,
+                    last_modified: Some(1),
+                });
+            }
+            bucket.objects.sort_by(|a, b| a.key.cmp(&b.key));
+            let (tx, mut rx) = mpsc::channel(1024);
+            let events = tokio::spawn(async move {
+                let mut n = 0u64;
+                while rx.recv().await.is_some() {
+                    n += 1;
+                }
+                n
+            });
+            let src = store.source(source).unwrap().unwrap();
+            let scanner = Scanner::new(Arc::clone(&store), &src, tx, ScanOptions::default());
+            let (_stop_tx, mut stop) = watch::channel(false);
+            for _ in 0..2 {
+                let probe = bench::Probe::start(&store, Some(wal.clone()));
+                let cpu = bench::cpu_seconds();
+                let t = std::time::Instant::now();
+                let pass = scanner.pass(&bucket, &mut stop).await.unwrap();
+                println!(
+                    "scale: scan pass {} over {} keys: {:.2}s, CPU {:.2}s, new {} changed {} \
+                     deleted {}; store lock wait {}",
+                    pass.pass,
+                    pass.listed,
+                    t.elapsed().as_secs_f64(),
+                    bench::cpu_seconds() - cpu,
+                    pass.new,
+                    pass.changed,
+                    pass.deleted,
+                    probe.stop()
+                );
+            }
+            drop(scanner);
+            println!("scale: events sent {}", events.await.unwrap());
+        }
+        "due" => {
+            let owner = doewood_core::InstanceId::new("scale").unwrap();
+            let mut first = Vec::new();
+            for _ in 0..5 {
+                let t = std::time::Instant::now();
+                backend.companies_due(&owner, None, 100).await.unwrap();
+                first.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            let t = std::time::Instant::now();
+            let (mut after, mut pages, mut companies, mut slowest) = (None, 0, 0, 0f64);
+            loop {
+                let p = std::time::Instant::now();
+                let page = backend.companies_due(&owner, after, 100).await.unwrap();
+                slowest = slowest.max(p.elapsed().as_secs_f64() * 1e3);
+                let Some(last) = page.last() else { break };
+                after = Some(last.company);
+                pages += 1;
+                companies += page.len();
+            }
+            println!(
+                "scale: companies_due first page {:.2} ms; a pass: {companies} companies in \
+                 {pages} pages, {:.2}s, slowest page {slowest:.2} ms",
+                median(first),
+                t.elapsed().as_secs_f64()
+            );
+        }
+        "analyze" => {
+            let t = std::time::Instant::now();
+            let done = store.optimize_all().unwrap();
+            println!(
+                "scale: statistics refreshed as `serve` does after ready ({:.1}s): {done:?}",
+                t.elapsed().as_secs_f64()
+            );
+        }
+        "offline" => {
+            use doewood_store::{
+                EnrichmentSettingsPatch, FeedSwitchesPatch, RegistrySwitchesPatch,
+            };
+            let off = Some(false);
+            store
+                .set_enrichment_settings(&EnrichmentSettingsPatch {
+                    registries: RegistrySwitchesPatch {
+                        gleif: off,
+                        vies: off,
+                        wikidata: off,
+                        edgar: off,
+                        apr: off,
+                        companies_house: off,
+                    },
+                    feeds: FeedSwitchesPatch {
+                        gleif: off,
+                        edgar: off,
+                        apr: off,
+                        companies_house: off,
+                    },
+                    favicon_fallback: off,
+                    ..EnrichmentSettingsPatch::default()
+                })
+                .unwrap();
+            println!("scale: every registry, feed and the favicon fallback switched off");
+        }
+        "api" => scale_api(&store, &backend, source, &keys).await,
+        other => panic!("unknown DOEWOOD_SCALE_PHASE {other}"),
+    }
+}
+
+/// The `api` phase of [`scale`].
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+async fn scale_api(
+    store: &Arc<Store>,
+    backend: &Arc<dyn Backend>,
+    source: SourceId,
+    keys: &[(String, u64)],
+) {
+    use doewood_api::pb;
+    use doewood_api::pb::graph_service_client::GraphServiceClient;
+    use doewood_api::pb::records_service_client::RecordsServiceClient;
+    use doewood_api::pb::search_service_client::SearchServiceClient;
+
+    let doc = |key: &str| {
+        let hash = store
+            .ingest_status(source, key)
+            .unwrap()
+            .and_then(|s| s.blake3)
+            .map(Blake3)
+            .expect("an ingested key");
+        let backend = Arc::clone(backend);
+        async move {
+            backend
+                .node_by_key(NodeKind::Document, &hash.to_hex())
+                .await
+                .unwrap()
+                .expect("its document")
+                .id
+        }
+    };
+    let middle = doc(&keys[keys.len() / 2].0).await;
+    let near = keys
+        .iter()
+        .rev()
+        .find(|(k, _)| k.starts_with("near/"))
+        .expect("a near-duplicate");
+    let near = doc(&near.0).await;
+    // The biggest company, from the due list (every company is due: nothing was enriched).
+    let owner = doewood_core::InstanceId::new("scale").unwrap();
+    let (mut after, mut big) = (None, (uuid::Uuid::nil(), 0));
+    loop {
+        let page = backend
+            .companies_due(&owner, after, doewood_model::DUE_MAX_LIMIT)
+            .await
+            .unwrap();
+        let Some(last) = page.last() else { break };
+        after = Some(last.company);
+        for d in page {
+            if d.documents > big.1 {
+                big = (d.company, d.documents);
+            }
+        }
+    }
+    let progress = Arc::new(doewood_api::Progress::new());
+    let api = bench::Api::start(store, backend, &progress, 0).await;
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{}", api.addr))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut records = RecordsServiceClient::new(channel.clone());
+    let mut graph = GraphServiceClient::new(channel.clone());
+    let mut search = SearchServiceClient::new(channel);
+    let mut report = Vec::new();
+    macro_rules! time {
+        ($name:expr, $call:expr, $items:expr) => {{
+            let mut ms = Vec::new();
+            let mut items = 0;
+            let mut error = None;
+            for _ in 0..11 {
+                let t = std::time::Instant::now();
+                match $call.await {
+                    Ok(r) => items = $items(r.into_inner()),
+                    Err(e) => error = Some(e.code()),
+                }
+                ms.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            ms.sort_by(f64::total_cmp);
+            report.push(format!(
+                "{} {:.2} ms (max {:.2}), {items} items{}",
+                $name,
+                ms[5],
+                ms[10],
+                error.map_or_else(String::new, |c| format!(", error {c:?}"))
+            ));
+        }};
+    }
+    time!(
+        "ListRecords",
+        records.list_records(pb::ListRecordsRequest {
+            source_id: source.to_string(),
+            page_size: 100,
+            page_token: String::new(),
+        }),
+        |r: pb::ListRecordsResponse| r.records.len()
+    );
+    for text in ["Ugovor", "Kupac Grupa"] {
+        time!(
+            format!("Search {text:?}"),
+            search.search(pb::SearchRequest {
+                text: text.into(),
+                limit: 20,
+                ..pb::SearchRequest::default()
+            }),
+            |r: pb::SearchResponse| r.hits.len()
+        );
+    }
+    time!(
+        "GetNode",
+        graph.get_node(pb::GetNodeRequest {
+            lookup: Some(pb::get_node_request::Lookup::Id(middle.to_string())),
+        }),
+        |_| 1
+    );
+    time!(
+        "Neighbours",
+        graph.neighbours(pb::NeighboursRequest {
+            node_id: near.to_string(),
+            direction: pb::Direction::Unspecified as i32,
+            edge_kinds: vec![pb::EdgeKind::SimilarTo as i32],
+            node_kind: pb::NodeKind::Document as i32,
+            at: String::new(),
+            include_inactive: false,
+        }),
+        |r: pb::NeighboursResponse| r.neighbours.len()
+    );
+    time!(
+        format!("CompanyDocuments ({} documents)", big.1),
+        graph.company_documents(pb::CompanyDocumentsRequest {
+            company_id: big.0.to_string(),
+        }),
+        |r: pb::CompanyDocumentsResponse| r.documents.len()
+    );
+    println!("scale: api, one client, median of 11:");
+    for line in report {
+        println!("  {line}");
+    }
+    api.stop().await;
 }
 
 /// The `throughput` measurement's helpers: `WatchProgress` streams on a real API server, and
@@ -1221,10 +1813,19 @@ mod bench {
     }
 
     /// Times a trivial store call every millisecond: what it waits for the lock. With the
-    /// store on disk, also the largest size its WAL file reached.
+    /// store on disk, also the largest size its WAL file reached, and how many times a
+    /// checkpoint reset it (the checkpoint sequence number in the WAL header, bytes 12 to 15).
     pub struct Probe {
         stop: Arc<AtomicBool>,
-        thread: std::thread::JoinHandle<(Vec<Duration>, u64)>,
+        thread: std::thread::JoinHandle<(Vec<Duration>, u64, u32)>,
+    }
+
+    /// The WAL header's checkpoint sequence number, when the file has a header.
+    fn wal_sequence(wal: &std::path::Path) -> Option<u32> {
+        use std::io::Read as _;
+        let mut head = [0u8; 16];
+        std::fs::File::open(wal).ok()?.read_exact(&mut head).ok()?;
+        Some(u32::from_be_bytes([head[12], head[13], head[14], head[15]]))
     }
 
     impl Probe {
@@ -1233,27 +1834,40 @@ mod bench {
             let thread = {
                 let (store, stop) = (Arc::clone(store), Arc::clone(&stop));
                 std::thread::spawn(move || {
-                    let (mut waits, mut wal_max) = (Vec::new(), 0);
+                    let (mut waits, mut wal_max, mut resets) = (Vec::new(), 0, 0);
+                    let mut seq = None;
                     while !stop.load(Ordering::Relaxed) {
                         let t = Instant::now();
                         store.schema_version().unwrap();
                         waits.push(t.elapsed());
-                        if let Some(len) = wal.as_ref().and_then(|w| std::fs::metadata(w).ok()) {
-                            wal_max = wal_max.max(len.len());
+                        if let Some(w) = wal.as_ref() {
+                            if let Ok(m) = std::fs::metadata(w) {
+                                wal_max = wal_max.max(m.len());
+                            }
+                            if let Some(now) = wal_sequence(w) {
+                                if let Some(before) = seq {
+                                    resets += now.wrapping_sub(before);
+                                }
+                                seq = Some(now);
+                            }
                         }
                         std::thread::sleep(Duration::from_millis(1));
                     }
-                    (waits, wal_max)
+                    (waits, wal_max, resets)
                 })
             };
             Self { stop, thread }
         }
 
-        /// Mean, 99th percentile and maximum; the WAL's largest size.
+        /// Mean, 99th percentile and maximum; the WAL's largest size and its resets.
         pub fn stop(self) -> String {
             self.stop.store(true, Ordering::Relaxed);
-            let (waits, wal_max) = self.thread.join().unwrap();
-            format!("{}, WAL at most {} MiB", stats(waits), wal_max >> 20)
+            let (waits, wal_max, resets) = self.thread.join().unwrap();
+            format!(
+                "{}, WAL at most {} MiB, reset {resets} times",
+                stats(waits),
+                wal_max >> 20
+            )
         }
     }
 
@@ -1322,7 +1936,7 @@ mod bench {
     }
 
     /// Mean, 99th percentile and maximum of `w`.
-    fn stats(mut w: Vec<Duration>) -> String {
+    pub fn stats(mut w: Vec<Duration>) -> String {
         w.sort();
         if w.is_empty() {
             return "-".into();

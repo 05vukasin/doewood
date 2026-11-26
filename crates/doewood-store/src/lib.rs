@@ -65,6 +65,6 @@ pub use store::sqs::{
     queue_url_region, valid_queue_url,
 };
 pub use store::{
-    DEFAULT_READERS, MAX_READERS, SECRET_MAX_LEN, STORE_FILE, Snapshot, Store, default_readers,
-    plan_readers,
+    ANALYSIS_LIMIT, DEFAULT_READERS, MAX_READERS, Optimized, SECRET_MAX_LEN, STORE_FILE, Snapshot,
+    Store, default_readers, plan_readers,
 };

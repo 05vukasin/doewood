@@ -14,11 +14,12 @@
 //! `s3:TestEvent`. Records go through the webhook's parser and comparison
 //! ([`super::webhook::parse_notifications`]).
 //!
-//! **Delivery.** A message is deleted only once it is handed off: its events are sent and
-//! recorded, or every record was ignored (another bucket, outside the prefix, already seen).
+//! **Delivery.** A message is deleted only once it is handed off: its events are recorded and
+//! sent, or every record was ignored (another bucket, outside the prefix, already seen).
 //! A hand-off that fails (the store, the event channel) leaves the message, and the ones after
 //! it in the batch, in the queue: SQS delivers them again after the visibility timeout, and the
-//! comparison with `objects_seen` makes that harmless. A body that is not a notification is
+//! comparison with `objects_seen` makes that harmless (a row recorded whose event was not sent
+//! stays `pending`, and ingest's sweep feeds it). A body that is not a notification is
 //! logged and deleted, so that it cannot come back forever; the periodic scan catches whatever
 //! it was about. (A redrive policy on the queue never sees it, since it is deleted on its first
 //! receive.)
