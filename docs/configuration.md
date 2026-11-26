@@ -141,9 +141,14 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
   5 minutes, then they retry with backoff) and find the schema migrated. The version is in
   the `doewood_schema` table. A database migrated by a newer doewood is
   refused (not ready) until this one is upgraded.
+- **Schema 11** (issue #141: the triggers behind `sketch_band_sizes` keep a row only for a
+  band bucket of two or more documents, which cut the WAL of ingest by 12 to 29%; new
+  functions only, no table or data changed, migrates in seconds, see
+  [deploy.md](deploy.md#postgres-wal-on-a-big-corpus-issue-141)) is the current version. As
+  with every schema, **all instances are upgraded together**.
 - **Schema 10** (issue #112: `edges_by_dst` is rebuilt as `(dst, kind, coalesce(valid_from,
   '-infinity'), id)`, the order `Neighbours` and `CompanyDocuments` page in; see
-  [api.md](api.md#pages-of-neighbours-and-companydocuments)) is the current version. The
+  [api.md](api.md#pages-of-neighbours-and-companydocuments)) was the one before. The
   migration drops and builds one index on `edges`; no data changes. On the issue #127
   `scale` store at 200,000 documents (997,834 edges, `edges` 223 MB) the build took 0.8 to
   1.0 s. For that long the migration's transaction holds `edges` exclusively: reads and
