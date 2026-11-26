@@ -37,12 +37,18 @@ persistence:
   storageClass: ""
   accessModes: [ReadWriteOnce]
 
+# Scanned pages OCR'd at the same time (DOEWOOD_OCR_JOBS): each job is its own engine, about
+# 0.55 GiB more, and 2 read about 35-45 % more pages a second than 1 with the same text
+# (docs/deploy.md, "OCR per page"). Empty: the binary's own default (one engine below 10 GiB).
+ocrJobs: 2
+
+# The memory includes the second OCR engine (+0.6 GiB over the 1 Gi / 4 Gi of one engine).
 resources:
   requests:
     cpu: 500m
-    memory: 1Gi
+    memory: 1638Mi
   limits:
-    memory: 4Gi
+    memory: 4710Mi
 
 podSecurityContext:
   runAsNonRoot: true
