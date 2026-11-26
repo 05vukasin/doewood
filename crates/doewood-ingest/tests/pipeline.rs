@@ -1269,7 +1269,8 @@ fn scale_file(i: usize) -> (String, Vec<u8>) {
         );
         return (format!("bench/{i}.pdf"), pdf);
     }
-    if i % 20 != 19 {
+    // `DOEWOOD_SCALE_NEAR=0` leaves the near-duplicates out (to see what they cost).
+    if i % 20 != 19 || std::env::var("DOEWOOD_SCALE_NEAR").is_ok_and(|v| v == "0") {
         return bench_file(i);
     }
     let text = common::prose(1_000_000 + (i as u64 / 20) % 50, 600);
@@ -1292,7 +1293,8 @@ fn scale_file(i: usize) -> (String, Vec<u8>) {
 /// - `ingest` (the default): adds files until the corpus has `DOEWOOD_SCALE_TO` (default
 ///   50,000), at most `DOEWOOD_SCALE_RUN` (default 25,000) in this run, and prints files/s
 ///   and the graph stage per 5,000 files, then the writer lock wait (a trivial call every
-///   millisecond) and the WAL's largest size and resets. The keys and sizes go to `keys.tsv`
+///   millisecond) and the WAL's largest size and resets (`DOEWOOD_SCALE_NEAR=0`: without
+///   the near-duplicates). The keys and sizes go to `keys.tsv`
 ///   in the directory, so the next run continues where this one stopped.
 /// - `sweep`: the ingest sweep's pending query over the whole source, and `object_counts`
 ///   (each progress snapshot reads it), median of 11.
@@ -1300,6 +1302,8 @@ fn scale_file(i: usize) -> (String, Vec<u8>) {
 ///   lock wait.
 /// - `due`: `companies_due` (no registries are called: only the query), the first page and a
 ///   whole pass in pages of 100, as the enrichment job reads it.
+/// - `offline`: switches every registry, feed and the favicon fallback off in the instance
+///   store, before `doewood serve` is started on the directory (idle memory).
 /// - `api`: one client through the API: `ListRecords` (the first page of 100), `Search` (a
 ///   word in every fourth document, and the biggest company's name), `GetNode`, `Neighbours`
 ///   (`similar_to` of a near-duplicate) and `CompanyDocuments` of the biggest company (the
@@ -1529,6 +1533,31 @@ async fn scale() {
                 median(first),
                 t.elapsed().as_secs_f64()
             );
+        }
+        "offline" => {
+            use doewood_store::{EnrichmentSettingsPatch, FeedSwitchesPatch, RegistrySwitchesPatch};
+            let off = Some(false);
+            store
+                .set_enrichment_settings(&EnrichmentSettingsPatch {
+                    registries: RegistrySwitchesPatch {
+                        gleif: off,
+                        vies: off,
+                        wikidata: off,
+                        edgar: off,
+                        apr: off,
+                        companies_house: off,
+                    },
+                    feeds: FeedSwitchesPatch {
+                        gleif: off,
+                        edgar: off,
+                        apr: off,
+                        companies_house: off,
+                    },
+                    favicon_fallback: off,
+                    ..EnrichmentSettingsPatch::default()
+                })
+                .unwrap();
+            println!("scale: every registry, feed and the favicon fallback switched off");
         }
         "api" => scale_api(&store, &backend, source, &keys).await,
         other => panic!("unknown DOEWOOD_SCALE_PHASE {other}"),
