@@ -611,19 +611,26 @@ async fn a_failed_hand_off_leaves_the_message_for_redelivery() {
         .unwrap();
     assert_eq!(mock.undeleted(), ["m"]);
     assert_eq!(mock.count("AmazonSQS.DeleteMessageBatch"), 0);
-    assert!(store.seen_object(source, "in/a.pdf").unwrap().is_none());
+    // The row is committed before the event is sent (issue #125): it is pending, and ingest's
+    // sweep feeds it although its event was not sent.
+    let seen = store.seen_object(source, "in/a.pdf").unwrap().unwrap();
+    assert_eq!(
+        store
+            .ingest_status(source, "in/a.pdf")
+            .unwrap()
+            .unwrap()
+            .status,
+        "pending"
+    );
 
-    // SQS delivers it again: handed off, then deleted.
+    // SQS delivers it again: already seen, so nothing is sent again, and it is deleted.
     let (tx, mut rx) = mpsc::channel(4);
     let running = run(&store, source, &mock, None, "us-east-1", fast(), tx);
-    let e = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(e.key, "in/a.pdf");
     until("deleted", || mock.undeleted().is_empty()).await;
     assert_eq!(mock.state().queue[0].receives, 2);
     running.stop().await;
+    assert!(rx.try_recv().is_err());
+    assert_eq!(store.seen_object(source, "in/a.pdf").unwrap(), Some(seen));
 
     // A source removed meanwhile: the message stays, and the inlet stops.
     mock.push("n", s3_record(BUCKET, "in/b.pdf", "ObjectCreated:Put"));

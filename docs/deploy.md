@@ -160,6 +160,9 @@ Alerts worth setting (tune the thresholds to your traffic):
   streams, which do not count against it), and `doewood_grpc_connections_open` per pod, to
   see whether the clients spread over the replicas.
 - **Not ready:** `doewood_ready == 0` for more than a few minutes.
+- **Ingest results dropped:** `rate(doewood_ingest_finish_unmatched_total[15m])` well above
+  the rate of objects changed or deleted while being ingested. Each one is ingested again by
+  the next sweep (issue #125).
 
 ## Sizing
 

@@ -172,6 +172,11 @@ async fn run(Loaded { config, warnings }: Loaded) -> Result<(), String> {
         .as_ref()
         .map(|(i, _)| i.start(ingest_rx, shutdown_rx.clone()));
     let summarizing = ingest.as_ref().map(|(_, s)| s.start(shutdown_rx.clone()));
+    if let Some((i, _)) = &ingest
+        && let Err(e) = ingest::register_metrics(i, state.registry())
+    {
+        warn!(error = %e, "the ingest metrics could not be registered");
+    }
     let enriching = enrichment::start(
         &config,
         &store,
