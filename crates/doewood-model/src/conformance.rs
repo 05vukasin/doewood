@@ -38,6 +38,7 @@ pub async fn run<B: Backend + ?Sized>(a: &B, b: &B) {
     ended_locations(a).await;
     records_by_source(a).await;
     sketches(a).await;
+    stop_bands(a).await;
     aliases(a).await;
     alias_batches(a).await;
     graph_batches(a).await;
@@ -1021,6 +1022,73 @@ pub async fn graph_batches<B: Backend + ?Sized>(s: &B) {
     ));
     // A missing end fails the call.
     assert!(s.upsert_edges(&[edge(a, Uuid::now_v7(), 6)]).await.is_err());
+}
+
+/// [`crate::SketchStore::sketch_candidates_within`] (issue #148): a band whose bucket holds
+/// more than `max_bucket` documents is skipped and counted; the bucket sizes follow
+/// replaced sketches.
+///
+/// # Panics
+///
+/// When the backend misbehaves.
+pub async fn stop_bands<B: Backend + ?Sized>(s: &B) {
+    let (wide, pair, own, gone) = (5_000, 5_001, u64::MAX - 5_002, 5_003);
+    for n in 81..=86 {
+        s.put_record(&hash(n), &raw(&json!({"n": n})), &versions("1"))
+            .await
+            .unwrap();
+    }
+    for n in 81..=85 {
+        let bands: &[u64] = if n <= 82 { &[wide, pair] } else { &[wide] };
+        s.put_sketch(&hash(n), &[n], bands).await.unwrap();
+    }
+    s.put_sketch(&hash(86), &[86], &[own]).await.unwrap();
+    let ask = [wide, pair, own, 7_777];
+    let keys = |c: &crate::Candidates| {
+        c.sketches
+            .iter()
+            .map(|k| (k.blake3, k.shared_bands))
+            .collect::<Vec<_>>()
+    };
+    // `wide` has 5 documents: over a limit of 4, skipped.
+    let got = s
+        .sketch_candidates_within(&ask, &hash(86), 0, 4)
+        .await
+        .unwrap();
+    assert_eq!(got.skipped_bands, 1);
+    assert_eq!(keys(&got), [(hash(81), 1), (hash(82), 1)]);
+    assert_eq!(got.sketches[0].signature, [81]);
+    // At the limit nothing is skipped, and the candidates are those of `sketch_candidates`.
+    let all = s
+        .sketch_candidates_within(&ask, &hash(86), 0, 5)
+        .await
+        .unwrap();
+    assert_eq!(all.skipped_bands, 0);
+    assert_eq!(
+        all.sketches,
+        s.sketch_candidates(&ask, &hash(86), 0).await.unwrap()
+    );
+    assert_eq!(all.sketches.len(), 5);
+    // A band given twice is one skipped band; only skipped bands: no candidate.
+    let got = s
+        .sketch_candidates_within(&[wide, wide], &hash(86), 0, 4)
+        .await
+        .unwrap();
+    assert_eq!((got.skipped_bands, got.sketches.len()), (1, 0));
+    // A replaced sketch leaves the bucket: `wide` is back to 4.
+    s.put_sketch(&hash(85), &[85], &[gone]).await.unwrap();
+    let got = s
+        .sketch_candidates_within(&ask, &hash(86), 0, 4)
+        .await
+        .unwrap();
+    assert_eq!(got.skipped_bands, 0);
+    assert_eq!(got.sketches.len(), 4);
+    assert_eq!(
+        s.sketch_candidates_within(&[], &hash(86), 0, 4)
+            .await
+            .unwrap(),
+        crate::Candidates::default()
+    );
 }
 
 /// The LSH band index: candidates by shared bands, replacement, the excluded document.

@@ -1,10 +1,13 @@
 //! Round trips to Postgres per graph write (issue #103), counted by a proxy between the store
 //! and the database that reads the wire protocol: a statement is a `Bind` or a simple `Query`
-//! the client sends (prepares are not counted), and a round trip is a send that starts while
-//! the connection has no answer outstanding (statements sent together, pipelined, are one).
+//! the client sends, and a round trip is a request (the messages up to a `Sync`, or a
+//! `Query`) that runs a statement and whose first byte came while the connection had no
+//! answer outstanding. Statements sent together, pipelined, are one; a request split over
+//! several reads is still one (issue #148: counting per read made the counts depend on
+//! timing); prepares and the startup are not counted.
 //! Runs when `DOEWOOD_TEST_POSTGRES_URL` is set, in a schema of its own.
 //!
-//! `near_duplicate_corpus` (ignored) is the measurement of issue #126 on either store.
+//! `near_duplicate_corpus` (ignored) is the measurement of issues #126 and #148 on either store.
 
 mod common;
 
@@ -100,6 +103,10 @@ async fn pump(client: TcpStream, server: TcpStream, counts: Arc<Counts>) {
         let outstanding = Arc::clone(&outstanding);
         async move {
             let (mut buf, mut typed, mut chunk) = (Vec::new(), false, vec![0u8; 64 * 1024]);
+            // The request being read (messages up to a `Sync` or a `Query`): whether the
+            // connection had no answer outstanding when its first byte came, and whether it
+            // runs a statement.
+            let mut request: Option<(bool, bool)> = None;
             loop {
                 let n = match cr.read(&mut chunk).await {
                     Ok(0) | Err(_) => break,
@@ -107,22 +114,29 @@ async fn pump(client: TcpStream, server: TcpStream, counts: Arc<Counts>) {
                 };
                 {
                     let mut out = outstanding.lock().unwrap();
-                    if *out == 0 && buf.is_empty() {
-                        counts.round_trips.fetch_add(1, Ordering::SeqCst);
+                    if request.is_none() && buf.is_empty() {
+                        request = Some((*out == 0, false));
                     }
                     buf.extend_from_slice(&chunk[..n]);
                     for t in messages(&mut buf, &mut typed) {
-                        match t {
-                            0 | b'S' => *out += 1,
-                            b'Q' => {
-                                *out += 1;
-                                counts.statements.fetch_add(1, Ordering::SeqCst);
-                            }
-                            b'B' => {
-                                counts.statements.fetch_add(1, Ordering::SeqCst);
-                            }
-                            _ => {}
+                        let (idle, statement) = request.get_or_insert((*out == 0, false));
+                        if matches!(t, b'B' | b'Q') {
+                            *statement = true;
+                            counts.statements.fetch_add(1, Ordering::SeqCst);
                         }
+                        if matches!(t, 0 | b'S' | b'Q') {
+                            // A request that runs a statement and waited for nothing is a
+                            // round trip; a prepare alone (`Parse`, `Describe`, `Sync`) and
+                            // the startup are not counted.
+                            if *idle && *statement {
+                                counts.round_trips.fetch_add(1, Ordering::SeqCst);
+                            }
+                            *out += 1;
+                            request = None;
+                        }
+                    }
+                    if request.is_none() && !buf.is_empty() {
+                        request = Some((*out == 0, false));
                     }
                 }
                 if sw.write_all(&chunk[..n]).await.is_err() {
@@ -433,11 +447,19 @@ fn env_or(var: &str, default: u64) -> u64 {
 /// `DOEWOOD_NEAR_DUP_COUNT` set, through the counting proxy), `similar_to` edges per
 /// document, and the candidate query alone for the last template document (best of 5), as
 /// its plan on Postgres. Last, a digest of every `similar_to` edge, to compare two builds.
+/// `DOEWOOD_NEAR_DUP_MAX_BUCKET` is the largest band bucket read (issue #148; default 1000,
+/// 1000000 is about no limit); skipped band keys per document are printed too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "a measurement (issue #126); see docs/deploy.md"]
 #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
 async fn near_duplicate_corpus() {
     let docs = env_or("DOEWOOD_NEAR_DUP_DOCS", 2000);
+    let max_bucket = u32::try_from(env_or("DOEWOOD_NEAR_DUP_MAX_BUCKET", 1000)).unwrap();
+    println!("largest band bucket read: {max_bucket}");
+    let settings = doewood_ingest::Similar {
+        min_jaccard: 0.8,
+        max_bucket,
+    };
     let (b, counts, pg): (Arc<dyn Backend>, Option<Arc<Counts>>, _) =
         if let Ok(dir) = std::env::var("DOEWOOD_NEAR_DUP_SQLITE") {
             let path = std::path::Path::new(&dir)
@@ -462,9 +484,10 @@ async fn near_duplicate_corpus() {
     };
     let window = (docs / 10).max(1);
     let (mut spent, mut similar, mut statements, mut trips) = (Duration::ZERO, 0usize, 0u64, 0u64);
+    let mut skipped = 0usize;
     let started = Instant::now();
     println!(
-        "docs | graph write ms/doc | statements/doc | round trips/doc | similar_to/doc | candidate query ms (candidates)"
+        "docs | graph write ms/doc | statements/doc | round trips/doc | similar_to/doc | bands skipped/doc | candidate query ms (candidates)"
     );
     for i in 0..docs {
         let h = hash(i);
@@ -479,11 +502,12 @@ async fn near_duplicate_corpus() {
         let before = counts.as_ref().map(|c| c.now());
         let t = Instant::now();
         let stats = writer
-            .write(&h, &at(&format!("near/{i}.txt")), &facts, "x", 0.8)
+            .write(&h, &at(&format!("near/{i}.txt")), &facts, "x", settings)
             .await
             .unwrap();
         spent += t.elapsed();
         similar += stats.similar;
+        skipped += stats.similar_buckets_skipped;
         if let (Some(c), Some(before)) = (&counts, before) {
             let s = c.since(before);
             statements += s.statements;
@@ -498,23 +522,25 @@ async fn near_duplicate_corpus() {
             for _ in 0..5 {
                 let t = Instant::now();
                 found = b
-                    .sketch_candidates(&bands, &hash(probe), 100)
+                    .sketch_candidates_within(&bands, &hash(probe), 100, max_bucket)
                     .await
                     .unwrap()
+                    .sketches
                     .len();
                 best = best.min(t.elapsed());
             }
             let per = |n: f64| n / window as f64;
             println!(
-                "{} | {:.2} | {:.1} | {:.1} | {:.1} | {:.2} ({found})",
+                "{} | {:.2} | {:.1} | {:.1} | {:.1} | {:.1} | {:.2} ({found})",
                 i + 1,
                 per(spent.as_secs_f64() * 1000.0),
                 per(statements as f64),
                 per(trips as f64),
                 per(similar as f64),
+                per(skipped as f64),
                 best.as_secs_f64() * 1000.0,
             );
-            (spent, similar, statements, trips) = (Duration::ZERO, 0, 0, 0);
+            (spent, similar, statements, trips, skipped) = (Duration::ZERO, 0, 0, 0, 0);
         }
     }
     println!("total: {:.1} s", started.elapsed().as_secs_f64());
@@ -531,12 +557,20 @@ async fn near_duplicate_corpus() {
             .unwrap();
         let plan = admin
             .query(
-                "EXPLAIN (ANALYZE, BUFFERS) SELECT c.blake3, s.signature, c.shared \
-                 FROM (SELECT blake3, count(*) AS shared FROM sketch_bands \
-                 WHERE band = ANY($1) AND blake3 <> $2 \
-                 GROUP BY blake3 ORDER BY shared DESC, blake3 LIMIT 100) c \
-                 JOIN sketches s ON s.blake3 = c.blake3 ORDER BY c.shared DESC, c.blake3",
-                &[&bands, &hash(probe).as_bytes().as_slice()],
+                "EXPLAIN (ANALYZE, BUFFERS) WITH big AS MATERIALIZED (\
+                 SELECT band FROM sketch_band_sizes WHERE band = ANY($1) AND docs > $3::bigint), \
+                 c AS (SELECT blake3, count(*) AS shared FROM sketch_bands \
+                 WHERE band = ANY(ARRAY(SELECT unnest($1::bigint[]) EXCEPT SELECT band FROM big)) \
+                 AND blake3 <> $2 \
+                 GROUP BY blake3 ORDER BY shared DESC, blake3 LIMIT 100) \
+                 SELECT (SELECT count(*) FROM big), c.blake3, s.signature, c.shared \
+                 FROM (SELECT 1) one LEFT JOIN (c JOIN sketches s ON s.blake3 = c.blake3) ON true \
+                 ORDER BY c.shared DESC, c.blake3",
+                &[
+                    &bands,
+                    &hash(probe).as_bytes().as_slice(),
+                    &i64::from(max_bucket),
+                ],
             )
             .await
             .unwrap();
@@ -588,10 +622,16 @@ async fn similar_documents_take_a_fixed_number_of_round_trips() {
     }
     println!("similar_to edges, then what the write took: {seen:?}");
     // Past the first documents, which open the pool's connections and prepare statements.
+    // Every call is one statement, so the count does not depend on how the client's writes
+    // reach the server (issue #148: pipelined batches could be split by the timing).
     for (similar, s) in &seen[10..] {
         assert!(*similar >= 10, "{similar} similar documents");
-        assert!(
-            s.round_trips <= ROUND_TRIPS_PER_DOC,
+        assert_eq!(
+            s.round_trips, ROUND_TRIPS_PER_DOC,
+            "{s:?} for {similar} edges"
+        );
+        assert_eq!(
+            s.statements, ROUND_TRIPS_PER_DOC,
             "{s:?} for {similar} edges"
         );
     }

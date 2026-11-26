@@ -200,6 +200,10 @@ Alerts worth setting (tune the thresholds to your traffic):
 - **Ingest results dropped:** `doewood_ingest_finish_unmatched_total` growing much faster than
   objects are changed or deleted while being ingested. Each count is a result that was not
   recorded; when its row is still pending, the next sweep ingests the object again (issue #125).
+- **Template-heavy sources** (not an alert): `doewood_ingest_similar_buckets_skipped_total`
+  counts band keys the `similar_to` query skipped because more than `similar_max_bucket`
+  documents share them (issue #148). It grows when one template (one supplier's invoices)
+  passes the limit; those documents then link only through their less common bands.
 
 ## Sizing
 
@@ -592,8 +596,10 @@ both stores in CI.
 
 What changed: `GraphStore::node_ids` reads the candidates' Document nodes in one statement
 (the few missing ones are still created one by one), and `GraphStore::upsert_edges` writes
-the edges in one transaction: pipelined on Postgres (`BEGIN`, the upserts and `COMMIT` in
-one round trip), one writer call on SQLite. A document costs 8 round trips on Postgres
+the edges in one transaction: one statement on Postgres (an `INSERT ... SELECT FROM unnest`
+upsert; since #148, before that the upserts were pipelined between `BEGIN` and `COMMIT`,
+which the client could split into more round trips on a busy machine), one writer call on
+SQLite. A document costs 8 round trips on Postgres
 however many similar documents it has (`similar_documents_take_a_fixed_number_of_round_trips`),
 against 8 plus 2 per similar document before.
 

@@ -40,8 +40,8 @@ use uuid::Uuid;
 use crate::company::{AliasKind, CompanyName, LadderStep};
 use crate::facts::{DocFacts, Party};
 
-/// How `similar_to` candidates are found. The least Jaccard estimate for an edge is a runtime
-/// setting (`IngestSettings::similar_min_jaccard`), passed to [`GraphWriter::write`].
+/// How `similar_to` candidates are found. The least Jaccard estimate for an edge and the
+/// largest band bucket are runtime settings ([`Similar`]), passed to [`GraphWriter::write`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SimilarityConfig {
     /// Most candidates looked at per document.
@@ -52,6 +52,35 @@ impl Default for SimilarityConfig {
     fn default() -> Self {
         Self {
             max_candidates: 100,
+        }
+    }
+}
+
+/// The runtime `similar_to` settings ([`doewood_store::IngestSettings`]), read for every
+/// file and passed to [`GraphWriter::write`]. A bare `f64` is the least Jaccard estimate with
+/// the default largest band bucket.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Similar {
+    /// Least Jaccard estimate for an edge (`similar_min_jaccard`).
+    pub min_jaccard: f64,
+    /// Largest band bucket the candidate query reads (`similar_max_bucket`, issue #148).
+    pub max_bucket: u32,
+}
+
+impl From<f64> for Similar {
+    fn from(min_jaccard: f64) -> Self {
+        Self {
+            min_jaccard,
+            max_bucket: doewood_store::DEFAULT_SIMILAR_MAX_BUCKET,
+        }
+    }
+}
+
+impl From<doewood_store::IngestSettings> for Similar {
+    fn from(s: doewood_store::IngestSettings) -> Self {
+        Self {
+            min_jaccard: s.similar_min_jaccard,
+            max_bucket: s.similar_max_bucket,
         }
     }
 }
@@ -78,6 +107,9 @@ pub struct WriteStats {
     pub pending_refs: usize,
     /// `similar_to` edges.
     pub similar: usize,
+    /// Band keys of the document skipped because their bucket held more than
+    /// `similar_max_bucket` documents (issue #148).
+    pub similar_buckets_skipped: usize,
     /// `party` edges that landed on the survivor of a merge that committed after the
     /// company was matched (issue #48).
     pub redirects: usize,
@@ -137,16 +169,17 @@ impl GraphWriter {
     }
 
     /// Writes one document found at `location`. Its record must already be stored.
-    /// `name` is the file name, the title of last resort. `min_jaccard` is the least Jaccard
-    /// estimate for a `similar_to` edge.
+    /// `name` is the file name, the title of last resort. `similar` is the least Jaccard
+    /// estimate for a `similar_to` edge and the largest band bucket read ([`Similar`]).
     pub async fn write(
         &self,
         blake3: &Blake3,
         location: &ObjectLocation,
         facts: &DocFacts,
         name: &str,
-        min_jaccard: f64,
+        similar_settings: impl Into<Similar>,
     ) -> Result<WriteStats> {
+        let similar_settings = similar_settings.into();
         let b = &self.backend;
         let hex = blake3.to_hex();
         let doc = b.upsert_location(blake3, location).await?.document;
@@ -179,7 +212,7 @@ impl GraphWriter {
                 self.cites(doc, &hex, facts, &mut refs).await
             },
             self.parties(doc, &hex, facts, &mut stats),
-            self.similar(blake3, doc, facts, min_jaccard, &mut similar),
+            self.similar(blake3, doc, facts, similar_settings, &mut similar),
         );
         props?;
         indexed?;
@@ -194,6 +227,7 @@ impl GraphWriter {
         stats.refs += cited;
         stats.pending_refs += pending_refs;
         stats.similar += similar.similar;
+        stats.similar_buckets_skipped += similar.similar_buckets_skipped;
         Ok(stats)
     }
 
@@ -300,7 +334,7 @@ impl GraphWriter {
         blake3: &Blake3,
         doc: Uuid,
         facts: &DocFacts,
-        min_jaccard: f64,
+        settings: Similar,
         stats: &mut WriteStats,
     ) -> Result<()> {
         let Some((sig, bands)) = &facts.minhash else {
@@ -308,10 +342,21 @@ impl GraphWriter {
         };
         let b = &self.backend;
         b.put_sketch(blake3, sig, bands).await?;
+        // Bands whose bucket is larger than the setting are skipped (issue #148): on a
+        // template-heavy corpus this changes which edges exist, and bounds the query.
         let candidates = b
-            .sketch_candidates(bands, blake3, self.similarity.max_candidates)
+            .sketch_candidates_within(
+                bands,
+                blake3,
+                self.similarity.max_candidates,
+                settings.max_bucket,
+            )
             .await?;
+        stats.similar_buckets_skipped +=
+            usize::try_from(candidates.skipped_bands).unwrap_or(usize::MAX);
+        let min_jaccard = settings.min_jaccard;
         let found: Vec<(Sketch, f64)> = candidates
+            .sketches
             .into_iter()
             .map(|c| {
                 let score = quail_sketch::jaccard_estimate(sig, &c.signature);

@@ -6,9 +6,10 @@ use doewood_model::SourceKey;
 use doewood_store::{
     AI_PRESETS, AiProviderInput, ApiKey, ApiSettingsPatch, CredentialsChange,
     DEADLINE_SECONDS_LIMIT, IngestSettingsPatch, KeyChange, MAX_CALLS_IN_FLIGHT_LIMIT, NewSource,
-    S3Credentials, SUMMARIZE_MAX_CONCURRENT_RANGE, SourcePatch, SourceState, SqsInletInput,
-    UrlStyle, valid_deadline_seconds, valid_max_calls_in_flight, valid_min_jaccard,
-    valid_provider_name, valid_summarize_max_concurrent,
+    S3Credentials, SIMILAR_MAX_BUCKET_RANGE, SUMMARIZE_MAX_CONCURRENT_RANGE, SourcePatch,
+    SourceState, SqsInletInput, UrlStyle, valid_deadline_seconds, valid_max_calls_in_flight,
+    valid_min_jaccard, valid_provider_name, valid_similar_max_bucket,
+    valid_summarize_max_concurrent,
 };
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
@@ -572,6 +573,18 @@ impl ConfigService for Api {
         {
             v.add("similar_min_jaccard", "must be above 0 and at most 1");
         }
+        if let Some(n) = req.similar_max_bucket
+            && !valid_similar_max_bucket(n)
+        {
+            v.add(
+                "similar_max_bucket",
+                format!(
+                    "must be {} to {}",
+                    SIMILAR_MAX_BUCKET_RANGE.start(),
+                    SIMILAR_MAX_BUCKET_RANGE.end()
+                ),
+            );
+        }
         if let Some(n) = req.summarize_max_concurrent
             && !valid_summarize_max_concurrent(n)
         {
@@ -587,6 +600,7 @@ impl ConfigService for Api {
         v.check()?;
         let patch = IngestSettingsPatch {
             similar_min_jaccard: req.similar_min_jaccard,
+            similar_max_bucket: req.similar_max_bucket,
             summarize_max_concurrent: req.summarize_max_concurrent,
         };
         let settings = self
@@ -595,6 +609,7 @@ impl ConfigService for Api {
             .await?;
         info!(
             similar_min_jaccard = settings.similar_min_jaccard,
+            similar_max_bucket = settings.similar_max_bucket,
             summarize_max_concurrent = settings.summarize_max_concurrent,
             "ingest settings set"
         );

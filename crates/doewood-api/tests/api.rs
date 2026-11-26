@@ -921,6 +921,7 @@ async fn ingest_settings_round_trip_and_validation() {
             .set_ingest_settings(pb::SetIngestSettingsRequest {
                 similar_min_jaccard: Some(0.9),
                 summarize_max_concurrent: Some(bad),
+                ..pb::SetIngestSettingsRequest::default()
             })
             .await
             .unwrap_err();
@@ -929,6 +930,34 @@ async fn ingest_settings_round_trip_and_validation() {
     let now = get().await;
     assert_eq!(now.summarize_max_concurrent, 4);
     assert!(eq(now.similar_min_jaccard, 1.0));
+
+    // The largest band bucket (issue #148): default 1000, 10 to 1000000.
+    assert_eq!(now.similar_max_bucket, 1000);
+    let set = config(&ch)
+        .set_ingest_settings(pb::SetIngestSettingsRequest {
+            similar_max_bucket: Some(250),
+            ..pb::SetIngestSettingsRequest::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(set.similar_max_bucket, 250);
+    assert_eq!(set.summarize_max_concurrent, 4);
+    assert_eq!(a.store.ingest_settings().unwrap().similar_max_bucket, 250);
+    for bad in [0, 9, 1_000_001] {
+        let err = config(&ch)
+            .set_ingest_settings(pb::SetIngestSettingsRequest {
+                similar_max_bucket: Some(bad),
+                summarize_max_concurrent: Some(2),
+                ..pb::SetIngestSettingsRequest::default()
+            })
+            .await
+            .unwrap_err();
+        invalid(&err, &["similar_max_bucket"]);
+    }
+    let now = get().await;
+    assert_eq!(now.similar_max_bucket, 250);
+    assert_eq!(now.summarize_max_concurrent, 4);
     a.stop().await;
 }
 

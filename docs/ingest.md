@@ -241,7 +241,20 @@ Numbers are in [Sizing, Records](deploy.md#records).
   for every file, so a change applies to the next file without a restart). A document's
   candidates cost the same round trips however many there are (issue #126): their Document
   nodes are read in one statement (`GraphStore::node_ids`) and the edges written in one batch
-  (`GraphStore::upsert_edges`: one transaction, pipelined on Postgres in one round trip).
+  (`GraphStore::upsert_edges`: one transaction, one statement on Postgres).
+- **Stop bands (issue #148).** A band key shared by more than `similar_max_bucket` documents
+  (runtime setting, 10 to 1,000,000, default 1000, `SetIngestSettings`) is skipped by the
+  candidate query: a bucket that large is a template's boilerplate, not similarity, and
+  reading it costs a row per document in it (quadratic over a corpus of one template). The
+  bucket sizes are kept in `sketch_band_sizes` by triggers on `sketch_bands` (both stores), so
+  the check is one row per band. **This changes which `similar_to` edges exist on
+  template-heavy corpora:** once a template has more than the limit of documents, a new one
+  of it is compared only through its less common bands, so it may link to fewer (or other)
+  near-duplicates than the exact top 100 by shared bands; documents that share only
+  boilerplate bands get no edge. Below the limit nothing changes. Skipped bands are counted
+  per document (`similar_buckets_skipped` in the `ingested` debug log) and in the metric
+  `doewood_ingest_similar_buckets_skipped_total`. The setting applies to the next file;
+  edges already written are kept (`ReprocessJob` with `force` compares again).
 - **Search:** title (`ref.title`, else the card's, the file's own, the file name), body (the
   summary card, the extractive summary, keywords, sheet text), kind, date and amount.
 

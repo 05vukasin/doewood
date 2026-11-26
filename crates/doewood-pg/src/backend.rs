@@ -8,15 +8,15 @@ use async_trait::async_trait;
 use deadpool_postgres::{GenericClient, Object, Pool, PoolError};
 use doewood_core::InstanceId;
 use doewood_model::{
-    Backend, Blake3, ClaimStore, Direction, Edge, EdgeKind, EdgeSource, Error, GraphStore,
-    LiveEdge, Located, LocationEnded, MERGE_CHAIN_MAX, Neighbour, NeighbourQuery, Node, NodeAlias,
-    NodeKind, ObjectLocation, OwnedAlias, PropsPatch, PutOutcome, Record, RecordStore, Result,
-    SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore, Sketch, SketchStore,
+    Backend, Blake3, Candidates, ClaimStore, Direction, Edge, EdgeKind, EdgeSource, Error,
+    GraphStore, LiveEdge, Located, LocationEnded, MERGE_CHAIN_MAX, Neighbour, NeighbourQuery, Node,
+    NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PropsPatch, PutOutcome, Record, RecordStore,
+    Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore, Sketch, SketchStore,
     SourceClaim, SourceKey, StepVersions, StoredEdge, band_to_i64, merged_into, record_page_bytes,
     records_limit, sketch_limit, validate_alias, validate_alias_count, validate_batch_count,
     validate_hashes, validate_node, validate_sketch, versions_from_json, versions_to_json,
 };
-use futures_util::future::{join3, try_join_all};
+use futures_util::future::try_join_all;
 use serde_json::Value;
 use serde_json::value::RawValue;
 use time::Date;
@@ -39,6 +39,20 @@ pub(crate) const SKETCH_CANDIDATES: &str = "SELECT c.blake3, s.signature, c.shar
      WHERE band = ANY($1) AND blake3 <> $2 \
      GROUP BY blake3 ORDER BY shared DESC, blake3 LIMIT $3) c \
      JOIN sketches s ON s.blake3 = c.blake3 ORDER BY c.shared DESC, c.blake3";
+
+/// [`SKETCH_CANDIDATES`] over the bands of `$1` whose bucket holds at most `$4` documents
+/// (issue #148): `big` reads one `sketch_band_sizes` row per band, and the bands left are
+/// counted as before. The first column is the number of skipped bands, on every row; with no
+/// candidate there is one row, the others NULL.
+pub(crate) const SKETCH_CANDIDATES_WITHIN: &str = "WITH big AS MATERIALIZED (\
+     SELECT band FROM sketch_band_sizes WHERE band = ANY($1) AND docs > $4::bigint), \
+     c AS (SELECT blake3, count(*) AS shared FROM sketch_bands \
+     WHERE band = ANY(ARRAY(SELECT unnest($1::bigint[]) EXCEPT SELECT band FROM big)) \
+     AND blake3 <> $2 \
+     GROUP BY blake3 ORDER BY shared DESC, blake3 LIMIT $3) \
+     SELECT (SELECT count(*) FROM big), c.blake3, s.signature, c.shared \
+     FROM (SELECT 1) one LEFT JOIN (c JOIN sketches s ON s.blake3 = c.blake3) ON true \
+     ORDER BY c.shared DESC, c.blake3";
 
 /// The `value.v` strings of the facts named `$2` in the records `$1` (`RecordStore::fact_texts`).
 /// A `facts` that is not an array has no facts; a fact that is not an object, or whose key or
@@ -304,6 +318,29 @@ fn edge_params<'a>(e: &'a Edge, x: &'a EdgeExtra) -> [&'a (dyn ToSql + Sync); 11
         &e.valid_to,
         &x.3,
     ]
+}
+
+/// [`GraphStore::upsert_edges`] in one statement: `$1` the ids for new edges, `$2` to `$11`
+/// the edges' columns as arrays. Returns each edge's id with its identity.
+fn upsert_edges_sql() -> String {
+    format!(
+        "INSERT INTO edges (id, src, dst, kind, props, evidence, confidence, state, \
+         valid_from, valid_to, source) \
+         SELECT * FROM unnest($1::uuid[], $2::uuid[], $3::uuid[], $4::text[], $5::jsonb[], \
+         $6::jsonb[], $7::real[], $8::text[], $9::date[], $10::date[], $11::text[]) \
+         {EDGE_ON_CONFLICT}, src, dst, kind, source, valid_from"
+    )
+}
+
+/// The columns of the `edges_identity` constraint.
+fn edge_identity(e: &Edge) -> (Uuid, Uuid, &'static str, &'static str, Option<Date>) {
+    (
+        e.src,
+        e.dst,
+        e.kind.as_str(),
+        e.source.as_str(),
+        e.valid_from,
+    )
 }
 
 async fn upsert_edge(c: &impl GenericClient, e: &Edge) -> Result<Uuid> {
@@ -745,33 +782,72 @@ impl GraphStore for PgStore {
         if edges.is_empty() {
             return Ok(Vec::new());
         }
-        let c = client(&self.pool).await?;
-        let st = c.prepare_cached(&upsert_edge_sql()).await.map_err(pg)?;
-        // Pipelined in one transaction (issue #126): `BEGIN`, the upserts in order and
-        // `COMMIT` go out together on this connection, one round trip and one commit for
-        // all of them. After a failed upsert the rest fail too and `COMMIT` rolls back, so
-        // nothing is written and the connection goes back to the pool outside a transaction
-        // (the `ROLLBACK` below is only a safeguard).
-        let extra: Vec<EdgeExtra> = edges.iter().map(edge_extra).collect();
-        let params: Vec<_> = edges
-            .iter()
-            .zip(&extra)
-            .map(|(e, x)| edge_params(e, x))
-            .collect();
-        let (begin, rows, commit) = join3(
-            c.batch_execute("BEGIN"),
-            try_join_all(params.iter().map(|p| c.query_one(&st, p))),
-            c.batch_execute("COMMIT"),
-        )
-        .await;
-        let done = begin.and(rows).and_then(|rows| commit.map(|()| rows));
-        match done {
-            Ok(rows) => rows.iter().map(|r| r.try_get(0).map_err(pg)).collect(),
-            Err(e) => {
-                let _ = c.batch_execute("ROLLBACK").await;
-                Err(pg(e))
+        // One statement for all of them (issues #126 and #148): one round trip and one
+        // transaction however the client's writes reach the server. Two edges of one
+        // identity cannot be upserted by one statement, so such a batch goes one by one, in
+        // one transaction.
+        let mut seen = std::collections::HashSet::with_capacity(edges.len());
+        if !edges.iter().all(|e| seen.insert(edge_identity(e))) {
+            let mut c = client(&self.pool).await?;
+            let tx = c.transaction().await.map_err(pg)?;
+            let mut ids = Vec::with_capacity(edges.len());
+            for e in edges {
+                ids.push(upsert_edge(&tx, e).await?);
             }
+            tx.commit().await.map_err(pg)?;
+            return Ok(ids);
         }
+        let ids: Vec<Uuid> = edges.iter().map(|_| Uuid::now_v7()).collect();
+        let src: Vec<Uuid> = edges.iter().map(|e| e.src).collect();
+        let dst: Vec<Uuid> = edges.iter().map(|e| e.dst).collect();
+        let kind: Vec<&str> = edges.iter().map(|e| e.kind.as_str()).collect();
+        let props: Vec<&Value> = edges.iter().map(|e| &e.props).collect();
+        let evidence: Vec<&Value> = edges.iter().map(|e| &e.evidence).collect();
+        let confidence: Vec<f32> = edges.iter().map(|e| e.confidence).collect();
+        let state: Vec<&str> = edges.iter().map(|e| e.state.as_str()).collect();
+        let valid_from: Vec<Option<Date>> = edges.iter().map(|e| e.valid_from).collect();
+        let valid_to: Vec<Option<Date>> = edges.iter().map(|e| e.valid_to).collect();
+        let source: Vec<&str> = edges.iter().map(|e| e.source.as_str()).collect();
+        let c = client(&self.pool).await?;
+        let rows = c
+            .rows(
+                &upsert_edges_sql(),
+                &[
+                    &ids,
+                    &src,
+                    &dst,
+                    &kind,
+                    &props,
+                    &evidence,
+                    &confidence,
+                    &state,
+                    &valid_from,
+                    &valid_to,
+                    &source,
+                ],
+            )
+            .await?;
+        let mut by_identity = std::collections::HashMap::with_capacity(rows.len());
+        for r in &rows {
+            let identity = (
+                r.try_get::<_, Uuid>(1).map_err(pg)?,
+                r.try_get::<_, Uuid>(2).map_err(pg)?,
+                r.try_get::<_, String>(3).map_err(pg)?,
+                r.try_get::<_, String>(4).map_err(pg)?,
+                r.try_get::<_, Option<Date>>(5).map_err(pg)?,
+            );
+            by_identity.insert(identity, r.try_get::<_, Uuid>(0).map_err(pg)?);
+        }
+        edges
+            .iter()
+            .map(|e| {
+                let (src, dst, kind, source, from) = edge_identity(e);
+                by_identity
+                    .get(&(src, dst, kind.to_owned(), source.to_owned(), from))
+                    .copied()
+                    .ok_or_else(|| bad("upserted edge", "missing from RETURNING"))
+            })
+            .collect()
     }
 
     async fn upsert_live_edge(&self, edge: &Edge) -> Result<LiveEdge> {
@@ -1129,6 +1205,51 @@ impl SketchStore for PgStore {
                 })
             })
             .collect()
+    }
+
+    async fn sketch_candidates_within(
+        &self,
+        bands: &[u64],
+        exclude: &Blake3,
+        limit: u32,
+        max_bucket: u32,
+    ) -> Result<Candidates> {
+        if bands.is_empty() {
+            return Ok(Candidates::default());
+        }
+        if bands.len() > SKETCH_MAX_BANDS {
+            return Err(Error::Invalid(format!(
+                "at most {SKETCH_MAX_BANDS} band keys per lookup"
+            )));
+        }
+        let bands: Vec<i64> = bands.iter().map(|b| band_to_i64(*b)).collect();
+        let c = client(&self.pool).await?;
+        let rows = c
+            .rows(
+                SKETCH_CANDIDATES_WITHIN,
+                &[
+                    &bands,
+                    &exclude.as_bytes().as_slice(),
+                    &i64::from(sketch_limit(limit)),
+                    &i64::from(max_bucket),
+                ],
+            )
+            .await?;
+        let mut out = Candidates::default();
+        for r in &rows {
+            out.skipped_bands =
+                u32::try_from(r.try_get::<_, i64>(0).map_err(pg)?).unwrap_or(u32::MAX);
+            let Some(h) = r.try_get::<_, Option<&[u8]>>(1).map_err(pg)? else {
+                continue;
+            };
+            out.sketches.push(Sketch {
+                blake3: Blake3::from_slice(h)?,
+                signature: r.try_get(2).map_err(pg)?,
+                shared_bands: u32::try_from(r.try_get::<_, i64>(3).map_err(pg)?)
+                    .unwrap_or(u32::MAX),
+            });
+        }
+        Ok(out)
     }
 }
 
