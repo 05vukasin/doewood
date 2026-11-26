@@ -1182,8 +1182,8 @@ DOEWOOD_SCALE_DIR=<dir> cargo test -p doewood-store --lib scale_store_sizes -- -
 | ingest sweep, nothing pending / `object_counts` | | 0.03 / 0.007 ms | 0.01 / 0.003 ms | | 0.03 / 0.007 ms | 0.02 / 0.004 ms |
 | unchanged scan pass over every key (before #138; after: 0.10 to 0.16 s and 0.37 to 0.67 s) | | (see below) | 7.6 to 8.3 s | | 0.46 to 0.50 s | 6.7 to 6.9 s |
 | writer lock wait during the scan, mean | | | 18 ms | | 3.6 ms | 16 ms |
-| `companies_due`, first page of 100 | | 51 ms | 235 ms | | 10 ms | 86 ms |
-| an enrichment pass of `companies_due` pages (registries off) | | 2.5 s, 94 pages | 41.6 s, 375 pages | | 0.28 s | 1.1 s |
+| `companies_due`, first page of 100 (SQLite before #139) | | 14 ms (51) | 55 ms (235) | | 10 ms | 86 ms |
+| an enrichment pass of `companies_due` pages (registries off; SQLite before #139) | | 0.12 s (2.5 s), 94 pages | 0.35 to 0.4 s (41.6 s), 375 pages | | 0.28 s | 1.1 s |
 | `ListRecords`, one client (page of 100) | | 12.8 ms | 9.7 ms | | 66 ms | 69 ms |
 | `Search`, a word in a quarter of the documents | | 17 ms | 71 ms | | 10 ms | 112 ms |
 | `Search`, the big company's name | | 8.8 ms | 34 ms | | 6.1 ms | 20 ms |
@@ -1197,7 +1197,7 @@ DOEWOOD_SCALE_DIR=<dir> cargo test -p doewood-store --lib scale_store_sizes -- -
 The single-client API rows are medians of 11 calls through the API on the `scale` store
 (`DOEWOOD_SCALE_PHASE=api`), on SQLite without planner statistics (ingest never refreshed
 them; after `analyze`, as `serve` does once it is ready, the 210k store answered within 30%
-of these, and `companies_due` was as slow); `api_load` seeds its own store (10, 50 or 200 thousand documents
+of these, and `companies_due` before #139 was as slow); `api_load` seeds its own store (10, 50 or 200 thousand documents
 of about 1 KiB, one company per 20, `DOEWOOD_BENCH_CLIENTS=10,100 DOEWOOD_BENCH_IDLE=0`).
 `serve` ran the release binary on the 210k store with every registry, feed and the favicon
 fallback switched off (`DOEWOOD_SCALE_PHASE=offline`), in a network namespace with only
@@ -1239,8 +1239,15 @@ What the numbers say:
   (The SQLite 50k pass, 1.0 to 1.5 s, was measured with a test bucket that was itself
   quadratic; the Postgres run's 50k pass uses the same instance store code.) Fixed in #138:
   the pass is now linear, see [below](#key-ranges-of-objects_seen-issue-138).
-- **SQLite's `companies_due` sorts every company for each page**, so an enrichment pass is
-  quadratic in the companies (41.6 s for 37,497); Postgres stays linear (1.1 s). Issue #139.
+- **SQLite's `companies_due` sorted every company for each page**, so an enrichment pass was
+  quadratic in the companies (41.6 s for 37,497); Postgres stays linear (1.1 s). Since #139
+  it reads the companies through `nodes_companies` from the page token: a pass is linear,
+  0.12 s at 50k and 0.35 to 0.4 s at 200k (the first page, 55 ms, holds the big company's
+  12,504 documents). With the store's pages out of the OS page cache (other jobs on the
+  server) the 200k pass took 4 to 8.5 s, nearly all of it disk reads (about 1 s of CPU);
+  the query before took 39 to 42 s either way. Measured on a store grown again to 200k
+  with the #127 code (`b1718f6`) plus the change, the old and new query on the same store
+  (docs/enrichment.md).
 - **SQLite `Search` slows faster than its matches grow** under load: `api_load` at 200k
   serves 508 calls/s, a tenth of 10k, and every call waits behind the searches. One search
   costs its matches on both stores (every match is ranked before the page is taken); on
