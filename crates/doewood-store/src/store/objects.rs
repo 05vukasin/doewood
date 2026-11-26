@@ -12,6 +12,57 @@ use super::Snapshot;
 use super::{Store, now};
 use crate::StoreError;
 
+// The key-range reads below have one SQL text per combination of bounds. A bound written as
+// `(?2 IS NULL OR key > ?2)` kept SQLite from using it as a range on the primary key (or the
+// queue index): every page read the source's keys from the first one and filtered, so a
+// pass over all keys was quadratic in their number (issue #138). Each text numbers its
+// parameters the same way, so the same arguments bind to every variant (an unused number
+// stays unbound).
+
+/// `seen_objects` without bounds.
+pub(crate) const SEEN_OBJECTS: &str = "SELECT key, etag, size, last_modified FROM objects_seen \
+     WHERE source_id = ?1 AND status <> 'deleted' ORDER BY key LIMIT ?4";
+/// `seen_objects` with `after` (`?2`).
+pub(crate) const SEEN_OBJECTS_AFTER: &str = "SELECT key, etag, size, last_modified \
+     FROM objects_seen WHERE source_id = ?1 AND status <> 'deleted' AND key > ?2 \
+     ORDER BY key LIMIT ?4";
+/// `seen_objects` with `upto` (`?3`).
+pub(crate) const SEEN_OBJECTS_UPTO: &str = "SELECT key, etag, size, last_modified \
+     FROM objects_seen WHERE source_id = ?1 AND status <> 'deleted' AND key <= ?3 \
+     ORDER BY key LIMIT ?4";
+/// `seen_objects` with both bounds.
+pub(crate) const SEEN_OBJECTS_BETWEEN: &str = "SELECT key, etag, size, last_modified \
+     FROM objects_seen WHERE source_id = ?1 AND status <> 'deleted' \
+     AND key > ?2 AND key <= ?3 ORDER BY key LIMIT ?4";
+
+/// `pending_objects` from the first key.
+pub(crate) const PENDING_OBJECTS: &str = "SELECT key, etag, size, last_modified \
+     FROM objects_seen INDEXED BY objects_seen_pending \
+     WHERE source_id = ?1 AND status = 'pending' ORDER BY key LIMIT ?3";
+/// `pending_objects` after `?2`.
+pub(crate) const PENDING_OBJECTS_AFTER: &str = "SELECT key, etag, size, last_modified \
+     FROM objects_seen INDEXED BY objects_seen_pending \
+     WHERE source_id = ?1 AND status = 'pending' AND key > ?2 ORDER BY key LIMIT ?3";
+
+/// `ingested_objects` from the first key.
+pub(crate) const INGESTED_OBJECTS: &str = "SELECT key, blake3 FROM objects_seen \
+     WHERE source_id = ?1 AND status IN ('done', 'skipped') AND blake3 IS NOT NULL \
+     ORDER BY key LIMIT ?3";
+/// `ingested_objects` after `?2`.
+pub(crate) const INGESTED_OBJECTS_AFTER: &str = "SELECT key, blake3 FROM objects_seen \
+     WHERE source_id = ?1 AND status IN ('done', 'skipped') AND blake3 IS NOT NULL \
+     AND key > ?2 ORDER BY key LIMIT ?3";
+
+/// The `seen_objects` text for the bounds given.
+pub(crate) fn seen_objects_sql(after: bool, upto: bool) -> &'static str {
+    match (after, upto) {
+        (false, false) => SEEN_OBJECTS,
+        (true, false) => SEEN_OBJECTS_AFTER,
+        (false, true) => SEEN_OBJECTS_UPTO,
+        (true, true) => SEEN_OBJECTS_BETWEEN,
+    }
+}
+
 /// An object discovery has seen and that was not deleted since.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SeenObject {
@@ -366,12 +417,7 @@ impl Snapshot<'_> {
         limit: usize,
     ) -> Result<Vec<SeenObject>, StoreError> {
         let conn = self.0;
-        let mut stmt = conn.prepare_cached(
-            "SELECT key, etag, size, last_modified FROM objects_seen \
-             WHERE source_id = ?1 AND status <> 'deleted' \
-             AND (?2 IS NULL OR key > ?2) AND (?3 IS NULL OR key <= ?3) \
-             ORDER BY key LIMIT ?4",
-        )?;
+        let mut stmt = conn.prepare_cached(seen_objects_sql(after.is_some(), upto.is_some()))?;
         let rows = stmt
             .query_map(
                 params![
@@ -442,12 +488,11 @@ impl Snapshot<'_> {
         // The planner's statistics are averages over the statuses, so it reads the primary
         // key in key order instead, which walks every ingested row of a mostly ingested
         // source. The queue index reads only the pending rows, already in key order.
-        let mut stmt = conn.prepare_cached(
-            "SELECT key, etag, size, last_modified FROM objects_seen \
-             INDEXED BY objects_seen_pending \
-             WHERE source_id = ?1 AND status = 'pending' AND (?2 IS NULL OR key > ?2) \
-             ORDER BY key LIMIT ?3",
-        )?;
+        let mut stmt = conn.prepare_cached(if after.is_some() {
+            PENDING_OBJECTS_AFTER
+        } else {
+            PENDING_OBJECTS
+        })?;
         let rows = stmt
             .query_map(
                 params![
@@ -504,11 +549,11 @@ impl Snapshot<'_> {
         limit: usize,
     ) -> Result<Vec<(String, [u8; 32])>, StoreError> {
         let conn = self.0;
-        let mut stmt = conn.prepare_cached(
-            "SELECT key, blake3 FROM objects_seen WHERE source_id = ?1 \
-             AND status IN ('done', 'skipped') AND blake3 IS NOT NULL \
-             AND (?2 IS NULL OR key > ?2) ORDER BY key LIMIT ?3",
-        )?;
+        let mut stmt = conn.prepare_cached(if after.is_some() {
+            INGESTED_OBJECTS_AFTER
+        } else {
+            INGESTED_OBJECTS
+        })?;
         let rows = stmt
             .query_map(
                 params![
@@ -608,6 +653,285 @@ mod tests {
             .record_objects(id, &[ObjectChange::Upsert(obj("b", 9))], None)
             .unwrap();
         assert_eq!(store.seen_object(id, "b").unwrap().unwrap().size, 9);
+    }
+
+    // The key-range reads as they were before issue #138, one text for every bound.
+    const OLD_SEEN: &str = "SELECT key, etag, size, last_modified FROM objects_seen \
+         WHERE source_id = ?1 AND status <> 'deleted' \
+         AND (?2 IS NULL OR key > ?2) AND (?3 IS NULL OR key <= ?3) ORDER BY key LIMIT ?4";
+    const OLD_PENDING: &str = "SELECT key, etag, size, last_modified FROM objects_seen \
+         INDEXED BY objects_seen_pending \
+         WHERE source_id = ?1 AND status = 'pending' AND (?2 IS NULL OR key > ?2) \
+         ORDER BY key LIMIT ?3";
+    const OLD_INGESTED: &str = "SELECT key, blake3 FROM objects_seen WHERE source_id = ?1 \
+         AND status IN ('done', 'skipped') AND blake3 IS NOT NULL \
+         AND (?2 IS NULL OR key > ?2) ORDER BY key LIMIT ?3";
+
+    /// Rows of `sql` with `args`, as (key, etag or hash) pairs.
+    fn rows(store: &Store, sql: &str, args: &[&dyn rusqlite::ToSql]) -> Vec<(String, Vec<u8>)> {
+        let conn = store.raw();
+        let mut stmt = conn.prepare(sql).unwrap();
+        stmt.query_map(args, |r| {
+            let second = match r.get_ref(1)? {
+                rusqlite::types::ValueRef::Text(t) | rusqlite::types::ValueRef::Blob(t) => {
+                    t.to_vec()
+                }
+                _ => Vec::new(),
+            };
+            Ok((r.get(0)?, second))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    /// `n` rows in two sources, in every status, keys in a mixed order (some with a shared
+    /// prefix, some multi-byte), with a pseudo-random status each. Returns the first source.
+    fn generated(store: &Store, n: usize) -> SourceId {
+        let id = store
+            .add_source(&NewSource::new("http://g", "b"), None)
+            .unwrap();
+        let other = store
+            .add_source(&NewSource::new("http://g", "c"), None)
+            .unwrap();
+        let statuses = ["pending", "done", "failed", "skipped", "deleted"];
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let conn = store.raw();
+        let mut insert = conn
+            .prepare(
+                "INSERT INTO objects_seen (source_id, key, etag, size, status, blake3, \
+                 updated_at) VALUES (?1, ?2, ?3, 1, ?4, ?5, 1)",
+            )
+            .unwrap();
+        for i in 0..n {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let key = match i % 4 {
+                0 => format!("a/{i:05}"),
+                1 => format!("a/{}", seed % 10_000),
+                2 => format!("Z{}é", i * 7),
+                _ => format!("{seed:x}"),
+            };
+            let status = statuses[usize::try_from(seed % 5).unwrap()];
+            // Some ingested rows without a hash, which `ingested_objects` leaves out.
+            let blake3 = (seed % 7 != 0).then(|| vec![u8::try_from(i % 256).unwrap(); 32]);
+            for source in [id, other] {
+                insert
+                    .execute(params![
+                        source.to_string(),
+                        key,
+                        format!("e{i}"),
+                        status,
+                        blake3
+                    ])
+                    .ok();
+            }
+        }
+        id
+    }
+
+    #[test]
+    fn range_reads_match_the_former_queries() {
+        let (store, _) = setup();
+        let id = generated(&store, 2000);
+        let src = id.to_string();
+        let keys: Vec<String> = rows(
+            &store,
+            OLD_SEEN,
+            params![src, None::<String>, None::<String>, -1],
+        )
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+        assert!(keys.len() > 1000, "{}", keys.len());
+        // Bounds: open, below every key, stored keys, keys between stored ones, past the end.
+        let mut bounds: Vec<Option<String>> = vec![None, Some(String::new()), Some("~".into())];
+        for k in keys.iter().step_by(97) {
+            bounds.push(Some(k.clone()));
+            bounds.push(Some(format!("{k}0")));
+        }
+        for after in &bounds {
+            for upto in &bounds {
+                for limit in [1_usize, 7, 1000] {
+                    let n = i64::try_from(limit).unwrap();
+                    let old = rows(&store, OLD_SEEN, params![src, after, upto, n]);
+                    let new: Vec<_> = store
+                        .seen_objects(id, after.as_deref(), upto.as_deref(), limit)
+                        .unwrap()
+                        .into_iter()
+                        .map(|o| (o.key, o.etag.unwrap().into_bytes()))
+                        .collect();
+                    assert_eq!(old, new, "seen {after:?} {upto:?} {limit}");
+                }
+            }
+            for limit in [1_usize, 7, 1000] {
+                let n = i64::try_from(limit).unwrap();
+                let old = rows(&store, OLD_PENDING, params![src, after, n]);
+                let new: Vec<_> = store
+                    .pending_objects(id, after.as_deref(), limit)
+                    .unwrap()
+                    .into_iter()
+                    .map(|o| (o.key, o.etag.unwrap().into_bytes()))
+                    .collect();
+                assert_eq!(old, new, "pending {after:?} {limit}");
+                let old = rows(&store, OLD_INGESTED, params![src, after, n]);
+                let new: Vec<_> = store
+                    .ingested_objects(id, after.as_deref(), limit)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(k, b)| (k, b.to_vec()))
+                    .collect();
+                assert_eq!(old, new, "ingested {after:?} {limit}");
+            }
+        }
+        // A walk page by page sees every live key once, in order.
+        let mut walked = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let page = store.seen_objects(id, after.as_deref(), None, 64).unwrap();
+            let Some(last) = page.last() else { break };
+            after = Some(last.key.clone());
+            walked.extend(page.into_iter().map(|o| o.key));
+        }
+        assert_eq!(walked, keys);
+    }
+
+    /// The plan of `sql`, one detail per line; every parameter bound to a text.
+    fn plan(store: &Store, sql: &str) -> String {
+        let conn = store.raw();
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let args = ["s", "k", "m", "10"];
+        let args = &args[..stmt.parameter_count()];
+        stmt.query_map(rusqlite::params_from_iter(args), |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n")
+    }
+
+    #[test]
+    fn range_reads_start_at_their_bound() {
+        let (store, _) = setup();
+        generated(&store, 500);
+        // Also with sampled statistics.
+        for analyzed in [false, true] {
+            if analyzed {
+                assert!(store.optimize_all().unwrap().tables > 0);
+            }
+            for (sql, range) in [
+                (SEEN_OBJECTS, "PRIMARY KEY (source_id=?)"),
+                (SEEN_OBJECTS_AFTER, "PRIMARY KEY (source_id=? AND key>?)"),
+                (SEEN_OBJECTS_UPTO, "PRIMARY KEY (source_id=? AND key<?)"),
+                (
+                    SEEN_OBJECTS_BETWEEN,
+                    "PRIMARY KEY (source_id=? AND key>? AND key<?)",
+                ),
+                (
+                    PENDING_OBJECTS,
+                    "INDEX objects_seen_pending (source_id=? AND status=?)",
+                ),
+                (
+                    PENDING_OBJECTS_AFTER,
+                    "INDEX objects_seen_pending (source_id=? AND status=? AND key>?)",
+                ),
+                (INGESTED_OBJECTS, "PRIMARY KEY (source_id=?)"),
+                (
+                    INGESTED_OBJECTS_AFTER,
+                    "PRIMARY KEY (source_id=? AND key>?)",
+                ),
+            ] {
+                let p = plan(&store, sql);
+                assert!(p.contains(&format!("USING {range}")), "{sql}:\n{p}");
+                assert!(!p.contains("TEMP B-TREE"), "{sql}:\n{p}");
+            }
+        }
+    }
+
+    /// Times the pages of an unchanged scan pass (each page of 1000 listed keys compared with
+    /// the stored rows up to its last key, `seen_objects` as the scanner calls it) and of a
+    /// sweep over a queue of pending keys, old queries against new. `DOEWOOD_KEYSET_KEYS` sets
+    /// the number of keys (200,000). Run with
+    /// `cargo test --release -p doewood-store keyset_pass -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement"]
+    fn keyset_pass() {
+        use std::time::Instant;
+
+        let n: usize = std::env::var("DOEWOOD_KEYSET_KEYS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200_000);
+        let tmp = tempfile::tempdir().unwrap();
+        let key = MasterKey::from_bytes([3; 32]);
+        let store = Store::open_with_readers(&tmp.path().join(crate::STORE_FILE), &key, 2).unwrap();
+        let id = store
+            .add_source(&NewSource::new("http://x", "b"), None)
+            .unwrap();
+        let keys: Vec<String> = (0..n)
+            .map(|i| format!("docs/{:03}/{i:07}.pdf", i % 997))
+            .collect();
+        for chunk in keys.chunks(10_000) {
+            let changes: Vec<_> = chunk
+                .iter()
+                .map(|k| ObjectChange::Upsert(obj(k, 1)))
+                .collect();
+            store.record_objects(id, &changes, None).unwrap();
+        }
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        let src = id.to_string();
+        let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
+        for round in 0..2 {
+            // The scan: (previous page's last key, this page's last key].
+            let t = Instant::now();
+            let mut seen = 0;
+            for (i, page) in sorted.chunks(1000).enumerate() {
+                let after = (i > 0).then(|| sorted[i * 1000 - 1].clone());
+                let upto = page.last().cloned();
+                seen += rows(&store, OLD_SEEN, params![src, after, upto, 1000]).len();
+            }
+            let old = ms(t);
+            assert_eq!(seen, n);
+            let t = Instant::now();
+            let mut seen = 0;
+            for (i, page) in sorted.chunks(1000).enumerate() {
+                let after = (i > 0).then(|| sorted[i * 1000 - 1].as_str());
+                seen += store
+                    .seen_objects(id, after, page.last().map(String::as_str), 1000)
+                    .unwrap()
+                    .len();
+            }
+            let new = ms(t);
+            assert_eq!(seen, n);
+            println!(
+                "round {round}, {n} keys, unchanged scan pages:  old {old:>9.1} ms  new {new:>9.1} ms"
+            );
+            // The sweep over a queue of pending keys (every key pending, after a first scan).
+            let t = Instant::now();
+            let (mut after, mut seen) = (None::<String>, 0);
+            loop {
+                let page = rows(&store, OLD_PENDING, params![src, after, 1000]);
+                let Some(last) = page.last() else { break };
+                after = Some(last.0.clone());
+                seen += page.len();
+            }
+            let old = ms(t);
+            assert_eq!(seen, n);
+            let t = Instant::now();
+            let (mut after, mut seen) = (None::<String>, 0);
+            loop {
+                let page = store.pending_objects(id, after.as_deref(), 1000).unwrap();
+                let Some(last) = page.last() else { break };
+                after = Some(last.key.clone());
+                seen += page.len();
+            }
+            let new = ms(t);
+            assert_eq!(seen, n);
+            println!(
+                "round {round}, {n} keys, pending sweep pages:   old {old:>9.1} ms  new {new:>9.1} ms"
+            );
+        }
     }
 
     #[test]
