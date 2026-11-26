@@ -217,9 +217,8 @@ impl Store {
         // Migrations run with foreign keys off (see `migrate`); they are on from here.
         migrate::migrate(&mut conn)?;
         conn.pragma_update(None, "foreign_keys", true)?;
-        // SQLite's advice for a long-lived connection: analyze what needs it now (bounded
-        // work), then `PRAGMA optimize` every few hours ([`Store::optimize`]).
-        conn.execute_batch("PRAGMA optimize = 0x10002;")?;
+        // The planner statistics are refreshed after the open, not here
+        // ([`Store::optimize_all`]): on a big store with stale statistics that takes seconds.
         let store = Self {
             conn: Mutex::new(conn),
             readers: Readers::default(),
@@ -412,6 +411,19 @@ impl Store {
             .transpose()
     }
 
+    /// Refreshes the query planner's statistics of every table that needs it, also those no
+    /// query used yet on this connection (`PRAGMA optimize = 0x10002`: SQLite's advice for a
+    /// long-lived connection after it opens, then [`Store::optimize`] every few hours).
+    ///
+    /// It analyzes whole tables whose statistics are missing or stale: nothing on a store
+    /// closed cleanly (the close optimizes), about 13 s at 50,000 documents after a crash or a
+    /// bulk load. The binary runs it once right after the start, in the background, so the
+    /// instance is ready without waiting for it (issue #118).
+    pub fn optimize_all(&self) -> Result<(), StoreError> {
+        self.conn().execute_batch("PRAGMA optimize = 0x10002;")?;
+        Ok(())
+    }
+
     /// Refreshes the query planner's statistics where they are stale (`PRAGMA optimize`);
     /// the binary calls it every hour.
     pub fn optimize(&self) -> Result<(), StoreError> {
@@ -511,6 +523,51 @@ mod tests {
 
     fn key(b: u8) -> MasterKey {
         MasterKey::from_bytes([b; 32])
+    }
+
+    /// The open leaves stale planner statistics alone (issue #118: seconds on a big store);
+    /// `optimize_all` refreshes them.
+    #[test]
+    fn statistics_are_refreshed_after_the_open_not_during_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(STORE_FILE);
+        let stats = |s: &Store| -> i64 {
+            let conn = s.conn();
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name = 'sqlite_stat1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            if exists == 0 {
+                return 0;
+            }
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_stat1 WHERE tbl = 'records'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        {
+            let store = Store::open(&path, &key(1)).unwrap();
+            let conn = store.conn();
+            for i in 0..2000_u32 {
+                let mut hash = [0_u8; 32];
+                hash[..4].copy_from_slice(&i.to_be_bytes());
+                conn.execute(
+                    "INSERT INTO records (blake3, body_json, updated_at) VALUES (?1, '{}', 1)",
+                    [hash.as_slice()],
+                )
+                .unwrap();
+            }
+            // Dropped without `close` (which optimizes), as after a crash.
+        }
+        let store = Store::open(&path, &key(1)).unwrap();
+        assert_eq!(stats(&store), 0, "the open analyzed");
+        store.optimize_all().unwrap();
+        assert!(stats(&store) > 0, "not analyzed");
     }
 
     #[test]

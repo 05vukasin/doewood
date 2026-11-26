@@ -45,14 +45,32 @@ pub async fn optimize(store: &Arc<Store>) {
     }
 }
 
-/// Runs [`purge`] on whatever backend `backend` holds, and [`optimize`] on the instance
-/// store, until shutdown.
+/// Refreshes the planner statistics of every table that needs it, once after the start
+/// ([`Store::optimize_all`]); off the start's critical path, as it can take seconds on a big
+/// store (issue #118).
+pub async fn optimize_all(store: &Arc<Store>) {
+    let store = Arc::clone(store);
+    let t = std::time::Instant::now();
+    match tokio::task::spawn_blocking(move || store.optimize_all()).await {
+        Ok(Ok(())) => info!(
+            took_ms = u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "instance store statistics refreshed"
+        ),
+        Ok(Err(e)) => warn!(error = %e, "PRAGMA optimize failed; retried at the next interval"),
+        Err(e) => warn!(error = %e, "PRAGMA optimize did not finish"),
+    }
+}
+
+/// Runs [`optimize_all`] on the instance store once, then [`purge`] on whatever backend
+/// `backend` holds and [`optimize`] on the instance store every [`INTERVAL`], until
+/// shutdown.
 pub fn start(
     store: Arc<Store>,
     backend: watch::Receiver<Option<Arc<dyn Backend>>>,
     mut shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        optimize_all(&store).await;
         let mut wait = FIRST;
         loop {
             tokio::select! {
@@ -100,6 +118,7 @@ mod tests {
         let (_backend_tx, backend_rx) = watch::channel(Some(backend));
         let (stop_tx, stop_rx) = watch::channel(false);
         optimize(&store).await;
+        optimize_all(&store).await;
         let task = start(store, backend_rx, stop_rx);
         stop_tx.send(true).unwrap();
         tokio::time::timeout(Duration::from_secs(5), task)
