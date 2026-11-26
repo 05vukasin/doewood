@@ -42,7 +42,8 @@ pub(crate) const COMPANIES_DUE: &str = "SELECT n.id, \
      WHERE e.dst = n.id AND e.kind = 'party' AND d.kind = 'document' \
      AND e.state NOT IN ('retracted', 'superseded')), \
      f.documents \
-     FROM nodes n INDEXED BY nodes_companies LEFT JOIN company_enrichment f ON f.company_id = n.id \
+     FROM nodes n INDEXED BY nodes_companies \
+     LEFT JOIN company_enrichment f ON f.company_id = n.id \
      WHERE n.kind = 'company' AND n.id > coalesce(?2, '') \
      AND NOT EXISTS (SELECT 1 FROM company_leases l \
      WHERE l.company_id = n.id AND l.owner <> ?1 AND l.expires_at > ?4) \
