@@ -48,8 +48,43 @@ docker run --rm doewood:dev config check
 
 Keep the master key: the store refuses to start with a different one.
 
-CI (`image` job) builds the image, runs this smoke test, and lints and renders the chart. It
-pushes nothing; publishing the image to a registry is not set up yet.
+CI (`image` job) builds the image, runs this smoke test, and lints and renders the chart, on every
+pull request and every push to `staging` and `main`. It pushes nothing.
+
+### The published image
+
+`.github/workflows/image.yml` publishes the image to GitHub Container Registry as
+`ghcr.io/05vukasin/doewood`, only from the release branch `main` and from `vX.Y.Z` tags (never
+from `staging` or a pull request). Each platform (linux/amd64, linux/arm64) is built on its own
+runner, smoke-tested as above, and pushed; the two are joined into one multi-platform image.
+
+| pushed from | tags |
+|---|---|
+| a push to `main` | `edge`, `sha-<short commit>` |
+| a tag `vX.Y.Z` | `X.Y.Z`, `X.Y`, `latest` |
+
+```sh
+docker pull ghcr.io/05vukasin/doewood:edge
+docker run --rm ghcr.io/05vukasin/doewood:edge version
+```
+
+Pin a digest (`ghcr.io/05vukasin/doewood@sha256:...`) or a version tag in production; `edge`
+moves with every push to `main`.
+
+Every published image carries an SBOM and maximal build provenance (BuildKit attestations), a
+GitHub build-provenance attestation, and a keyless cosign signature. The certificate is issued by
+GitHub's OIDC provider to this workflow:
+
+```sh
+cosign verify ghcr.io/05vukasin/doewood:edge \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github.com/05vukasin/doewood/\.github/workflows/image\.yml@refs/(heads/main|tags/v.+)$'
+gh attestation verify oci://ghcr.io/05vukasin/doewood:edge --repo 05vukasin/doewood
+docker buildx imagetools inspect ghcr.io/05vukasin/doewood:edge --format '{{ json .SBOM }}'
+```
+
+In the Helm chart, set `image.repository: ghcr.io/05vukasin/doewood` and `image.tag` to a
+released version.
 
 ## Helm
 
@@ -95,7 +130,8 @@ them, which suits only reads of the shared store (see [Load balancing](#load-bal
 | `extraEnv` | `[]` | more variables, for example `RUST_LOG`, `DOEWOOD_INGEST_JOBS` |
 | `service.type`, `service.grpcPort`, `service.opsPort` | `ClusterIP`, `7443`, `7444` | the Service |
 | `persistence.size`, `persistence.storageClass`, `persistence.accessModes` | `1Gi`, default class, `[ReadWriteOnce]` | each pod's volume |
-| `resources` | requests 500m CPU and 1 GiB, limit 4 GiB | measured: about 1.1 GiB at most with OCR, 0.4 GiB for a 120k-row XLSX (see [Sizing](#sizing)); the ingest jobs follow the memory limit |
+| `ocrJobs` | `2` | `DOEWOOD_OCR_JOBS`: OCR engines at once; empty for the binary's default (one below 10 GiB). 2 read 35 to 45 % more scanned pages a second than 1, same text, about 0.55 GiB more (see [OCR per page](#ocr-per-page)) |
+| `resources` | requests 500m CPU and 1638 MiB, limit 4710 MiB | one OCR engine needs about 1 GiB / 4 GiB; the second engine of `ocrJobs: 2` adds 0.6 GiB to both (see [Sizing](#sizing)); the ingest jobs follow the memory limit |
 | `podSecurityContext`, `securityContext` | non-root 10001, `fsGroup` 10001, seccomp `RuntimeDefault`, read-only root, no privilege escalation, all capabilities dropped | security |
 | `terminationGracePeriodSeconds` | `30` | shutdown time |
 | `podAnnotations`, `podLabels`, `nodeSelector`, `tolerations`, `affinity` | empty | scheduling and metadata |
@@ -276,7 +312,7 @@ The analyzer rows include each engine's cold first page.
   workers and 1, 2 and 4 jobs).
 - **What to set:** the default stays quail's plan (one engine per GiB of 20 % of the total
   memory, so one below 10 GiB). Set `DOEWOOD_OCR_JOBS=2` where a pod has room for about 1.5
-  GiB of OCR (the chart's 4 GiB limit has), and 4 only with about 2.5 GiB for OCR and 4 cores;
+  GiB of OCR (the chart does since 2026-11-26: `ocrJobs: 2`, with 0.6 GiB more request and limit), and 4 only with about 2.5 GiB for OCR and 4 cores;
   jobs above the workers are not used.
 - The single-page and 20-page runs of #63 above all ran with one engine; their 0.42 to 0.66
   pages/s include the store, S3 and the pipeline, which this in-process test leaves out.
@@ -1087,7 +1123,7 @@ DOEWOOD_SCALE_DIR=<dir> cargo test -p doewood-store --lib scale_store_sizes -- -
 | SQLite WAL during ingest: at most / resets per 1,000 files | 4 MiB / 83 | 5 MiB / 93 | 6 MiB / 113 | | | |
 | Postgres WAL per document (the 25,000 files up to that size) | | | | 26 KB (25k) | 30 KB | 109 KB |
 | ingest sweep, nothing pending / `object_counts` | | 0.03 / 0.007 ms | 0.01 / 0.003 ms | | 0.03 / 0.007 ms | 0.02 / 0.004 ms |
-| unchanged scan pass over every key | | (see below) | 7.6 to 8.3 s | | 0.46 to 0.50 s | 6.7 to 6.9 s |
+| unchanged scan pass over every key (before #138; after: 0.10 to 0.16 s and 0.37 to 0.67 s) | | (see below) | 7.6 to 8.3 s | | 0.46 to 0.50 s | 6.7 to 6.9 s |
 | writer lock wait during the scan, mean | | | 18 ms | | 3.6 ms | 16 ms |
 | `companies_due`, first page of 100 | | 51 ms | 235 ms | | 10 ms | 86 ms |
 | an enrichment pass of `companies_due` pages (registries off) | | 2.5 s, 94 pages | 41.6 s, 375 pages | | 0.28 s | 1.1 s |
@@ -1141,10 +1177,11 @@ What the numbers say:
   them (deeper b-trees, a 5 GiB file over a 2 MiB page cache per connection).
 - **The ingest sweep and the progress counts do not grow**: the sweep reads only pending rows
   and `object_counts` is kept by triggers.
-- **An unchanged scan pass grows with the square of the keys** (0.5 s at 50k, 7 to 8 s at
-  200k, CPU-bound): each chunk's `seen_objects` scans the source's keys from the first one.
-  Issue #138. (The SQLite 50k pass, 1.0 to 1.5 s, was measured with a test bucket that was
-  itself quadratic; the Postgres run's 50k pass uses the same instance store code.)
+- **An unchanged scan pass grew with the square of the keys** (0.5 s at 50k, 7 to 8 s at
+  200k, CPU-bound): each chunk's `seen_objects` scanned the source's keys from the first one.
+  (The SQLite 50k pass, 1.0 to 1.5 s, was measured with a test bucket that was itself
+  quadratic; the Postgres run's 50k pass uses the same instance store code.) Fixed in #138:
+  the pass is now linear, see [below](#key-ranges-of-objects_seen-issue-138).
 - **SQLite's `companies_due` sorts every company for each page**, so an enrichment pass is
   quadratic in the companies (41.6 s for 37,497); Postgres stays linear (1.1 s). Issue #139.
 - **SQLite `Search` slows faster than its matches grow** under load: `api_load` at 200k
@@ -1270,6 +1307,40 @@ ranking, for the owner to decide (see the PR of #140): for example rank only a b
 candidates (the newest N matches, or the first N by an index order) and say so in the API, or
 keep per-word document counts so SQLite need not count them at every search.
 
+### Key ranges of `objects_seen` (issue #138)
+
+`seen_objects` (the scanner's comparison of a listing page with the stored rows),
+`pending_objects` (the ingest sweep) and `ingested_objects` (reprocessing) wrote an optional
+bound as `(?2 IS NULL OR key > ?2)`. That form kept SQLite from using the bound as a range on
+the primary key (or the queue index `objects_seen_pending`): every page read the source's
+keys from the first one and filtered them, so walking a source page by page was quadratic in
+its keys. Each query now has one SQL text per combination of bounds, and its plan starts at
+the bound (`SEARCH objects_seen USING PRIMARY KEY (source_id=? AND key>? AND key<?)`; the
+sweep `USING INDEX objects_seen_pending (source_id=? AND status=? AND key>?)`). Tests check
+the plans and compare the pages with the former queries. The Postgres store has no
+`objects_seen` (the instance store is SQLite with either shared store), so nothing changes
+there.
+
+Measured with `scale`'s `scan` phase (release build, the 4 vCPU server above, a `keys.tsv`
+of `bench/` and `near/` keys and an instance store holding only those rows; the second pass
+of each run is the unchanged one) and with `keyset_pass` in
+`crates/doewood-store/src/store/objects.rs` (ignored; the store reads alone, old and new
+query in the same run):
+
+| | 50,000 keys | 200,000 keys |
+|---|---|---|
+| unchanged scan pass (`scale`), before | 0.41 s (CPU 0.43 s) | 6.57 s (CPU 6.86 s) |
+| same, after | 0.10 to 0.16 s (CPU 0.10 to 0.12 s) | 0.37 to 0.67 s (CPU 0.34 to 0.46 s) |
+| `seen_objects` pages of a pass (`keyset_pass`), old / new | 117 to 119 / 16 to 23 ms | 1,899 to 2,039 / 60 to 62 ms |
+| `pending_objects` pages over a full queue, old / new | 502 to 503 / 31 to 32 ms | 8,789 to 8,838 / 128 to 132 ms |
+
+- **The pass is linear now**: four times the keys cost about four times the time, where
+  they cost 16 times before. (The first pass of a run is the slower figure: a cold page
+  cache.)
+- **The sweep over a long queue** (every key pending, as after a first scan or a
+  reprocess) gained the most: the old form also read the queue index from its start for
+  every page.
+
 ### Requests and limits
 
 Per doewood instance (one pod):
@@ -1279,9 +1350,9 @@ Per doewood instance (one pod):
 | typical: text documents, a few scans | 500m | 512 MiB | 2 GiB |
 | OCR-heavy: mostly scans | 2 to 4 (each OCR engine uses up to 4 threads) | 1.5 GiB | 4 GiB |
 
-- The chart's defaults (500m, 1 GiB, limit 4 GiB) fit both, so they are unchanged: the request
-  covers the OCR engine with one worker, the limit covers 4 workers with OCR plus a large
-  spreadsheet in flight. With a lower limit the default worker count drops (half the room under
+- The chart's defaults (500m, 1638 MiB, limit 4710 MiB, `ocrJobs: 2`) fit both: the request
+  covers two OCR engines with one worker, the limit covers 4 workers with OCR plus a large
+  spreadsheet in flight. With `ocrJobs: ""` (one engine) 1 GiB / 4 GiB is enough. With a lower limit the default worker count drops (half the room under
   the limit, 512 MiB a worker), and so does the memory budget (half the workers' plan: 768 MiB
   with 3 workers under 4 GiB). Files over 16 MiB beyond the budget wait. A workbook over the
   cell cap fails: each worker's share of half the room under the limit at 320 bytes a cell,

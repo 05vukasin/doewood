@@ -1361,7 +1361,10 @@ mod tests {
     fn plan(store: &Store, sql: &str) -> String {
         let conn = store.raw();
         let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-        stmt.query_map(["s", "k"], |r| r.get::<_, String>(3))
+        // Every parameter is a text: the plan does not depend on the values.
+        let args = ["s", "k", "k2", "10"];
+        let args = &args[..stmt.parameter_count()];
+        stmt.query_map(rusqlite::params_from_iter(args), |r| r.get::<_, String>(3))
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
@@ -1371,17 +1374,19 @@ mod tests {
     #[test]
     fn hot_queries_use_their_indexes() {
         let store = store();
-        // `pending_objects` (as it is written there): the queue index, no sort. Without
-        // `INDEXED BY`, SQLite 3.54 reads the primary key here, even after `ANALYZE` of a
-        // source whose rows are spread over the five statuses.
-        let p = plan(
-            &store,
-            "SELECT key, etag, size, last_modified FROM objects_seen \
-             INDEXED BY objects_seen_pending \
-             WHERE source_id = ?1 AND status = 'pending' AND (?2 IS NULL OR key > ?2) \
-             ORDER BY key LIMIT 10",
-        );
+        // `pending_objects`: the queue index, no sort. Without `INDEXED BY`, SQLite 3.54
+        // reads the primary key here, even after `ANALYZE` of a source whose rows are spread
+        // over the five statuses.
+        let p = plan(&store, crate::store::objects::PENDING_OBJECTS);
         assert!(p.contains("USING INDEX objects_seen_pending"), "{p}");
+        assert!(!p.contains("TEMP B-TREE"), "{p}");
+        // After a key: a range on the index, not a scan from the source's first key
+        // (issue #138).
+        let p = plan(&store, crate::store::objects::PENDING_OBJECTS_AFTER);
+        assert!(
+            p.contains("USING INDEX objects_seen_pending (source_id=? AND status=? AND key>?)"),
+            "{p}"
+        );
         assert!(!p.contains("TEMP B-TREE"), "{p}");
         // The same with sampled statistics (issue #118).
         let source = store
@@ -1400,14 +1405,14 @@ mod tests {
                 .unwrap();
         }
         assert!(store.optimize_all().unwrap().tables > 0);
-        let p = plan(
-            &store,
-            "SELECT key, etag, size, last_modified FROM objects_seen \
-             INDEXED BY objects_seen_pending \
-             WHERE source_id = ?1 AND status = 'pending' AND (?2 IS NULL OR key > ?2) \
-             ORDER BY key LIMIT 10",
-        );
+        let p = plan(&store, crate::store::objects::PENDING_OBJECTS);
         assert!(p.contains("USING INDEX objects_seen_pending"), "{p}");
+        assert!(!p.contains("TEMP B-TREE"), "{p}");
+        let p = plan(&store, crate::store::objects::PENDING_OBJECTS_AFTER);
+        assert!(
+            p.contains("USING INDEX objects_seen_pending (source_id=? AND status=? AND key>?)"),
+            "{p}"
+        );
         assert!(!p.contains("TEMP B-TREE"), "{p}");
         let indexes: i64 = store
             .raw()

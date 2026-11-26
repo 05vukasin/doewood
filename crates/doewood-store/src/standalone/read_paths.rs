@@ -547,12 +547,13 @@ fn hot_queries() -> Vec<(&'static str, String, Vec<Sql>)> {
     vec![
         (
             "pending_objects",
-            "SELECT key, etag, size, last_modified FROM objects_seen \
-             INDEXED BY objects_seen_pending \
-             WHERE source_id = ?1 AND status = 'pending' AND (?2 IS NULL OR key > ?2) \
-             ORDER BY key LIMIT 100"
-                .to_owned(),
-            vec![text("s"), Sql::Null],
+            crate::store::objects::PENDING_OBJECTS_AFTER.to_owned(),
+            vec![text("s"), text("k"), Sql::Integer(100)],
+        ),
+        (
+            "seen_objects",
+            crate::store::objects::SEEN_OBJECTS_BETWEEN.to_owned(),
+            vec![text("s"), text("k"), text("m"), Sql::Integer(1000)],
         ),
         (
             "object_counts",

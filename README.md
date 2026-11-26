@@ -95,6 +95,10 @@ The `.proto` files compile with `protox` (pure Rust) in `doewood-api`'s build sc
 
 ## Development
 
+Branches: `staging` is development (the default branch; every pull request goes there), `main` is
+release (fast-forwarded from `staging`; a push to it or a `v*` tag publishes the image, see
+[docs/deploy.md](docs/deploy.md#the-published-image)).
+
 The rules follow quail's: Rust 2024 on the pinned toolchain (1.97.1), clippy pedantic with
 `-D warnings`, `unsafe` denied, CI on Linux, macOS, Windows and Linux ARM, plus `cargo deny`.
 
