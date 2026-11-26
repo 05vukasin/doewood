@@ -162,6 +162,17 @@ async fn store() -> Option<(
     tokio_postgres::Client,
     String,
 )> {
+    store_via(true).await
+}
+
+/// [`store`], through the proxy only when `proxied` (nothing is counted otherwise: the proxy
+/// itself adds time to every message).
+async fn store_via(proxied_conn: bool) -> Option<(
+    Arc<dyn Backend>,
+    Arc<Counts>,
+    tokio_postgres::Client,
+    String,
+)> {
     let Some(url) = std::env::var(PG_VAR).ok().filter(|v| !v.trim().is_empty()) else {
         eprintln!("skipping: {PG_VAR} is not set; the Postgres variant did not run");
         return None;
@@ -184,8 +195,10 @@ async fn store() -> Option<(
         .next()
         .unwrap();
     let (addr, counts) = proxy(upstream).await;
-    proxied.set_host(Some("127.0.0.1")).unwrap();
-    proxied.set_port(Some(addr.port())).unwrap();
+    if proxied_conn {
+        proxied.set_host(Some("127.0.0.1")).unwrap();
+        proxied.set_port(Some(addr.port())).unwrap();
+    }
     let sep = if proxied.query().is_some() { '&' } else { '?' };
     let scoped = format!("{proxied}{sep}sslmode=disable&options=-c%20search_path%3D{schema}");
     let pg = doewood_pg::PgStore::connect(&doewood_core::PostgresUrl::parse(&scoped).unwrap())
@@ -414,7 +427,8 @@ fn env_or(var: &str, default: u64) -> u64 {
 /// [`common::near_duplicate_text`] with 4 templates, written one after the other through the
 /// graph writer, on Postgres (`DOEWOOD_TEST_POSTGRES_URL`) or, when `DOEWOOD_NEAR_DUP_SQLITE`
 /// names a directory, on a SQLite store file in it. Per tenth of the corpus: the graph write
-/// per document, statements and round trips per document (Postgres), `similar_to` edges per
+/// per document, statements and round trips per document (Postgres with
+/// `DOEWOOD_NEAR_DUP_COUNT` set, through the counting proxy), `similar_to` edges per
 /// document, and the candidate query alone for the last template document (best of 5), as
 /// its plan on Postgres. Last, a digest of every `similar_to` edge, to compare two builds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -434,9 +448,10 @@ async fn near_duplicate_corpus() {
                 None,
             )
         } else {
-            let (b, counts, admin, schema) = store().await.expect("a store to measure");
-            println!("store: Postgres");
-            (b, Some(counts), Some((admin, schema)))
+            let count = std::env::var_os("DOEWOOD_NEAR_DUP_COUNT").is_some();
+            let (b, counts, admin, schema) = store_via(count).await.expect("a store to measure");
+            println!("store: Postgres, round trips counted: {count}");
+            (b, count.then_some(counts), Some((admin, schema)))
         };
     let writer = GraphWriter::new(Arc::clone(&b), SimilarityConfig::default());
     let hash = |i: u64| {
