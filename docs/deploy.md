@@ -1294,7 +1294,9 @@ What the numbers say:
   checkpoint over indexes keyed by hashes and random ids; half the checkpoints were
   requested by `max_wal_size` 1 GB). Issue #141.
 - **`CompanyDocuments` returns every document of the company** (12,504 nodes, 150 ms on
-  either store): linear, but unbounded; pagination is #112.
+  either store): linear, but unbounded. Since #112 it pages (50 by default, at most 1000):
+  the first page of a 12,000-document company takes 0.4 ms on SQLite and 1.2 ms on Postgres
+  (docs/api.md, [Pages of Neighbours and CompanyDocuments](api.md#pages-of-neighbours-and-companydocuments)).
 - **`ListRecords`, `GetNode` and `Neighbours` do not grow** beyond their result size; Postgres
   `ListRecords` is its `jsonb` round trip (#121).
 - **Memory does not follow the store**: an idle instance on the 210k store holds 100 to 120

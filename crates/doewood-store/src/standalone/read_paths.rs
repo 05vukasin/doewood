@@ -3,6 +3,7 @@
 //! returned, unchanged sketches and search rows are not written again, and an ignored test
 //! times each changed path before and after (docs/ingest.md, "Read paths").
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -772,5 +773,259 @@ fn stale_statistics_refresh() {
         for ext in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
         }
+    }
+}
+
+/// Issue #112: the neighbour query before the pages (whole, sorted), kept as the reference:
+/// the edge ids it returned.
+fn neighbours_before(
+    conn: &Connection,
+    node: &str,
+    q: &doewood_model::NeighbourQuery,
+) -> Vec<String> {
+    use doewood_model::Direction;
+    let (at_node, other) = match q.direction {
+        Direction::Out => ("e.src = ?1", "e.dst"),
+        Direction::In => ("e.dst = ?1", "e.src"),
+        Direction::Both => (
+            "(e.src = ?1 OR e.dst = ?1)",
+            "(CASE WHEN e.src = ?1 THEN e.dst ELSE e.src END)",
+        ),
+    };
+    let mut args = vec![Sql::Text(node.to_owned())];
+    let mut text =
+        format!("SELECT e.id FROM edges e JOIN nodes n ON n.id = {other} WHERE {at_node}");
+    if !q.edge_kinds.is_empty() {
+        text.push_str(" AND e.kind IN (");
+        text.push_str(&vec!["?"; q.edge_kinds.len()].join(", "));
+        text.push(')');
+        args.extend(
+            q.edge_kinds
+                .iter()
+                .map(|k| Sql::Text(k.as_str().to_owned())),
+        );
+    }
+    if let Some(kind) = q.node_kind {
+        text.push_str(" AND n.kind = ?");
+        args.push(Sql::Text(kind.as_str().to_owned()));
+    }
+    if !q.include_inactive {
+        text.push_str(" AND e.state NOT IN ('retracted', 'superseded')");
+    }
+    text.push_str(" ORDER BY e.kind, e.valid_from IS NOT NULL, e.valid_from, e.id");
+    let mut stmt = conn.prepare(&text).unwrap();
+    stmt.query_map(params_from_iter(args), |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// The company-documents query before the pages (ordered by key): the document ids.
+const COMPANY_DOCUMENTS_BEFORE: &str = "SELECT DISTINCT n.id, n.key FROM edges e \
+     JOIN nodes n ON n.id = e.src WHERE e.dst = ?1 AND e.kind = 'party' AND n.kind = 'document' \
+     AND e.state NOT IN ('retracted', 'superseded') ORDER BY n.key";
+
+/// Dates a third of the seeded edges, retracts some and links companies, so that the pages
+/// cross dated, undated and inactive edges of several kinds.
+fn vary_edges(conn: &Connection) {
+    conn.execute_batch(
+        "UPDATE edges SET valid_from = 2460000 + (rowid % 7) WHERE rowid % 3 = 0; \
+         UPDATE edges SET state = 'retracted' WHERE rowid % 11 = 0;",
+    )
+    .unwrap();
+    let t = now();
+    for (src, dst, kind) in [
+        (1, 2, "parent_of"),
+        (3, 1, "parent_of"),
+        (1, 4, "subsidiary_of"),
+    ] {
+        conn.execute(
+            "INSERT INTO edges (id, src, dst, kind, confidence, state, source, created_at, \
+             updated_at) VALUES (?1, ?2, ?3, ?4, 0.9, 'active', 'registry', ?5, ?5)",
+            params![
+                Uuid::now_v7().to_string(),
+                uuid_of(1, src),
+                uuid_of(1, dst),
+                kind,
+                t
+            ],
+        )
+        .unwrap();
+    }
+    conn.execute_batch("ANALYZE").unwrap();
+}
+
+#[tokio::test]
+async fn graph_pages_match_the_queries_before() {
+    use doewood_model::{Direction, EdgeCursor, EdgeKind, NeighbourQuery, NodeKind, page_full};
+    let store = Arc::new(Store::open_in_memory(&MasterKey::from_bytes([1; 32])).unwrap());
+    seed(&mut store.conn(), 600, 20);
+    vary_edges(&store.conn());
+    let s = Standalone::new(Arc::clone(&store));
+    let kinds: [&[EdgeKind]; 3] = [
+        &[],
+        &[EdgeKind::Party],
+        &[EdgeKind::ParentOf, EdgeKind::Party],
+    ];
+    for node in [uuid_of(1, 1), uuid_of(1, 2), uuid_of(2, 17)] {
+        let id: Uuid = node.parse().unwrap();
+        for direction in [Direction::Out, Direction::In, Direction::Both] {
+            for edge_kinds in kinds {
+                for (node_kind, include_inactive) in [
+                    (None, false),
+                    (Some(NodeKind::Document), false),
+                    (None, true),
+                ] {
+                    let q = NeighbourQuery {
+                        direction,
+                        edge_kinds: edge_kinds.to_vec(),
+                        node_kind,
+                        at: None,
+                        include_inactive,
+                    };
+                    let before = neighbours_before(&store.conn(), &node, &q);
+                    let whole: Vec<String> = s
+                        .neighbours(id, &q)
+                        .await
+                        .unwrap()
+                        .iter()
+                        .map(|n| n.edge.id.to_string())
+                        .collect();
+                    assert_eq!(whole, before, "{q:?}");
+                    for limit in [7, 1000] {
+                        let (mut walked, mut after) = (Vec::new(), None::<EdgeCursor>);
+                        loop {
+                            let page = s
+                                .neighbours_page(id, &q, after.as_ref(), limit, usize::MAX)
+                                .await
+                                .unwrap();
+                            let full = page_full(&page, limit, usize::MAX, |_| 0);
+                            after = page.last().map(|n| EdgeCursor::of(&n.edge));
+                            walked.extend(page.iter().map(|n| n.edge.id.to_string()));
+                            if !full {
+                                break;
+                            }
+                        }
+                        assert_eq!(walked, before, "{q:?}, pages of {limit}");
+                    }
+                }
+            }
+        }
+    }
+    // Company documents: the same set as before, each once, paged in the new order.
+    for c in [1, 2, 19] {
+        let company = uuid_of(1, c);
+        let before: BTreeSet<String> = {
+            let conn = store.conn();
+            let mut stmt = conn.prepare(COMPANY_DOCUMENTS_BEFORE).unwrap();
+            stmt.query_map([&company], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let id: Uuid = company.parse().unwrap();
+        let whole: Vec<String> = s
+            .company_documents(id)
+            .await
+            .unwrap()
+            .iter()
+            .map(|n| n.id.to_string())
+            .collect();
+        assert_eq!(whole.iter().cloned().collect::<BTreeSet<_>>(), before);
+        assert_eq!(whole.len(), before.len(), "each once");
+        let (mut walked, mut after) = (Vec::new(), None::<EdgeCursor>);
+        loop {
+            let page = s
+                .company_documents_page(id, after.as_ref(), 13, usize::MAX)
+                .await
+                .unwrap();
+            let full = page.len() >= 13;
+            after = page.last().map(|d| d.edge);
+            walked.extend(page.iter().map(|d| d.node.id.to_string()));
+            if !full {
+                break;
+            }
+        }
+        assert_eq!(walked, whole, "company {c}");
+    }
+}
+
+/// The plan details of the page queries (issue #112), with `args` bound, less the merge's
+/// sort of each range's rows (at most a page each).
+fn page_plan(conn: &Connection, sql: &str, args: &[Sql]) -> String {
+    let mut p = plan_of(conn, sql, args);
+    for n in 1..8 {
+        p = p.replace(
+            &format!("SCAN (subquery-{n}) | USE TEMP B-TREE FOR ORDER BY"),
+            "SCAN",
+        );
+    }
+    p
+}
+
+#[test]
+fn graph_pages_start_at_their_token() {
+    use doewood_model::{Direction, EdgeCursor, EdgeKind, NeighbourQuery};
+    let store = Store::open_in_memory(&MasterKey::from_bytes([1; 32])).unwrap();
+    let mut conn = store.conn();
+    seed(&mut conn, 2000, 20);
+    vary_edges(&conn);
+    let company = uuid_of(1, 1);
+    let cursor = EdgeCursor {
+        kind: EdgeKind::Party,
+        valid_from: None,
+        id: Uuid::nil(),
+    };
+    let incoming = NeighbourQuery {
+        direction: Direction::In,
+        edge_kinds: vec![EdgeKind::Party],
+        ..NeighbourQuery::default()
+    };
+    for (analyzed, after) in [(true, None), (true, Some(&cursor)), (false, Some(&cursor))] {
+        if !analyzed {
+            conn.execute_batch("DROP TABLE sqlite_stat1").unwrap();
+        }
+        let (sql, mut args) = super::pages::neighbours_sql(&incoming, after, Some(50)).unwrap();
+        args[0] = Sql::Text(company.clone());
+        let p = page_plan(&conn, &sql, &args);
+        let ranges: &[&str] = if after.is_some() {
+            &[
+                "USING INDEX edges_by_dst (dst=? AND kind=? AND <expr>=? AND id>?)",
+                "USING INDEX edges_by_dst (dst=? AND kind=? AND <expr>>?)",
+            ]
+        } else {
+            &["USING INDEX edges_by_dst (dst=? AND kind=?)"]
+        };
+        for range in ranges {
+            assert!(p.contains(range), "{range}: {p}");
+        }
+        assert!(!p.contains("TEMP B-TREE"), "{p}");
+
+        let sql = super::pages::company_documents_sql(after.is_some(), true);
+        let mut args = vec![Sql::Text(company.clone())];
+        if after.is_some() {
+            args.extend([
+                Sql::Integer(super::pages::VF_MIN),
+                Sql::Text(Uuid::nil().to_string()),
+            ]);
+        }
+        args.push(Sql::Integer(50));
+        let p = page_plan(&conn, &sql, &args);
+        let ranges: &[&str] = if after.is_some() {
+            &[
+                "USING INDEX edges_by_dst (dst=? AND kind=? AND <expr>=? AND id>?)",
+                "USING INDEX edges_by_dst (dst=? AND kind=? AND <expr>>?)",
+            ]
+        } else {
+            &["USING INDEX edges_by_dst (dst=? AND kind=?)"]
+        };
+        for range in ranges {
+            assert!(p.contains(range), "{range}: {p}");
+        }
+        assert!(
+            p.contains("edges_identity (src=? AND dst=? AND kind=?)"),
+            "{p}"
+        );
+        assert!(!p.contains("TEMP B-TREE"), "{p}");
     }
 }

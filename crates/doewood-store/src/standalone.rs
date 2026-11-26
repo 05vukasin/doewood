@@ -13,13 +13,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use doewood_core::InstanceId;
 use doewood_model::{
-    Backend, Blake3, Candidates, ClaimStore, Direction, Edge, EdgeKind, EdgeSource, Error,
+    Backend, Blake3, Candidates, ClaimStore, Edge, EdgeCursor, EdgeKind, EdgeSource, Error,
     GraphStore, LiveEdge, Located, LocationEnded, MERGE_CHAIN_MAX, Neighbour, NeighbourQuery, Node,
-    NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PropsPatch, PutOutcome, Record, RecordStore,
-    Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore, Sketch, SketchStore,
-    SourceClaim, SourceKey, StepVersions, StoredEdge, band_to_i64, merged_into, records_limit,
-    sketch_limit, validate_alias, validate_batch_count, validate_hashes, validate_node,
-    validate_sketch, versions_from_json, versions_to_json,
+    NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PartyDocument, PropsPatch, PutOutcome, Record,
+    RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore, Sketch,
+    SketchStore, SourceClaim, SourceKey, StepVersions, StoredEdge, band_to_i64, merged_into,
+    records_limit, sketch_limit, validate_alias, validate_batch_count, validate_hashes,
+    validate_node, validate_sketch, versions_from_json, versions_to_json,
 };
 use rusqlite::types::Value as Sql;
 use rusqlite::{
@@ -38,6 +38,7 @@ use enrichment::DOCUMENTS;
 mod enrichment;
 mod feeds;
 mod merges;
+mod pages;
 mod proposals;
 #[cfg(test)]
 mod read_paths;
@@ -60,23 +61,6 @@ fn sketch_candidates_sql(bands: usize) -> String {
          GROUP BY blake3 ORDER BY shared DESC, blake3 LIMIT ?) c \
          JOIN sketches s ON s.blake3 = c.blake3 ORDER BY c.shared DESC, c.blake3"
     )
-}
-
-/// [`GraphStore::company_documents`], the first `limit` of them when given.
-fn company_documents(conn: &Connection, company: Uuid, limit: Option<u32>) -> Result<Vec<Node>> {
-    let mut stmt = conn
-        .prepare_cached(&format!(
-            "SELECT DISTINCT {NODE_COLUMNS} FROM edges e JOIN nodes n ON n.id = e.src \
-             WHERE e.dst = ?1 AND e.kind = 'party' AND n.kind = 'document' \
-             AND e.state NOT IN ('retracted', 'superseded') ORDER BY n.key LIMIT ?2"
-        ))
-        .map_err(sql)?;
-    // A negative limit is no limit.
-    let limit = limit.map_or(-1, i64::from);
-    let rows = stmt
-        .query_map(params![company.to_string(), limit], |r| node_at(r, 0))
-        .map_err(sql)?;
-    rows.map(|row| node_from(row.map_err(sql)?)).collect()
 }
 
 /// The SQLite backend. Cheap to clone: every clone shares the one store.
@@ -800,76 +784,70 @@ impl GraphStore for Standalone {
 
     async fn neighbours(&self, node: Uuid, q: &NeighbourQuery) -> Result<Vec<Neighbour>> {
         let q = q.clone();
+        self.read(move |conn| pages::neighbours(conn, node, &q, None))
+            .await
+    }
+
+    async fn neighbours_page(
+        &self,
+        node: Uuid,
+        q: &NeighbourQuery,
+        after: Option<&EdgeCursor>,
+        limit: u32,
+        max_bytes: usize,
+    ) -> Result<Vec<Neighbour>> {
+        let (q, after) = (q.clone(), after.copied());
         self.read(move |conn| {
-            let me = node.to_string();
-            let (at_node, other) = match q.direction {
-                Direction::Out => ("e.src = ?1", "e.dst"),
-                Direction::In => ("e.dst = ?1", "e.src"),
-                Direction::Both => (
-                    "(e.src = ?1 OR e.dst = ?1)",
-                    "(CASE WHEN e.src = ?1 THEN e.dst ELSE e.src END)",
-                ),
-            };
-            let mut args = vec![Sql::Text(me)];
-            let mut sql_text = format!(
-                "SELECT {EDGE_COLUMNS}, {NODE_COLUMNS} FROM edges e \
-                 JOIN nodes n ON n.id = {other} WHERE {at_node}"
-            );
-            if !q.edge_kinds.is_empty() {
-                let marks = vec!["?"; q.edge_kinds.len()].join(", ");
-                sql_text.push_str(" AND e.kind IN (");
-                sql_text.push_str(&marks);
-                sql_text.push(')');
-                args.extend(
-                    q.edge_kinds
-                        .iter()
-                        .map(|k| Sql::Text(k.as_str().to_owned())),
-                );
-            }
-            if let Some(kind) = q.node_kind {
-                sql_text.push_str(" AND n.kind = ?");
-                args.push(Sql::Text(kind.as_str().to_owned()));
-            }
-            if let Some(at) = q.at {
-                sql_text.push_str(
-                    " AND (e.valid_from IS NULL OR e.valid_from <= ?) \
-                     AND (e.valid_to IS NULL OR e.valid_to > ?)",
-                );
-                args.extend([Sql::Integer(julian(at)), Sql::Integer(julian(at))]);
-            }
-            if !q.include_inactive {
-                sql_text.push_str(" AND e.state NOT IN ('retracted', 'superseded')");
-            }
-            sql_text.push_str(" ORDER BY e.kind, e.valid_from IS NOT NULL, e.valid_from, e.id");
-            let mut stmt = conn.prepare(&sql_text).map_err(sql)?;
-            let rows = stmt
-                .query_map(params_from_iter(args), |r| {
-                    Ok((edge_at(r)?, node_at(r, 11)?))
-                })
-                .map_err(sql)?;
-            rows.map(|row| {
-                let (edge, node) = row.map_err(sql)?;
-                Ok(Neighbour {
-                    edge: edge_from(edge)?,
-                    node: node_from(node)?,
-                })
-            })
-            .collect()
+            pages::neighbours(conn, node, &q, Some((after.as_ref(), limit, max_bytes)))
         })
         .await
     }
 
     async fn company_documents(&self, company: Uuid) -> Result<Vec<Node>> {
-        self.read(move |conn| company_documents(conn, company, None))
-            .await
+        self.read(move |conn| {
+            Ok(
+                pages::company_documents(conn, company, None, None, usize::MAX)?
+                    .into_iter()
+                    .map(|d| d.node)
+                    .collect(),
+            )
+        })
+        .await
+    }
+
+    async fn company_documents_page(
+        &self,
+        company: Uuid,
+        after: Option<&EdgeCursor>,
+        limit: u32,
+        max_bytes: usize,
+    ) -> Result<Vec<PartyDocument>> {
+        let after = after.copied();
+        self.read(move |conn| {
+            pages::company_documents(
+                conn,
+                company,
+                after.as_ref(),
+                Some(records_limit(limit)),
+                max_bytes,
+            )
+        })
+        .await
     }
 
     async fn company_documents_first(&self, company: Uuid, limit: u32) -> Result<Vec<Node>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        self.read(move |conn| company_documents(conn, company, Some(limit)))
-            .await
+        self.read(move |conn| {
+            Ok(
+                pages::company_documents(conn, company, None, Some(limit), usize::MAX)?
+                    .into_iter()
+                    .map(|d| d.node)
+                    .collect(),
+            )
+        })
+        .await
     }
 
     async fn company_document_count(&self, company: Uuid) -> Result<u64> {

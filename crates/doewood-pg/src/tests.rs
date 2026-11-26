@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::PgStore;
 
 mod companies_due;
+mod graph_pages;
 mod list_records;
 mod read_paths;
 mod record_text;

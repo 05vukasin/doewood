@@ -683,6 +683,113 @@ pub struct Neighbour {
     pub node: Node,
 }
 
+/// A position in the order of [`crate::GraphStore::neighbours`] (issue #112): an edge's kind,
+/// its `valid_from` (undated first) and its id. A page of
+/// [`crate::GraphStore::neighbours_page`] or [`crate::GraphStore::company_documents_page`]
+/// starts after it. As text (a page token) it is `<kind>.<Julian day of valid_from, empty when
+/// undated>.<id>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EdgeCursor {
+    /// The edge's kind.
+    pub kind: EdgeKind,
+    /// The day the edge starts to hold; `None` for an undated edge.
+    pub valid_from: Option<Date>,
+    /// The edge's id.
+    pub id: Uuid,
+}
+
+impl EdgeCursor {
+    /// The position of a stored edge.
+    pub fn of(edge: &StoredEdge) -> Self {
+        Self {
+            kind: edge.edge.kind,
+            valid_from: edge.edge.valid_from,
+            id: edge.id,
+        }
+    }
+}
+
+impl fmt::Display for EdgeCursor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.", self.kind)?;
+        if let Some(d) = self.valid_from {
+            write!(f, "{}", d.to_julian_day())?;
+        }
+        write!(f, ".{}", self.id.as_hyphenated())
+    }
+}
+
+impl FromStr for EdgeCursor {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self, Error> {
+        let bad = || Error::Invalid(format!("not an edge position: {s:?}"));
+        let mut parts = s.splitn(3, '.');
+        let (Some(kind), Some(day), Some(id)) = (parts.next(), parts.next(), parts.next()) else {
+            return Err(bad());
+        };
+        let valid_from = if day.is_empty() {
+            None
+        } else {
+            let day: i32 = day.parse().map_err(|_| bad())?;
+            Some(Date::from_julian_day(day).map_err(|_| bad())?)
+        };
+        Ok(Self {
+            kind: kind.parse().map_err(|_| bad())?,
+            valid_from,
+            id: Uuid::try_parse(id).map_err(|_| bad())?,
+        })
+    }
+}
+
+/// A document of [`crate::GraphStore::company_documents_page`]: the node, and the position of
+/// its first live `party` edge to the company, which orders it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PartyDocument {
+    /// The Document node.
+    pub node: Node,
+    /// Its first live `party` edge to the company.
+    pub edge: EdgeCursor,
+}
+
+/// The length of `value` as JSON text, counted without building the text.
+pub fn json_len(value: &Value) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut c = Count(0);
+    // Writing a `Value` to a sink that never fails cannot fail.
+    let _ = serde_json::to_writer(&mut c, value);
+    c.0
+}
+
+/// What a node counts against a page's byte budget (issue #112): its key and its props' JSON
+/// text.
+pub fn node_page_bytes(node: &Node) -> usize {
+    node.key.len() + json_len(&node.props)
+}
+
+/// What a neighbour counts against a page's byte budget: its node's bytes
+/// ([`node_page_bytes`]) and its edge's props and evidence as JSON text.
+pub fn neighbour_page_bytes(n: &Neighbour) -> usize {
+    node_page_bytes(&n.node) + json_len(&n.edge.edge.props) + json_len(&n.edge.edge.evidence)
+}
+
+/// Whether a page of `limit` items (as [`records_limit`] reads it) and `max_bytes`, each
+/// counted by `bytes`, ended at either bound, so a next page may follow: the rule
+/// [`crate::GraphStore::neighbours_page`] and [`crate::GraphStore::company_documents_page`]
+/// stop by.
+pub fn page_full<T>(page: &[T], limit: u32, max_bytes: usize, bytes: impl Fn(&T) -> usize) -> bool {
+    page.len() >= records_limit(limit) as usize
+        || page.iter().map(bytes).sum::<usize>() >= max_bytes
+}
+
 /// The nodes [`crate::GraphStore::upsert_location`] touched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Located {
@@ -900,6 +1007,63 @@ pub struct SearchHit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edge_cursor_round_trip() {
+        let id = Uuid::now_v7();
+        for valid_from in [
+            None,
+            Some(Date::from_calendar_date(2024, time::Month::March, 9).unwrap()),
+        ] {
+            let c = EdgeCursor {
+                kind: EdgeKind::SubsidiaryOf,
+                valid_from,
+                id,
+            };
+            let text = c.to_string();
+            assert_eq!(text.parse::<EdgeCursor>().unwrap(), c, "{text}");
+        }
+        assert_eq!(
+            EdgeCursor {
+                kind: EdgeKind::Party,
+                valid_from: None,
+                id: Uuid::nil(),
+            }
+            .to_string(),
+            "party..00000000-0000-0000-0000-000000000000"
+        );
+        for bad in [
+            "",
+            "party",
+            "party.",
+            "party..x",
+            "nope..00000000-0000-0000-0000-000000000000",
+            "party.x.00000000-0000-0000-0000-000000000000",
+            "party.99999999999.00000000-0000-0000-0000-000000000000",
+            "0011223344556677889900112233445566778899001122334455667788990011",
+        ] {
+            assert!(bad.parse::<EdgeCursor>().is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn page_bytes() {
+        assert_eq!(
+            json_len(&serde_json::json!({"a": [1, "b"]})),
+            r#"{"a":[1,"b"]}"#.len()
+        );
+        let node = Node {
+            id: Uuid::nil(),
+            kind: NodeKind::Document,
+            key: "abc".into(),
+            props: serde_json::json!({"x": 1}),
+        };
+        assert_eq!(node_page_bytes(&node), 3 + 7);
+        let page = vec![node.clone(), node];
+        assert!(page_full(&page, 2, usize::MAX, node_page_bytes));
+        assert!(!page_full(&page, 3, 21, node_page_bytes));
+        assert!(page_full(&page, 3, 20, node_page_bytes));
+    }
 
     #[test]
     fn blake3_hex_round_trip() {

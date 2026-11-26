@@ -1751,6 +1751,7 @@ async fn scale_api(
             node_kind: pb::NodeKind::Document as i32,
             at: String::new(),
             include_inactive: false,
+            ..Default::default()
         }),
         |r: pb::NeighboursResponse| r.neighbours.len()
     );
@@ -1758,6 +1759,7 @@ async fn scale_api(
         format!("CompanyDocuments ({} documents)", big.1),
         graph.company_documents(pb::CompanyDocumentsRequest {
             company_id: big.0.to_string(),
+            ..Default::default()
         }),
         |r: pb::CompanyDocumentsResponse| r.documents.len()
     );
