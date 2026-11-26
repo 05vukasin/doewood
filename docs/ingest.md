@@ -357,6 +357,9 @@ are there for enrichment, and no document merges on a fuzzy match yet.
   SQLite (and Postgres with `DOEWOOD_TEST_POSTGRES_URL`), then the records, the graph (pending
   references, companies across spellings and identifiers, `similar_to`), search, retries,
   deletes and reprocessing. `throughput` (ignored) measures files per second.
+- `tests/company_rows.rs` (ignored, a measurement): what each document's company props patch
+  costs, for one supplier on every document against many small ones (issue #129; numbers in
+  [deploy.md](deploy.md#company-rows-rewritten-by-every-document-issue-129)).
 - Unit tests in `pipeline.rs` stall an analysis past the watchdog: the file fails, the worker
   goes on, the stalled analysis keeps its bytes counted until it returns and then frees them, a
   worker leaves at most one behind, and each file is hashed once. Others hold a big file past
