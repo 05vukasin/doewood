@@ -118,6 +118,7 @@ pub(crate) fn ingest_settings(s: doewood_store::IngestSettings) -> pb::IngestSet
     pb::IngestSettings {
         similar_min_jaccard: s.similar_min_jaccard,
         summarize_max_concurrent: s.summarize_max_concurrent,
+        similar_max_bucket: s.similar_max_bucket,
     }
 }
 

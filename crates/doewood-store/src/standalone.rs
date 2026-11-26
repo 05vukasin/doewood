@@ -13,10 +13,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use doewood_core::InstanceId;
 use doewood_model::{
-    Backend, Blake3, ClaimStore, Direction, Edge, EdgeKind, EdgeSource, Error, GraphStore,
-    LiveEdge, Located, LocationEnded, MERGE_CHAIN_MAX, Neighbour, NeighbourQuery, Node, NodeAlias,
-    NodeKind, ObjectLocation, OwnedAlias, PropsPatch, PutOutcome, Record, RecordStore, Result,
-    SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore, Sketch, SketchStore,
+    Backend, Blake3, Candidates, ClaimStore, Direction, Edge, EdgeKind, EdgeSource, Error,
+    GraphStore, LiveEdge, Located, LocationEnded, MERGE_CHAIN_MAX, Neighbour, NeighbourQuery, Node,
+    NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PropsPatch, PutOutcome, Record, RecordStore,
+    Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore, Sketch, SketchStore,
     SourceClaim, SourceKey, StepVersions, StoredEdge, band_to_i64, merged_into, records_limit,
     sketch_limit, validate_alias, validate_batch_count, validate_hashes, validate_node,
     validate_sketch, versions_from_json, versions_to_json,
@@ -1147,8 +1147,21 @@ impl SketchStore for Standalone {
         exclude: &Blake3,
         limit: u32,
     ) -> Result<Vec<Sketch>> {
+        Ok(self
+            .sketch_candidates_within(bands, exclude, limit, u32::MAX)
+            .await?
+            .sketches)
+    }
+
+    async fn sketch_candidates_within(
+        &self,
+        bands: &[u64],
+        exclude: &Blake3,
+        limit: u32,
+        max_bucket: u32,
+    ) -> Result<Candidates> {
         if bands.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Candidates::default());
         }
         if bands.len() > SKETCH_MAX_BANDS {
             return Err(Error::Invalid(format!(
@@ -1156,16 +1169,41 @@ impl SketchStore for Standalone {
             )));
         }
         let (exclude, limit) = (*exclude, i64::from(sketch_limit(limit)));
-        let mut args: Vec<Sql> = bands
-            .iter()
-            .map(|b| Sql::Integer(band_to_i64(*b)))
-            .collect();
-        args.push(Sql::Blob(exclude.as_bytes().to_vec()));
-        args.push(Sql::Integer(limit));
-        let bands_len = bands.len();
+        let bands: Vec<i64> = bands.iter().map(|b| band_to_i64(*b)).collect();
         self.read(move |conn| {
+            // Issue #148: the bands whose bucket is too large, one `sketch_band_sizes` row
+            // each; `u32::MAX` (no limit) skips the lookup.
+            let big: BTreeSet<i64> = if max_bucket == u32::MAX {
+                BTreeSet::new()
+            } else {
+                let marks = vec!["?"; bands.len()].join(", ");
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT band FROM sketch_band_sizes WHERE band IN ({marks}) AND docs > ?"
+                    ))
+                    .map_err(sql)?;
+                let args = bands
+                    .iter()
+                    .map(|b| Sql::Integer(*b))
+                    .chain([Sql::Integer(i64::from(max_bucket))]);
+                let rows = stmt
+                    .query_map(params_from_iter(args), |r| r.get(0))
+                    .map_err(sql)?;
+                rows.collect::<rusqlite::Result<_>>().map_err(sql)?
+            };
+            let kept: Vec<i64> = bands.iter().copied().filter(|b| !big.contains(b)).collect();
+            let skipped_bands = u32::try_from(big.len()).unwrap_or(u32::MAX);
+            if kept.is_empty() {
+                return Ok(Candidates {
+                    sketches: Vec::new(),
+                    skipped_bands,
+                });
+            }
+            let mut args: Vec<Sql> = kept.iter().map(|b| Sql::Integer(*b)).collect();
+            args.push(Sql::Blob(exclude.as_bytes().to_vec()));
+            args.push(Sql::Integer(limit));
             let mut stmt = conn
-                .prepare(&sketch_candidates_sql(bands_len))
+                .prepare(&sketch_candidates_sql(kept.len()))
                 .map_err(sql)?;
             let rows = stmt
                 .query_map(params_from_iter(args), |r| {
@@ -1176,15 +1214,20 @@ impl SketchStore for Standalone {
                     ))
                 })
                 .map_err(sql)?;
-            rows.map(|row| {
-                let (h, signature, shared) = row.map_err(sql)?;
-                Ok(Sketch {
-                    blake3: Blake3::from_slice(&h)?,
-                    signature,
-                    shared_bands: u32::try_from(shared).unwrap_or(u32::MAX),
+            let sketches = rows
+                .map(|row| {
+                    let (h, signature, shared) = row.map_err(sql)?;
+                    Ok(Sketch {
+                        blake3: Blake3::from_slice(&h)?,
+                        signature,
+                        shared_bands: u32::try_from(shared).unwrap_or(u32::MAX),
+                    })
                 })
+                .collect::<Result<_>>()?;
+            Ok(Candidates {
+                sketches,
+                skipped_bands,
             })
-            .collect()
         })
         .await
     }

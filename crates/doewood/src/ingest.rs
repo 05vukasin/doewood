@@ -102,8 +102,9 @@ pub async fn build(
 }
 
 /// Registers ingest's metrics on the ops port's registry: `doewood_ingest_finish_unmatched_total`
-/// (issue #125), read from [`Ingest::stats`] when `/metrics` is scraped. The registry does not
-/// keep ingest (and so the store) alive.
+/// (issue #125) and `doewood_ingest_similar_buckets_skipped_total` (issue #148), read from
+/// [`Ingest::stats`] when `/metrics` is scraped. The registry does not keep ingest (and so the
+/// store) alive.
 pub fn register_metrics(ingest: &Ingest, registry: &Registry) -> prometheus::Result<()> {
     let stats = ingest.stats_reader();
     let unmatched = StatCounter::new(
@@ -112,7 +113,15 @@ pub fn register_metrics(ingest: &Ingest, registry: &Registry) -> prometheus::Res
          deleted meanwhile, or an event ahead of its row).",
         move || stats().map_or(0, |s| s.finish_unmatched),
     )?;
-    registry.register(Box::new(unmatched))
+    registry.register(Box::new(unmatched))?;
+    let stats = ingest.stats_reader();
+    let skipped = StatCounter::new(
+        "doewood_ingest_similar_buckets_skipped_total",
+        "Band keys the similar_to candidate query skipped because more documents than \
+         similar_max_bucket share them (template boilerplate).",
+        move || stats().map_or(0, |s| s.similar_buckets_skipped),
+    )?;
+    registry.register(Box::new(skipped))
 }
 
 /// A counter that follows a count kept elsewhere, read when it is collected.

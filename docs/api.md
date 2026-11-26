@@ -105,7 +105,10 @@ The comments in the `.proto` files are the reference for every field. In short:
   the next file without a restart. Edges already written are kept; `ReprocessJob` with
   `force: true` compares a source's documents again (a lower value adds edges, a higher one
   removes none). It replaces the old `DOEWOOD_SIMILAR_MIN_JACCARD` variable (see
-  [configuration.md](configuration.md)). `summarize_max_concurrent` is how many `Summarize`
+  [configuration.md](configuration.md)). `similar_max_bucket` is the largest LSH band bucket
+  the `similar_to` candidate query reads: 10 to 1000000 (default 1000), anything else is
+  `INVALID_ARGUMENT`; a band key shared by more documents is skipped (issue #148, see
+  [ingest.md](ingest.md)). `summarize_max_concurrent` is how many `Summarize`
   calls read and analyze a file at once: 1 to 16 (default 2), anything else is
   `INVALID_ARGUMENT`. It is read for every `Summarize` call, so it applies to the next one;
   calls in flight keep running.

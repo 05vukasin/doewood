@@ -1,6 +1,8 @@
 //! `similar_to` edges on a generated corpus with near-duplicates (issue #126): the graph writer
 //! writes the same edges as the per-candidate loop it had before (a node lookup, maybe a node
-//! insert, and an edge upsert for each candidate), on SQLite and, when
+//! insert, and an edge upsert for each candidate, with no stop band). No band bucket of this
+//! corpus is over the default `similar_max_bucket` (1000), so the stop band of issue #148
+//! skips nothing and the edges stay the same. On SQLite and, when
 //! `DOEWOOD_TEST_POSTGRES_URL` is set, on Postgres in a schema of its own.
 
 mod common;
@@ -64,10 +66,11 @@ async fn write_new(b: &Arc<dyn Backend>) {
     for i in 0..DOCS {
         record(&**b, i).await;
         if !sketch_only(i) {
-            writer
+            let stats = writer
                 .write(&hash(i), &at(i), &facts(i), "x", MIN_JACCARD)
                 .await
                 .unwrap();
+            assert_eq!(stats.similar_buckets_skipped, 0, "no bucket over the limit");
         }
     }
 }

@@ -200,6 +200,10 @@ Alerts worth setting (tune the thresholds to your traffic):
 - **Ingest results dropped:** `doewood_ingest_finish_unmatched_total` growing much faster than
   objects are changed or deleted while being ingested. Each count is a result that was not
   recorded; when its row is still pending, the next sweep ingests the object again (issue #125).
+- **Template-heavy sources** (not an alert): `doewood_ingest_similar_buckets_skipped_total`
+  counts band keys the `similar_to` query skipped because more than `similar_max_bucket`
+  documents share them (issue #148). It grows when one template (one supplier's invoices)
+  passes the limit; those documents then link only through their less common bands.
 
 ## Sizing
 
@@ -648,8 +652,10 @@ both stores in CI.
 
 What changed: `GraphStore::node_ids` reads the candidates' Document nodes in one statement
 (the few missing ones are still created one by one), and `GraphStore::upsert_edges` writes
-the edges in one transaction: pipelined on Postgres (`BEGIN`, the upserts and `COMMIT` in
-one round trip), one writer call on SQLite. A document costs 8 round trips on Postgres
+the edges in one transaction: one statement on Postgres (an `INSERT ... SELECT FROM unnest`
+upsert; since #148, before that the upserts were pipelined between `BEGIN` and `COMMIT`,
+which the client could split into more round trips on a busy machine), one writer call on
+SQLite. A document costs 8 round trips on Postgres
 however many similar documents it has (`similar_documents_take_a_fixed_number_of_round_trips`),
 against 8 plus 2 per similar document before.
 
@@ -658,9 +664,39 @@ that shares a band, then keeps the best 100. At 10,000 documents (2,000 per temp
 reads 53,543 index entries for one template document (`EXPLAIN (ANALYZE, BUFFERS)`: 26 ms;
 13.5 ms best of 5 from the client), against 10,400 entries at 2,000 documents: linear in the
 number of near-duplicates, so quadratic over a corpus of one template. The graph write per
-document rose from 25 ms at 2,000 documents to 31 ms at 10,000 on Postgres. A bound on the
-bucket (an LSH "stop band") would change which edges exist, so it is left to a decision
-(issue #126).
+document rose from 25 ms at 2,000 documents to 31 ms at 10,000 on Postgres. Bounded since
+issue #148, below.
+
+### Stop bands (issue #148)
+
+The same `near_duplicate_corpus` on Postgres, on this change, with the default
+`similar_max_bucket` of 1000 against 1,000,000 (no bound in practice), one run each:
+
+| documents | graph write per document, no bound / 1000 | candidate query (best of 5), no bound / 1000 | `similar_to` per document, no bound / 1000 | bands skipped per document (1000) |
+|---|---|---|---|---|
+| 3,000 | 18.1 / 17.5 ms | 9.6 / 8.0 ms | 80 / 80 | 0 |
+| 6,000 | 21.9 / 20.5 ms | 9.2 / 2.2 ms | 80 / 80 | 6 (the buckets pass 1000) |
+| 9,000 | 25.7 / 11.0 ms | 27.1 / 1.1 ms | 80 / 57 | 22 |
+| 10,000 (10,500) | 30.7 / 11.1 ms | 15.8 / 0.4 ms | 80 / 53 | 22 |
+| 15,000 | not run / 11.4 ms | not run / 1.5 ms | 52 | 22.5 |
+
+(Per window of a tenth of the corpus; the candidate query is timed for the last template
+document of the window. The machine was shared with other builds.)
+
+On SQLite (a store file, 10,000 documents, the bound at 1000) the graph write per document
+rose to 38.8 ms at 5,000 documents and came back to 20.7 ms at 10,000 (candidate query 8.1 ms
+at 5,000, 0.2 to 0.5 ms from 8,000 on); the same 22 bands per document are skipped. (The
+measurement of #126 on SQLite went from 35 to 42 ms per document between 1,200 and 4,000
+documents, still rising.)
+
+With the bound the graph write stays flat once the 4 templates pass 1000 documents each
+(about 5,000 documents): at 15,000 documents the candidate query reads 32 `sketch_band_sizes`
+rows and 128 `sketch_bands` entries (`EXPLAIN ANALYZE` 3.0 ms), against 53,543 entries and
+31 ms at 10,000 without it. The cost is fewer edges for template documents: they link only
+through the bands their template does not share with more than 1000 others (52 instead of
+80 edges per document on average over the corpus, 22 of 32 bands skipped). With the bound
+off, the edges are the same as before: the digest of every `similar_to` edge at 10,000
+documents is the one of #126 (`1cbe59b1…`).
 
 ### API under many clients (issue #80)
 

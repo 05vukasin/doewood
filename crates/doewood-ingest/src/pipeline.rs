@@ -7,7 +7,9 @@
 //!   pending object, so a restart, a row whose event was never sent (a crash or stop between
 //!   the commit and the send), or a source added while ingest was busy, are all picked up. A
 //!   finish that matches no pending row of its version is counted
-//!   ([`Stats::finish_unmatched`], `doewood_ingest_finish_unmatched_total`).
+//!   ([`Stats::finish_unmatched`], `doewood_ingest_finish_unmatched_total`). Band buckets
+//!   the `similar_to` query skipped are counted too ([`Stats::similar_buckets_skipped`],
+//!   `doewood_ingest_similar_buckets_skipped_total`, issue #148).
 //! - **Backpressure.** The dispatcher hands jobs to the workers through a bounded queue and
 //!   waits while it is full, so it stops reading the scanners' bounded event channel, and the
 //!   scanners wait in turn.
@@ -427,6 +429,9 @@ pub struct Stats {
     /// was not recorded: the object changed or was deleted meanwhile. (Until issue #125 an
     /// event could also come before its row was committed; the sweep then ingested it again.)
     pub finish_unmatched: u64,
+    /// Band keys skipped by the `similar_to` candidate query because their bucket held more
+    /// than `similar_max_bucket` documents (issue #148), summed over files.
+    pub similar_buckets_skipped: u64,
     /// Where the workers' time went, summed over files (issue #69).
     pub time: StageTimes,
 }
@@ -755,6 +760,7 @@ impl Ingest {
             analyzed = s.analyzed,
             redirected = s.redirected,
             finish_unmatched = s.finish_unmatched,
+            similar_buckets_skipped = s.similar_buckets_skipped,
             mib = s.bytes / (1 << 20),
             secs = self.inner.started.elapsed().as_secs(),
             time = ?s.time,
@@ -1077,13 +1083,7 @@ impl Ingest {
         let facts = DocFacts::from_record(&body);
         let stats = self
             .writer(backend)
-            .write(
-                &blake3,
-                &location,
-                &facts,
-                &name,
-                settings.similar_min_jaccard,
-            )
+            .write(&blake3, &location, &facts, &name, settings)
             .await?;
         self.stage(t, |s| &mut s.graph);
         {
@@ -1091,6 +1091,8 @@ impl Ingest {
             s.time.company_lock_wait += stats.company_lock_wait;
             s.time.company_lock_hold += stats.company_lock_hold;
             s.redirected += u64::try_from(stats.redirects).unwrap_or(u64::MAX);
+            s.similar_buckets_skipped +=
+                u64::try_from(stats.similar_buckets_skipped).unwrap_or(u64::MAX);
         }
         debug!(
             source = %id,
@@ -1100,6 +1102,7 @@ impl Ingest {
             parties = stats.parties,
             refs = stats.refs,
             similar = stats.similar,
+            similar_buckets_skipped = stats.similar_buckets_skipped,
             redirects = stats.redirects,
             "ingested"
         );

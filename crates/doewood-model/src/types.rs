@@ -765,6 +765,16 @@ pub struct Sketch {
     pub shared_bands: u32,
 }
 
+/// What [`crate::SketchStore::sketch_candidates_within`] found.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Candidates {
+    /// The candidates, as [`crate::SketchStore::sketch_candidates`] returns them over the
+    /// bands that were looked at.
+    pub sketches: Vec<Sketch>,
+    /// Distinct band keys skipped because their bucket was too large.
+    pub skipped_bands: u32,
+}
+
 /// Most band keys one sketch carries.
 pub const SKETCH_MAX_BANDS: usize = 256;
 

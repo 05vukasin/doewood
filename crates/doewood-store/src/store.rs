@@ -721,6 +721,7 @@ mod tests {
                 "search_index",
                 "secrets",
                 "settings",
+                "sketch_band_sizes",
                 "sketch_bands",
                 "sketches",
                 "source_claims",
