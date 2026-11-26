@@ -1374,9 +1374,9 @@ mod tests {
     #[test]
     fn hot_queries_use_their_indexes() {
         let store = store();
-        // `pending_objects`: the queue index, no sort. Without
-        // `INDEXED BY`, SQLite 3.54 reads the primary key here, even after `ANALYZE` of a
-        // source whose rows are spread over the five statuses.
+        // `pending_objects`: the queue index, no sort. Without `INDEXED BY`, SQLite 3.54
+        // reads the primary key here, even after `ANALYZE` of a source whose rows are spread
+        // over the five statuses.
         let p = plan(&store, crate::store::objects::PENDING_OBJECTS);
         assert!(p.contains("USING INDEX objects_seen_pending"), "{p}");
         assert!(!p.contains("TEMP B-TREE"), "{p}");

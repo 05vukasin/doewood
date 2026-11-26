@@ -715,7 +715,8 @@ mod tests {
             };
             let status = statuses[usize::try_from(seed % 5).unwrap()];
             // Some ingested rows without a hash, which `ingested_objects` leaves out.
-            let blake3 = (seed % 7 != 0).then(|| vec![u8::try_from(i % 256).unwrap(); 32]);
+            let blake3 =
+                (!seed.is_multiple_of(7)).then(|| vec![u8::try_from(i % 256).unwrap(); 32]);
             for source in [id, other] {
                 insert
                     .execute(params![
