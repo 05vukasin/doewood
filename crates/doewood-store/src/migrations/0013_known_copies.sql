@@ -1,4 +1,4 @@
--- doewood instance store, schema 12: known copies (issue #131). Additive: a source option and
+-- doewood instance store, schema 13: known copies (issue #131). Additive: a source option and
 -- a new table; no data changes.
 
 -- Per source, off by default: a new key whose single-part, non-SSE-KMS/C ETag and size match

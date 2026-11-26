@@ -1416,6 +1416,7 @@ async fn records_graph_and_search() {
                 node_kind: pb::NodeKind::Document as i32,
                 at: "2026-03-01".into(),
                 include_inactive: false,
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -1442,6 +1443,7 @@ async fn records_graph_and_search() {
         let docs = graph
             .company_documents(pb::CompanyDocumentsRequest {
                 company_id: acme.to_string(),
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -1454,7 +1456,10 @@ async fn records_graph_and_search() {
         let doc_id = docs[0].id.clone();
         invalid(
             &graph
-                .company_documents(pb::CompanyDocumentsRequest { company_id: doc_id })
+                .company_documents(pb::CompanyDocumentsRequest {
+                    company_id: doc_id,
+                    ..Default::default()
+                })
                 .await
                 .unwrap_err(),
             &["company_id"],
@@ -1499,6 +1504,7 @@ async fn records_graph_and_search() {
                     node_kind: 17,
                     at: "March 1".into(),
                     include_inactive: false,
+                    ..Default::default()
                 })
                 .await
                 .unwrap_err(),
@@ -1653,6 +1659,7 @@ async fn neighbours_and_company_documents_tell_missing_from_empty() {
             async move {
                 g.company_documents(pb::CompanyDocumentsRequest {
                     company_id: id.to_string(),
+                    ..Default::default()
                 })
                 .await
                 .map(|r| r.into_inner().documents.len())
@@ -2399,6 +2406,7 @@ async fn merges_undo_split_and_dismissals() {
             async move {
                 g.company_documents(pb::CompanyDocumentsRequest {
                     company_id: c.to_string(),
+                    ..Default::default()
                 })
                 .await
                 .unwrap()
@@ -3221,6 +3229,136 @@ async fn resuming_before_the_pass_waits_for_it() {
         let owner = shared.backend.source_owner(&key).await.unwrap().unwrap();
         assert_eq!(owner.owner.as_str(), "inst-b");
         b.stop().await;
+        shared.drop_schema().await;
+    }
+}
+
+/// Issue #112: `Neighbours` and `CompanyDocuments` page as `ListRecords` does. The default
+/// page is 50, more than 1000 or a foreign token is `INVALID_ARGUMENT`, walking the tokens
+/// returns every item once, and an empty page still tells a missing node apart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn neighbours_and_company_documents_page() {
+    for shared in Shared::all().await {
+        let name = shared.name;
+        let a = Instance::start("inst-a", Some(shared.backend.clone())).await;
+        let mut graph = GraphServiceClient::new(a.channel().await);
+        let be = &shared.backend;
+        let co = be
+            .upsert_node(NodeKind::Company, "e112-co", &json!({"name": "Pages"}))
+            .await
+            .unwrap();
+        let mut docs = Vec::new();
+        for i in 0..120u32 {
+            let d = be
+                .upsert_node(
+                    NodeKind::Document,
+                    &format!("{:064x}", 0x0112_0000 + i),
+                    &json!({}),
+                )
+                .await
+                .unwrap();
+            be.upsert_edge(&Edge::new(d, co, EdgeKind::Party, EdgeSource::Document))
+                .await
+                .unwrap();
+            docs.push(d.to_string());
+        }
+        let documents = |page_size: u32, page_token: String| {
+            let mut g = graph.clone();
+            async move {
+                g.company_documents(pb::CompanyDocumentsRequest {
+                    company_id: co.to_string(),
+                    page_size,
+                    page_token,
+                })
+                .await
+                .map(tonic::Response::into_inner)
+            }
+        };
+        let neighbours = |page_size: u32, page_token: String| {
+            let mut g = graph.clone();
+            async move {
+                g.neighbours(pb::NeighboursRequest {
+                    node_id: co.to_string(),
+                    direction: pb::Direction::In as i32,
+                    page_size,
+                    page_token,
+                    ..Default::default()
+                })
+                .await
+                .map(tonic::Response::into_inner)
+            }
+        };
+        let first = documents(0, String::new()).await.unwrap();
+        assert_eq!(first.documents.len(), 50, "{name}: the default page");
+        assert!(!first.next_page_token.is_empty());
+        let first = neighbours(0, String::new()).await.unwrap();
+        assert_eq!(first.neighbours.len(), 50, "{name}");
+        for size in [1, 7, 1000] {
+            let (mut walked, mut token) = (Vec::new(), String::new());
+            loop {
+                let page = documents(size, token).await.unwrap();
+                walked.extend(page.documents.into_iter().map(|d| d.id));
+                token = page.next_page_token;
+                if token.is_empty() {
+                    break;
+                }
+            }
+            // Undated edges, written in this order: the documents come in the same order.
+            assert_eq!(walked, docs, "{name}: pages of {size}");
+            let (mut walked, mut token) = (Vec::new(), String::new());
+            loop {
+                let page = neighbours(size, token).await.unwrap();
+                walked.extend(page.neighbours.into_iter().map(|n| n.node.unwrap().id));
+                token = page.next_page_token;
+                if token.is_empty() {
+                    break;
+                }
+            }
+            assert_eq!(walked, docs, "{name}: neighbour pages of {size}");
+        }
+        invalid(
+            &documents(1001, String::new()).await.unwrap_err(),
+            &["page_size"],
+        );
+        invalid(
+            &neighbours(1001, String::new()).await.unwrap_err(),
+            &["page_size"],
+        );
+        for bad in ["x", "abc", &hash(1).to_hex()] {
+            invalid(
+                &documents(10, bad.to_owned()).await.unwrap_err(),
+                &["page_token"],
+            );
+            invalid(
+                &neighbours(10, bad.to_owned()).await.unwrap_err(),
+                &["page_token"],
+            );
+        }
+        // A neighbour token of another kind is not a CompanyDocuments token.
+        let other = format!("parent_of..{}", uuid::Uuid::nil());
+        invalid(
+            &documents(10, other.clone()).await.unwrap_err(),
+            &["page_token"],
+        );
+        // For Neighbours it is a place in the order: every party edge comes after `parent_of`,
+        // none after `trading_name_of`.
+        assert_eq!(neighbours(1000, other).await.unwrap().neighbours.len(), 120);
+        let last = format!("trading_name_of..{}", uuid::Uuid::nil());
+        assert!(neighbours(10, last).await.unwrap().neighbours.is_empty());
+        // Past the end: an empty page, and still NOT_FOUND for a missing node.
+        let end = format!("party..{}", uuid::Uuid::max());
+        let page = documents(10, end.clone()).await.unwrap();
+        assert!(page.documents.is_empty() && page.next_page_token.is_empty());
+        let err = graph
+            .company_documents(pb::CompanyDocumentsRequest {
+                company_id: uuid::Uuid::now_v7().to_string(),
+                page_size: 10,
+                page_token: end,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::NotFound, "{name}: {err:?}");
+        a.stop().await;
         shared.drop_schema().await;
     }
 }

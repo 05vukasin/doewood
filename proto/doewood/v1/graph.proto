@@ -7,10 +7,12 @@ package doewood.v1;
 service GraphService {
   // A node by id, or by kind and key.
   rpc GetNode(GetNodeRequest) returns (Node);
-  // The edges at a node and the nodes at their other ends, ordered by edge kind, then
-  // `valid_from` (undated first), then edge id.
+  // The edges at a node and the nodes at their other ends, ordered by edge kind (its name),
+  // then `valid_from` (undated first), then edge id; a page at a time, as ListRecords.
   rpc Neighbours(NeighboursRequest) returns (NeighboursResponse);
-  // The documents with a live `party` edge to a company, ordered by key.
+  // The documents with a live `party` edge to a company, each once, in the order of their
+  // first such edge (its `valid_from`, undated first, then its id); a page at a time, as
+  // ListRecords.
   rpc CompanyDocuments(CompanyDocumentsRequest) returns (CompanyDocumentsResponse);
 
   // Reversible company merges (ADR 0002 section 1.8). The merge log, newest first: every
@@ -160,6 +162,10 @@ message NeighboursRequest {
   string at = 5;
   // Also return retracted and superseded edges.
   bool include_inactive = 6;
+  // 1 to 1000; 0 means 50. A page also ends at about 3 MiB of props and evidence.
+  uint32 page_size = 7;
+  // `next_page_token` of the previous page, with the same filters; empty for the first.
+  string page_token = 8;
 }
 
 message Neighbour {
@@ -170,14 +176,22 @@ message Neighbour {
 
 message NeighboursResponse {
   repeated Neighbour neighbours = 1;
+  // Empty on the last page.
+  string next_page_token = 2;
 }
 
 message CompanyDocumentsRequest {
   string company_id = 1;
+  // 1 to 1000; 0 means 50. A page also ends at about 3 MiB of props.
+  uint32 page_size = 2;
+  // `next_page_token` of the previous page; empty for the first.
+  string page_token = 3;
 }
 
 message CompanyDocumentsResponse {
   repeated Node documents = 1;
+  // Empty on the last page.
+  string next_page_token = 2;
 }
 
 // Who merged or split.

@@ -18,7 +18,8 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0009_feeds.sql"),
     include_str!("migrations/0010_status_counts.sql"),
     include_str!("migrations/0011_sketch_band_sizes.sql"),
-    include_str!("migrations/0012_known_copies.sql"),
+    include_str!("migrations/0012_graph_pages.sql"),
+    include_str!("migrations/0013_known_copies.sql"),
 ];
 
 /// The schema version this binary writes.
@@ -68,4 +69,58 @@ pub(crate) fn migrate_to(conn: &mut Connection, target: i64) -> Result<i64, Stor
         tx.commit()?;
     }
     Ok(target.min(SCHEMA_VERSION))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use rusqlite::Connection;
+
+    use super::{SCHEMA_VERSION, migrate_to};
+
+    /// Times each pending migration of the store file `DOEWOOD_MIGRATE_DB` (issue #112: the
+    /// `edges_by_dst` rebuild of schema 12 on a big store): first its SQL and the foreign key
+    /// check apart, rolled back, then as [`super::migrate`] runs it. Migrates the file: run it
+    /// on a copy.
+    /// `DOEWOOD_MIGRATE_DB=<file> cargo test --release -p doewood-store --lib migration_timings
+    /// -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement (issue #112); see docs/configuration.md"]
+    fn migration_timings() {
+        let path = std::env::var("DOEWOOD_MIGRATE_DB").expect("DOEWOOD_MIGRATE_DB");
+        let mut conn = Connection::open(path).unwrap();
+        let from: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        let edges: i64 = conn
+            .query_row("SELECT count(*) FROM edges", [], |r| r.get(0))
+            .unwrap();
+        println!("schema {from}, {edges} edges");
+        // The two parts of each migration, timed apart and rolled back: its SQL, then the
+        // foreign key check the runner makes before it commits.
+        for target in from + 1..=SCHEMA_VERSION {
+            let tx = conn.transaction().unwrap();
+            let t = Instant::now();
+            tx.execute_batch(super::MIGRATIONS[usize::try_from(target - 1).unwrap()])
+                .unwrap();
+            let sql = t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            let _: i64 = tx
+                .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            println!(
+                "migration {target}, rolled back: SQL {sql:.2} s, foreign key check {:.2} s",
+                t.elapsed().as_secs_f64()
+            );
+        }
+        for target in from + 1..=SCHEMA_VERSION {
+            let t = Instant::now();
+            migrate_to(&mut conn, target).unwrap();
+            println!("migration {target}: {:.2} s", t.elapsed().as_secs_f64());
+        }
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+    }
 }

@@ -216,6 +216,19 @@ refused: the workbook has more than 1,600,000 cells ...`, and how to raise the c
     (`match`), with the document in the edge's evidence: `Neighbours` with `direction` in and
     `edge_kinds` party lists them. A company that ingest has not patched since the upgrade can
     still show the old stored list until its next document.
+- **Neighbours** and **CompanyDocuments** page as ListRecords does (issue #112): `page_size`
+  (default 50, at most 1000; more is `INVALID_ARGUMENT`), `page_token` and `next_page_token`.
+  A page also ends with the item that brings it to 3 MiB (node keys and props, and for
+  Neighbours the edges' props and evidence, as JSON text). **Since #112 a client that ignores
+  `next_page_token` sees only the first page**, 50 items by default: before, both returned
+  every item in one response. Pass the same filters with each `page_token`. Neighbours are
+  ordered by edge kind (its name), then `valid_from` (undated first), then edge id, as before.
+  CompanyDocuments lists each document once, in the order of its first live `party` edge to
+  the company (that edge's `valid_from`, undated first, then its id; edge ids are UUIDv7, so
+  undated documents come in the order they were linked); before #112 they were ordered by key.
+  A token that is not one from a previous page is `INVALID_ARGUMENT`; an empty page still
+  tells a missing node (`NOT_FOUND`) and, for CompanyDocuments, a node that is not a company
+  (`INVALID_ARGUMENT`) apart. See [Pages of Neighbours and CompanyDocuments](#pages-of-neighbours-and-companydocuments).
 - **Search** matches every word of `text` and every filter that is set (company, kind, date and
   amount ranges, source), with `limit` (up to 1000) and `offset`.
 
@@ -523,7 +536,9 @@ grpcurl -plaintext -d '{"key": {"kind": "NODE_KIND_COMPANY", "key": "acme"}}' \
     127.0.0.1:7443 doewood.v1.GraphService/GetNode
 grpcurl -plaintext -d '{"node_id": "<uuid>", "direction": "DIRECTION_IN", "edge_kinds": ["EDGE_KIND_PARTY"]}' \
     127.0.0.1:7443 doewood.v1.GraphService/Neighbours
-grpcurl -plaintext -d '{"company_id": "<uuid>"}' 127.0.0.1:7443 doewood.v1.GraphService/CompanyDocuments
+grpcurl -plaintext -d '{"company_id": "<uuid>", "page_size": 1000}' 127.0.0.1:7443 doewood.v1.GraphService/CompanyDocuments
+grpcurl -plaintext -d '{"company_id": "<uuid>", "page_size": 1000, "page_token": "<next_page_token>"}' \
+    127.0.0.1:7443 doewood.v1.GraphService/CompanyDocuments
 grpcurl -plaintext -d '{"company_id": "<uuid>", "page_size": 20}' 127.0.0.1:7443 doewood.v1.GraphService/ListMerges
 grpcurl -plaintext -d '{"merge_id": "<uuid>", "dismiss": true, "reason": "not the same company"}' \
     127.0.0.1:7443 doewood.v1.GraphService/UndoMerge
@@ -738,6 +753,58 @@ each, `origin/main` at `77524d9` before and this change after.
 The peak of a page of big records drops from two to 2.7 times the whole page's 37.5 MiB of
 bodies to about twice the 3 MiB budget. Walking big records takes more pages, so more
 round trips: 20 to 60 % longer in all. Small records page as before.
+
+## Pages of Neighbours and CompanyDocuments
+
+Before issue #112 `Neighbours` and `CompanyDocuments` returned every item in one response: for
+a company with 12,504 documents, 150 ms and every node in memory at once (docs/deploy.md,
+issue #127). They now page with ListRecords' size, maximum and byte budget
+(`RECORDS_PAGE_BYTES`, 3 MiB), through `GraphStore::neighbours_page` and
+`GraphStore::company_documents_page`.
+
+The token is a place in the order, not an offset: `<edge kind>.<Julian day of valid_from,
+empty when undated>.<edge id>` of the page's last edge (opaque to clients; a CompanyDocuments
+token is always a `party` edge). Schema 12 (SQLite) and 10 (Postgres) rebuild `edges_by_dst`
+as `(dst, kind, valid_from with undated lowest, id)`, the order of a node's incoming edges, so
+a page reads the index from its token and stops at its size:
+
+- A page is a `UNION ALL` of index ranges, each limited to the page size: per direction, and
+  after a token one range for the rest of the token's kind (on SQLite two: the rest of its
+  day, then later days, since SQLite starts no scan at a row value holding an expression)
+  and one for the kinds after it. The merge sorts at most a page per range. Outgoing edges use
+  `edges_by_src (src, kind)` as before and are sorted per page: a node's outgoing edges are
+  few (ingest caps `similar_to` at 100 a document), so that index was left narrow.
+- CompanyDocuments reads the company's party edges in that order and keeps an edge only when
+  it is its document's first live party edge to the company (an index probe per edge, no
+  `DISTINCT` over the company), which is why it is ordered by that edge rather than by key.
+- Postgres reads a page through a portal 64 rows at a time, so it stops at the byte budget
+  as ListRecords does; SQLite reads row by row. Edge kinds sort in the database's collation on
+  Postgres (before, `COLLATE "C"`), which orders the 14 kind names the same in any collation
+  that orders lowercase letters alphabetically.
+- The plan tests (`graph_pages_start_at_their_token` in `doewood-store` and `doewood-pg`)
+  assert the ranges and that nothing sorts more than a page; `graph_pages_match_the_queries_before`
+  walks pages of 7 and 1000 against the queries before #112 (the same neighbours in the same
+  order; the same documents, once each); the conformance case `graph_pages` walks every
+  direction and filter at several sizes and byte budgets on both backends.
+
+Measured with `api_load` (release build, 10 s a step, `DOEWOOD_BENCH_DOCS=12000
+DOEWOOD_BENCH_COMPANIES=1 DOEWOOD_BENCH_ONLY=CompanyDocuments DOEWOOD_BENCH_IDLE=0
+DOEWOOD_BENCH_WATCH_PCT=0`, one company with all 12,000 documents, the #127 shape;
+`pgvector/pgvector:pg17` on an internal Docker network; 4-core server, other agents' builds
+queued behind the same lock). Before: `staging` at `72b459c`, every document in each
+response; after: the default first page of 50. RSS is the whole test process (server and
+clients), its peak during the step.
+
+| | p50 / p99, 1 client | peak RSS | p50 / p99, 10 clients | calls/s, 10 clients | peak RSS |
+|---|---|---|---|---|---|
+| SQLite, before | 57.7 / 81.0 ms | 98 MiB | 170 / 238 ms | 58 | 140 MiB |
+| SQLite, after | 0.42 / 1.17 ms | 38 MiB | 1.8 / 5.1 ms | 5,116 | 40 MiB |
+| Postgres, before | 48.5 / 78.6 ms | 68 MiB | 111 / 178 ms | 90 | 68 MiB |
+| Postgres, after | 1.24 / 1.98 ms | 18 MiB | 1.6 / 3.3 ms | 5,862 | 20 MiB |
+
+A client that needs every document now walks 12 pages of 1000 (or 240 of 50), and then the
+empty page that a full last page's token leads to; each page costs its own size, so the walk
+is linear.
 
 ## Search by company
 

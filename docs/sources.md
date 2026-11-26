@@ -66,7 +66,7 @@ again (issue #131):
 
 - Every GetObject response of a single-part object without SSE-KMS or SSE-C records its ETag
   and size against the content's BLAKE3 hash (the instance store's `known_content` table,
-  schema 12), whatever the source's setting.
+  schema 13), whatever the source's setting.
 - When a source has the setting on, a pending object whose listed ETag is 32 hex digits (no
   `-<parts>` suffix, so not a multipart upload) and whose listed size match such a row gets a
   HEAD. Only when the HEAD reports the same ETag and size, and no SSE-KMS
