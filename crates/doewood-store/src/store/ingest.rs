@@ -7,7 +7,7 @@
 //!   analyses may run at once. Unset means [`DEFAULT_SUMMARIZE_MAX_CONCURRENT`]. Read for every
 //!   `Summarize` call.
 
-use super::Store;
+use super::{Snapshot, Store};
 use crate::StoreError;
 
 /// Settings key of the `similar_to` threshold.
@@ -67,21 +67,9 @@ impl Store {
     /// Ingest's settings. A missing row gives the default; so does a stored value that is not
     /// valid (only possible by editing the file by hand).
     pub fn ingest_settings(&self) -> Result<IngestSettings, StoreError> {
-        let similar_min_jaccard = self
-            .setting(SIMILAR_MIN_JACCARD)?
-            .and_then(|v| v.as_f64())
-            .filter(|x| valid_min_jaccard(*x))
-            .unwrap_or(DEFAULT_SIMILAR_MIN_JACCARD);
-        let summarize_max_concurrent = self
-            .setting(SUMMARIZE_MAX_CONCURRENT)?
-            .and_then(|v| v.as_u64())
-            .and_then(|n| u32::try_from(n).ok())
-            .filter(|n| valid_summarize_max_concurrent(*n))
-            .unwrap_or(DEFAULT_SUMMARIZE_MAX_CONCURRENT);
-        Ok(IngestSettings {
-            similar_min_jaccard,
-            summarize_max_concurrent,
-        })
+        // `Snapshot::ingest_settings` itself is not general enough over the snapshot's lifetime.
+        #[allow(clippy::redundant_closure_for_method_calls)]
+        self.snapshot(|s| s.ingest_settings())
     }
 
     /// Applies `patch` and returns the settings now in effect. An invalid value changes
@@ -113,6 +101,27 @@ impl Store {
             self.set_setting(SUMMARIZE_MAX_CONCURRENT, &serde_json::json!(n))?;
         }
         self.ingest_settings()
+    }
+}
+
+impl Snapshot<'_> {
+    /// Ingest's settings ([`Store::ingest_settings`]).
+    pub fn ingest_settings(&self) -> Result<IngestSettings, StoreError> {
+        let similar_min_jaccard = self
+            .setting(SIMILAR_MIN_JACCARD)?
+            .and_then(|v| v.as_f64())
+            .filter(|x| valid_min_jaccard(*x))
+            .unwrap_or(DEFAULT_SIMILAR_MIN_JACCARD);
+        let summarize_max_concurrent = self
+            .setting(SUMMARIZE_MAX_CONCURRENT)?
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| valid_summarize_max_concurrent(*n))
+            .unwrap_or(DEFAULT_SUMMARIZE_MAX_CONCURRENT);
+        Ok(IngestSettings {
+            similar_min_jaccard,
+            summarize_max_concurrent,
+        })
     }
 }
 

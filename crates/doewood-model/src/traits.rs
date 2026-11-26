@@ -95,9 +95,38 @@ pub trait GraphStore: Send + Sync {
     /// A node by kind and key.
     async fn node_by_key(&self, kind: NodeKind, key: &str) -> Result<Option<Node>>;
 
+    /// The ids of the nodes of `kind` with `keys`, in the same order; `None` for a missing
+    /// one. A backend may read them in one statement (issue #126). At most
+    /// [`crate::GRAPH_BATCH_MAX`] per call.
+    async fn node_ids(&self, kind: NodeKind, keys: &[String]) -> Result<Vec<Option<Uuid>>> {
+        crate::validate_batch_count(keys.len())?;
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            out.push(self.node_by_key(kind, key).await?.map(|n| n.id));
+        }
+        Ok(out)
+    }
+
     /// Inserts the edge, or updates the edge with the same `(src, dst, kind, source,
     /// valid_from)`. Returns its id. Both nodes must exist.
     async fn upsert_edge(&self, edge: &Edge) -> Result<Uuid>;
+
+    /// [`GraphStore::upsert_edge`] of each edge, in order, as if one call followed the other;
+    /// the ids in the same order. An invalid edge fails the call before anything is written.
+    /// A backend may write them in one transaction (issue #126; Postgres pipelines it, one
+    /// round trip), so an error may leave none of them written. Writers that can race on the
+    /// same edges keep them in one order. At most [`crate::GRAPH_BATCH_MAX`] per call.
+    async fn upsert_edges(&self, edges: &[Edge]) -> Result<Vec<Uuid>> {
+        crate::validate_batch_count(edges.len())?;
+        for e in edges {
+            e.validate()?;
+        }
+        let mut out = Vec::with_capacity(edges.len());
+        for e in edges {
+            out.push(self.upsert_edge(e).await?);
+        }
+        Ok(out)
+    }
 
     /// [`GraphStore::upsert_edge`] onto live companies (issue #48): an end that is a
     /// merged-away company (a husk with `merged_into`, ADR 0002 section 1.8) is replaced by

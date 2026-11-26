@@ -531,6 +531,44 @@ proxy that reads the wire protocol, and fails above the targets (each store call
 one round trip; the `throughput` mix is at most 15 statements and 14.5 round trips per
 document, 32.25 of each before).
 
+### Similar documents on near-duplicate corpora (issue #126)
+
+`near_duplicate_corpus` in `crates/doewood-ingest/tests/round_trips.rs` (ignored) writes a
+generated corpus through the graph writer, one document after the other: four in five
+documents come from one of 4 templates (a shared 300-word body under a header of their own,
+like the invoices of one supplier; Jaccard about 0.9, most of the 32 LSH bands shared), the
+fifth is distinct. So a template document has 100 candidates (`max_candidates`) and about 80
+`similar_to` edges on average over the corpus. Test profile, Postgres 17 in a container on
+an internal Docker network on the same machine, a SQLite store file; `main` at `baf53ad`
+against this change, back to back on a shared machine:
+
+| store | documents | graph write per document before / after | round trips per document before / after |
+|---|---|---|---|
+| Postgres | 1,200 to 3,600 | 114 to 120 / 20 to 25 ms | 166 / 7.6 |
+| SQLite | 1,200 to 4,000 | 35 to 42 / 23 to 34 ms | (one writer hop per edge / one per batch) |
+
+(Round trips counted through the proxy at 2,000 documents; the times are with a direct
+connection, since the proxy adds to every message.) The edges are the same: the digest of
+every `similar_to` edge (ends by key, props, confidence) is equal before and after on both
+stores, and `tests/similar.rs` compares the edges with the per-candidate loop of before on
+both stores in CI.
+
+What changed: `GraphStore::node_ids` reads the candidates' Document nodes in one statement
+(the few missing ones are still created one by one), and `GraphStore::upsert_edges` writes
+the edges in one transaction: pipelined on Postgres (`BEGIN`, the upserts and `COMMIT` in
+one round trip), one writer call on SQLite. A document costs 8 round trips on Postgres
+however many similar documents it has (`similar_documents_take_a_fixed_number_of_round_trips`),
+against 8 plus 2 per similar document before.
+
+**The candidate query still grows with the bucket.** It counts every `sketch_bands` row
+that shares a band, then keeps the best 100. At 10,000 documents (2,000 per template) it
+reads 53,543 index entries for one template document (`EXPLAIN (ANALYZE, BUFFERS)`: 26 ms;
+13.5 ms best of 5 from the client), against 10,400 entries at 2,000 documents: linear in the
+number of near-duplicates, so quadratic over a corpus of one template. The graph write per
+document rose from 25 ms at 2,000 documents to 31 ms at 10,000 on Postgres. A bound on the
+bucket (an LSH "stop band") would change which edges exist, so it is left to a decision
+(issue #126).
+
 ### API under many clients (issue #80)
 
 `api_load` in `crates/doewood-api/tests/api_load.rs` (ignored): an in-process API server on a
@@ -984,6 +1022,34 @@ takes traffic (on average half a period after ready). The chart's readiness prob
 2 s (it ran every 5 s before) with 8 failures, about 16 s before a pod that lost Postgres is
 taken out, as before. The liveness probe stays at every 10 s with 6 failures: the process
 answers `/healthz` from the start, and a slow start never needs more.
+
+### The instance store per file (issue #128)
+
+Each file made three blocking calls to the instance store: its ingest status, its source
+and the runtime settings, and the finish. The status was read on the writer, so it waited
+behind the scanner's `record_objects` and the other workers' `finish_object` commits. Now
+each attempt reads the status, the source and the settings in one read transaction on a
+read-only connection (an instance read, so it keeps its priority over the API's, #109); the
+settings are still read per file, and the finish stays on the writer. The other read-only
+`objects_seen` reads (`seen_objects`, `seen_object`, `live_object_count`,
+`pending_objects`, `ingested_objects`) moved to the readers too. None needs to see its own
+uncommitted writes: every write commits before it returns, and `inflight` holds a key until
+its attempt is recorded, so the status a worker reads is the committed one.
+
+Measured with `throughput` (release build, `DOEWOOD_BENCH_FILES=2000 DOEWOOD_BENCH_JOBS=4
+DOEWOOD_BENCH_READERS=4`: the store on disk with 4 readers, one API client asking for a
+`ListRecords` page of 100 every millisecond; `main` at `af345f7` against this change, the
+two test binaries run alternately, 3 runs each):
+
+| | files/s | store stage per file | writer lock wait mean / p99 | `ListRecords` mean |
+|---|---|---|---|---|
+| before | 341, 338, 341 | 1.42, 1.45, 1.46 ms (12%) | 646 to 668 us / 3.8 to 4.2 ms | 10.4 to 10.6 ms |
+| after | 354, 354, 345 | 1.00, 0.98, 1.00 ms (9%) | 685 to 710 us / 3.8 to 4.2 ms | 10.3 to 10.7 ms |
+
+- **4% more files/s** (median 354 against 341), and the store stage takes 30% less per file.
+- **The writer's lock wait is unchanged** within noise (a trivial writer call every
+  millisecond; slightly higher mean, as more files a second commit more finishes). The
+  writer now serves only writes on this path.
 
 ### Requests and limits
 
