@@ -29,7 +29,7 @@ pub use enrichment::{
     Enrichment, EnrichmentOptions, EnrichmentParts, EnrichmentStats, Feed, FeedOptions, FeedStats,
     FeedTemplates, Templates, WebClientFactory,
 };
-pub use graph::{GraphWriter, SimilarityConfig, WriteStats};
+pub use graph::{GraphWriter, Similar, SimilarityConfig, WriteStats};
 pub use llm::{
     Clock, OnDemandSummary, QueueConfig, Summaries, SummariesParts, SummarizeError, SummarizeInput,
     SystemClock,

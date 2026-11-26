@@ -3,6 +3,9 @@
 //!
 //! - The settings row `ingest.similar_min_jaccard` holds the least `MinHash` Jaccard estimate
 //!   for a `similar_to` edge. Unset means [`DEFAULT_SIMILAR_MIN_JACCARD`].
+//! - The settings row `ingest.similar_max_bucket` holds the largest LSH band bucket the
+//!   `similar_to` candidate query reads (issue #148): a band key more documents share is
+//!   skipped. Unset means [`DEFAULT_SIMILAR_MAX_BUCKET`].
 //! - The settings row `ingest.summarize_max_concurrent` holds how many on-demand `Summarize`
 //!   analyses may run at once. Unset means [`DEFAULT_SUMMARIZE_MAX_CONCURRENT`]. Read for every
 //!   `Summarize` call.
@@ -15,6 +18,21 @@ pub const SIMILAR_MIN_JACCARD: &str = "ingest.similar_min_jaccard";
 
 /// The `similar_to` threshold when none is set.
 pub const DEFAULT_SIMILAR_MIN_JACCARD: f64 = 0.8;
+
+/// Settings key of the largest band bucket the `similar_to` candidate query reads.
+pub const SIMILAR_MAX_BUCKET: &str = "ingest.similar_max_bucket";
+
+/// The largest band bucket read when none is set: a band key shared by more documents is a
+/// template's boilerplate, not similarity (issue #148).
+pub const DEFAULT_SIMILAR_MAX_BUCKET: u32 = 1000;
+
+/// The range [`SIMILAR_MAX_BUCKET`] accepts.
+pub const SIMILAR_MAX_BUCKET_RANGE: std::ops::RangeInclusive<u32> = 10..=1_000_000;
+
+/// Whether `n` is a usable largest band bucket: 10 to 1,000,000.
+pub fn valid_similar_max_bucket(n: u32) -> bool {
+    SIMILAR_MAX_BUCKET_RANGE.contains(&n)
+}
 
 /// Settings key of the on-demand `Summarize` cap.
 pub const SUMMARIZE_MAX_CONCURRENT: &str = "ingest.summarize_max_concurrent";
@@ -41,6 +59,8 @@ pub fn valid_min_jaccard(x: f64) -> bool {
 pub struct IngestSettings {
     /// Least `MinHash` Jaccard estimate for a `similar_to` edge.
     pub similar_min_jaccard: f64,
+    /// Largest LSH band bucket the `similar_to` candidate query reads.
+    pub similar_max_bucket: u32,
     /// On-demand `Summarize` analyses (with the object read before them) at once.
     pub summarize_max_concurrent: u32,
 }
@@ -49,6 +69,7 @@ impl Default for IngestSettings {
     fn default() -> Self {
         Self {
             similar_min_jaccard: DEFAULT_SIMILAR_MIN_JACCARD,
+            similar_max_bucket: DEFAULT_SIMILAR_MAX_BUCKET,
             summarize_max_concurrent: DEFAULT_SUMMARIZE_MAX_CONCURRENT,
         }
     }
@@ -59,6 +80,8 @@ impl Default for IngestSettings {
 pub struct IngestSettingsPatch {
     /// The new `similar_to` threshold.
     pub similar_min_jaccard: Option<f64>,
+    /// The new largest band bucket.
+    pub similar_max_bucket: Option<u32>,
     /// The new on-demand `Summarize` cap.
     pub summarize_max_concurrent: Option<u32>,
 }
@@ -85,6 +108,15 @@ impl Store {
                 "{SIMILAR_MIN_JACCARD} must be above 0 and at most 1"
             )));
         }
+        if let Some(n) = patch.similar_max_bucket
+            && !valid_similar_max_bucket(n)
+        {
+            return Err(StoreError::InvalidSetting(format!(
+                "{SIMILAR_MAX_BUCKET} must be {} to {}",
+                SIMILAR_MAX_BUCKET_RANGE.start(),
+                SIMILAR_MAX_BUCKET_RANGE.end()
+            )));
+        }
         if let Some(n) = patch.summarize_max_concurrent
             && !valid_summarize_max_concurrent(n)
         {
@@ -96,6 +128,9 @@ impl Store {
         }
         if let Some(x) = patch.similar_min_jaccard {
             self.set_setting(SIMILAR_MIN_JACCARD, &serde_json::json!(x))?;
+        }
+        if let Some(n) = patch.similar_max_bucket {
+            self.set_setting(SIMILAR_MAX_BUCKET, &serde_json::json!(n))?;
         }
         if let Some(n) = patch.summarize_max_concurrent {
             self.set_setting(SUMMARIZE_MAX_CONCURRENT, &serde_json::json!(n))?;
@@ -112,6 +147,12 @@ impl Snapshot<'_> {
             .and_then(|v| v.as_f64())
             .filter(|x| valid_min_jaccard(*x))
             .unwrap_or(DEFAULT_SIMILAR_MIN_JACCARD);
+        let similar_max_bucket = self
+            .setting(SIMILAR_MAX_BUCKET)?
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| valid_similar_max_bucket(*n))
+            .unwrap_or(DEFAULT_SIMILAR_MAX_BUCKET);
         let summarize_max_concurrent = self
             .setting(SUMMARIZE_MAX_CONCURRENT)?
             .and_then(|v| v.as_u64())
@@ -120,6 +161,7 @@ impl Snapshot<'_> {
             .unwrap_or(DEFAULT_SUMMARIZE_MAX_CONCURRENT);
         Ok(IngestSettings {
             similar_min_jaccard,
+            similar_max_bucket,
             summarize_max_concurrent,
         })
     }
@@ -180,6 +222,7 @@ mod tests {
                 .set_ingest_settings(&IngestSettingsPatch {
                     similar_min_jaccard: Some(0.5),
                     summarize_max_concurrent: Some(bad),
+                    ..IngestSettingsPatch::default()
                 })
                 .unwrap_err();
             assert!(matches!(err, StoreError::InvalidSetting(_)), "{bad}: {err}");
@@ -195,6 +238,47 @@ mod tests {
         ] {
             s.set_setting(SUMMARIZE_MAX_CONCURRENT, &bad).unwrap();
             assert_eq!(s.ingest_settings().unwrap().summarize_max_concurrent, 2);
+        }
+    }
+
+    #[test]
+    fn max_bucket_set_validated_and_kept_apart() {
+        let s = store();
+        assert_eq!(s.ingest_settings().unwrap().similar_max_bucket, 1000);
+        for n in [10, 5000, 1_000_000] {
+            let set = s
+                .set_ingest_settings(&IngestSettingsPatch {
+                    similar_max_bucket: Some(n),
+                    ..IngestSettingsPatch::default()
+                })
+                .unwrap();
+            assert_eq!(set.similar_max_bucket, n);
+            assert_eq!(
+                set.summarize_max_concurrent,
+                DEFAULT_SUMMARIZE_MAX_CONCURRENT
+            );
+        }
+        // Out of range: refused, and nothing in the patch is written.
+        for bad in [0, 9, 1_000_001, u32::MAX] {
+            let err = s
+                .set_ingest_settings(&IngestSettingsPatch {
+                    similar_min_jaccard: Some(0.5),
+                    similar_max_bucket: Some(bad),
+                    ..IngestSettingsPatch::default()
+                })
+                .unwrap_err();
+            assert!(matches!(err, StoreError::InvalidSetting(_)), "{bad}: {err}");
+        }
+        let now = s.ingest_settings().unwrap();
+        assert_eq!(now.similar_max_bucket, 1_000_000);
+        assert!((now.similar_min_jaccard - DEFAULT_SIMILAR_MIN_JACCARD).abs() < f64::EPSILON);
+        // A bad stored value reads as the default.
+        for bad in [serde_json::json!(5), serde_json::json!("2000")] {
+            s.set_setting(SIMILAR_MAX_BUCKET, &bad).unwrap();
+            assert_eq!(
+                s.ingest_settings().unwrap().similar_max_bucket,
+                DEFAULT_SIMILAR_MAX_BUCKET
+            );
         }
     }
 

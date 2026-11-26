@@ -105,7 +105,10 @@ The comments in the `.proto` files are the reference for every field. In short:
   the next file without a restart. Edges already written are kept; `ReprocessJob` with
   `force: true` compares a source's documents again (a lower value adds edges, a higher one
   removes none). It replaces the old `DOEWOOD_SIMILAR_MIN_JACCARD` variable (see
-  [configuration.md](configuration.md)). `summarize_max_concurrent` is how many `Summarize`
+  [configuration.md](configuration.md)). `similar_max_bucket` is the largest LSH band bucket
+  the `similar_to` candidate query reads: 10 to 1000000 (default 1000), anything else is
+  `INVALID_ARGUMENT`; a band key shared by more documents is skipped (issue #148, see
+  [ingest.md](ingest.md)). `summarize_max_concurrent` is how many `Summarize`
   calls read and analyze a file at once: 1 to 16 (default 2), anything else is
   `INVALID_ARGUMENT`. It is read for every `Summarize` call, so it applies to the next one;
   calls in flight keep running.
@@ -770,6 +773,21 @@ for the small company, it reads its 10 edges and 10 rows. The first attempt guar
 with a regular expression (`~ '^[0-9a-f]{64}$'`), which alone cost 150 ms on 25,000 keys; the
 guard is now `starts_with(d.key, 'ref:')`, since document keys are validated (lowercase hex or
 a `ref:` placeholder).
+
+## Search on words alone
+
+A search with words and no other filter (issue #140) used to join every match to its
+`search_index` row and sort them all by score, date and hash before taking the page, so a
+word in a quarter of the documents cost a row read per match. SQLite now scores the matches
+on the FTS index alone, takes the score of the last hit the page can reach (the
+`limit + offset`-th best) as a cut, and joins and sorts only the matches scoring at least
+that: every match below the cut has at least `limit + offset` matches ahead of it, so the page
+is the same, ties included (`text_search_matches_the_query_before` in
+`crates/doewood-store/src/standalone/search_scale.rs` compares every page of 9 texts and 9
+pages on two generated corpora with the query before). Searches with a filter, and Postgres
+(whose rank and sort keys are in the same heap row), run as before. Every match is still
+scored: the ranking (`bm25` on SQLite, `ts_rank` on Postgres) needs all of them for an exact
+page. See [deploy.md](deploy.md#search-on-a-big-corpus-issue-140) for the measurements.
 
 ## Tests
 

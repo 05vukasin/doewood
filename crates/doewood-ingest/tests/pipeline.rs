@@ -1065,6 +1065,54 @@ async fn similarity_uses_the_stored_threshold() {
     h.stop().await;
 }
 
+/// The largest band bucket is the runtime setting `similar_max_bucket` (issue #148): once more
+/// documents share a band key than it allows, the band is skipped and counted
+/// (`Stats::similar_buckets_skipped`, the `doewood_ingest_similar_buckets_skipped_total`
+/// metric). Below the limit nothing is skipped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn similarity_skips_buckets_above_the_stored_limit() {
+    use doewood_store::IngestSettingsPatch;
+
+    let store = Arc::new(Store::open_in_memory(&MasterKey::from_bytes([8; 32])).unwrap());
+    let backend: Arc<dyn Backend> = Arc::new(Standalone::new(Arc::clone(&store)));
+    let h = Harness::start(
+        Arc::clone(&store),
+        Arc::clone(&backend),
+        1,
+        Duration::from_millis(10),
+    );
+    store
+        .set_ingest_settings(&IngestSettingsPatch {
+            similar_max_bucket: Some(10),
+            ..IngestSettingsPatch::default()
+        })
+        .unwrap();
+    // One text, one word changed per copy: the copies share most of their 32 band keys.
+    let copy = |i: usize| {
+        let text = common::prose(11, 600);
+        let mut words: Vec<&str> = text.split(' ').collect();
+        words[(i * 37 + 5) % 600] = "changed";
+        words.join(" ").into_bytes()
+    };
+    for i in 0..10 {
+        h.put(&[(&format!("in/{i}.txt"), copy(i), true)]).await;
+        h.settle().await;
+    }
+    assert_eq!(
+        h.ingest.stats().similar_buckets_skipped,
+        0,
+        "10 fit the limit"
+    );
+    h.put(&[("in/10.txt", copy(10), true)]).await;
+    h.settle().await;
+    let skipped = h.ingest.stats().similar_buckets_skipped;
+    assert!(
+        skipped >= 10,
+        "the 11th document skips its shared bands: {skipped}"
+    );
+    h.stop().await;
+}
+
 /// File `i` of `throughput`'s mix: a contract PDF (its supplier distinct, its buyer the same
 /// company in every one), an amendment DOCX citing the contract before it, an invoice TXT
 /// and a small XLSX, in turn.

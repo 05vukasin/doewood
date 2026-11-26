@@ -14,12 +14,12 @@ use time::Date;
 use uuid::Uuid;
 
 use crate::{
-    Blake3, CacheRow, DismissRequest, Dismissal, DismissalQuery, DueCompany, Edge, Enrichment,
-    FeedState, IconRow, LiveEdge, Located, LocationEnded, MergeEntry, MergeQuery, MergeRequest,
-    Neighbour, NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation, OwnedAlias, Proposal,
-    ProposalQuery, ProposalRequest, PropsPatch, PutOutcome, Record, ResolveRequest, Result,
-    SearchDoc, SearchHit, SearchQuery, Sketch, SourceClaim, SourceKey, SplitRequest, StepVersions,
-    UndoOutcome, UndoRequest,
+    Blake3, CacheRow, Candidates, DismissRequest, Dismissal, DismissalQuery, DueCompany, Edge,
+    Enrichment, FeedState, IconRow, LiveEdge, Located, LocationEnded, MergeEntry, MergeQuery,
+    MergeRequest, Neighbour, NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation, OwnedAlias,
+    Proposal, ProposalQuery, ProposalRequest, PropsPatch, PutOutcome, Record, ResolveRequest,
+    Result, SearchDoc, SearchHit, SearchQuery, Sketch, SourceClaim, SourceKey, SplitRequest,
+    StepVersions, UndoOutcome, UndoRequest,
 };
 
 /// quail and hedgehog records, keyed by BLAKE3.
@@ -113,8 +113,8 @@ pub trait GraphStore: Send + Sync {
 
     /// [`GraphStore::upsert_edge`] of each edge, in order, as if one call followed the other;
     /// the ids in the same order. An invalid edge fails the call before anything is written.
-    /// A backend may write them in one transaction (issue #126; Postgres pipelines it, one
-    /// round trip), so an error may leave none of them written. Writers that can race on the
+    /// A backend may write them in one transaction (Postgres: one statement, issues #126 and
+    /// #148), so an error may leave none of them written. Writers that can race on the
     /// same edges keep them in one order. At most [`crate::GRAPH_BATCH_MAX`] per call.
     async fn upsert_edges(&self, edges: &[Edge]) -> Result<Vec<Uuid>> {
         crate::validate_batch_count(edges.len())?;
@@ -307,6 +307,20 @@ pub trait SketchStore: Send + Sync {
         exclude: &Blake3,
         limit: u32,
     ) -> Result<Vec<Sketch>>;
+
+    /// [`SketchStore::sketch_candidates`] over only the bands whose bucket holds at most
+    /// `max_bucket` documents (`exclude` included, once its sketch is stored): the LSH "stop
+    /// band" of issue #148. A larger bucket is a template's boilerplate, not similarity, and
+    /// reading it would cost a row per document in it. The bucket sizes are kept with the
+    /// bands, so the check is one row per band. Also returns how many distinct band keys were
+    /// skipped.
+    async fn sketch_candidates_within(
+        &self,
+        bands: &[u64],
+        exclude: &Blake3,
+        limit: u32,
+        max_bucket: u32,
+    ) -> Result<Candidates>;
 }
 
 /// The page size [`SketchStore::sketch_candidates`] uses for `limit`.

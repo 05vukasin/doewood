@@ -13,10 +13,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use doewood_core::InstanceId;
 use doewood_model::{
-    Backend, Blake3, ClaimStore, Direction, Edge, EdgeKind, EdgeSource, Error, GraphStore,
-    LiveEdge, Located, LocationEnded, MERGE_CHAIN_MAX, Neighbour, NeighbourQuery, Node, NodeAlias,
-    NodeKind, ObjectLocation, OwnedAlias, PropsPatch, PutOutcome, Record, RecordStore, Result,
-    SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore, Sketch, SketchStore,
+    Backend, Blake3, Candidates, ClaimStore, Direction, Edge, EdgeKind, EdgeSource, Error,
+    GraphStore, LiveEdge, Located, LocationEnded, MERGE_CHAIN_MAX, Neighbour, NeighbourQuery, Node,
+    NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PropsPatch, PutOutcome, Record, RecordStore,
+    Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore, Sketch, SketchStore,
     SourceClaim, SourceKey, StepVersions, StoredEdge, band_to_i64, merged_into, records_limit,
     sketch_limit, validate_alias, validate_batch_count, validate_hashes, validate_node,
     validate_sketch, versions_from_json, versions_to_json,
@@ -45,6 +45,8 @@ mod read_paths;
 mod scale;
 #[cfg(test)]
 mod search_company;
+#[cfg(test)]
+mod search_scale;
 
 /// The candidate query for `bands` band keys, then the excluded hash and the limit. As on
 /// Postgres (issue #74): the bands are counted and limited on `sketch_bands` alone (its
@@ -1145,8 +1147,21 @@ impl SketchStore for Standalone {
         exclude: &Blake3,
         limit: u32,
     ) -> Result<Vec<Sketch>> {
+        Ok(self
+            .sketch_candidates_within(bands, exclude, limit, u32::MAX)
+            .await?
+            .sketches)
+    }
+
+    async fn sketch_candidates_within(
+        &self,
+        bands: &[u64],
+        exclude: &Blake3,
+        limit: u32,
+        max_bucket: u32,
+    ) -> Result<Candidates> {
         if bands.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Candidates::default());
         }
         if bands.len() > SKETCH_MAX_BANDS {
             return Err(Error::Invalid(format!(
@@ -1154,16 +1169,41 @@ impl SketchStore for Standalone {
             )));
         }
         let (exclude, limit) = (*exclude, i64::from(sketch_limit(limit)));
-        let mut args: Vec<Sql> = bands
-            .iter()
-            .map(|b| Sql::Integer(band_to_i64(*b)))
-            .collect();
-        args.push(Sql::Blob(exclude.as_bytes().to_vec()));
-        args.push(Sql::Integer(limit));
-        let bands_len = bands.len();
+        let bands: Vec<i64> = bands.iter().map(|b| band_to_i64(*b)).collect();
         self.read(move |conn| {
+            // Issue #148: the bands whose bucket is too large, one `sketch_band_sizes` row
+            // each; `u32::MAX` (no limit) skips the lookup.
+            let big: BTreeSet<i64> = if max_bucket == u32::MAX {
+                BTreeSet::new()
+            } else {
+                let marks = vec!["?"; bands.len()].join(", ");
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT band FROM sketch_band_sizes WHERE band IN ({marks}) AND docs > ?"
+                    ))
+                    .map_err(sql)?;
+                let args = bands
+                    .iter()
+                    .map(|b| Sql::Integer(*b))
+                    .chain([Sql::Integer(i64::from(max_bucket))]);
+                let rows = stmt
+                    .query_map(params_from_iter(args), |r| r.get(0))
+                    .map_err(sql)?;
+                rows.collect::<rusqlite::Result<_>>().map_err(sql)?
+            };
+            let kept: Vec<i64> = bands.iter().copied().filter(|b| !big.contains(b)).collect();
+            let skipped_bands = u32::try_from(big.len()).unwrap_or(u32::MAX);
+            if kept.is_empty() {
+                return Ok(Candidates {
+                    sketches: Vec::new(),
+                    skipped_bands,
+                });
+            }
+            let mut args: Vec<Sql> = kept.iter().map(|b| Sql::Integer(*b)).collect();
+            args.push(Sql::Blob(exclude.as_bytes().to_vec()));
+            args.push(Sql::Integer(limit));
             let mut stmt = conn
-                .prepare(&sketch_candidates_sql(bands_len))
+                .prepare(&sketch_candidates_sql(kept.len()))
                 .map_err(sql)?;
             let rows = stmt
                 .query_map(params_from_iter(args), |r| {
@@ -1174,15 +1214,20 @@ impl SketchStore for Standalone {
                     ))
                 })
                 .map_err(sql)?;
-            rows.map(|row| {
-                let (h, signature, shared) = row.map_err(sql)?;
-                Ok(Sketch {
-                    blake3: Blake3::from_slice(&h)?,
-                    signature,
-                    shared_bands: u32::try_from(shared).unwrap_or(u32::MAX),
+            let sketches = rows
+                .map(|row| {
+                    let (h, signature, shared) = row.map_err(sql)?;
+                    Ok(Sketch {
+                        blake3: Blake3::from_slice(&h)?,
+                        signature,
+                        shared_bands: u32::try_from(shared).unwrap_or(u32::MAX),
+                    })
                 })
+                .collect::<Result<_>>()?;
+            Ok(Candidates {
+                sketches,
+                skipped_bands,
             })
-            .collect()
         })
         .await
     }
@@ -1339,6 +1384,9 @@ impl SearchStore for Standalone {
         let q = q.clone();
         self.read(move |conn| {
             let words = q.words();
+            if !words.is_empty() && only_text(&q) {
+                return text_search(conn, &words, &q);
+            }
             let mut args = Vec::new();
             let mut sql_text = if words.is_empty() {
                 "SELECT s.blake3, s.title, s.kind, s.doc_date, s.amount, 0.0 AS score \
@@ -1414,34 +1462,85 @@ impl SearchStore for Standalone {
                 Sql::Integer(i64::from(q.offset)),
             ]);
             let mut stmt = conn.prepare(&sql_text).map_err(sql)?;
-            let rows = stmt
-                .query_map(params_from_iter(args), |r| {
-                    Ok((
-                        r.get::<_, Vec<u8>>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, Option<String>>(2)?,
-                        r.get::<_, Option<i64>>(3)?,
-                        r.get::<_, Option<f64>>(4)?,
-                        r.get::<_, f64>(5)?,
-                    ))
-                })
-                .map_err(sql)?;
-            rows.map(|row| {
-                let (h, title, kind, date, amount, score) = row.map_err(sql)?;
-                #[allow(clippy::cast_possible_truncation)]
-                Ok(SearchHit {
-                    blake3: Blake3::from_slice(&h)?,
-                    title,
-                    kind,
-                    date: from_julian(date)?,
-                    amount,
-                    score: score as f32,
-                })
-            })
-            .collect()
+            search_hits(&mut stmt, params_from_iter(args))
         })
         .await
     }
+}
+
+/// Whether `q` filters on nothing but its words.
+fn only_text(q: &SearchQuery) -> bool {
+    q.company.is_none()
+        && q.kind.is_none()
+        && q.date_from.is_none()
+        && q.date_to.is_none()
+        && q.amount_min.is_none()
+        && q.amount_max.is_none()
+        && q.source.is_none()
+}
+
+/// A search on words alone (issue #140). Ranked as before, by score, then date (newest
+/// first, undated last), then hash; but only the matches that can be on the page are read
+/// from `search_index`. The matches are scored on the FTS index alone, the score of the
+/// last hit the page can reach (`limit + offset`-th best) is the cut, and only the matches
+/// scoring at least the cut are joined and sorted in full: every match below it has at
+/// least `limit + offset` matches ahead of it, so the page is the same. Before, every match
+/// was joined to its row and sorted, which cost a row read per match.
+fn text_search(conn: &Connection, words: &[String], q: &SearchQuery) -> Result<Vec<SearchHit>> {
+    // Each word quoted: the words are letters and digits only, and a quoted string is never
+    // parsed as FTS5 syntax. Juxtaposed strings are an AND.
+    let phrase = words
+        .iter()
+        .map(|w| format!("\"{w}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let (limit, offset) = (i64::from(q.effective_limit()), i64::from(q.offset));
+    let mut stmt = conn.prepare_cached(TEXT_SEARCH).map_err(sql)?;
+    search_hits(&mut stmt, params![phrase, limit, offset])
+}
+
+/// [`text_search`]'s query: the words, the limit, the offset. With fewer matches than the
+/// page reaches the cut is minus infinity (`-9e999`), which lets every match through.
+/// Materialized, each match is scored once, and the cut compares the very same values.
+const TEXT_SEARCH: &str = "WITH m AS MATERIALIZED (SELECT rowid AS id, \
+     -bm25(search_fts, 10.0, 1.0) AS score FROM search_fts WHERE search_fts MATCH ?1) \
+     SELECT s.blake3, s.title, s.kind, s.doc_date, s.amount, m.score \
+     FROM m JOIN search_index s ON s.rowid = m.id \
+     WHERE m.score >= coalesce((SELECT score FROM m ORDER BY score DESC \
+     LIMIT 1 OFFSET ?2 + ?3 - 1), -9e999) \
+     ORDER BY m.score DESC, s.doc_date IS NULL, s.doc_date DESC, s.blake3 \
+     LIMIT ?2 OFFSET ?3";
+
+/// The hits of a search statement: hash, title, kind, date, amount and score.
+fn search_hits(
+    stmt: &mut rusqlite::Statement<'_>,
+    args: impl rusqlite::Params,
+) -> Result<Vec<SearchHit>> {
+    let rows = stmt
+        .query_map(args, |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, Option<f64>>(4)?,
+                r.get::<_, f64>(5)?,
+            ))
+        })
+        .map_err(sql)?;
+    rows.map(|row| {
+        let (h, title, kind, date, amount, score) = row.map_err(sql)?;
+        #[allow(clippy::cast_possible_truncation)]
+        Ok(SearchHit {
+            blake3: Blake3::from_slice(&h)?,
+            title,
+            kind,
+            date: from_julian(date)?,
+            amount,
+            score: score as f32,
+        })
+    })
+    .collect()
 }
 
 #[async_trait]
