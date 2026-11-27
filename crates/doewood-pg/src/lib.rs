@@ -31,6 +31,7 @@ mod feeds;
 mod merges;
 mod migrate;
 mod pages;
+mod payments;
 mod proposals;
 mod purge;
 #[cfg(test)]

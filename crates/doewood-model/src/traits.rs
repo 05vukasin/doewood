@@ -18,10 +18,10 @@ use crate::{
     CompanyRow, DismissRequest, Dismissal, DismissalQuery, DueCompany, Edge, EdgeCursor,
     Enrichment, FeedState, Folded, IconRow, LiveEdge, Located, LocationEnded, MergeEntry,
     MergeQuery, MergeRequest, Neighbour, NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation,
-    OwnedAlias, PartyDocument, Proposal, ProposalQuery, ProposalRequest, PropsPatch, Purged,
+    OwnedAlias, PartyDocument, Payment, PaymentFilter, PaymentRow, Proposal, ProposalQuery, ProposalRequest, PropsPatch, Purged,
     PutOutcome, Record, ResolveRequest, Result, SearchDoc, SearchHit, SearchQuery, SimilarKey,
-    SimilarKeys, Sketch, SourceClaim, SourceKey, SplitRequest, StepVersions, StoredText,
-    UndoOutcome, UndoRequest,
+    SimilarKeys, Sketch, SourceClaim, SourceKey, Spend, SpendGroup, SplitRequest, StepVersions,
+    StoredText, UndoOutcome, UndoRequest,
 };
 
 /// quail and hedgehog records, keyed by BLAKE3.
@@ -651,6 +651,43 @@ pub trait PurgeStore: Send + Sync {
     async fn purge_orphan_records(&self, after: Option<&str>, limit: u32) -> Result<Purged>;
 }
 
+/// Payments (issue #193, see [`crate::payment`]): one row per record in the `payments` index
+/// table, and the reads over it. A row goes with its record.
+#[async_trait]
+pub trait PaymentStore: Send + Sync {
+    /// Inserts or replaces the payment row of its record (`row.blake3`); writing the same row
+    /// again changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::NotFound`] when no record `row.blake3` is stored;
+    /// [`crate::Error::Invalid`] when [`PaymentRow::validate`] fails.
+    async fn put_payment(&self, row: &PaymentRow) -> Result<()>;
+
+    /// Removes the payment row of `blake3`, if any (a record re-analyzed into no payment).
+    async fn delete_payment(&self, blake3: &Blake3) -> Result<()>;
+
+    /// One page of the payments that match `filter`, ordered by hash, after `after`: at most
+    /// `limit` ([`crate::payments_limit`]), ending early with the one that brings the page to
+    /// `max_bytes` ([`crate::payment_page_bytes`]). Each carries the companies its document's
+    /// live `party` edges mark as supplier and buyer ([`crate::SIDE_PROP`]; the most confident
+    /// edge, then the smallest company id, when there are several).
+    async fn list_payments(
+        &self,
+        filter: &PaymentFilter,
+        after: Option<&Blake3>,
+        limit: u32,
+        max_bytes: usize,
+    ) -> Result<Vec<Payment>>;
+
+    /// What suppliers are paid: per supplier (only `supplier`, when given) the sums of the
+    /// amounts by currency, period and `group`, and the categories and subjects of their
+    /// documents. Payments without an amount count in `provides` only. At most
+    /// [`crate::SPEND_MAX_ROWS`] rows of each, `truncated` when more were left out.
+    async fn supplier_spend(&self, supplier: Option<uuid::Uuid>, group: SpendGroup)
+    -> Result<Spend>;
+}
+
 /// A complete backend: everything the service needs from its store.
 #[async_trait]
 pub trait Backend:
@@ -665,6 +702,7 @@ pub trait Backend:
     + MergeStore
     + ProposalStore
     + PurgeStore
+    + PaymentStore
 {
     /// `postgres` or `sqlite`.
     fn name(&self) -> &'static str;

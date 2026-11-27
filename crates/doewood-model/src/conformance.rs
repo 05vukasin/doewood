@@ -58,6 +58,7 @@ pub async fn run<B: Backend + ?Sized>(a: &B, b: &B) {
     live_edges(a, b).await;
     live_writes(a, b).await;
     explorer(a).await;
+    payments(a).await;
     purge_overlaps(a, b).await;
     purge_races(a, b).await;
     // Last: it purges every orphan the cases before left.
@@ -84,6 +85,298 @@ fn raw(v: &serde_json::Value) -> Box<RawValue> {
 
 fn versions(quail: &str) -> StepVersions {
     StepVersions::from([("quail".to_owned(), quail.to_owned())])
+}
+
+/// Payments (issue #193): rows beside their records, filters, pages, the supplier and buyer
+/// read through the `party` edges marked `side`, and per-currency spend.
+///
+/// # Panics
+///
+/// When the backend misbehaves.
+#[allow(clippy::too_many_lines)]
+pub async fn payments<B: Backend + ?Sized>(s: &B) {
+    use crate::{
+        Highlight, PaymentDetail, PaymentFilter, PaymentLine, PaymentRow, SIDE_PROP, SpendGroup,
+    };
+    let h = |n| purge_hash(0xa5, n);
+    let detail = |n: u32| {
+        PaymentDetail {
+            subject_source: Some("clause".into()),
+            net: Some("100.00".into()),
+            method: "rules".into(),
+            lines: vec![PaymentLine {
+                description: Some(format!("line {n}")),
+                total: Some("100.00".into()),
+                ..PaymentLine::default()
+            }],
+            highlights: vec![Highlight {
+                key: "payment.amount".into(),
+                page: 0,
+                block: n,
+                start: 3,
+                end: 9,
+                quote: "120,00".into(),
+                conf: 0.8,
+            }],
+            ..PaymentDetail::default()
+        }
+        .to_body()
+        .unwrap()
+    };
+    #[allow(clippy::type_complexity)]
+    let rows: [(u8, Option<&str>, Option<&str>, Option<i64>, &str, Option<&str>, Option<Date>); 5] = [
+        (1, Some("software maintenance"), Some("it_software"), Some(1_200_000_000), "RSD",
+         Some("one_off"), Some(day(2026, 3, 14))),
+        (2, Some("software licence"), Some("it_software"), Some(100_000_000), "RSD",
+         Some("monthly"), Some(day(2026, 4, 1))),
+        (3, Some("legal services"), Some("legal"), Some(5_000_000), "EUR", Some("one_off"),
+         Some(day(2025, 12, 31))),
+        (4, Some("office cleaning"), Some("cleaning_facility"), None, "RSD", None, None),
+        (5, None, None, Some(990_000), "USD", None, None),
+    ];
+    let row = |r: &(u8, Option<&str>, Option<&str>, Option<i64>, &str, Option<&str>, Option<Date>)| {
+        PaymentRow {
+            blake3: h(r.0),
+            subject: r.1.map(str::to_owned),
+            category: r.2.map(str::to_owned),
+            category_label: r.2.map(|c| format!("label {c}")),
+            amount: r.3,
+            basis: Some("gross".into()),
+            currency: Some(r.4.to_owned()),
+            period: r.5.map(str::to_owned),
+            date: r.6,
+            supplier_name: Some(format!("Supplier {}", r.0)),
+            buyer_name: None,
+            conf: 0.8,
+            detail: detail(u32::from(r.0)),
+        }
+    };
+    // A row needs its record.
+    let missing = s.put_payment(&row(&rows[0])).await.unwrap_err();
+    assert!(matches!(missing, Error::NotFound(_)), "{missing}");
+    let mut docs = Vec::new();
+    for r in &rows {
+        s.put_record(&h(r.0), &raw(&json!({"payment": r.0})), &versions("1"))
+            .await
+            .unwrap();
+        s.put_payment(&row(r)).await.unwrap();
+        // Again: unchanged.
+        s.put_payment(&row(r)).await.unwrap();
+        docs.push(
+            s.upsert_node(NodeKind::Document, &h(r.0).to_hex(), &json!({}))
+                .await
+                .unwrap(),
+        );
+    }
+    let company = |key: &'static str| async move {
+        s.upsert_node(NodeKind::Company, key, &json!({"name": key}))
+            .await
+            .unwrap()
+    };
+    let (s1, s2, b1) = (
+        company("pay:s1").await,
+        company("pay:s2").await,
+        company("pay:b1").await,
+    );
+    let party = |doc: Uuid, c: Uuid, side: Option<&str>, conf: f32| {
+        let mut props = json!({"role": "party"});
+        if let Some(side) = side {
+            props[SIDE_PROP] = json!(side);
+        }
+        Edge::new(doc, c, EdgeKind::Party, EdgeSource::Document)
+            .with_props(props)
+            .with_confidence(conf)
+    };
+    for e in [
+        party(docs[0], s1, Some("supplier"), 0.9),
+        party(docs[0], b1, Some("buyer"), 0.8),
+        party(docs[1], s1, Some("supplier"), 0.9),
+        // 3 names two suppliers: the more confident one is its supplier.
+        party(docs[2], s1, Some("supplier"), 0.4),
+        party(docs[2], s2, Some("supplier"), 0.6),
+        // A party without a side is neither.
+        party(docs[3], b1, None, 0.9),
+        // A retracted supplier edge does not count.
+        party(docs[4], s2, Some("supplier"), 0.9).with_state(EdgeState::Retracted),
+    ] {
+        s.upsert_edge(&e).await.unwrap();
+    }
+    let list = |filter: PaymentFilter| async move {
+        s.list_payments(&filter, None, 0, usize::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| p.row.blake3)
+            .collect::<Vec<_>>()
+    };
+    let all = s
+        .list_payments(&PaymentFilter::default(), None, 0, usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        all.iter().map(|p| p.row.blake3).collect::<Vec<_>>(),
+        (1..=5).map(h).collect::<Vec<_>>()
+    );
+    let sides: Vec<_> = all.iter().map(|p| (p.document, p.supplier, p.buyer)).collect();
+    assert_eq!(
+        sides,
+        [
+            (Some(docs[0]), Some(s1), Some(b1)),
+            (Some(docs[1]), Some(s1), None),
+            (Some(docs[2]), Some(s2), None),
+            (Some(docs[3]), None, None),
+            (Some(docs[4]), None, None),
+        ]
+    );
+    // The row as written.
+    let p1 = &all[0].row;
+    assert_eq!(p1.subject.as_deref(), Some("software maintenance"));
+    assert_eq!(p1.amount, Some(1_200_000_000));
+    assert_eq!(p1.date, Some(day(2026, 3, 14)));
+    assert_eq!(p1.supplier_name.as_deref(), Some("Supplier 1"));
+    assert!((p1.conf - 0.8).abs() < 1e-6);
+    let d = p1.detail().unwrap();
+    assert_eq!(d.highlights[0].block, 1);
+    assert_eq!(d.lines[0].description.as_deref(), Some("line 1"));
+    assert_eq!(all[3].row.amount, None);
+    assert_eq!(all[3].row.date, None);
+    // Pages, by hash.
+    let first = s
+        .list_payments(&PaymentFilter::default(), None, 2, usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 2);
+    let next = s
+        .list_payments(&PaymentFilter::default(), Some(&h(2)), 2, usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        next.iter().map(|p| p.row.blake3).collect::<Vec<_>>(),
+        [h(3), h(4)]
+    );
+    // A byte budget ends a page with the row that reaches it.
+    let small = s
+        .list_payments(&PaymentFilter::default(), None, 0, 1)
+        .await
+        .unwrap();
+    assert_eq!(small.len(), 1);
+    // Filters.
+    let f = PaymentFilter::default;
+    assert_eq!(list(PaymentFilter { supplier: Some(s1), ..f() }).await, [h(1), h(2)]);
+    assert_eq!(list(PaymentFilter { supplier: Some(s2), ..f() }).await, [h(3)]);
+    assert_eq!(list(PaymentFilter { buyer: Some(b1), ..f() }).await, [h(1)]);
+    assert_eq!(
+        list(PaymentFilter { category: Some("it_software".into()), ..f() }).await,
+        [h(1), h(2)]
+    );
+    assert_eq!(list(PaymentFilter { currency: Some("EUR".into()), ..f() }).await, [h(3)]);
+    assert_eq!(list(PaymentFilter { period: Some("monthly".into()), ..f() }).await, [h(2)]);
+    assert_eq!(
+        list(PaymentFilter { from: Some(day(2026, 1, 1)), ..f() }).await,
+        [h(1), h(2)]
+    );
+    assert_eq!(
+        list(PaymentFilter { from: Some(day(2026, 3, 14)), to: Some(day(2026, 3, 14)), ..f() })
+            .await,
+        [h(1)]
+    );
+    assert_eq!(list(PaymentFilter { to: Some(day(2025, 12, 31)), ..f() }).await, [h(3)]);
+    assert_eq!(
+        list(PaymentFilter { supplier: Some(s1), period: Some("one_off".into()), ..f() }).await,
+        [h(1)]
+    );
+
+    // Spend: per supplier, currency and period, never across them.
+    let spend = s.supplier_spend(None, SpendGroup::Category).await.unwrap();
+    assert!(!spend.truncated);
+    let totals: Vec<_> = spend
+        .totals
+        .iter()
+        .map(|t| {
+            (
+                t.supplier,
+                t.currency.as_str(),
+                t.period.as_str(),
+                t.group.as_str(),
+                t.total,
+                t.documents,
+            )
+        })
+        .collect();
+    let mut want = vec![
+        (Some(s1), "RSD", "monthly", "it_software", 100_000_000, 1),
+        (Some(s1), "RSD", "one_off", "it_software", 1_200_000_000, 1),
+        (Some(s2), "EUR", "one_off", "legal", 5_000_000, 1),
+    ];
+    if s2 < s1 {
+        want.rotate_left(2);
+    }
+    want.push((None, "USD", "", "", 990_000, 1));
+    assert_eq!(totals, want);
+    // What each provides, documents without an amount included.
+    let provides: Vec<_> = spend
+        .provides
+        .iter()
+        .map(|p| (p.supplier, p.category.as_str(), p.subject.as_str(), p.documents))
+        .collect();
+    assert!(provides.contains(&(Some(s1), "it_software", "software maintenance", 1)));
+    assert!(provides.contains(&(Some(s1), "it_software", "software licence", 1)));
+    assert!(provides.contains(&(Some(s2), "legal", "legal services", 1)));
+    assert!(provides.contains(&(None, "cleaning_facility", "office cleaning", 1)));
+    assert!(provides.contains(&(None, "", "", 1)));
+    assert_eq!(provides.len(), 5);
+    let label = spend
+        .provides
+        .iter()
+        .find(|p| p.category == "legal")
+        .map(|p| p.category_label.as_str());
+    assert_eq!(label, Some("label legal"));
+    // One supplier, by month and by year.
+    let by_month = s.supplier_spend(Some(s1), SpendGroup::Month).await.unwrap();
+    let months: Vec<_> = by_month
+        .totals
+        .iter()
+        .map(|t| (t.supplier, t.period.as_str(), t.group.as_str(), t.total))
+        .collect();
+    assert_eq!(
+        months,
+        [
+            (Some(s1), "monthly", "2026-04", 100_000_000),
+            (Some(s1), "one_off", "2026-03", 1_200_000_000),
+        ]
+    );
+    assert!(by_month.provides.iter().all(|p| p.supplier == Some(s1)));
+    assert_eq!(by_month.provides.len(), 2);
+    let by_year = s.supplier_spend(Some(s2), SpendGroup::Year).await.unwrap();
+    assert_eq!(by_year.totals.len(), 1);
+    assert_eq!(by_year.totals[0].group, "2025");
+    let none = s.supplier_spend(Some(b1), SpendGroup::Year).await.unwrap();
+    assert!(none.totals.is_empty() && none.provides.is_empty());
+
+    // A row replaced, and one removed.
+    let mut r2 = row(&rows[1]);
+    r2.amount = Some(200_000_000);
+    s.put_payment(&r2).await.unwrap();
+    let got = s
+        .list_payments(&PaymentFilter::default(), Some(&h(1)), 1, usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(got[0].row.amount, Some(200_000_000));
+    s.delete_payment(&h(5)).await.unwrap();
+    s.delete_payment(&h(5)).await.unwrap();
+    assert_eq!(list(f()).await, [h(1), h(2), h(3), h(4)]);
+    // Too long a subject is refused.
+    let mut long = row(&rows[0]);
+    long.subject = Some("x".repeat(crate::PAYMENT_TEXT_MAX + 1));
+    assert!(matches!(
+        s.put_payment(&long).await.unwrap_err(),
+        Error::Invalid(_)
+    ));
+    // Clean up for the cases after (no location holds these: the last purge would take them).
+    for r in &rows {
+        s.delete_payment(&h(r.0)).await.unwrap();
+    }
+    assert!(list(f()).await.is_empty());
 }
 
 /// Records: insert, unchanged repeat, update, read back.
@@ -4527,6 +4820,26 @@ pub async fn purge<B: Backend + ?Sized>(s: &B) {
             .await
             .unwrap();
     }
+    // Their payment rows (issue #193): they go with the record too.
+    for n in [1, 2] {
+        s.put_payment(&crate::PaymentRow {
+            blake3: h(n),
+            subject: Some(format!("purgeable {n}")),
+            category: None,
+            category_label: None,
+            amount: Some(10_000),
+            basis: None,
+            currency: Some("PRG".into()),
+            period: None,
+            date: None,
+            supplier_name: None,
+            buyer_name: None,
+            conf: 0.5,
+            detail: raw(&json!({"method": "rules"})),
+        })
+        .await
+        .unwrap();
+    }
     s.put_sketch(&h(1), &[1, 2, 3], &[0xd1_0001, 0xd1_0002])
         .await
         .unwrap();
@@ -4632,9 +4945,26 @@ pub async fn purge<B: Backend + ?Sized>(s: &B) {
             "location {key}"
         );
     }
-    // 2 stays, held elsewhere, with its text; its edge to 1 is gone with 1.
+    // 2 stays, held elsewhere, with its text and payment; its edge to 1 is gone with 1.
     assert!(s.get_record(&h(2)).await.unwrap().is_some());
     assert!(s.get_document_text(&h(2)).await.unwrap().is_some());
+    let paid = s
+        .list_payments(
+            &crate::PaymentFilter {
+                currency: Some("PRG".into()),
+                ..crate::PaymentFilter::default()
+            },
+            None,
+            0,
+            usize::MAX,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        paid.iter().map(|p| p.row.blake3).collect::<Vec<_>>(),
+        [h(2)],
+        "the purged record's payment went with it"
+    );
     let out = s
         .neighbours(
             d2.document,

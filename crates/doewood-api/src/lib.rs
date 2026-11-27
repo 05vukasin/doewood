@@ -35,6 +35,7 @@ mod jobs;
 mod limits;
 mod merges;
 mod metrics;
+mod payments;
 mod progress;
 mod proposals;
 mod purge;

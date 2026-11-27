@@ -761,6 +761,7 @@ mod tests {
                 "nodes",
                 "object_counts",
                 "objects_seen",
+                "payments",
                 "records",
                 "registry_cache",
                 "registry_feeds",

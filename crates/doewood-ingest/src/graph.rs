@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use doewood_model::{
     Backend, Blake3, Direction, Edge, EdgeKind, EdgeSource, EdgeState, NeighbourQuery, NodeKind,
     ObjectLocation, PENDING_REF_PREFIX, PropsPatch, Result, SearchDoc, SimilarEdge, SimilarKeyKind,
-    SimilarRelation, merged_into,
+    SIDE_BUYER, SIDE_PROP, SIDE_SUPPLIER, SimilarRelation, merged_into,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -385,9 +385,10 @@ impl GraphWriter {
         // similar documents. Each step keeps its own order. All of them finish before the
         // first error, in this order, is returned.
         let (mut stats, mut refs, mut similar) = Default::default();
-        let (props, indexed, refs_done, parties, similar_done) = tokio::join!(
+        let (props, indexed, paid, refs_done, parties, similar_done) = tokio::join!(
             b.update_props(doc, &patch),
             b.index_document(&search),
+            self.payment(blake3, facts),
             async {
                 self.numbers(doc, &hex, facts, &mut refs).await?;
                 self.cites(doc, &hex, facts, &mut refs).await
@@ -397,6 +398,7 @@ impl GraphWriter {
         );
         props?;
         indexed?;
+        paid?;
         refs_done?;
         parties?;
         similar_done?;
@@ -410,6 +412,22 @@ impl GraphWriter {
         stats.similar += similar.similar;
         stats.similar_buckets_skipped += similar.similar_buckets_skipped;
         Ok(stats)
+    }
+
+    /// The document's payment row (issue #193), rebuilt from its facts; removed when it has
+    /// none.
+    async fn payment(&self, blake3: &Blake3, facts: &DocFacts) -> Result<()> {
+        let Some(p) = &facts.payment else {
+            return self.backend.delete_payment(blake3).await;
+        };
+        let (supplier, buyer) = crate::payment::sides(&facts.parties);
+        let row = p.row(
+            *blake3,
+            facts.date,
+            supplier.map(|i| &facts.parties[i]),
+            buyer.map(|i| &facts.parties[i]),
+        )?;
+        self.backend.put_payment(&row).await
     }
 
     /// The document's own numbers become its aliases; pending references to them move here.
@@ -637,8 +655,21 @@ impl GraphWriter {
             return Ok(()); // nothing to match: no lock, no reads
         }
         let keys = lock_keys(&work);
+        // The payment's sides (issue #193): which party is the supplier, which the buyer.
+        let (supplier, buyer) = crate::payment::sides(&facts.parties);
+        let key_of = |i: Option<usize>| i.map(|i| facts.parties[i].quail_key.as_str());
+        let (supplier, buyer) = (key_of(supplier), key_of(buyer));
+        let side_of = |p: &Party| {
+            if Some(p.quail_key.as_str()) == supplier {
+                Some(SIDE_SUPPLIER)
+            } else if Some(p.quail_key.as_str()) == buyer {
+                Some(SIDE_BUYER)
+            } else {
+                None
+            }
+        };
         // One edge per company: candidates that resolve to the same one merge their roles.
-        let mut edges: BTreeMap<Uuid, (Party, Match)> = BTreeMap::new();
+        let mut edges: BTreeMap<Uuid, (Party, Match, Option<&str>)> = BTreeMap::new();
         let waited = Instant::now();
         let mut guard = self.locks.keys(keys.iter().map(String::as_str)).await;
         let mut held = Instant::now();
@@ -665,11 +696,11 @@ impl GraphWriter {
                 stats.new_companies += 1;
             }
             self.learn_aliases(m.company, learned).await?;
-            add_edge(&mut edges, p, m);
+            add_edge(&mut edges, p, m, side_of(p));
         }
         drop(guard);
         stats.company_lock_hold += held.elapsed();
-        for (company, (p, m)) in edges {
+        for (company, (p, m, side)) in edges {
             let mentions: Vec<Value> = p
                 .mentions
                 .iter()
@@ -681,19 +712,23 @@ impl GraphWriter {
                 .iter()
                 .map(crate::company::Identifier::alias)
                 .collect();
+            let mut props = json!({
+                "role": p.roles.first().map_or("party", String::as_str),
+                "roles": p.roles,
+                "surface": p.surface,
+                "match": {
+                    "step": m.step.map_or("created", LadderStep::as_str),
+                    "alias": m.alias,
+                    "confidence": m.confidence,
+                    "conflicts": m.conflicts,
+                    "dismissed": m.dismissed.map(|d| d.to_string()),
+                },
+            });
+            if let Some(side) = side {
+                props[SIDE_PROP] = json!(side);
+            }
             let edge = Edge::new(doc, company, EdgeKind::Party, EdgeSource::Document)
-                .with_props(json!({
-                    "role": p.roles.first().map_or("party", String::as_str),
-                    "roles": p.roles,
-                    "surface": p.surface,
-                    "match": {
-                        "step": m.step.map_or("created", LadderStep::as_str),
-                        "alias": m.alias,
-                        "confidence": m.confidence,
-                        "conflicts": m.conflicts,
-                        "dismissed": m.dismissed.map(|d| d.to_string()),
-                    },
-                }))
+                .with_props(props)
                 .with_evidence(json!([{
                     "document": hex,
                     "mentions": mentions,
@@ -1021,10 +1056,18 @@ fn lock_keys(work: &[Work<'_>]) -> Vec<String> {
 }
 
 /// Adds a party's match to the document's edges: candidates that resolve to the same company
-/// merge their roles.
-fn add_edge(edges: &mut BTreeMap<Uuid, (Party, Match)>, p: &Party, m: Match) {
+/// merge their roles, and the supplier side wins over the buyer's.
+fn add_edge<'s>(
+    edges: &mut BTreeMap<Uuid, (Party, Match, Option<&'s str>)>,
+    p: &Party,
+    m: Match,
+    side: Option<&'s str>,
+) {
     match edges.get_mut(&m.company) {
-        Some((q, _)) => {
+        Some((q, _, s)) => {
+            if side == Some(SIDE_SUPPLIER) || s.is_none() {
+                *s = side.or(*s);
+            }
             for r in &p.roles {
                 if !q.roles.contains(r) {
                     q.roles.push(r.clone());
@@ -1033,7 +1076,7 @@ fn add_edge(edges: &mut BTreeMap<Uuid, (Party, Match)>, p: &Party, m: Match) {
             q.score = q.score.max(p.score);
         }
         None => {
-            edges.insert(m.company, (p.clone(), m));
+            edges.insert(m.company, (p.clone(), m, side));
         }
     }
 }
