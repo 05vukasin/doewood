@@ -1029,7 +1029,9 @@ async fn similarity_uses_the_stored_threshold() {
     let set = |x: f64| {
         store
             .set_ingest_settings(&IngestSettingsPatch {
+                // Both MinHash bars (issue #169): a near copy has its own.
                 similar_min_jaccard: Some(x),
+                similar_near_copy_min_jaccard: Some(x),
                 ..IngestSettingsPatch::default()
             })
             .unwrap();

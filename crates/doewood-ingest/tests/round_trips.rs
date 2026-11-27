@@ -647,8 +647,10 @@ async fn similarity_keys_take_no_extra_round_trip() {
     println!("similar_to edges, then what the write took: {seen:?}");
     for (similar, s) in &seen[10..] {
         assert!(*similar >= 10, "{similar} similar documents");
-        assert_eq!(
-            s.round_trips, ROUND_TRIPS_PER_DOC,
+        // At most as many as without keys (the pipelined pairs can also let another of the
+        // write's statements share a round trip).
+        assert!(
+            s.round_trips <= ROUND_TRIPS_PER_DOC,
             "{s:?} for {similar} edges"
         );
         // Two statements more: the keys' write and their lookup.
