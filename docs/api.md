@@ -284,8 +284,8 @@ refused: the workbook has more than 1,600,000 cells ...`, and how to raise the c
     `truncated` says a cap cut it, so a shorter path (or one, when none came back) may exist;
     no paths and `truncated: false` means there is none within `max_depth`.
   - Document counts, the document total, degrees and weights are counted by the store, not
-    on each read, and trail the edges by a few seconds: `stale: true` says a large change (a bulk ingest) is still
-    being counted. A missing seed or path end is `NOT_FOUND`.
+    on each read, and trail the edges by a few seconds: `stale: true` says a large change (a
+    bulk ingest) is still being counted. A missing seed or path end is `NOT_FOUND`.
 
 Dates are `YYYY-MM-DD` strings; JSON props and evidence are strings holding JSON.
 
