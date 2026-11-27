@@ -47,8 +47,8 @@ pub use feed::{
 pub use keyfacts::{
     BlockHighlight, CARD_MAX_BYTES, Card, CardAdvance, CardDuration, CardEvidence, CardHighlight,
     CardLiabilityCap, CardParty, CardPenalty, CardSla, FACT_HIGHLIGHTS_MAX, FACTS_MAX_LIMIT,
-    FactColumns, FactFilter, FactRow, FoundDocument, facts_limit, fold, format_day, parse_day,
-    parse_units,
+    FactColumns, FactFilter, FactRow, FoundDocument, KIND_FAMILIES, facts_limit, fold, format_day,
+    parse_day, parse_units,
 };
 pub use merge::{
     DismissRequest, Dismissal, DismissalQuery, EVIDENCE_MAX_BYTES, MERGE_CHAIN_MAX,

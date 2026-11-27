@@ -151,8 +151,11 @@ pub(crate) async fn find(
         wheres.push(by_company(SIDE_BUYER, &at));
         wheres.push(format!("s.buy = {at}"));
     }
+    let kinds = filter.kinds();
+    if !kinds.is_empty() {
+        wheres.push(format!("p.kind = ANY({})", args.push(kinds)));
+    }
     for (col, v) in [
-        ("p.kind", &filter.kind),
         ("p.category", &filter.category),
         ("p.currency", &filter.currency),
     ] {

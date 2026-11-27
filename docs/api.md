@@ -1108,8 +1108,9 @@ document beside the record (see [ingest.md](ingest.md#key-facts)).
   between `start` and `end` (characters) is the quote. GetDocumentText returns them per block;
   the card per field; ListPayments per payment. At most 1024 per document.
 - **FindDocuments** filters the documents by their key facts; every filter set must hold:
-  - `kind` (quail's instrument kind: `contract`, `msa`, `invoice`, `offer`, `nda`, ...);
-    `category`; `governing_law` (case ignored; a country finds its subdivisions too, `GB`
+  - `kind` (quail's instrument kind: `contract`, `msa`, `invoice`, `quote`, `nda`, ...;
+    case ignored): `contract` and `invoice` find their whole family, `kind_exact` the kind
+    alone ([Kind families](#for-ai-agents), issue #199); `category`; `governing_law` (case ignored; a country finds its subdivisions too, `GB`
     finds `GB-EAW`, England and Wales);
   - `supplier_id` and `customer_id`: a company, through the document's `party` edge marked
     `side: supplier` or `side: buyer` (as ListPayments, so merges move them);
@@ -1186,6 +1187,20 @@ Other filters: `{"supplier_name": "alfa soft"}`, `{"category": "rent_lease", "en
 "2027-06-30"}`, `{"currency": "EUR", "amount_min": "10000"}`, `{"has_penalty": true}`,
 `{"has_guarantee": false, "kind": "contract"}`, `{"court": "sud u beogradu"}`,
 `{"signed_from": "2026-01-01", "signed_to": "2026-03-31"}`.
+
+**Kind families** (issue #199). `kind` names a family, so an agent asking for contracts also
+gets the master agreements, NDAs and annexes (case ignored):
+
+| `kind` | finds `card.kind` |
+|---|---|
+| `contract` | `contract`, `msa`, `nda`, `sla`, `lease`, `framework_agreement`, `annex`, `amendment`, `amended_restated`, `sow`, `change_order`, `side_letter` |
+| `invoice` | `invoice`, `credit_note`, `pro_forma` |
+| any other (`msa`, `po`, `quote`, ...) | that kind only |
+
+The kinds are quail's instrument kinds (`ref.instrument_kind`; quail gives a lease `contract`
+and a pro forma `invoice`), plus `sla`, `lease`, `credit_note` and `pro_forma` for other
+producers. `"kind_exact": true` matches the kind alone: `{"kind": "contract", "kind_exact":
+true}` misses an `msa`. `FoundDocument.kind` is the document's own kind.
 
 **`get_document_card`**: `{"blake3": "9f2c…"}`. The answer's `card_json`, for the Serbian
 contract of `crates/doewood-ingest/tests/key_facts.rs` (shortened: fewer fields and

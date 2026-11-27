@@ -459,9 +459,18 @@ async fn key_facts_through_ingest() {
         let day = |s: &str| parse_day(s);
         let f = FactFilter::default;
         let cases: Vec<(FactFilter, Vec<Blake3>)> = vec![
+            // `contract` is a family (issue #199): it finds the English master agreement.
             (
                 FactFilter {
                     kind: Some("contract".into()),
+                    ..f()
+                },
+                vec![ugovor, agreement],
+            ),
+            (
+                FactFilter {
+                    kind: Some("contract".into()),
+                    kind_exact: true,
                     ..f()
                 },
                 vec![ugovor],

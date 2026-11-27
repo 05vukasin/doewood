@@ -2038,7 +2038,7 @@ async fn key_facts_card_text_and_find() {
                 .await
                 .unwrap();
             let (kind, law) =
-                [("contract", "RS"), ("contract", "GB"), ("invoice", "RS")][usize::from(n)];
+                [("contract", "RS"), ("msa", "GB"), ("invoice", "RS")][usize::from(n)];
             let row = FactRow::new(
                 h,
                 card(kind, law),
@@ -2261,6 +2261,15 @@ async fn key_facts_card_text_and_find() {
         .await
         .unwrap();
         assert_eq!(blake3s(&r), hex(&[0, 1]), "{name}");
+        // Kind families (issue #199): `contract` finds the msa, unless exact; case ignored.
+        let r = find(pb::FindDocumentsRequest {
+            kind: "Contract".into(),
+            kind_exact: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(blake3s(&r), hex(&[0]), "{name}");
         // Pages of one.
         let mut token = String::new();
         let mut seen = Vec::new();
