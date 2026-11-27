@@ -259,7 +259,8 @@ pub(crate) async fn find(
     let req = request.get_ref();
     let mut v = Violations::default();
     let filter = FactFilter {
-        kind: text(&mut v, "kind", &req.kind),
+        kind: text(&mut v, "kind", &req.kind).map(|k| k.to_ascii_lowercase()),
+        kind_exact: req.kind_exact,
         supplier: opt_uuid(&mut v, "supplier_id", &req.supplier_id),
         customer: opt_uuid(&mut v, "customer_id", &req.customer_id),
         supplier_name: text(&mut v, "supplier_name", &req.supplier_name),

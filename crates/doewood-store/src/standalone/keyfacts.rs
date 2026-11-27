@@ -201,8 +201,12 @@ pub(super) fn find(
         args.push(Sql::Text(c.to_string()));
         args.push(Sql::Text(c.to_string()));
     }
+    let kinds = filter.kinds();
+    if !kinds.is_empty() {
+        wheres.push(format!("s.kind IN ({})", vec!["?"; kinds.len()].join(", ")));
+        args.extend(kinds.into_iter().map(Sql::Text));
+    }
     for (col, v) in [
-        ("s.kind", &filter.kind),
         ("s.category", &filter.category),
         ("s.currency", &filter.currency),
     ] {

@@ -522,8 +522,8 @@ pub async fn document_facts<B: Backend + ?Sized>(s: &B) {
             ..CardDuration::default()
         })
     };
-    // 1: a Serbian service contract; 2: an English one; 3: a lease without an end;
-    // 4: an invoice; 5: a contract that ends by its term.
+    // 1: a Serbian service contract; 2: an English master agreement; 3: a lease without an
+    // end; 4: an invoice; 5: a contract that ends by its term.
     let cards = [
         Card {
             kind: Some("contract".into()),
@@ -563,7 +563,7 @@ pub async fn document_facts<B: Backend + ?Sized>(s: &B) {
             ..Card::default()
         },
         Card {
-            kind: Some("contract".into()),
+            kind: Some("msa".into()),
             supplier: party("Alpha Widgets LLC"),
             customer: party("Beta Components GmbH"),
             signed: Some("2026-03-01".into()),
@@ -579,7 +579,7 @@ pub async fn document_facts<B: Backend + ?Sized>(s: &B) {
             ..Card::default()
         },
         Card {
-            kind: Some("contract".into()),
+            kind: Some("lease".into()),
             supplier: party("Gama Nekretnine d.o.o."),
             customer: party("Đorđević i sinovi d.o.o."),
             signed: Some("2025-06-01".into()),
@@ -751,6 +751,37 @@ pub async fn document_facts<B: Backend + ?Sized>(s: &B) {
         (
             FactFilter {
                 kind: Some("invoice".into()),
+                ..f()
+            },
+            vec![4],
+        ),
+        // Kind families (issue #199): a contract finds the master agreement and the lease.
+        (
+            FactFilter {
+                kind: Some("contract".into()),
+                ..f()
+            },
+            vec![1, 2, 3, 5],
+        ),
+        (
+            FactFilter {
+                kind: Some("contract".into()),
+                kind_exact: true,
+                ..f()
+            },
+            vec![1, 5],
+        ),
+        (
+            FactFilter {
+                kind: Some("msa".into()),
+                ..f()
+            },
+            vec![2],
+        ),
+        (
+            FactFilter {
+                kind: Some("invoice".into()),
+                kind_exact: true,
                 ..f()
             },
             vec![4],

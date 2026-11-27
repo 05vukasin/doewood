@@ -626,12 +626,56 @@ pub struct FoundDocument {
     pub customer: Option<Uuid>,
 }
 
+/// Kind families of [`FactFilter::kind`] (issue #199): a family name finds each kind listed
+/// for it. The kinds are quail's `card.kind` values (`ref.instrument_kind`), plus `sla`,
+/// `lease`, `credit_note` and `pro_forma` for other producers (quail gives a lease
+/// `contract` and a pro forma `invoice`). Any other kind finds itself only.
+pub const KIND_FAMILIES: &[(&str, &[&str])] = &[
+    (
+        "contract",
+        &[
+            "contract",
+            "msa",
+            "nda",
+            "sla",
+            "lease",
+            "framework_agreement",
+            "annex",
+            "amendment",
+            "amended_restated",
+            "sow",
+            "change_order",
+            "side_letter",
+        ],
+    ),
+    ("invoice", &["invoice", "credit_note", "pro_forma"]),
+];
+
+impl FactFilter {
+    /// The kinds [`FactFilter::kind`] finds: its family, or itself alone (exact, or not a
+    /// family name); empty without a kind filter.
+    pub fn kinds(&self) -> Vec<String> {
+        let Some(kind) = &self.kind else {
+            return Vec::new();
+        };
+        if !self.kind_exact
+            && let Some((_, kinds)) = KIND_FAMILIES.iter().find(|(f, _)| *f == kind)
+        {
+            return kinds.iter().map(|k| (*k).to_owned()).collect();
+        }
+        vec![kind.clone()]
+    }
+}
+
 /// Filters of [`crate::FactStore::find_documents`]; every one set must hold. Date bounds are
 /// inclusive, and a document without the date never matches one.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FactFilter {
-    /// `card.kind` (`contract`, `invoice`, ...).
+    /// `card.kind` (`contract`, `invoice`, ...). A family name ([`KIND_FAMILIES`]) finds
+    /// every kind of its family unless [`FactFilter::kind_exact`] is set.
     pub kind: Option<String>,
+    /// Match [`FactFilter::kind`] alone, not its family.
+    pub kind_exact: bool,
     /// The supplier company.
     pub supplier: Option<Uuid>,
     /// The customer company.
@@ -678,6 +722,37 @@ mod tests {
 
     fn day(y: i32, m: u8, d: u8) -> Date {
         Date::from_calendar_date(y, Month::try_from(m).unwrap(), d).unwrap()
+    }
+
+    #[test]
+    fn kind_families() {
+        let kinds = |kind: &str, kind_exact| {
+            FactFilter {
+                kind: Some(kind.into()),
+                kind_exact,
+                ..FactFilter::default()
+            }
+            .kinds()
+        };
+        let contract = kinds("contract", false);
+        for k in [
+            "contract",
+            "msa",
+            "nda",
+            "lease",
+            "framework_agreement",
+            "annex",
+        ] {
+            assert!(contract.iter().any(|c| c == k), "{k}");
+        }
+        assert!(!contract.iter().any(|c| c == "invoice"));
+        assert_eq!(
+            kinds("invoice", false),
+            ["invoice", "credit_note", "pro_forma"]
+        );
+        assert_eq!(kinds("contract", true), ["contract"]);
+        assert_eq!(kinds("msa", false), ["msa"]);
+        assert!(FactFilter::default().kinds().is_empty());
     }
 
     #[test]
