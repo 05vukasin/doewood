@@ -24,7 +24,9 @@
 //!
 //! **Not in the set:** PIB, deleted companies (a deleted company is absent, so `None`), the
 //! date of a status change, statutory changes, mergers and divisions. Those are in APR's
-//! paid data service only.
+//! paid data service only. docs/registries.md (APR: What the open data lacks) lists the
+//! sources checked, the TLS setup ([`AprConfig::extra_roots_pem`]) and the attribution the
+//! licence requires.
 
 mod model;
 mod snapshot;
@@ -253,7 +255,9 @@ impl Apr {
         };
         if kind == IdKind::RsPib {
             return Err(warning(WarningKind::Unsupported(
-                "the APR open data has no PIB; look up by MB".to_owned(),
+                "the APR open data has no PIB; look up by MB (docs/registries.md, APR: What the \
+                 open data lacks)"
+                    .to_owned(),
             )));
         }
         self.by_mb(&id).await
