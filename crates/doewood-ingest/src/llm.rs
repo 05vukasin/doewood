@@ -25,9 +25,13 @@
 //! - **`Summarize`** ([`Summaries::summarize`]) skips the queue and stores nothing: it reads
 //!   the file (the bytes given, or an object of a source whose policy is not `off`), analyzes
 //!   it without storing the record, and summarizes it with the named or default provider.
+//!   By BLAKE3 (issue #167) it reads the stored record instead and summarizes its digest as it
+//!   is: no fetch, no OCR, no analysis. That needs one of this instance's sources to hold the
+//!   object with a policy that is not `off`, as for an object.
 //! - **`Summarize` cap.** At most `IngestSettings::summarize_max_concurrent` calls (runtime
-//!   setting, default 2, read for every call) read and analyze a file at once. The slot is
-//!   taken before the object is read and freed when the analysis ends (also when the client
+//!   setting, default 2, read for every call) read and analyze a file, or read a stored
+//!   record, at once. The slot is taken before the object (or record) is read and freed when
+//!   the analysis ends, or by BLAKE3 when the record is read (also when the client
 //!   went away or the call timed out: the slot goes with the blocking analysis, not with the
 //!   call). The provider call that follows holds no slot: it is bounded by
 //!   [`QueueConfig::max_concurrent`]. A call that finds no free slot fails at once with
@@ -182,6 +186,11 @@ pub enum SummarizeInput {
         source: SourceId,
         /// The object key.
         key: String,
+    },
+    /// A document doewood has stored: its record is summarized as it is (issue #167).
+    Stored {
+        /// The content's hash.
+        blake3: Blake3,
     },
 }
 
@@ -760,6 +769,10 @@ impl Summaries {
     ) -> Result<OnDemandSummary, SummarizeError> {
         let provider = self.provider(provider).await?;
         let (bytes, name, from_store, slot) = match input {
+            SummarizeInput::Stored { blake3 } => {
+                let body = self.stored_record(blake3).await?;
+                return self.summarize_record(provider, blake3, &body).await;
+            }
             SummarizeInput::Content { bytes, name } => {
                 self.check_size(bytes.len())?;
                 let slot = self.take_slot().await?;
@@ -788,15 +801,58 @@ impl Summaries {
             }
         };
         let (blake3, body) = self.record_of(bytes, name, from_store, slot).await?;
-        let kind = DocFacts::from_record(&body).kind.unwrap_or_default();
+        self.summarize_record(provider, blake3, &body).await
+    }
+
+    /// `Summarize` by BLAKE3 (issue #167): the stored record as it is, with no fetch and no
+    /// analysis. The read holds a slot of the `Summarize` cap, freed before the provider call.
+    /// NOT_FOUND without a record of that hash; FAILED_PRECONDITION unless one of this
+    /// instance's sources holds the object with a policy that is not `off`.
+    async fn stored_record(&self, blake3: Blake3) -> Result<Box<RawValue>, SummarizeError> {
+        let _slot = self.take_slot().await?;
+        let Some(backend) = self.inner.backend.borrow().clone() else {
+            return Err(SummarizeError::Unavailable(
+                "the records store is not connected".to_owned(),
+            ));
+        };
+        let record = backend
+            .get_record(&blake3)
+            .await
+            .map_err(|e| SummarizeError::Unavailable(format!("cannot read the record: {e}")))?
+            .ok_or_else(|| {
+                SummarizeError::NotFound(format!("no record with BLAKE3 {}", blake3.to_hex()))
+            })?;
+        let hash = blake3.0;
+        if self
+            .db(move |s| s.on_demand_source_of(&hash))
+            .await?
+            .is_none()
+        {
+            return Err(SummarizeError::FailedPrecondition(format!(
+                "no source of this instance with an LLM policy other than off holds {}: set \
+                 one to on_demand (or all, or kinds) with ConfigService.SetLlmPolicy",
+                blake3.to_hex()
+            )));
+        }
+        Ok(record.body)
+    }
+
+    /// The summary of a record (stored or just analyzed), with `provider`.
+    async fn summarize_record(
+        &self,
+        provider: Arc<Provider>,
+        blake3: Blake3,
+        body: &RawValue,
+    ) -> Result<OnDemandSummary, SummarizeError> {
+        let kind = DocFacts::from_record(body).kind.unwrap_or_default();
         let mut out = OnDemandSummary {
             blake3: blake3.to_hex(),
             kind,
             ..OnDemandSummary::default()
         };
-        let Some(prepared) = Prepared::from_record(&body) else {
+        let Some(prepared) = Prepared::from_record(body) else {
             // Too little text for a model: quail's extractive summary stands, if there is one.
-            let Some(text) = fact_text(&body, keys::EXTRACTIVE.as_str()) else {
+            let Some(text) = fact_text(body, keys::EXTRACTIVE.as_str()) else {
                 return Err(SummarizeError::FailedPrecondition(
                     "the file has no text to summarize".to_owned(),
                 ));
@@ -826,7 +882,7 @@ impl Summaries {
             }
             Err(e) => {
                 // The provider failed: the extractive summary, and why.
-                out.digest = fact_text(&body, keys::EXTRACTIVE.as_str()).unwrap_or_default();
+                out.digest = fact_text(body, keys::EXTRACTIVE.as_str()).unwrap_or_default();
                 out.extractive = true;
                 out.warnings.push(e);
             }

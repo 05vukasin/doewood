@@ -19,10 +19,11 @@ use crate::pb::{
     AddSourceRequest, AiProvider, ApiSettings, EnrichmentSettings, GetApiSettingsRequest,
     GetEnrichmentSettingsRequest, GetIngestSettingsRequest, GetSourceRequest, IngestSettings,
     ListAiProvidersRequest, ListAiProvidersResponse, ListSourcesRequest, ListSourcesResponse,
-    PauseSourceRequest, ReleaseSourceClaimRequest, ReleaseSourceClaimResponse, RemoveSourceRequest,
-    RemoveSourceResponse, RemoveSqsInletRequest, ResumeSourceRequest, SetAiProviderRequest,
-    SetApiSettingsRequest, SetEnrichmentSettingsRequest, SetIngestSettingsRequest,
-    SetLlmPolicyRequest, SetSqsInletRequest, Source, UpdateSourceRequest,
+    PauseSourceRequest, ReleaseSourceClaimRequest, ReleaseSourceClaimResponse,
+    RemoveAiProviderRequest, RemoveAiProviderResponse, RemoveSourceRequest, RemoveSourceResponse,
+    RemoveSqsInletRequest, ResumeSourceRequest, SetAiProviderRequest, SetApiSettingsRequest,
+    SetEnrichmentSettingsRequest, SetIngestSettingsRequest, SetLlmPolicyRequest,
+    SetSqsInletRequest, Source, UpdateSourceRequest,
 };
 use crate::validate::{self, Violations};
 use crate::{Api, ApiState, claims, convert, enrichment, error};
@@ -691,6 +692,34 @@ impl ConfigService for Api {
             debug!(provider = %provider.name, preset = %provider.preset, "AI provider unchanged");
         }
         Ok(Response::new(convert::ai_provider(&provider)))
+    }
+
+    async fn remove_ai_provider(
+        &self,
+        request: Request<RemoveAiProviderRequest>,
+    ) -> Result<Response<RemoveAiProviderResponse>, Status> {
+        let name = request.into_inner().name;
+        let mut v = Violations::default();
+        if name.is_empty() {
+            v.add("name", "required");
+        } else if !valid_provider_name(&name) {
+            v.add(
+                "name",
+                "must be 1 to 64 lowercase letters, digits, '_' or '-'",
+            );
+        }
+        v.check()?;
+        let removed = self.state.db(move |s| s.remove_ai_provider(&name)).await?;
+        let was_default = removed.as_ref().is_some_and(|p| p.is_default);
+        if let Some(p) = &removed {
+            info!(provider = %p.name, preset = %p.preset, was_default, "AI provider removed");
+            // The queue looks again: without a default its jobs wait, with the reason logged.
+            self.state.llm_settings_changed();
+        }
+        Ok(Response::new(RemoveAiProviderResponse {
+            removed: removed.is_some(),
+            was_default,
+        }))
     }
 
     async fn list_ai_providers(

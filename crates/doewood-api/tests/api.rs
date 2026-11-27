@@ -849,6 +849,79 @@ async fn ai_providers_are_write_only() {
     a.stop().await;
 }
 
+/// Issue #170: `RemoveAiProvider` removes a provider with its sealed key and IAM credentials;
+/// removing the default leaves no default; an unknown provider is OK with `removed` false.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remove_ai_provider_takes_its_secrets() {
+    let a = Instance::start("inst-a", Some(Shared::sqlite().backend)).await;
+    let ch = a.channel().await;
+    config(&ch)
+        .set_ai_provider(pb::SetAiProviderRequest {
+            preset: "bedrock".into(),
+            model: "test.model-v1:0".into(),
+            base_url: "https://bedrock-runtime.eu-west-2.amazonaws.com".into(),
+            api_key: API_KEY.into(),
+            aws_access_key_id: "AKIDTESTREMOVE1".into(),
+            aws_secret_access_key: "test-aws-secret-remove".into(),
+            ..pb::SetAiProviderRequest::default()
+        })
+        .await
+        .unwrap();
+    config(&ch)
+        .set_ai_provider(pb::SetAiProviderRequest {
+            preset: "openai".into(),
+            model: "gpt-test".into(),
+            api_key: API_KEY.into(),
+            ..pb::SetAiProviderRequest::default()
+        })
+        .await
+        .unwrap();
+    let remove = |name: &str| pb::RemoveAiProviderRequest { name: name.into() };
+
+    let r = config(&ch)
+        .remove_ai_provider(remove("bedrock"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(r.removed && r.was_default, "{r:?}");
+    assert!(a.store.ai_api_key("bedrock").unwrap().is_none());
+    assert!(a.store.ai_aws_credentials("bedrock").unwrap().is_none());
+    let list = config(&ch)
+        .list_ai_providers(pb::ListAiProvidersRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(list.providers.len(), 1);
+    assert!(list.providers[0].name == "openai" && !list.providers[0].is_default);
+
+    // Idempotent: again, or an unknown name, is OK and removes nothing.
+    for name in ["bedrock", "nope"] {
+        let r = config(&ch)
+            .remove_ai_provider(remove(name))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!r.removed && !r.was_default, "{name}: {r:?}");
+    }
+    let r = config(&ch)
+        .remove_ai_provider(remove("openai"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(r.removed && !r.was_default, "{r:?}");
+    assert!(a.store.ai_api_key("openai").unwrap().is_none());
+    assert!(a.store.ai_providers().unwrap().is_empty());
+
+    for name in ["", "Bad Name"] {
+        let err = config(&ch)
+            .remove_ai_provider(remove(name))
+            .await
+            .unwrap_err();
+        invalid(&err, &["name"]);
+    }
+    a.stop().await;
+}
+
 /// Issue #145: Bedrock IAM credentials are write-only (only `aws_credentials_set` comes
 /// back), bedrock-only, the key pair both or neither; the same call again changes nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2472,9 +2545,31 @@ async fn summarize_hands_requests_to_ingest() {
         .unwrap()
         .into_inner();
     assert_eq!(r.provider, "local");
+    // By BLAKE3 (issue #167): the hash goes to ingest as it is; a malformed one is refused.
+    let r = sum
+        .summarize(pb::SummarizeRequest {
+            input: Some(pb::summarize_request::Input::Blake3("cd".repeat(32))),
+            name: String::new(),
+            provider: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(r.digest, "A supply contract.");
+    for bad in ["", "not-a-hash"] {
+        let err = sum
+            .summarize(pb::SummarizeRequest {
+                input: Some(pb::summarize_request::Input::Blake3(bad.into())),
+                name: String::new(),
+                provider: String::new(),
+            })
+            .await
+            .unwrap_err();
+        invalid(&err, &["blake3"]);
+    }
     {
         let seen = fake.seen.lock().unwrap();
-        assert_eq!(seen.len(), 2);
+        assert_eq!(seen.len(), 3);
         assert!(matches!(
             &seen[0],
             (doewood_api::OnDemandInput::Location { key, .. }, Some(p)) if key == "in/a.pdf" && p == "local"
@@ -2482,6 +2577,10 @@ async fn summarize_hands_requests_to_ingest() {
         assert!(matches!(
             &seen[1],
             (doewood_api::OnDemandInput::Content { name, bytes }, None) if name == "a.txt" && bytes == b"text"
+        ));
+        assert!(matches!(
+            &seen[2],
+            (doewood_api::OnDemandInput::Stored { blake3 }, None) if blake3.to_hex() == "cd".repeat(32)
         ));
     }
     // Ingest's errors are statuses with their message.

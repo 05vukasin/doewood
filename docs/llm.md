@@ -13,6 +13,7 @@ ingest: fetch → analyze → store record, graph, search ─▶ policy asks? �
                                                                               │
 LLM queue: pending jobs ─▶ source cap and daily budget ─▶ provider ─▶ summary.llm in the record
 Summarize (API): file or object ─▶ analyze (not stored) ─▶ provider ─▶ answer (nothing stored)
+                 blake3 ─▶ stored record ──────────────────▶ provider ─▶ answer (nothing stored)
 ```
 
 ## Configuration
@@ -33,6 +34,10 @@ nothing comes from the environment ([configuration.md](configuration.md)).
   both are stored. IAM credentials are sealed and write-only too; `ListAiProviders` shows only
   `aws_credentials_set`. A change of key or credentials applies to the next call: the queue
   builds a new summarizer when the endpoint changes.
+  `ConfigService.RemoveAiProvider` removes a provider with its sealed key and credentials. If
+  it was the default there is no default until another provider is set (the next one set
+  becomes it): queued jobs wait, as without any provider, and `Summarize` without a provider
+  name is refused. Summaries already in flight finish.
 - **A policy per source** (`ConfigService.SetLlmPolicy`, or `llm_policy` in `AddSource`):
 
   | mode | queued at ingest | `Summarize` of its objects |
@@ -89,14 +94,22 @@ is the caller's choice).
   policy governs what leaves a source's bucket, and these bytes come from the caller (example
   in [api.md](api.md#summarize)). An object already stored with current step versions is read from its record;
   anything else is analyzed (and not stored).
+- Or the BLAKE3 of a document doewood has stored (`blake3`, issue #167): its record (Postgres
+  or SQLite, wherever records live) is read and its `summary.digest` goes to the provider as
+  it is, with no fetch, no OCR and no analysis, even when the record's step versions are
+  older. The policy rule of `location` holds here too: one of this instance's sources must
+  hold the object (not deleted) with a policy that is not `off`. Only those sources' objects
+  are looked at, so with every policy `off` the call is refused without a scan.
 - Output: the summary, the fact check of the model's output (claims checked, supported, the
   unsupported ones), the provider and model, the file's BLAKE3 and kind. A failing provider or
   an output that fails the fact check gives the extractive summary with `extractive` set and
   the reason in `warnings`.
 - Errors: `FAILED_PRECONDITION` without a provider (or one without its key, or without a base
   URL where the preset needs one), for a source whose policy is `off`, a file without text, or
-  a file larger than ingest analyzes (512 MiB); `NOT_FOUND` for an unknown provider or source;
-  `UNAVAILABLE` without ingest or when the object cannot be read; `RESOURCE_EXHAUSTED` over the
+  a file larger than ingest analyzes (512 MiB), and by `blake3` when no source with a policy
+  other than `off` holds the object; `NOT_FOUND` for an unknown provider or source, or a
+  `blake3` doewood has no record of; `UNAVAILABLE` without ingest, when the object cannot be
+  read, or when the records store is not connected; `RESOURCE_EXHAUSTED` over the
   cap below.
 
 ### Cap
@@ -107,7 +120,8 @@ path, outside ingest's bounded workers, so `Summarize` has its own cap:
 - At most `summarize_max_concurrent` calls read and analyze a file at once. It is an ingest
   setting (`ConfigService.SetIngestSettings`, 1 to 16, default 2), read for every call: a
   change applies to the next call without a restart; calls in flight keep running.
-- The slot covers reading the object (`location`) and the analysis. It is freed when the
+- The slot covers reading the object (`location`) and the analysis; by `blake3`, reading the
+  stored record and the policy check. It is freed when the
   analysis ends, also when the client went away or the call timed out first (the analysis
   cannot be stopped midway, so its slot stays until it does). The provider call after it holds
   no slot: it is bounded with the queue's calls (at most 64 in flight in all).
