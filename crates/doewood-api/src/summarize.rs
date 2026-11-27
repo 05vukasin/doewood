@@ -6,6 +6,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use doewood_core::SourceId;
+use doewood_model::Blake3;
 use doewood_store::valid_provider_name;
 use tonic::{Request, Response, Status};
 
@@ -33,6 +34,11 @@ pub enum OnDemandInput {
         source: SourceId,
         /// The object key.
         key: String,
+    },
+    /// A stored document, by its BLAKE3: its record is summarized as it is.
+    Stored {
+        /// The content's hash.
+        blake3: Blake3,
     },
 }
 
@@ -115,8 +121,9 @@ impl SummarizeService for Api {
         let req = request.into_inner();
         let mut v = Violations::default();
         let mut source = None;
+        let mut blake3 = None;
         match &req.input {
-            None => v.add("input", "set content or location"),
+            None => v.add("input", "set content, location or blake3"),
             Some(Input::Content(bytes)) => {
                 if bytes.is_empty() {
                     v.add("content", "empty");
@@ -134,6 +141,7 @@ impl SummarizeService for Api {
                     v.add("location.key", format!("must be 1 to {NAME_MAX_LEN} bytes"));
                 }
             }
+            Some(Input::Blake3(hex)) => blake3 = validate::blake3(&mut v, "blake3", hex),
         }
         if req.name.len() > NAME_MAX_LEN || req.name.contains(char::is_control) {
             v.add(
@@ -170,16 +178,21 @@ impl SummarizeService for Api {
                 "ingest is not running on this instance, so nothing can be summarized",
             ));
         };
-        let input = match (req.input, source) {
-            (Some(Input::Content(bytes)), _) => OnDemandInput::Content {
+        let input = match (req.input, source, blake3) {
+            (Some(Input::Content(bytes)), _, _) => OnDemandInput::Content {
                 bytes,
                 name: req.name,
             },
-            (Some(Input::Location(at)), Some(source)) => OnDemandInput::Location {
+            (Some(Input::Location(at)), Some(source), _) => OnDemandInput::Location {
                 source,
                 key: at.key,
             },
-            _ => return Err(Status::invalid_argument("input: set content or location")),
+            (Some(Input::Blake3(_)), _, Some(blake3)) => OnDemandInput::Stored { blake3 },
+            _ => {
+                return Err(Status::invalid_argument(
+                    "input: set content, location or blake3",
+                ));
+            }
         };
         let provider = (!req.provider.is_empty()).then_some(req.provider);
         let r = on_demand.summarize(input, provider).await.map_err(status)?;

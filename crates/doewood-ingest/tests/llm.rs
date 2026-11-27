@@ -856,6 +856,96 @@ async fn summarize_stores_nothing() {
     h.stop().await;
 }
 
+/// Issue #167: `Summarize` by BLAKE3 summarizes the stored record's digest as it is, with no
+/// fetch and no analysis, and stores nothing; NOT_FOUND for an unknown hash, and refused while
+/// no source with a policy other than `off` holds the object.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn summarize_by_blake3_reads_the_stored_record() {
+    let mock = Mock::start(good());
+    let h = Harness::start(Some(&mock.url()), Duration::from_secs(10));
+    let s = h.source("stored", LlmMode::OnDemand, 2, None);
+    h.put(s, &[("in/a.txt", agreement(700))]).await;
+    h.ingested(&[s]).await;
+    let blake3 = Blake3(h.blake3(s, "in/a.txt"));
+    let before = h.record(s, "in/a.txt").await;
+    // The bytes are gone from the bucket: only the stored record can serve the call.
+    let reads = h.fetch.reads_of("in/a.txt");
+    h.fetch.objects.lock().unwrap().remove("in/a.txt");
+    let stored = || SummarizeInput::Stored { blake3 };
+
+    let r = h.summaries.summarize(stored(), None).await.unwrap();
+    assert!(!r.extractive, "{r:?}");
+    assert!(r.digest.contains("Northwind Traders"), "{r:?}");
+    assert_eq!(r.blake3, blake3.to_hex());
+    assert_eq!(r.provider, "mock");
+    assert!(r.checked > 0 && r.supported == r.checked, "{r:?}");
+    assert_eq!(mock.count(), 1);
+    assert_eq!(h.fetch.reads_of("in/a.txt"), reads);
+    // The model read the stored digest.
+    let sent = &mock.requests()[0].body;
+    assert!(sent.contains("Northwind Traders"), "{sent}");
+    assert_eq!(h.summaries.summarize_in_flight(), 0);
+
+    // A failing provider: the record's extractive summary, and why.
+    mock.set(Reply {
+        status: 500,
+        body: "{}".into(),
+        delay: Duration::ZERO,
+    });
+    let r = h.summaries.summarize(stored(), None).await.unwrap();
+    assert!(r.extractive && r.provider.is_empty() && !r.digest.is_empty(), "{r:?}");
+    assert!(r.warnings.iter().any(|w| w.contains("500")), "{r:?}");
+    mock.set(good());
+
+    // Nothing was stored: the record is unchanged, and no job or spend.
+    assert_eq!(h.record(s, "in/a.txt").await, before);
+    assert!(summary_of(&before).is_none());
+    assert_eq!(
+        h.store.llm_counts(s).unwrap(),
+        doewood_store::LlmCounts::default()
+    );
+    assert_eq!(
+        h.store.llm_usage(s, utc_day(NOON)).unwrap(),
+        doewood_store::LlmUsage::default()
+    );
+
+    // An unknown hash.
+    let err = h
+        .summaries
+        .summarize(
+            SummarizeInput::Stored {
+                blake3: Blake3([0xab; 32]),
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, SummarizeError::NotFound(m) if m.contains(&"ab".repeat(32))),
+        "{err:?}"
+    );
+
+    // The only source holding it has its policy off: refused, nothing sent.
+    h.store
+        .update_source(
+            s,
+            &SourcePatch {
+                llm_policy: Some(LlmPolicy::default()),
+                ..SourcePatch::default()
+            },
+        )
+        .unwrap();
+    let calls = mock.count();
+    let err = h.summaries.summarize(stored(), None).await.unwrap_err();
+    assert!(
+        matches!(&err, SummarizeError::FailedPrecondition(m) if m.contains("off")),
+        "{err:?}"
+    );
+    assert_eq!(mock.count(), calls);
+    assert_eq!(h.summaries.summarize_in_flight(), 0);
+    h.stop().await;
+}
+
 /// The `Summarize` cap: calls beyond it are refused at once with `RESOURCE_EXHAUSTED`, the
 /// setting applies to the next call without a restart, and a refused, failed or cancelled call
 /// leaves no slot taken.
@@ -890,7 +980,7 @@ async fn summarize_cap_refuses_extra_calls_and_frees_slots() {
         h.summaries.summarize_in_flight() == 2
     })
     .await;
-    // A third is refused at once, with content or a location, and takes no slot.
+    // A third is refused at once, with content, a location or a BLAKE3, and takes no slot.
     let err = h
         .summaries
         .summarize(
@@ -909,7 +999,19 @@ async fn summarize_cap_refuses_extra_calls_and_frees_slots() {
         .await
         .unwrap_err();
     assert!(busy(&err), "{err:?}");
-    assert_eq!(h.summaries.summarize_rejected(), 2);
+    // By BLAKE3 too (issue #167): reading a stored record takes a slot as well.
+    let err = h
+        .summaries
+        .summarize(
+            SummarizeInput::Stored {
+                blake3: Blake3([1; 32]),
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(busy(&err), "{err:?}");
+    assert_eq!(h.summaries.summarize_rejected(), 3);
     assert_eq!(h.summaries.summarize_in_flight(), 2);
     assert_eq!(mock.count(), 0);
 
@@ -968,6 +1070,6 @@ async fn summarize_cap_refuses_extra_calls_and_frees_slots() {
         .unwrap();
     assert!(!r.extractive, "{r:?}");
     assert_eq!(h.summaries.summarize_in_flight(), 0);
-    assert_eq!(h.summaries.summarize_rejected(), 3);
+    assert_eq!(h.summaries.summarize_rejected(), 4);
     h.stop().await;
 }
