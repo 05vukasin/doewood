@@ -36,6 +36,9 @@ use crate::store::readers::Caller;
 use enrichment::DOCUMENTS;
 
 mod enrichment;
+mod explore;
+#[cfg(test)]
+mod explore_scale;
 mod feeds;
 mod merges;
 mod pages;
@@ -1090,6 +1093,79 @@ impl GraphStore for Standalone {
 
     async fn aliases_of(&self, node: Uuid) -> Result<Vec<OwnedAlias>> {
         self.read(move |conn| merges::aliases_of(conn, node)).await
+    }
+
+    async fn neighbours_of_many(
+        &self,
+        nodes: &[Uuid],
+        q: &NeighbourQuery,
+        per_node: u32,
+        max_bytes: usize,
+    ) -> Result<Vec<(Uuid, Neighbour)>> {
+        if nodes.is_empty() || per_node == 0 {
+            return Ok(Vec::new());
+        }
+        let (nodes, q) = (nodes.to_vec(), q.clone());
+        // One read for every node: the page query once a node, on one connection.
+        self.read(move |conn| {
+            let mut out = Vec::new();
+            let mut bytes = 0usize;
+            for node in nodes {
+                if bytes >= max_bytes {
+                    break;
+                }
+                for n in
+                    pages::neighbours(conn, node, &q, Some((None, per_node, max_bytes - bytes)))?
+                {
+                    bytes += doewood_model::neighbour_page_bytes(&n);
+                    out.push((node, n));
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn fold_company_graph(&self, max_rows: u32) -> Result<doewood_model::Folded> {
+        self.run(move |conn| explore::fold(conn, max_rows)).await
+    }
+
+    async fn list_companies(
+        &self,
+        filter: &doewood_model::CompanyFilter,
+        order: doewood_model::CompanyOrder,
+        after: Option<&doewood_model::CompanyCursor>,
+        limit: u32,
+        max_bytes: usize,
+    ) -> Result<Vec<doewood_model::CompanyRow>> {
+        filter.validate()?;
+        let (filter, after) = (filter.clone(), after.cloned());
+        let limit = limit.clamp(1, doewood_model::COMPANY_GRAPH_NODES_MAX + 1);
+        self.read(move |conn| {
+            explore::list_companies(conn, &filter, order, after.as_ref(), limit, max_bytes)
+        })
+        .await
+    }
+
+    async fn company_links(
+        &self,
+        companies: &[Uuid],
+        min_documents: u32,
+        limit: u32,
+    ) -> Result<Vec<doewood_model::CompanyLink>> {
+        if companies.len() > doewood_model::COMPANY_GRAPH_NODES_MAX as usize {
+            return Err(Error::Invalid(format!(
+                "at most {} companies",
+                doewood_model::COMPANY_GRAPH_NODES_MAX
+            )));
+        }
+        if companies.len() < 2 || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let companies = companies.to_vec();
+        let limit = limit.min(doewood_model::COMPANY_GRAPH_LINKS_MAX + 1);
+        self.read(move |conn| explore::company_links(conn, &companies, min_documents, limit))
+            .await
     }
 }
 

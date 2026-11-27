@@ -1290,6 +1290,50 @@ async fn throughput() {
     if let Some(statements) = statements {
         println!("throughput: {statements}");
     }
+    // Issue #172: what the company graph's change log holds after the run (nothing folded it:
+    // the harness runs no background fold), and how long folding all of it takes.
+    let (rows, log_bytes): (i64, i64) = if let Some(Shared {
+        cleanup: Some((admin, schema)),
+        ..
+    }) = &pg
+    {
+        let r = admin
+            .query_one(
+                &format!(
+                    "SELECT count(*), pg_total_relation_size('{schema}.company_graph_log') \
+                     FROM {schema}.company_graph_log"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        (r.get(0), r.get(1))
+    } else {
+        let (rows, bytes) = store.table_size("company_graph_log").unwrap();
+        (
+            i64::try_from(rows).unwrap_or(i64::MAX),
+            i64::try_from(bytes).unwrap_or(i64::MAX),
+        )
+    };
+    let fold = std::time::Instant::now();
+    let mut folded = 0;
+    loop {
+        let f = backend
+            .fold_company_graph(doewood_model::explore::FOLD_BATCH)
+            .await
+            .unwrap();
+        folded += f.rows;
+        if !f.more {
+            break;
+        }
+    }
+    println!(
+        "throughput: company graph log {rows} rows ({:.0} a file), {:.2} MiB; folded {folded} \
+         rows in {:.2}s",
+        rows as f64 / n as f64,
+        log_bytes as f64 / f64::from(1 << 20),
+        fold.elapsed().as_secs_f64()
+    );
     assert_eq!(c.done, n as u64);
     h.stop().await;
     if let Some(pg) = pg {

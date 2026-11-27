@@ -328,6 +328,25 @@ impl Store {
         Ok(names)
     }
 
+    /// The rows of `table` and the bytes of its b-trees (the table's and its indexes', from
+    /// `dbstat`): for measurements (issue #172).
+    pub fn table_size(&self, table: &str) -> Result<(u64, u64), StoreError> {
+        let conn = self.conn();
+        let rows: i64 = conn.query_row(&format!("SELECT count(*) FROM \"{table}\""), [], |r| {
+            r.get(0)
+        })?;
+        let bytes: i64 = conn.query_row(
+            "SELECT coalesce(sum(d.pgsize), 0) FROM dbstat d \
+             JOIN sqlite_schema m ON m.name = d.name WHERE m.tbl_name = ?1",
+            [table],
+            |r| r.get(0),
+        )?;
+        Ok((
+            u64::try_from(rows).unwrap_or(0),
+            u64::try_from(bytes).unwrap_or(0),
+        ))
+    }
+
     /// Reads a runtime setting.
     pub fn setting(&self, key: &str) -> Result<Option<serde_json::Value>, StoreError> {
         self.snapshot(|s| s.setting(key))
@@ -721,10 +740,13 @@ mod tests {
             [
                 "company_dismissals",
                 "company_enrichment",
+                "company_graph_log",
                 "company_leases",
+                "company_links",
                 "company_merges",
                 "company_proposals",
                 "company_registry_due",
+                "company_stats",
                 "edges",
                 "favicons",
                 "jobs",

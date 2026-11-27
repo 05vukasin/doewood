@@ -69,6 +69,11 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("migrations/0013_known_copies.sql"),
         fk_check: FkCheck::Skip,
     },
+    // New tables filled from `nodes` and `edges`, indexes and triggers (issue #172).
+    Migration {
+        sql: include_str!("migrations/0014_company_graph.sql"),
+        fk_check: FkCheck::Tables(&["company_stats", "company_graph_log"]),
+    },
 ];
 
 /// The schema version this binary writes.

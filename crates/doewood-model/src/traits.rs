@@ -14,8 +14,9 @@ use time::Date;
 use uuid::Uuid;
 
 use crate::{
-    Blake3, CacheRow, Candidates, DismissRequest, Dismissal, DismissalQuery, DueCompany, Edge,
-    EdgeCursor, Enrichment, FeedState, IconRow, LiveEdge, Located, LocationEnded, MergeEntry,
+    Blake3, CacheRow, Candidates, CompanyCursor, CompanyFilter, CompanyLink, CompanyOrder,
+    CompanyRow, DismissRequest, Dismissal, DismissalQuery, DueCompany, Edge, EdgeCursor,
+    Enrichment, FeedState, Folded, IconRow, LiveEdge, Located, LocationEnded, MergeEntry,
     MergeQuery, MergeRequest, Neighbour, NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation,
     OwnedAlias, PartyDocument, Proposal, ProposalQuery, ProposalRequest, PropsPatch, PutOutcome,
     Record, ResolveRequest, Result, SearchDoc, SearchHit, SearchQuery, Sketch, SourceClaim,
@@ -259,6 +260,65 @@ pub trait GraphStore: Send + Sync {
 
     /// The aliases `node` owns, ordered by kind, then alias.
     async fn aliases_of(&self, node: Uuid) -> Result<Vec<OwnedAlias>>;
+
+    /// [`GraphStore::neighbours_page`] of each of `nodes`, in that order: the first
+    /// `per_node` neighbours of each (at most [`crate::RECORDS_MAX_LIMIT`]), each with the
+    /// node it was read for, ending early with the neighbour that brings them all to
+    /// `max_bytes` ([`crate::neighbour_page_bytes`]). A backend may read them in one
+    /// statement (Postgres; issue #172).
+    async fn neighbours_of_many(
+        &self,
+        nodes: &[Uuid],
+        query: &NeighbourQuery,
+        per_node: u32,
+        max_bytes: usize,
+    ) -> Result<Vec<(Uuid, Neighbour)>> {
+        let mut out = Vec::new();
+        let mut bytes = 0usize;
+        for &node in nodes {
+            if per_node == 0 || bytes >= max_bytes {
+                break;
+            }
+            let page = self
+                .neighbours_page(node, query, None, per_node, max_bytes - bytes)
+                .await?;
+            for n in page {
+                bytes += crate::neighbour_page_bytes(&n);
+                out.push((node, n));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Folds the company graph's change log into its counts (issue #172, see
+    /// [`crate::explore`]): at most `max_rows` log rows and every other log row of their
+    /// nodes, in one transaction, one fold at a time across instances.
+    async fn fold_company_graph(&self, max_rows: u32) -> Result<Folded>;
+
+    /// A page of the live companies (not merged away) that match `filter`, in `order`, after
+    /// `after` (a cursor of the same order), with their counts as last folded: at most
+    /// `limit` (at most [`crate::COMPANY_GRAPH_NODES_MAX`] + 1), ending early with the one
+    /// that reaches `max_bytes` ([`crate::company_row_bytes`]). The page starts at `after` in
+    /// the order's index; filters are checked on the companies in order.
+    async fn list_companies(
+        &self,
+        filter: &CompanyFilter,
+        order: CompanyOrder,
+        after: Option<&CompanyCursor>,
+        limit: u32,
+        max_bytes: usize,
+    ) -> Result<Vec<CompanyRow>>;
+
+    /// The pairs among `companies` (at most [`crate::COMPANY_GRAPH_NODES_MAX`]) that share at
+    /// least `min_documents` documents or have a corporate-event edge, as last folded: the
+    /// most shared documents first, then the most events, then by `a` and `b`; at most
+    /// `limit` (at most [`crate::COMPANY_GRAPH_LINKS_MAX`] + 1).
+    async fn company_links(
+        &self,
+        companies: &[Uuid],
+        min_documents: u32,
+        limit: u32,
+    ) -> Result<Vec<CompanyLink>>;
 }
 
 /// Reversible company merges (ADR 0002 section 1.8): the merge log, undo and split, and

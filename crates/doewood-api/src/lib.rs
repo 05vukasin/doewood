@@ -28,6 +28,7 @@ mod config;
 mod convert;
 mod enrichment;
 mod error;
+mod explore;
 mod graph;
 mod icons;
 mod jobs;

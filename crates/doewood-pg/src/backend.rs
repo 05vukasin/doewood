@@ -1174,6 +1174,57 @@ impl GraphStore for PgStore {
     async fn aliases_of(&self, node: Uuid) -> Result<Vec<OwnedAlias>> {
         crate::merges::aliases_of(&client(&self.pool).await?, node).await
     }
+
+    async fn neighbours_of_many(
+        &self,
+        nodes: &[Uuid],
+        q: &NeighbourQuery,
+        per_node: u32,
+        max_bytes: usize,
+    ) -> Result<Vec<(Uuid, Neighbour)>> {
+        if nodes.is_empty() || per_node == 0 {
+            return Ok(Vec::new());
+        }
+        validate_batch_count(nodes.len())?;
+        let mut c = client(&self.pool).await?;
+        pages::neighbours_of_many(&mut c, nodes, q, per_node, max_bytes).await
+    }
+
+    async fn fold_company_graph(&self, max_rows: u32) -> Result<doewood_model::Folded> {
+        crate::explore::fold(&self.pool, max_rows).await
+    }
+
+    async fn list_companies(
+        &self,
+        filter: &doewood_model::CompanyFilter,
+        order: doewood_model::CompanyOrder,
+        after: Option<&doewood_model::CompanyCursor>,
+        limit: u32,
+        max_bytes: usize,
+    ) -> Result<Vec<doewood_model::CompanyRow>> {
+        filter.validate()?;
+        let limit = limit.clamp(1, doewood_model::COMPANY_GRAPH_NODES_MAX + 1);
+        crate::explore::list_companies(&self.pool, filter, order, after, limit, max_bytes).await
+    }
+
+    async fn company_links(
+        &self,
+        companies: &[Uuid],
+        min_documents: u32,
+        limit: u32,
+    ) -> Result<Vec<doewood_model::CompanyLink>> {
+        if companies.len() > doewood_model::COMPANY_GRAPH_NODES_MAX as usize {
+            return Err(Error::Invalid(format!(
+                "at most {} companies",
+                doewood_model::COMPANY_GRAPH_NODES_MAX
+            )));
+        }
+        if companies.len() < 2 || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = limit.min(doewood_model::COMPANY_GRAPH_LINKS_MAX + 1);
+        crate::explore::company_links(&self.pool, companies, min_documents, limit).await
+    }
 }
 
 #[async_trait]

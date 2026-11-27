@@ -26,6 +26,7 @@ mod backend;
 mod cached;
 mod convert;
 mod enrichment;
+mod explore;
 mod feeds;
 mod merges;
 mod migrate;

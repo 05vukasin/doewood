@@ -3612,3 +3612,323 @@ async fn webhooks_for_a_source_claimed_elsewhere_are_ignored() {
         shared.drop_schema().await;
     }
 }
+
+/// The explorer's reads through gRPC (issue #172), on SQLite and Postgres: companies with
+/// their counts and pages, the company graph, a subgraph and a path, and the checks on every
+/// request. The rules themselves are the conformance suite's (`explorer`).
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn explorer_reads() {
+    for shared in Shared::all().await {
+        let name = shared.name;
+        let a = Instance::start("inst-a", Some(shared.backend.clone())).await;
+        let graph = GraphServiceClient::new(a.channel().await);
+        let be = &shared.backend;
+        let mut cos = Vec::new();
+        for i in 0..5u32 {
+            cos.push(
+                be.upsert_node(
+                    NodeKind::Company,
+                    &format!("e172-co-{i}"),
+                    &json!({"name": format!("E172 Co {i}"),
+                            "names": [format!("E172 Co {i}"), format!("Other {i}")],
+                            "website": {"url": "https://e172.example/"},
+                            "icon": {"domain": "e172.example"}}),
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        be.claim_alias(
+            NodeKind::Company,
+            "id:lei:E172000000000000001",
+            cos[0],
+            &json!({}),
+        )
+        .await
+        .unwrap();
+        // Company i buys in 10 - 2i documents, each with company i + 1 as the supplier.
+        let mut n = 0u32;
+        let mut docs = Vec::new();
+        for i in 0..4usize {
+            for _ in 0..(10 - 2 * i) {
+                let d = be
+                    .upsert_node(
+                        NodeKind::Document,
+                        &format!("{:064x}", 0x0172_1000 + n),
+                        &json!({}),
+                    )
+                    .await
+                    .unwrap();
+                n += 1;
+                be.upsert_edges(&[
+                    Edge::new(d, cos[i], EdgeKind::Party, EdgeSource::Document)
+                        .with_props(json!({"role": "buyer"})),
+                    Edge::new(d, cos[i + 1], EdgeKind::Party, EdgeSource::Document)
+                        .with_props(json!({"role": "supplier"})),
+                ])
+                .await
+                .unwrap();
+                docs.push(d);
+            }
+        }
+        let filter = Some(pb::CompanyFilter {
+            name_prefix: "e172 co".into(),
+            ..Default::default()
+        });
+        let list = |page_size: u32, page_token: String| {
+            let mut g = graph.clone();
+            let filter = filter.clone();
+            async move {
+                g.list_companies(pb::ListCompaniesRequest {
+                    filter,
+                    order: pb::CompanyOrder::Documents as i32,
+                    page_size,
+                    page_token,
+                })
+                .await
+                .map(tonic::Response::into_inner)
+            }
+        };
+        // The read folds first, so the counts are there at once.
+        let all = list(0, String::new()).await.unwrap();
+        assert!(!all.stale, "{name}");
+        assert!(all.next_page_token.is_empty(), "{name}");
+        let mut want = vec![
+            (cos[1], 18, 2),
+            (cos[2], 14, 2),
+            (cos[0], 10, 1),
+            (cos[3], 10, 2),
+            (cos[4], 4, 1),
+        ];
+        want.sort_by_key(|x| std::cmp::Reverse((x.1, x.0)));
+        let want: Vec<(String, u64, u64)> = want
+            .into_iter()
+            .map(|(id, d, g)| (id.to_string(), d, g))
+            .collect();
+        let got: Vec<(String, u64, u64)> = all
+            .companies
+            .iter()
+            .map(|c| (c.id.clone(), c.document_count, c.degree))
+            .collect();
+        assert_eq!(got, want, "{name}");
+        let first = all
+            .companies
+            .iter()
+            .find(|c| c.id == cos[0].to_string())
+            .unwrap();
+        assert_eq!(first.name, "E172 Co 0");
+        assert_eq!(first.aliases, ["Other 0"]);
+        assert_eq!(
+            first.identifiers,
+            [pb::CompanyIdentifier {
+                kind: "lei".into(),
+                value: "E172000000000000001".into()
+            }]
+        );
+        assert_eq!(first.website, "https://e172.example/");
+        assert_eq!(first.favicon_domain, "e172.example");
+        // Pages of two: the same companies, then an empty token.
+        let (mut walked, mut token) = (Vec::new(), String::new());
+        loop {
+            let page = list(2, token).await.unwrap();
+            walked.extend(page.companies.into_iter().map(|c| c.id));
+            token = page.next_page_token;
+            if token.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(walked, got.iter().map(|g| g.0.clone()).collect::<Vec<_>>());
+        invalid(
+            &graph
+                .clone()
+                .list_companies(pb::ListCompaniesRequest {
+                    filter: Some(pb::CompanyFilter {
+                        name_prefix: "x".repeat(201),
+                        ..Default::default()
+                    }),
+                    order: 9,
+                    page_size: 1001,
+                    page_token: "garbage".into(),
+                })
+                .await
+                .unwrap_err(),
+            &["filter.name_prefix", "order", "page_size", "page_token"],
+        );
+        // A token of another order is refused.
+        let by_docs = list(1, String::new()).await.unwrap().next_page_token;
+        invalid(
+            &graph
+                .clone()
+                .list_companies(pb::ListCompaniesRequest {
+                    filter: filter.clone(),
+                    order: pb::CompanyOrder::Name as i32,
+                    page_token: by_docs,
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err(),
+            &["page_token"],
+        );
+
+        // The company graph: four links in a chain; capped at three companies.
+        let g = graph
+            .clone()
+            .company_graph(pb::CompanyGraphRequest {
+                filter: filter.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!g.truncated, "{name}");
+        assert_eq!(g.companies.len(), 5);
+        let weights: Vec<u64> = g.links.iter().map(|l| l.shared_documents).collect();
+        assert_eq!(weights, [10, 8, 6, 4], "{name}");
+        let top = &g.links[0];
+        let buyer = top
+            .roles
+            .iter()
+            .find(|r| r.company_id == cos[0].to_string())
+            .unwrap();
+        assert_eq!((buyer.role.as_str(), buyer.documents), ("buyer", 10));
+        let g = graph
+            .clone()
+            .company_graph(pb::CompanyGraphRequest {
+                filter: filter.clone(),
+                min_weight: 7,
+                limit: 3,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(g.truncated);
+        assert_eq!(g.companies.len(), 3);
+        // Co 1, Co 2 and one of Co 0 / Co 3: only the 8-document link 1-2 (and 10, 0-1 if Co 0).
+        assert!(g.links.iter().all(|l| l.shared_documents >= 7));
+        invalid(
+            &graph
+                .clone()
+                .company_graph(pb::CompanyGraphRequest {
+                    limit: 2001,
+                    max_links: 20_001,
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err(),
+            &["limit", "max_links"],
+        );
+
+        // A subgraph around Co 0 and a path from Co 0 to Co 4 (eight edges: too far).
+        let sub = graph
+            .clone()
+            .subgraph(pb::SubgraphRequest {
+                seed_ids: vec![cos[0].to_string()],
+                depth: 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!sub.truncated, "{name}");
+        // Co 0, its ten documents, then Co 1 (their other party).
+        assert_eq!(sub.nodes.len(), 12, "{name}");
+        assert_eq!(sub.edges.len(), 20, "{name}");
+        assert_eq!(sub.nodes[0].depth, 0);
+        let sub = graph
+            .clone()
+            .subgraph(pb::SubgraphRequest {
+                seed_ids: vec![cos[0].to_string()],
+                depth: 2,
+                limit: 5,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(sub.truncated);
+        assert_eq!(sub.nodes.len(), 5);
+        invalid(
+            &graph
+                .clone()
+                .subgraph(pb::SubgraphRequest {
+                    seed_ids: vec!["nope".into()],
+                    depth: 4,
+                    node_kinds: vec![99],
+                    edge_kinds: vec![99],
+                    limit: 2001,
+                    max_edges: 10_001,
+                    as_of: "2024-13-01".into(),
+                })
+                .await
+                .unwrap_err(),
+            &[
+                "seed_ids[0]",
+                "depth",
+                "limit",
+                "max_edges",
+                "node_kinds[0]",
+                "edge_kinds[0]",
+                "as_of",
+            ],
+        );
+        let missing = graph
+            .clone()
+            .subgraph(pb::SubgraphRequest {
+                seed_ids: vec![uuid::Uuid::from_u128(0x172).to_string()],
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::NotFound);
+        let from = cos[0];
+        let path = |to: uuid::Uuid, max_depth: u32| {
+            let mut g = graph.clone();
+            async move {
+                g.path(pb::PathRequest {
+                    from_id: from.to_string(),
+                    to_id: to.to_string(),
+                    max_depth,
+                    max_paths: 10,
+                    ..Default::default()
+                })
+                .await
+                .map(tonic::Response::into_inner)
+            }
+        };
+        let p = path(cos[2], 0).await.unwrap();
+        // Co 0 - document - Co 1 - document - Co 2: one path for each pair of documents, at
+        // most ten.
+        assert_eq!(p.paths.len(), 10, "{name}");
+        assert!(
+            p.paths
+                .iter()
+                .all(|p| p.edges.len() == 4 && p.nodes.len() == 5)
+        );
+        assert_eq!(p.paths[0].nodes[0].id, cos[0].to_string());
+        assert_eq!(p.paths[0].nodes[4].id, cos[2].to_string());
+        let p = path(cos[4], 6).await.unwrap();
+        assert!(
+            p.paths.is_empty() && !p.truncated,
+            "{name}: eight edges away"
+        );
+        let p = path(cos[4], 0).await.unwrap();
+        assert!(p.paths.is_empty());
+        invalid(
+            &graph
+                .clone()
+                .path(pb::PathRequest {
+                    from_id: "nope".into(),
+                    max_depth: 7,
+                    max_paths: 11,
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err(),
+            &["from_id", "to_id", "max_depth", "max_paths"],
+        );
+        a.stop().await;
+        drop(docs);
+    }
+}

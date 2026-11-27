@@ -88,9 +88,11 @@ enum Range {
 
 /// The neighbour query: `UNION ALL` of index ranges, one per direction and, after a cursor,
 /// one for the rest of the cursor's kind and one for the kinds after it, each limited to the
-/// page size. Columns: the edge (0 to 10), the node (11 to 14), the sort key (15). `$1` is
-/// the node. `None` when no range can match.
+/// page size. Columns: the edge (0 to 10), the node (11 to 14), the sort key (15). `node` is
+/// the node's expression (`$1`, or a column of a lateral join). `None` when no range can
+/// match.
 pub(crate) fn neighbours_sql(
+    node: &str,
     q: &NeighbourQuery,
     after: Option<&EdgeCursor>,
     limit: Option<i64>,
@@ -136,10 +138,10 @@ pub(crate) fn neighbours_sql(
         for range in &ranges {
             let mut s = format!(
                 "SELECT {EDGE_COLUMNS}, {NODE_COLUMNS}, {VF_KEY} AS vf_key FROM edges e \
-                 JOIN nodes n ON n.id = {other} WHERE {at} = $1"
+                 JOIN nodes n ON n.id = {other} WHERE {at} = {node}"
             );
             if not_self {
-                s.push_str(" AND e.src <> $1");
+                let _ = write!(s, " AND e.src <> {node}");
             }
             match range {
                 Range::All => {}
@@ -207,8 +209,13 @@ pub(crate) async fn neighbours(
     let limit = page.map(|(_, l, _)| records_limit(l));
     let mut args = Args::default();
     args.push(node);
-    let Some(sql) = neighbours_sql(q, page.and_then(|p| p.0), limit.map(i64::from), &mut args)
-    else {
+    let Some(sql) = neighbours_sql(
+        "$1",
+        q,
+        page.and_then(|p| p.0),
+        limit.map(i64::from),
+        &mut args,
+    ) else {
         return Ok(Vec::new());
     };
     // Cached: the shapes are few (direction, filters, a cursor or not, its kind's place).
@@ -296,4 +303,52 @@ pub(crate) async fn company_documents(
         |d| node_page_bytes(&d.node),
     )
     .await
+}
+
+/// [`doewood_model::GraphStore::neighbours_of_many`] in one statement (issue #172): the page
+/// query of [`neighbours_sql`] for each node of `$1` in a lateral join, in the nodes' order,
+/// read through a portal up to `max_bytes`. Column 16 is the node's place in `$1`.
+pub(crate) async fn neighbours_of_many(
+    c: &mut Object,
+    nodes: &[Uuid],
+    q: &NeighbourQuery,
+    per_node: u32,
+    max_bytes: usize,
+) -> Result<Vec<(Uuid, Neighbour)>> {
+    let per_node = records_limit(per_node);
+    let mut args = Args::default();
+    args.push(nodes.to_vec());
+    let Some(inner) = neighbours_sql("f.id", q, None, Some(i64::from(per_node)), &mut args) else {
+        return Ok(Vec::new());
+    };
+    let total = nodes.len().saturating_mul(per_node as usize);
+    let sql = format!(
+        "SELECT x.*, f.ord FROM unnest($1::uuid[]) WITH ORDINALITY f (id, ord) \
+         CROSS JOIN LATERAL ({inner}) x ORDER BY f.ord, 4, 16, 1"
+    );
+    let ords = paged(
+        c,
+        &sql,
+        &args.refs(),
+        Some((total.max(1), max_bytes)),
+        |r| {
+            let ord: i64 = r.try_get(16).map_err(pg)?;
+            Ok((
+                ord,
+                Neighbour {
+                    edge: edge_at(r)?,
+                    node: node_at(r, 11)?,
+                },
+            ))
+        },
+        |(_, n)| neighbour_page_bytes(n),
+    )
+    .await?;
+    Ok(ords
+        .into_iter()
+        .filter_map(|(ord, n)| {
+            let at = usize::try_from(ord).ok()?.checked_sub(1)?;
+            Some((*nodes.get(at)?, n))
+        })
+        .collect())
 }

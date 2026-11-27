@@ -264,6 +264,8 @@ async fn run(Loaded { config, warnings }: Loaded, started: Instant) -> Result<()
     // instance store's planner statistics refreshed: first right now, after the start, as that
     // can take seconds on a big store (issue #118).
     let purging = cleanup::start(Arc::clone(&store), backend_rx.clone(), shutdown_rx.clone());
+    // The company graph's counts follow the edges (issue #172).
+    let folding = cleanup::start_fold(backend_rx.clone(), shutdown_rx.clone());
 
     let signal = signals.recv().await;
     info!(signal, "shutting down");
@@ -301,6 +303,9 @@ async fn run(Loaded { config, warnings }: Loaded, started: Instant) -> Result<()
     }
     if let Err(e) = purging.await {
         warn!(error = %e, "cache purge task failed");
+    }
+    if let Err(e) = folding.await {
+        warn!(error = %e, "company graph fold task failed");
     }
     let backend = backend_rx.borrow().as_ref().map(|b| b.name());
     info!(backend, "servers stopped");
