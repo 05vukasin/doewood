@@ -12,10 +12,10 @@ use doewood_model::{
     GraphStore, LiveEdge, Located, LocationEnded, MERGE_CHAIN_MAX, Neighbour, NeighbourQuery, Node,
     NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PartyDocument, PropsPatch, PutOutcome, Record,
     RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore, Sketch,
-    SketchStore, SourceClaim, SourceKey, StepVersions, StoredEdge, band_to_i64, merged_into,
-    record_page_bytes, records_limit, sketch_limit, validate_alias, validate_alias_count,
-    validate_batch_count, validate_hashes, validate_node, validate_sketch, versions_from_json,
-    versions_to_json,
+    SketchStore, SourceClaim, SourceKey, StepVersions, StoredEdge, StoredText, band_to_i64,
+    merged_into, record_page_bytes, records_limit, sketch_limit, validate_alias,
+    validate_alias_count, validate_batch_count, validate_hashes, validate_node, validate_sketch,
+    versions_from_json, versions_to_json,
 };
 use futures_util::future::try_join_all;
 use serde_json::Value;
@@ -105,6 +105,12 @@ const PUT_RECORD: &str = "INSERT INTO records (blake3, body, versions) VALUES ($
      ELSE records.body IS DISTINCT FROM EXCLUDED.body END \
      OR records.versions IS DISTINCT FROM EXCLUDED.versions \
      RETURNING (xmax = 0) AS inserted";
+
+/// [`RecordStore::put_document_text`]: `$1` the hash, `$2` the canonical text. Unchanged text
+/// is not written again, so `updated_at` stays; a missing record is a foreign key error.
+const PUT_DOCUMENT_TEXT: &str = "INSERT INTO document_texts (blake3, body) VALUES ($1, $2) \
+     ON CONFLICT (blake3) DO UPDATE SET body = EXCLUDED.body, updated_at = now() \
+     WHERE document_texts.body IS DISTINCT FROM EXCLUDED.body";
 
 /// The rows of the first batch [`LIST_RECORDS`] reads from its portal.
 const LIST_RECORDS_BATCH: usize = 8;
@@ -755,6 +761,54 @@ impl RecordStore for PgStore {
         drop(portal);
         tx.commit().await.map_err(pg)?;
         Ok(page)
+    }
+
+    async fn put_document_text(&self, blake3: &Blake3, body: &RawValue) -> Result<()> {
+        // As for records (ADR 0003, decision 4): every stored body parses as jsonb.
+        if has_nul_escape(body.get()) {
+            return Err(Error::Invalid(
+                "a document text cannot hold \\u0000".to_owned(),
+            ));
+        }
+        let c = client(&self.pool).await?;
+        c.exec(
+            PUT_DOCUMENT_TEXT,
+            &[&blake3.as_bytes().as_slice(), &body.get()],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_document_text(&self, blake3: &Blake3) -> Result<()> {
+        let c = client(&self.pool).await?;
+        c.exec(
+            "DELETE FROM document_texts WHERE blake3 = $1",
+            &[&blake3.as_bytes().as_slice()],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn get_document_text(&self, blake3: &Blake3) -> Result<Option<StoredText>> {
+        let c = client(&self.pool).await?;
+        c.opt(
+            "SELECT body, extract(epoch FROM updated_at)::bigint FROM document_texts \
+             WHERE blake3 = $1",
+            &[&blake3.as_bytes().as_slice()],
+        )
+        .await?
+        .map(|r| {
+            let body: String = r.try_get(0).map_err(pg)?;
+            Ok(StoredText {
+                blake3: *blake3,
+                body: RawValue::from_string(body).map_err(|e| Error::Backend {
+                    backend: "postgres",
+                    message: format!("stored document text: {e}"),
+                })?,
+                updated_at: r.try_get(1).map_err(pg)?,
+            })
+        })
+        .transpose()
     }
 }
 

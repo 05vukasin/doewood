@@ -20,7 +20,7 @@ use crate::{
     MergeQuery, MergeRequest, Neighbour, NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation,
     OwnedAlias, PartyDocument, Proposal, ProposalQuery, ProposalRequest, PropsPatch, PutOutcome,
     Record, ResolveRequest, Result, SearchDoc, SearchHit, SearchQuery, Sketch, SourceClaim,
-    SourceKey, SplitRequest, StepVersions, UndoOutcome, UndoRequest,
+    SourceKey, SplitRequest, StepVersions, StoredText, UndoOutcome, UndoRequest,
 };
 
 /// quail and hedgehog records, keyed by BLAKE3.
@@ -63,6 +63,22 @@ pub trait RecordStore: Send + Sync {
         limit: u32,
         max_bytes: usize,
     ) -> Result<Vec<Record>>;
+
+    /// Inserts or replaces the document text of the stored record `blake3` (issue #166):
+    /// canonical JSON text of a [`crate::DocumentText`], as [`crate::DocumentText::to_body`]
+    /// writes it. Writing the same text again does not touch `updated_at`. Removing the record
+    /// removes its text.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::NotFound`] when no record `blake3` is stored.
+    async fn put_document_text(&self, blake3: &Blake3, body: &RawValue) -> Result<()>;
+
+    /// Removes the document text of `blake3`, if any (a file re-analyzed into no text).
+    async fn delete_document_text(&self, blake3: &Blake3) -> Result<()>;
+
+    /// The stored document text of `blake3`.
+    async fn get_document_text(&self, blake3: &Blake3) -> Result<Option<StoredText>>;
 }
 
 /// The typed graph of ADR 0001 section 7 and ADR 0002 section 3.

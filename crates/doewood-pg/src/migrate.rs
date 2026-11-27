@@ -24,6 +24,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0011_band_sizes_shared.sql"),
     include_str!("migrations/0012_company_graph.sql"),
     include_str!("migrations/0013_company_documents_total.sql"),
+    include_str!("migrations/0014_document_texts.sql"),
 ];
 
 /// The schema version this binary writes.

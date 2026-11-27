@@ -145,7 +145,12 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
 - **Schema 11** (issue #141: the triggers behind `sketch_band_sizes` keep a row only for a
   band bucket of two or more documents, which cut the WAL of ingest by 12 to 29%; new
   functions only, no table or data changed, migrates in seconds, see
-  [deploy.md](deploy.md#postgres-wal-on-a-big-corpus-issue-141)) is the current version. As
+  [deploy.md](deploy.md#postgres-wal-on-a-big-corpus-issue-141)) came before schemas 12 and
+  13 (the company graph, issues #172 and #181).
+- **Schema 14** (issue #166: a new, empty table `document_texts` for the documents' text,
+  lz4 like `records.body`; see [api.md](api.md#document-text)) is the current version. Nothing
+  else changes. **Down path:** `DROP TABLE document_texts; DELETE FROM doewood_schema WHERE
+  version = 14;`. The instance's own SQLite file went to schema 16 with the same table. As
   with every schema, **all instances are upgraded together**.
 - **Schema 10** (issue #112: `edges_by_dst` is rebuilt as `(dst, kind, coalesce(valid_from,
   '-infinity'), id)`, the order `Neighbours` and `CompanyDocuments` page in; see
@@ -230,7 +235,7 @@ foreign keys it could break, as the runner declares per migration (issue #159): 
 for one that rebuilds a table, deletes rows or moves data (schemas 1 to 10); only the tables
 it fills for one that writes into new tables (schemas 11, 14 and 15); none for one that writes
 no rows and rebuilds nothing (schema 12, an index; schema 13, a column with a default and a new
-table). A violation rolls the migration back and the instance does not start.
+table; schema 16, a new table). A violation rolls the migration back and the instance does not start.
 A test holds each migration to its declaration.
 
 `doewood.sqlite` runs in WAL mode with `synchronous = NORMAL`, and a `journal_size_limit` of
