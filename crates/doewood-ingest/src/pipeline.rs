@@ -33,6 +33,12 @@
 //!   [`Stats::known_copies`] and [`Stats::known_copy_bytes`].
 //! - **Deleted objects** end their `located_at` edge; the document stays, with its other
 //!   locations.
+//! - **Sources another instance owns** (issue #25, the store's [`doewood_store::ClaimView`]):
+//!   their jobs are dropped, not run. A queued object's pending row is deleted, by the worker
+//!   that takes its job or, for the whole source in one statement, by the sweep; a deletion is
+//!   left to the owner. Counted in the view. The check reads memory only, so it costs no
+//!   store call per object. Until the start-up claim pass has checked the claims, the workers
+//!   wait.
 //! - **Bounded analysis.** A file is hashed once, on a blocking thread. Its analysis has one
 //!   deadline (quail's engine, hedgehog's read and normalizer, [`Analyzer::analyze_hashed`]),
 //!   and a watchdog of the file's time cap plus [`IngestConfig::watchdog_grace`] backs it up
@@ -56,7 +62,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use doewood_core::SourceId;
+use doewood_core::{InstanceId, SourceId};
 use doewood_model::{Backend, Blake3, ObjectLocation};
 use doewood_s3::{
     ClientOptions, EventKind, ObjectEvent, ObjectMeta, S3Client, S3Config, S3Error, md5_etag,
@@ -676,6 +682,14 @@ enum Job {
     },
 }
 
+impl Job {
+    fn source(&self) -> SourceId {
+        match self {
+            Self::Ingest { source, .. } | Self::Delete { source, .. } => *source,
+        }
+    }
+}
+
 /// The running tasks.
 pub struct IngestHandle {
     dispatcher: JoinHandle<()>,
@@ -873,10 +887,34 @@ impl Ingest {
                 return false;
             }
         };
+        let claims = self.inner.store.claims();
         for source in sources
             .into_iter()
             .filter(|s| s.state != SourceState::Removed)
         {
+            // Another instance owns it (issue #25): its queue is dropped in one statement.
+            // Before the claims are checked, its objects are queued and the workers decide.
+            if claims.is_checked()
+                && let Some(owner) = claims.owner_elsewhere(source.id)
+            {
+                let id = source.id;
+                match self.db(move |s| s.drop_pending_objects(id)).await {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        claims.count_dropped_queued(n);
+                        info!(
+                            source = %id,
+                            owner = %owner,
+                            dropped = n,
+                            "source claimed by another instance; its queued objects were \
+                             dropped, not ingested"
+                        );
+                        (self.inner.on_change)(id);
+                    }
+                    Err(e) => warn!(source = %id, error = %e, "cannot drop the queued objects"),
+                }
+                continue;
+            }
             let mut after: Option<String> = None;
             loop {
                 let (id, from) = (source.id, after.clone());
@@ -972,6 +1010,21 @@ impl Ingest {
                     }
                 }
             };
+            // Another instance owns the source (issue #25): it scans the bucket itself, so the
+            // job is dropped here. Until the start-up claim pass has checked the claims, the
+            // workers wait. Both checks read memory only (the store's claim view).
+            let claims = self.inner.store.claims();
+            if !claims.is_checked() {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.wait_for(|s| *s) => return,
+                    () = claims.checked() => {}
+                }
+            }
+            if let Some(owner) = claims.owner_elsewhere(job.source()) {
+                self.drop_claimed(job, &owner).await;
+                continue;
+            }
             match job {
                 Job::Ingest {
                     source,
@@ -998,6 +1051,46 @@ impl Ingest {
                 }
             }
         }
+    }
+
+    /// Drops a job of a source another instance owns: an object's pending row is deleted
+    /// (a later scan here, once the claim is this instance's, sees it as new), a deletion is
+    /// left to the owner. Counted in the claim view: an object when its row was deleted here.
+    async fn drop_claimed(&self, job: Job, owner: &InstanceId) {
+        let source = job.source();
+        match job {
+            Job::Ingest { key, etag, .. } => {
+                let k = key.clone();
+                let dropped = self
+                    .db(move |s| s.drop_pending_object(source, &k, etag.as_deref()))
+                    .await;
+                match dropped {
+                    // Counted once: the sweep may have dropped the row already.
+                    Ok(true) => self.inner.store.claims().count_dropped_queued(1),
+                    Ok(false) => {}
+                    Err(e) => {
+                        warn!(source = %source, key, error = %e, "cannot drop a queued object");
+                    }
+                }
+                debug!(
+                    source = %source,
+                    key,
+                    owner = %owner,
+                    "source claimed by another instance; queued object dropped, not ingested"
+                );
+                lock(&self.inner.inflight).remove(&(source, key));
+            }
+            Job::Delete { key, .. } => {
+                self.inner.store.claims().count_dropped_queued(1);
+                debug!(
+                    source = %source,
+                    key,
+                    owner = %owner,
+                    "source claimed by another instance; deletion left to the owner"
+                );
+            }
+        }
+        (self.inner.on_change)(source);
     }
 
     /// Ingests one object version, with retries, and records how it ended. `charge` is the

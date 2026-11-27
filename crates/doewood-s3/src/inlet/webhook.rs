@@ -146,8 +146,8 @@ fn decode_key(key: &str) -> String {
 pub struct WebhookOutcome {
     /// Events sent.
     pub emitted: usize,
-    /// Records ignored: another bucket, outside the prefix, already seen, or the source is
-    /// not active.
+    /// Records ignored: another bucket, outside the prefix, already seen, the source is not
+    /// active, or another instance owns it.
     pub ignored: usize,
 }
 
@@ -187,7 +187,8 @@ impl WebhookInlet {
 /// `objects_seen`, records it and sends the event, like a scan does: a new or changed object
 /// is recorded (`pending`) before its event is sent, so the worker finds its row; a deletion
 /// is sent first, then recorded. Records of another bucket, outside the prefix, already seen,
-/// or of a source that is not scanned are ignored. A failure part-way leaves the rest undone;
+/// of a source that is not scanned, or of one another instance owns (the store's claim view)
+/// are ignored. A failure part-way leaves the rest undone;
 /// handing the same notifications off again is safe, since what was recorded is then seen (a
 /// pending row whose event was not sent is fed by ingest's sweep).
 pub(crate) async fn deliver(
@@ -202,6 +203,22 @@ pub(crate) async fn deliver(
         .await?
         .ok_or(WebhookError::UnknownSource(source))?;
     let mut outcome = WebhookOutcome::default();
+    // Another instance owns the source (issue #25): it scans the bucket itself. Accepted and
+    // ignored, as for a source that is not scanned, and counted.
+    if let Some(owner) = store.claims().owner_elsewhere(source) {
+        outcome.ignored = notifications.len();
+        store
+            .claims()
+            .count_dropped_events(u64::try_from(outcome.ignored).unwrap_or(u64::MAX));
+        tracing::debug!(
+            source = %source,
+            owner = %owner,
+            records = outcome.ignored,
+            ?origin,
+            "source claimed by another instance; notifications ignored"
+        );
+        return Ok(outcome);
+    }
     if !src.state.is_scanned() {
         outcome.ignored = notifications.len();
         return Ok(outcome);
