@@ -324,7 +324,10 @@ already running.
   start: it is not scanned, an active source turns `error` with the reason
   `claimed by instance "doewood-1" since 2026-11-24T10:00:00Z; this instance does not scan it`
   (a paused one stays paused), and a WARN `source claimed by another instance` names the owner.
-  The log line `source claims checked in the shared store` gives the counts. See
+  The log line `source claims checked in the shared store` gives the counts. Until it, ingest
+  holds its work; after it, the queued objects and webhook notifications of a source another
+  instance owns are dropped, not ingested. An owner that is gone for good keeps its claims
+  until `ReleaseSourceClaim` releases them ([deploy](deploy.md#a-dead-instance)). See
   [sources](sources.md#claims).
 
 ### The master key
@@ -358,7 +361,7 @@ every variable, with secrets redacted, and every warning. It creates nothing.
 |---|---|
 | `/healthz` | `200 ok` while the process runs |
 | `/readyz` | `200 ready` once the store is open; `503` before that and during shutdown |
-| `/metrics` | Prometheus text: `doewood_build_info`, `doewood_ready`, `doewood_start_time_seconds`, `doewood_ops_requests_total`, `doewood_ingest_finish_unmatched_total`, `doewood_ingest_known_copies_total`, `doewood_ingest_known_copy_bytes_total` |
+| `/metrics` | Prometheus text: `doewood_build_info`, `doewood_ready`, `doewood_start_time_seconds`, `doewood_ops_requests_total`, `doewood_ingest_claimed_elsewhere_dropped_total`, `doewood_ingest_finish_unmatched_total`, `doewood_ingest_known_copies_total`, `doewood_ingest_known_copy_bytes_total` |
 | `POST /events/s3/{source_id}` | MinIO / S3 event notifications for a source (see [api.md](api.md#event-webhook)) |
 
 On SIGTERM or SIGINT, doewood reports not ready, stops its servers (the gRPC API gets up to 10 s

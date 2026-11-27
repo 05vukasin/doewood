@@ -13,7 +13,9 @@ instance; removing the source releases the claim.
 
 A claim is a row in the shared store naming the owning instance (`DOEWOOD_INSTANCE_ID`) and when
 it first claimed the source ([ADR 0001](adr/0001-architecture.md), section 2). It has no lease
-and does not expire: it stays until its owner removes the source.
+and does not expire: it stays until its owner removes the source, or an operator releases it
+with `ReleaseSourceClaim` after the owner is gone for good ([api.md](api.md#sources),
+[deploy.md](deploy.md#a-dead-instance)).
 
 With a shared Postgres, `serve` re-claims its sources at start, once the database answers
 (before that, no scanner runs):
@@ -30,10 +32,30 @@ source claims it first: while the other instance holds the claim, `ResumeSource`
 `ALREADY_EXISTS` naming it; once that instance removes the source, `ResumeSource` claims and
 scans it. Standalone, nothing of this runs: claims live in the instance's own file.
 
-Known limits: objects that were already pending for a source before its claim went to another
-instance are still ingested from the local queue, and S3 event notifications sent to this
-instance for such a source are still accepted. Changing `DOEWOOD_INSTANCE_ID` makes the old name
-the owner of every source: keep it stable (on Kubernetes it is the pod name).
+A source another instance owns gets no work done here (issue #25); the owner scans the bucket
+itself:
+
+- **Ingest's local queue.** Objects already pending for it (for example from before the claim
+  went to the other instance) are dropped, not ingested: their pending rows are deleted, so a
+  scan here sees them as new once this instance holds the claim again. The sweep drops them in
+  one statement; an event in flight is dropped by the worker that takes it. A deletion event
+  is left to the owner.
+- **Event notifications.** The webhook answers `200` with the records counted as `ignored`, as
+  for a paused source, and queues nothing.
+- Both are counted in `doewood_ingest_claimed_elsewhere_dropped_total` (`path` `queue` or
+  `webhook`, [api.md](api.md#metrics)) and logged at DEBUG (a sweep's drop at INFO, with the
+  count).
+
+The instance knows which sources another instance owns from the start-up claim pass and from
+`ResumeSource`, and keeps that in memory: the check costs no database call per object. Until
+the start-up pass has run, ingest holds its work. A paused source claimed elsewhere keeps its
+state, and its queue is dropped too.
+
+Known limits: an instance learns that another one owns a source only at start and when the
+source is resumed. If a claim is released (`ReleaseSourceClaim`) while its owner still runs,
+that owner keeps scanning until it restarts. Changing `DOEWOOD_INSTANCE_ID` makes the old name
+the owner of every source: keep it stable (on Kubernetes it is the pod name), or release the
+old name's claims as in [deploy.md](deploy.md#a-dead-instance).
 
 ## Any S3-compatible store
 

@@ -2,7 +2,7 @@
 //! configuration, its reprocess jobs offered to the API, and the LLM queue with on-demand
 //! summaries.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Instant;
 
 use doewood_api::{
@@ -20,7 +20,7 @@ use doewood_s3::ClientOptions;
 use doewood_store::Store;
 use prometheus::core::{Collector, Desc};
 use prometheus::proto::MetricFamily;
-use prometheus::{IntCounter, Registry};
+use prometheus::{IntCounter, IntCounterVec, Opts, Registry};
 use tokio::sync::watch;
 use tracing::{error, info};
 use uuid::Uuid;
@@ -139,6 +139,64 @@ pub fn register_metrics(ingest: &Ingest, registry: &Registry) -> prometheus::Res
         move || stats().map_or(0, |s| s.known_copy_bytes),
     )?;
     registry.register(Box::new(bytes))
+}
+
+/// Registers `doewood_ingest_claimed_elsewhere_dropped_total` on the ops port's registry
+/// (issue #25), read from the store's claim view when `/metrics` is scraped. It counts with or
+/// without ingest (the webhook drops too). The registry does not keep the store alive.
+pub fn register_claim_metrics(store: &Arc<Store>, registry: &Registry) -> prometheus::Result<()> {
+    registry.register(Box::new(ClaimDropCounter::new(store)?))
+}
+
+/// `doewood_ingest_claimed_elsewhere_dropped_total{path}` (issue #25): queued objects
+/// (`path="queue"`) and event notification records (`path="webhook"`) of sources another
+/// instance owns, dropped instead of ingested. Read from the store's claim view when collected.
+struct ClaimDropCounter {
+    counters: IntCounterVec,
+    store: Weak<Store>,
+    /// Collections one at a time, so that a count is added once.
+    sync: Mutex<()>,
+}
+
+impl ClaimDropCounter {
+    fn new(store: &Arc<Store>) -> prometheus::Result<Self> {
+        let counters = IntCounterVec::new(
+            Opts::new(
+                "doewood_ingest_claimed_elsewhere_dropped_total",
+                "Work dropped because another instance owns the source in the shared store: \
+                 queued objects (path=queue) and event notification records (path=webhook).",
+            ),
+            &["path"],
+        )?;
+        for path in ["queue", "webhook"] {
+            counters.with_label_values(&[path]);
+        }
+        Ok(Self {
+            counters,
+            store: Arc::downgrade(store),
+            sync: Mutex::new(()),
+        })
+    }
+}
+
+impl Collector for ClaimDropCounter {
+    fn desc(&self) -> Vec<&Desc> {
+        self.counters.desc()
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        let _one = self.sync.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(store) = Weak::upgrade(&self.store) {
+            let drops = store.claims().drops();
+            for (path, now) in [("queue", drops.queued), ("webhook", drops.events)] {
+                let c = self.counters.with_label_values(&[path]);
+                if now > c.get() {
+                    c.inc_by(now - c.get());
+                }
+            }
+        }
+        self.counters.collect()
+    }
 }
 
 /// A counter that follows a count kept elsewhere, read when it is collected.

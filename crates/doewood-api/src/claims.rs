@@ -14,17 +14,27 @@
 //! A claim call that fails (the database went away again) retries the whole pass with backoff;
 //! claims are idempotent. Until the pass has finished, resuming a source only stores the new
 //! state, and the pass starts its scanner. After it, resuming a source claims it first.
+//!
+//! What the instance learns is kept in the store's [`doewood_store::ClaimView`] too: ingest
+//! drops the queued objects of a source another instance owns, and the webhook inlet ignores
+//! its notifications (issue #25). Until the pass has finished, ingest holds its work.
+//!
+//! [`release_claim`] is `ConfigService.ReleaseSourceClaim` (issue #24): an operator deletes a
+//! claim, whoever owns it, so that another instance can take the bucket after its owner is
+//! gone for good. Nothing is taken over automatically.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use doewood_core::InstanceId;
 use doewood_model::{Backend, Error as ModelError, SourceKey};
-use doewood_store::{Source, SourceState, Store};
+use doewood_store::{CLAIMED_BY, Source, SourceState, Store};
 use tokio::sync::watch;
+use tonic::Status;
 use tracing::{info, warn};
 
-use crate::ApiState;
+use crate::{ApiState, error, pb};
 
 const MIN_RETRY: Duration = Duration::from_secs(1);
 const MAX_RETRY: Duration = Duration::from_mins(1);
@@ -99,6 +109,7 @@ async fn pass(state: &ApiState, backend: &Arc<dyn Backend>) -> Result<Reclaimed,
         match backend.claim_source(&key, state.instance()).await {
             Ok(_) => {
                 found.claimed += 1;
+                state.store().claims().set_mine(source.id);
                 if let Some(d) = state.discovery() {
                     d.start_source(&source);
                 }
@@ -131,6 +142,11 @@ pub(crate) async fn mark_conflict(
     if let Some(d) = state.discovery() {
         d.stop_source(source.id);
     }
+    // Paused or not, its queued objects and notifications are dropped from now on.
+    state
+        .store()
+        .claims()
+        .set_elsewhere(source.id, owner.clone());
     if source.state == SourceState::Paused {
         warn!(
             source = %source.id,
@@ -155,11 +171,88 @@ pub(crate) async fn mark_conflict(
     Ok(reason)
 }
 
+/// `ConfigService.ReleaseSourceClaim` (issue #24): deletes `owner`'s claim on `key`, whichever
+/// instance `owner` is, so that another instance can take the bucket. Idempotent: no claim is
+/// `released: false`. A claim held by another instance than `owner` is FAILED_PRECONDITION and
+/// stays; so is this instance's claim on one of its own sources (`RemoveSource` releases it
+/// with the source). Each call is logged with the key, the owner, this instance and the
+/// caller's address: a release at WARN, as it lifts the guard of ADR 0001 section 2 for
+/// that bucket.
+pub(crate) async fn release_claim(
+    state: &ApiState,
+    key: &SourceKey,
+    owner: &InstanceId,
+    peer: Option<SocketAddr>,
+) -> Result<pb::ReleaseSourceClaimResponse, Status> {
+    let _guard = state.lock_sources().await;
+    let backend = state.backend()?;
+    let peer = peer.map_or_else(|| "unknown".to_owned(), |p| p.to_string());
+    let not_owner = |holder: &InstanceId| {
+        Status::failed_precondition(format!(
+            "source {key} is claimed by instance {:?}, not {:?}; nothing was released",
+            holder.as_str(),
+            owner.as_str()
+        ))
+    };
+    let none = |why: &str| {
+        info!(
+            key = %key,
+            owner = %owner,
+            released_by = %state.instance(),
+            peer = %peer,
+            "source claim release asked for; {why}"
+        );
+        pb::ReleaseSourceClaimResponse::default()
+    };
+    let Some(claim) = backend.source_owner(key).await.map_err(error::model)? else {
+        return Ok(none("nobody holds the claim"));
+    };
+    if &claim.owner != owner {
+        return Err(not_owner(&claim.owner));
+    }
+    if owner == state.instance() {
+        let (e, b, p) = (
+            key.endpoint().to_owned(),
+            key.bucket().to_owned(),
+            key.prefix().to_owned(),
+        );
+        if let Some(local) = state.db(move |s| s.source_by_key(&e, &b, &p)).await?
+            && local.state != SourceState::Removed
+        {
+            return Err(Status::failed_precondition(format!(
+                "this instance owns source {key} as {}: remove the source instead",
+                local.id
+            )));
+        }
+    }
+    match backend.release_source(key, owner).await {
+        Ok(true) => {
+            warn!(
+                key = %key,
+                owner = %owner,
+                claimed_at = claim.claimed_at,
+                released_by = %state.instance(),
+                peer = %peer,
+                "source claim released by an operator; another instance may claim the source now"
+            );
+            Ok(pb::ReleaseSourceClaimResponse {
+                released: true,
+                owner: owner.as_str().to_owned(),
+                claimed_at: claim.claimed_at,
+            })
+        }
+        // Released by someone else in between.
+        Ok(false) => Ok(none("nobody holds the claim")),
+        Err(ModelError::SourceClaimed { owner: holder, .. }) => Err(not_owner(&holder)),
+        Err(e) => Err(error::model(e)),
+    }
+}
+
 /// `claimed by instance "<owner>" since <UTC time>; this instance does not scan it`.
 pub(crate) fn conflict_reason(owner: &InstanceId, since: Option<i64>) -> String {
     let since = since.map_or_else(String::new, |t| format!(" since {}", utc(t)));
     format!(
-        "claimed by instance {:?}{since}; this instance does not scan it",
+        "{CLAIMED_BY}{:?}{since}; this instance does not scan it",
         owner.as_str()
     )
 }

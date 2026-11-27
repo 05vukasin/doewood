@@ -115,7 +115,8 @@ helm install doewood charts/doewood \
 Instances are independent: each has its own settings and sources, set through the API. Each
 source is claimed in the shared Postgres by one instance; a restarted pod re-claims its sources
 under the same name, and one another instance owns is reported (state `error`, the owner in the
-reason) instead of scanned (see [sources](sources.md#claims)). Talk to
+reason) instead of scanned (see [sources](sources.md#claims); for an instance that is gone for
+good, see [A dead instance](#a-dead-instance)). Talk to
 one instance through the headless Service, for example
 `doewood-0.doewood-headless.<namespace>.svc:7443`; the regular Service spreads calls over all of
 them, which suits only reads of the shared store (see [Load balancing](#load-balancing)).
@@ -138,6 +139,34 @@ them, which suits only reads of the shared store (see [Load balancing](#load-bal
 
 `/metrics` is on the ops port; add scrape annotations through `podAnnotations` if your
 Prometheus uses them. See [Metrics and alerts](#metrics-and-alerts).
+
+### A dead instance
+
+A source claim has no lease ([sources](sources.md#claims)): when an instance is gone for good
+(its pod and volume deleted, or it runs again under another `DOEWOOD_INSTANCE_ID`), its claims
+stay, and no other instance can add or resume those sources. To move them:
+
+1. Make sure the old instance does not run: `kubectl get pod doewood-3` finds nothing (or it
+   was renamed). A running owner would keep scanning; releasing its claim does not stop it.
+2. Find its claims. Another instance that has the source reports it as `error` with
+   `claimed by instance "doewood-3" since ...` (`ListSources`), and `AddSource` on any
+   instance fails with `ALREADY_EXISTS` naming the owner. In Postgres:
+   `SELECT endpoint, bucket, prefix, claimed_at FROM source_claims WHERE owner = 'doewood-3';`
+3. Release each one through any instance:
+
+   ```sh
+   grpcurl -plaintext -d '{"endpoint": "http://minio:9000", "bucket": "docs", "prefix": "in/",
+       "owner": "doewood-3"}' doewood-0.doewood-headless:7443 \
+       doewood.v1.ConfigService/ReleaseSourceClaim
+   ```
+
+   `released: true` names the owner and its claim time; the instance logs
+   `source claim released by an operator` at WARN with the caller's address. Repeating the call
+   answers `released: false`. A claim another instance has taken meanwhile is
+   `FAILED_PRECONDITION` and stays.
+4. On the instance that takes the bucket over, `AddSource` it, or `ResumeSource` it if it is
+   already there (in `error`, claimed by the old name). The new owner scans the whole bucket; a
+   file whose record is already in the shared store is fetched and hashed, not analyzed again.
 
 ## Load balancing
 
@@ -205,6 +234,10 @@ Alerts worth setting (tune the thresholds to your traffic):
   The store empties its WAL when it is over 64 MiB or idle (issue #151); a WAL that stays
   large means a read or a write holds a lock longer than the 50 ms the checkpoint waits for,
   for example a backup tool or an `sqlite3` shell with a transaction open on the file.
+- **Sources owned elsewhere** (not an alert): `doewood_ingest_claimed_elsewhere_dropped_total`
+  counts queued objects and webhook records this instance dropped because another instance owns
+  the source (issue #25). A webhook count that keeps growing means the bucket's notifications
+  go to the wrong instance: point them at the owner.
 - **Template-heavy sources** (not an alert): `doewood_ingest_similar_buckets_skipped_total`
   counts band keys the `similar_to` query skipped because more than `similar_max_bucket`
   documents share them (issue #148). It grows when one template (one supplier's invoices)

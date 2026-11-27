@@ -18,7 +18,7 @@ rusqlite = { version = "0.41", features = ["bundled"] }
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
-tokio = { workspace = true, features = ["rt"] }
+tokio = { workspace = true, features = ["rt", "sync"] }
 tracing.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
