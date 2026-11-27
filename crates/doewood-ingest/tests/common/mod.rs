@@ -181,6 +181,91 @@ pub fn docx(title: &str, body: &[&str]) -> Vec<u8> {
     ])
 }
 
+/// A minimal PPTX: one slide per `(title, body lines)`, with a layout and a master.
+pub fn pptx(slides: &[(&str, &[&str])]) -> Vec<u8> {
+    const NS: &str = r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main""#;
+    const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    const RELS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+    let sp = |id: u32, ph: &str, body: &str| {
+        format!(
+            r#"<p:sp><p:nvSpPr><p:cNvPr id="{id}" name="Shape {id}"/><p:cNvSpPr/><p:nvPr>{ph}</p:nvPr></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/>{body}</p:txBody></p:sp>"#
+        )
+    };
+    let para = |t: &str| format!("<a:p><a:r><a:t>{}</a:t></a:r></a:p>", xml_escape(t));
+    let part = |root: &str, shapes: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:{root} {NS}><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>{shapes}</p:spTree></p:cSld></p:{root}>"#
+        )
+    };
+    let mut ct = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>"#,
+    );
+    let mut ids = String::new();
+    let mut prels = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="{RELS}"><Relationship Id="rIdM" Type="{REL}/slideMaster" Target="slideMasters/slideMaster1.xml"/>"#
+    );
+    let mut files: Vec<(String, String)> = Vec::new();
+    for (k, (title, body)) in slides.iter().enumerate() {
+        let i = k + 1;
+        ct.push_str(&format!(r#"<Override PartName="/ppt/slides/slide{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>"#));
+        ids.push_str(&format!(r#"<p:sldId id="{}" r:id="rIdS{i}"/>"#, 256 + k));
+        prels.push_str(&format!(
+            r#"<Relationship Id="rIdS{i}" Type="{REL}/slide" Target="slides/slide{i}.xml"/>"#
+        ));
+        let lines: String = body.iter().map(|l| para(l)).collect();
+        let shapes =
+            sp(2, r#"<p:ph type="title"/>"#, &para(title)) + &sp(3, r#"<p:ph idx="1"/>"#, &lines);
+        files.push((format!("ppt/slides/slide{i}.xml"), part("sld", &shapes)));
+        files.push((
+            format!("ppt/slides/_rels/slide{i}.xml.rels"),
+            format!(r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="{RELS}"><Relationship Id="rId1" Type="{REL}/slideLayout" Target="../slideLayouts/slideLayout1.xml"/></Relationships>"#),
+        ));
+    }
+    ct.push_str("</Types>");
+    prels.push_str("</Relationships>");
+    let placeholders =
+        sp(2, r#"<p:ph type="title"/>"#, "") + &sp(3, r#"<p:ph type="body" idx="1"/>"#, "");
+    files.splice(0..0, [("[Content_Types].xml".to_owned(), ct)]);
+    files.extend([
+        (
+            "_rels/.rels".to_owned(),
+            format!(r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="{RELS}"><Relationship Id="rId1" Type="{REL}/officeDocument" Target="ppt/presentation.xml"/></Relationships>"#),
+        ),
+        (
+            "ppt/presentation.xml".to_owned(),
+            format!(r#"<?xml version="1.0" encoding="UTF-8"?><p:presentation {NS}><p:sldMasterIdLst><p:sldMasterId id="2147483648" r:id="rIdM"/></p:sldMasterIdLst><p:sldIdLst>{ids}</p:sldIdLst><p:sldSz cx="9144000" cy="6858000"/></p:presentation>"#),
+        ),
+        ("ppt/_rels/presentation.xml.rels".to_owned(), prels),
+        (
+            "ppt/slideLayouts/slideLayout1.xml".to_owned(),
+            part("sldLayout", &placeholders),
+        ),
+        (
+            "ppt/slideLayouts/_rels/slideLayout1.xml.rels".to_owned(),
+            format!(r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="{RELS}"><Relationship Id="rId1" Type="{REL}/slideMaster" Target="../slideMasters/slideMaster1.xml"/></Relationships>"#),
+        ),
+        (
+            "ppt/slideMasters/slideMaster1.xml".to_owned(),
+            part("sldMaster", &placeholders),
+        ),
+    ]);
+    zip_of(&files)
+}
+
+/// A minimal HTML page: a title, an `h1` and one paragraph per line.
+pub fn html(title: &str, paras: &[&str]) -> Vec<u8> {
+    let body: String = paras
+        .iter()
+        .map(|p| format!("<p>{}</p>", xml_escape(p)))
+        .collect();
+    let title = xml_escape(title);
+    format!(
+        "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><title>{title}</title></head>\
+         <body><h1>{title}</h1>{body}</body></html>\n"
+    )
+    .into_bytes()
+}
+
 /// A minimal XLSX: one sheet, inline strings and numbers, the first row a header.
 pub fn xlsx(sheet: &str, rows: &[&[&str]]) -> Vec<u8> {
     let col = |i: usize| char::from(b'A' + u8::try_from(i).unwrap());

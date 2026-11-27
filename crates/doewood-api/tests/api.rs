@@ -1484,6 +1484,174 @@ async fn list_records_pages_end_at_the_byte_budget() {
     }
 }
 
+/// `GetDocumentText` (issue #166): the stored text a page of blocks at a time, with heading
+/// paths, pages without blocks, sheets, and the paging errors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn get_document_text() {
+    use doewood_model::{BlockKind, TEXT_MAX_BYTES, TextBlock, TextBuilder, TextOrigin, TextZone};
+    for shared in Shared::all().await {
+        let a = Instance::start("inst-a", Some(shared.backend.clone())).await;
+        let ch = a.channel().await;
+        let be = &shared.backend;
+        let h = hash(166);
+        be.put_record(
+            &h,
+            &doewood_model::canonical::to_canonical(&json!({"n": 166})).unwrap(),
+            &[("quail".to_owned(), "1".to_owned())].into(),
+        )
+        .await
+        .unwrap();
+        let mut b = TextBuilder::new("pdf.extract", "3", TEXT_MAX_BYTES);
+        let block = |kind, text: String, level| TextBlock {
+            kind,
+            text,
+            zone: Some(TextZone::Body),
+            level,
+            table: None,
+            row: None,
+        };
+        b.page(0, None, TextOrigin::None);
+        for p in 1..=5u32 {
+            b.page(p, None, TextOrigin::Native);
+            b.block(block(BlockKind::Heading, format!("Part {p}"), Some(1)));
+            for i in 0..99 {
+                b.block(block(BlockKind::Paragraph, format!("p{p}.{i}"), None));
+            }
+        }
+        b.page(6, Some("Prices"), TextOrigin::Native);
+        b.block(TextBlock {
+            kind: BlockKind::SheetRow,
+            text: "Item\tQty".to_owned(),
+            zone: None,
+            level: None,
+            table: None,
+            row: Some(0),
+        });
+        let text = b.finish();
+        be.put_document_text(&h, &text.to_body().unwrap())
+            .await
+            .unwrap();
+
+        let mut records = RecordsServiceClient::new(ch.clone());
+        let ask = |page_token: String, page_size: u32| pb::GetDocumentTextRequest {
+            blake3: h.to_hex(),
+            page_size,
+            page_token,
+        };
+        let (mut token, mut sizes, mut pages, mut blocks) =
+            (String::new(), Vec::new(), Vec::new(), Vec::new());
+        loop {
+            let r = records
+                .get_document_text(ask(token, 0))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                (
+                    r.extractor.as_str(),
+                    r.extractor_version.as_str(),
+                    r.truncated
+                ),
+                ("pdf.extract", "3", false),
+                "{}",
+                shared.name
+            );
+            assert_eq!(r.total_blocks, 501, "{}", shared.name);
+            sizes.push(r.pages.iter().map(|p| p.blocks.len()).sum::<usize>());
+            for p in r.pages {
+                if pages.last().map(|(i, _, _)| *i) != Some(p.index) {
+                    pages.push((p.index, p.origin.clone(), p.sheet.clone()));
+                }
+                blocks.extend(p.blocks);
+            }
+            if r.next_page_token.is_empty() {
+                break;
+            }
+            token = r.next_page_token;
+        }
+        assert_eq!(sizes, [200, 200, 101], "{}", shared.name);
+        let want_pages: Vec<(u32, String, String)> = (0..=6)
+            .map(|i| {
+                let origin = if i == 0 { "none" } else { "native" };
+                let sheet = if i == 6 { "Prices" } else { "" };
+                (i, origin.to_owned(), sheet.to_owned())
+            })
+            .collect();
+        assert_eq!(pages, want_pages, "{}", shared.name);
+        let idx: Vec<u32> = blocks.iter().map(|b| b.index).collect();
+        assert_eq!(idx, (0..501).collect::<Vec<_>>(), "{}", shared.name);
+        let b = &blocks[150];
+        assert_eq!(
+            (b.kind.as_str(), b.text.as_str(), b.page, b.zone.as_str()),
+            ("paragraph", "p2.49", 2, "body"),
+            "{}",
+            shared.name
+        );
+        assert_eq!(b.heading_path, ["Part 2"], "{}", shared.name);
+        let heading = &blocks[100];
+        assert_eq!(
+            (
+                heading.kind.as_str(),
+                heading.level,
+                heading.heading_path.len()
+            ),
+            ("heading", 1, 0),
+            "{}",
+            shared.name
+        );
+        let row = &blocks[500];
+        assert_eq!(
+            (
+                row.kind.as_str(),
+                row.sheet.as_str(),
+                row.row,
+                row.zone.as_str()
+            ),
+            ("sheet_row", "Prices", Some(0), ""),
+            "{}",
+            shared.name
+        );
+
+        // Errors.
+        let code = |r: Result<tonic::Response<pb::GetDocumentTextResponse>, tonic::Status>| {
+            r.map(|_| ()).unwrap_err().code()
+        };
+        let mut c = records.clone();
+        assert_eq!(
+            code(c.get_document_text(ask(String::new(), 1001)).await),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            code(c.get_document_text(ask("nonsense".into(), 0)).await),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            code(c.get_document_text(ask("1.5".into(), 0)).await),
+            tonic::Code::FailedPrecondition
+        );
+        let stored = be.get_document_text(&h).await.unwrap().unwrap();
+        assert_eq!(
+            code(
+                c.get_document_text(ask(format!("{}.502", stored.updated_at), 0))
+                    .await
+            ),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            code(
+                c.get_document_text(pb::GetDocumentTextRequest {
+                    blake3: hash(167).to_hex(),
+                    ..Default::default()
+                })
+                .await
+            ),
+            tonic::Code::NotFound
+        );
+        a.stop().await;
+        shared.drop_schema().await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn records_graph_and_search() {
     for shared in Shared::all().await {

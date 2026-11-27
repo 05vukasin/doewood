@@ -105,6 +105,9 @@ pub struct SheetOutcome {
     pub failed: Option<String>,
     /// The threads hedgehog's normalizer ran with (0: it did not run).
     pub threads: usize,
+    /// The workbook's text, a block per row ([`crate::text::from_workbook`]), when asked for
+    /// and the workbook was read.
+    pub text: Option<doewood_model::DocumentText>,
 }
 
 /// Reads and analyzes a workbook, stopping at `deadline` (the file's): hedgehog's read checks
@@ -140,6 +143,20 @@ pub fn analyze_on(
     deadline: Option<Instant>,
     max_cells: u64,
     cpus: Option<&Arc<CpuSlots>>,
+) -> SheetOutcome {
+    analyze_text_on(bytes, name, format, deadline, max_cells, cpus, 0)
+}
+
+/// [`analyze_on`], with the workbook's text ([`SheetOutcome::text`]) of at most `text_max`
+/// bytes (0: none).
+pub fn analyze_text_on(
+    bytes: &[u8],
+    name: &str,
+    format: &str,
+    deadline: Option<Instant>,
+    max_cells: u64,
+    cpus: Option<&Arc<CpuSlots>>,
+    text_max: usize,
 ) -> SheetOutcome {
     let mut out = SheetOutcome::default();
     // The read borrows the free slots too, for its call only (one thread without a loan).
@@ -213,6 +230,9 @@ pub fn analyze_on(
     let text = sample_text(&wb);
     if !text.is_empty() {
         out.facts.push(fact(keys::TEXT, Value::text(text)));
+    }
+    if text_max > 0 {
+        out.text = Some(crate::text::from_workbook(&wb, HEDGEHOG_REV, text_max));
     }
     tables(&wb, deadline, cpus, &mut out);
     out

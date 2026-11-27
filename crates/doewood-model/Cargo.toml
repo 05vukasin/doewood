@@ -14,16 +14,13 @@ conformance = []
 [dependencies]
 async-trait.workspace = true
 doewood-core.workspace = true
-# `Serialize`, for writing JSON text without a `Value` tree.
-serde = "1"
+# `Serialize`, for writing JSON text without a `Value` tree; the derives for the stored
+# document text.
+serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
 uuid.workspace = true
-
-[dev-dependencies]
-# The tests derive `Serialize` for the shapes they write.
-serde = { version = "1", features = ["derive"] }
 
 [lints]
 workspace = true

@@ -63,7 +63,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use doewood_core::{InstanceId, SourceId};
-use doewood_model::{Backend, Blake3, ObjectLocation};
+use doewood_model::{Backend, Blake3, ObjectLocation, PutOutcome};
 use doewood_s3::{
     ClientOptions, EventKind, ObjectEvent, ObjectMeta, S3Client, S3Config, S3Error, md5_etag,
 };
@@ -1292,7 +1292,8 @@ impl Ingest {
                 .await?;
             lock(&self.inner.stats).analyzed += 1;
             t = self.stage(t, |s| &mut s.analyze);
-            backend.put_record(&a.blake3, &a.body, &a.versions).await?;
+            let put = backend.put_record(&a.blake3, &a.body, &a.versions).await?;
+            put_text(backend, &a, put).await?;
             t = self.stage(t, |s| &mut s.record);
             (a.body, a.outcome)
         };
@@ -1710,6 +1711,22 @@ fn stored_outcome(body: &RawValue) -> Outcome {
         Some("unknown" | "zip" | "image") | None => Outcome::Unsupported,
         Some(_) => Outcome::Analyzed,
     }
+}
+
+/// Writes the text of a file just analyzed beside its record (issue #166), or removes an old
+/// one when the analysis has none. A record new to the store (`put` is `Inserted`) has no old
+/// text.
+async fn put_text(
+    backend: &Arc<dyn Backend>,
+    a: &Analysis,
+    put: PutOutcome,
+) -> Result<(), IngestError> {
+    match &a.text {
+        Some(text) => backend.put_document_text(&a.blake3, text).await?,
+        None if put != PutOutcome::Inserted => backend.delete_document_text(&a.blake3).await?,
+        None => {}
+    }
+    Ok(())
 }
 
 #[cfg(test)]

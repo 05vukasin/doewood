@@ -1,4 +1,4 @@
--- doewood instance store, schema 16: an index on `locations.document_id` (issue #168). An
+-- doewood instance store, schema 17: an index on `locations.document_id` (issue #168). An
 -- index only; no data changes.
 --
 -- A purge deletes Document, Location and company nodes. Each node deleted makes SQLite look

@@ -1,4 +1,4 @@
--- doewood shared store, schema 14: an index on `locations.document_id` (issue #168). An index
+-- doewood shared store, schema 15: an index on `locations.document_id` (issue #168). An index
 -- only; no data changes. Older instances refuse this schema, so every instance is upgraded
 -- together.
 --

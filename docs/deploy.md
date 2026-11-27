@@ -185,8 +185,8 @@ stay, and no other instance can add or resume those sources. To move them:
 ## Privacy and deletion
 
 doewood keeps what it learned from a file after the file is gone: deleting an object, or
-`RemoveSource`, ends its locations, but the record (the extracted text and facts, an LLM
-summary), the search row, the Document node with its parties, and the companies found in it
+`RemoveSource`, ends its locations, but the record (the facts, an LLM
+summary), the document's text, the search row, the Document node with its parties, and the companies found in it
 stay. To honour a deletion request, purge (issue #168; [api.md](api.md#purges), and
 [ingest.md](ingest.md#purges) for exactly what goes):
 
