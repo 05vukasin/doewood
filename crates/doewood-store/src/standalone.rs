@@ -15,10 +15,10 @@ use doewood_core::InstanceId;
 use doewood_model::{
     Backend, Blake3, Candidates, ClaimStore, Edge, EdgeCursor, EdgeKind, EdgeSource, Error,
     GraphStore, LiveEdge, Located, LocationEnded, MERGE_CHAIN_MAX, Neighbour, NeighbourQuery, Node,
-    NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PartyDocument, PropsPatch, PurgeStore, Purged, PutOutcome, Record,
-    RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore, Sketch,
-    SketchStore, SourceClaim, SourceKey, StepVersions, StoredEdge, StoredText, band_to_i64,
-    merged_into, records_limit, sketch_limit, validate_alias, validate_batch_count,
+    NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PartyDocument, PropsPatch, PurgeStore, Purged,
+    PutOutcome, Record, RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery,
+    SearchStore, Sketch, SketchStore, SourceClaim, SourceKey, StepVersions, StoredEdge, StoredText,
+    band_to_i64, merged_into, records_limit, sketch_limit, validate_alias, validate_batch_count,
     validate_hashes, validate_node, validate_sketch, versions_from_json, versions_to_json,
 };
 use rusqlite::types::Value as Sql;

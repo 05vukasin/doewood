@@ -18,9 +18,9 @@ use crate::{
     CompanyRow, DismissRequest, Dismissal, DismissalQuery, DueCompany, Edge, EdgeCursor,
     Enrichment, FeedState, Folded, IconRow, LiveEdge, Located, LocationEnded, MergeEntry,
     MergeQuery, MergeRequest, Neighbour, NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation,
-    OwnedAlias, PartyDocument, Proposal, ProposalQuery, ProposalRequest, PropsPatch, Purged, PutOutcome,
-    Record, ResolveRequest, Result, SearchDoc, SearchHit, SearchQuery, Sketch, SourceClaim,
-    SourceKey, SplitRequest, StepVersions, StoredText, UndoOutcome, UndoRequest,
+    OwnedAlias, PartyDocument, Proposal, ProposalQuery, ProposalRequest, PropsPatch, Purged,
+    PutOutcome, Record, ResolveRequest, Result, SearchDoc, SearchHit, SearchQuery, Sketch,
+    SourceClaim, SourceKey, SplitRequest, StepVersions, StoredText, UndoOutcome, UndoRequest,
 };
 
 /// quail and hedgehog records, keyed by BLAKE3.
