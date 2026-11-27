@@ -256,6 +256,11 @@ async fn run(Loaded { config, warnings }: Loaded, started: Instant) -> Result<()
         let (api, shutdown) = (api.clone(), shutdown_rx.clone());
         tokio::spawn(async move { doewood_api::reclaim_sources(&api, shutdown).await })
     });
+    // Purges an earlier run left unfinished carry on (issue #168).
+    let resuming = {
+        let (api, shutdown) = (api.clone(), shutdown_rx.clone());
+        tokio::spawn(async move { doewood_api::resume_purges(&api, shutdown).await })
+    };
     let api_server = start_api(&config, api_listener, api)?;
     state.step("api", t);
     // Ready now in standalone mode; with Postgres, once it answers (see `shared`).
@@ -281,6 +286,9 @@ async fn run(Loaded { config, warnings }: Loaded, started: Instant) -> Result<()
         && let Err(e) = task.await
     {
         warn!(error = %e, "source claim task failed");
+    }
+    if let Err(e) = resuming.await {
+        warn!(error = %e, "purge resume task failed");
     }
     state.clear_webhook();
     scanning.stop().await;

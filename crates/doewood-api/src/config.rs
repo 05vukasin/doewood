@@ -317,6 +317,7 @@ impl Api {
     ) -> Result<doewood_store::Source, Status> {
         let _guard = self.state.lock_sources().await;
         let current = self.state.source(id).await?;
+        not_purging(&current)?;
         let previous = current.state;
         // With a shared store, a source is scanned only under this instance's claim.
         let claim_now = state.is_scanned() && self.state.shared_claims();
@@ -381,6 +382,17 @@ impl Api {
     }
 }
 
+/// A source being purged (state `removed`, issue #168) only changes through its purge.
+fn not_purging(source: &doewood_store::Source) -> Result<(), Status> {
+    if source.state == SourceState::Removed {
+        return Err(Status::failed_precondition(format!(
+            "source {} is being purged; PurgeSource carries on with an interrupted purge",
+            source.id
+        )));
+    }
+    Ok(())
+}
+
 #[tonic::async_trait]
 impl ConfigService for Api {
     async fn add_source(
@@ -399,6 +411,7 @@ impl ConfigService for Api {
         let (id, patch, key) = check_update(request.get_ref())?;
         let _guard = self.state.lock_sources().await;
         let current = self.state.source(id).await?;
+        not_purging(&current)?;
         if patch.url_style == Some(UrlStyle::VirtualHost) {
             let mut v = Violations::default();
             validate::bucket(&mut v, "url_style", &current.bucket, UrlStyle::VirtualHost);
@@ -454,6 +467,7 @@ impl ConfigService for Api {
         let id = check_id("source_id", &request.get_ref().source_id)?;
         let _guard = self.state.lock_sources().await;
         let source = self.state.source(id).await?;
+        not_purging(&source)?;
         // The claim goes first: if the shared store is away, nothing is removed and the
         // call can be repeated, instead of leaving a claim nobody owns.
         let backend = self.state.backend()?;

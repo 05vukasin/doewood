@@ -84,9 +84,14 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("migrations/0016_document_texts.sql"),
         fk_check: FkCheck::Skip,
     },
+    // An index only (issue #168).
+    Migration {
+        sql: include_str!("migrations/0017_locations_by_document.sql"),
+        fk_check: FkCheck::Skip,
+    },
     // A new empty table (issue #169).
     Migration {
-        sql: include_str!("migrations/0017_similar_keys.sql"),
+        sql: include_str!("migrations/0018_similar_keys.sql"),
         fk_check: FkCheck::Skip,
     },
 ];

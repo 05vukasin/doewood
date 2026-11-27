@@ -1,4 +1,4 @@
--- doewood instance store, schema 17: the exact-match keys of typed similarity (issue #169).
+-- doewood instance store, schema 18: the exact-match keys of typed similarity (issue #169).
 -- One new empty table; no existing rows change.
 --
 -- A document's keys: the first 64 bits of its folded-text key, its template property, its

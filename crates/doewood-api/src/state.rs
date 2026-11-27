@@ -15,6 +15,7 @@ use crate::icons::Icons;
 use crate::limits::CallLimits;
 use crate::metrics::ApiMetrics;
 use crate::progress::{Progress, Snapshots};
+use crate::purge::Purges;
 use crate::reprocess::Reprocessor;
 use crate::summarize::OnDemand;
 use crate::{convert, error, pb};
@@ -86,6 +87,8 @@ struct Inner {
     call_limits: Arc<CallLimits>,
     /// The request and connection metrics.
     metrics: Arc<ApiMetrics>,
+    /// The purge jobs this instance started (issue #168).
+    purges: Purges,
 }
 
 impl ApiState {
@@ -110,6 +113,7 @@ impl ApiState {
                 sources: tokio::sync::Mutex::new(()),
                 call_limits: Arc::new(CallLimits::new(doewood_store::ApiSettings::default())),
                 metrics: Arc::new(ApiMetrics::new()),
+                purges: Purges::default(),
             }),
         }
     }
@@ -145,6 +149,10 @@ impl ApiState {
     /// `registry`, the one `/metrics` serves. Fails if they are registered there already.
     pub fn register_metrics(&self, registry: &prometheus::Registry) -> prometheus::Result<()> {
         self.inner.metrics.register(registry)
+    }
+
+    pub(crate) fn purges(&self) -> &Purges {
+        &self.inner.purges
     }
 
     pub(crate) fn metrics(&self) -> &Arc<ApiMetrics> {

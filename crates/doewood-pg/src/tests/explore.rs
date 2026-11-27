@@ -1,13 +1,16 @@
 //! Issue #172 on generated data, as on SQLite (`doewood-store`, `standalone/explore_scale.rs`):
 //! the company graph's counts, folded from the log (also while writers and other folds run),
 //! match a count from scratch (and the document total of issue #181, also across the upgrade
-//! to schema 13); and an ignored test times the explorer's reads.
+//! to schema 13), also after purges delete documents and companies (issue #168); and an
+//! ignored test times the explorer's reads.
 
 use std::collections::BTreeMap;
 use std::time::Instant;
 
 use doewood_model::explore::LINK_PARTIES_MAX;
-use doewood_model::{Edge, EdgeKind, EdgeSource, EdgeState, GraphStore, NodeKind};
+use doewood_model::{
+    Edge, EdgeKind, EdgeSource, EdgeState, GraphStore, NodeKind, PurgeStore, Purged,
+};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -252,6 +255,98 @@ async fn folded_counts_match_a_count_from_scratch() {
     db.drop_schema().await;
 }
 
+/// Records for every seeded document, and a live location for one in ten: the rest are
+/// orphans for a purge.
+const LOCATE_SOME: &str = "
+    INSERT INTO records (blake3, body, versions)
+      SELECT decode(key, 'hex'), '{}', '{}' FROM nodes WHERE kind = 'document';
+    INSERT INTO nodes (id, kind, key, props)
+      SELECT gen_random_uuid(), 'location', jsonb_build_array('http://s', 'b', key)::text, '{}'
+      FROM nodes WHERE kind = 'document' AND get_byte(decode(key, 'hex'), 0) % 10 = 0;
+    INSERT INTO locations (node_id, document_id, blake3, endpoint, bucket, object_key)
+      SELECT l.id, d.id, decode(d.key, 'hex'), 'http://s', 'b', d.key
+      FROM nodes d JOIN nodes l ON l.kind = 'location'
+        AND l.key = jsonb_build_array('http://s', 'b', d.key)::text
+      WHERE d.kind = 'document' AND get_byte(decode(d.key, 'hex'), 0) % 10 = 0;";
+
+/// Every batch of an orphan purge of records.
+async fn purge_records(s: &crate::PgStore) -> Purged {
+    let (mut total, mut after) = (Purged::default(), None::<String>);
+    loop {
+        let p = s.purge_orphan_records(after.as_deref(), 97).await.unwrap();
+        total.add(&p);
+        match p.next {
+            Some(n) => after = Some(n),
+            None => return total,
+        }
+    }
+}
+
+/// Issue #168: purges delete documents (and the companies only they named, with their
+/// corporate edges) through the edges' delete triggers, so the folded counts still match a
+/// count from scratch; with two purges on two pools and a fold racing them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn purged_counts_match_a_count_from_scratch() {
+    let Some(url) = test_url() else { return };
+    let db = Scratch::new(&url).await;
+    let (s, other) = (db.store().await, db.store().await);
+    let c = db.client().await;
+    c.batch_execute(&seed(3000, 300, false)).await.unwrap();
+    c.batch_execute(LOCATE_SOME).await.unwrap();
+    s.fold_company_graph(2000).await.unwrap();
+    c.batch_execute(CHURN).await.unwrap();
+    let kept: i64 = c
+        .query_one("SELECT count(*) FROM locations", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let purgers: Vec<_> = [s.clone(), other.clone()]
+        .into_iter()
+        .map(|store| tokio::spawn(async move { purge_records(&store).await }))
+        .collect();
+    let folder = {
+        let store = other.clone();
+        tokio::spawn(async move {
+            for _ in 0..40 {
+                store.fold_company_graph(50).await.unwrap();
+            }
+        })
+    };
+    let mut purged = Purged::default();
+    for p in purgers {
+        purged.add(&p.await.unwrap());
+    }
+    folder.await.unwrap();
+    // Each record went once, whichever purge got it.
+    assert_eq!(i64::try_from(purged.records).unwrap(), 3000 - kept);
+    assert!(purged.companies > 0, "{purged:?}");
+    let left: i64 = c
+        .query_one("SELECT count(*) FROM records", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(left, kept);
+    while s.fold_company_graph(500).await.unwrap().more {}
+    let (want_stats, want_pairs) = from_scratch(&c).await;
+    let (stats, pairs) = stored(&c).await;
+    assert!(!want_pairs.is_empty());
+    assert_eq!(pairs, want_pairs);
+    assert_eq!(stats, want_stats);
+    let (want, got) = totals(&c).await;
+    assert_eq!(got, want);
+    let stale: i64 = c
+        .query_one(
+            "SELECT count(*) FROM company_stats s WHERE NOT EXISTS \
+             (SELECT 1 FROM nodes n WHERE n.id = s.company_id)",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(stale, 0);
+    db.drop_schema().await;
+}
+
 /// Issue #181: the upgrade to schema 13 counts the total as folded so far, so the folds after
 /// it keep it exact, though the log still holds rows of documents folded before (and churned
 /// since) and of documents never folded.
@@ -264,14 +359,14 @@ async fn schema_13_counts_the_total_with_log_rows_pending() {
         let s = db.store().await;
         c.batch_execute(&seed(3000, 300, false)).await.unwrap();
         // Fold a part as schema 12 would (the total's row aside), then go back to schema 12
-        // (schema 14's table goes too, so 13 and 14 run again).
+        // (schema 14's table and schema 15's index go too, so 13 to 15 run again).
         s.fold_company_graph(2000).await.unwrap();
     }
     c.batch_execute(
-        // The schemas after 13 go too (issue #166's `document_texts`, issue #169's
+        // The schemas after 13 go too (issue #166's `document_texts`, #168's index, #169's
         // `similar_keys`), so 13 runs again.
         "DROP TABLE document_texts; DROP TABLE similar_keys; DROP TABLE company_graph_totals; \
-         DELETE FROM doewood_schema WHERE version >= 13;",
+         DROP INDEX locations_by_document; DELETE FROM doewood_schema WHERE version >= 13;",
     )
     .await
     .unwrap();

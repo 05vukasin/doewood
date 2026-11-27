@@ -1,4 +1,4 @@
-//! `JobsService`: the progress stream, and reprocessing.
+//! `JobsService`: the progress stream, reprocessing, and purges.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -12,10 +12,12 @@ use uuid::Uuid;
 use crate::Api;
 use crate::pb::jobs_service_server::JobsService;
 use crate::pb::{
-    ProgressUpdate, ReprocessJobRequest, ReprocessJobResponse, ReprocessProgress,
-    WatchProgressRequest, WatchReprocessRequest, reprocess_progress,
+    ProgressUpdate, PurgeJobResponse, PurgeOrphansRequest, PurgeProgress, PurgeSourceRequest,
+    ReprocessJobRequest, ReprocessJobResponse, ReprocessProgress, WatchProgressRequest,
+    WatchPurgeRequest, WatchReprocessRequest, purge_progress, reprocess_progress,
 };
 use crate::progress::Watch;
+use crate::purge::{PurgePhase, PurgeView};
 use crate::reprocess::{ReprocessPhase, ReprocessView};
 use crate::validate::{self, Violations};
 
@@ -24,11 +26,13 @@ const MAX_WATCHED: usize = 1000;
 
 type ProgressStream = Pin<Box<dyn Stream<Item = Result<ProgressUpdate, Status>> + Send>>;
 type ReprocessStream = Pin<Box<dyn Stream<Item = Result<ReprocessProgress, Status>> + Send>>;
+type PurgeStream = Pin<Box<dyn Stream<Item = Result<PurgeProgress, Status>> + Send>>;
 
 #[tonic::async_trait]
 impl JobsService for Api {
     type WatchProgressStream = ProgressStream;
     type WatchReprocessStream = ReprocessStream;
+    type WatchPurgeStream = PurgeStream;
 
     async fn watch_progress(
         &self,
@@ -86,21 +90,7 @@ impl JobsService for Api {
         &self,
         request: Request<WatchReprocessRequest>,
     ) -> Result<Response<Self::WatchReprocessStream>, Status> {
-        let raw = request.get_ref().job_id.trim();
-        let mut v = Violations::default();
-        let job = match Uuid::parse_str(raw) {
-            Ok(j) => Some(j),
-            Err(_) if raw.is_empty() => {
-                v.add("job_id", "required");
-                None
-            }
-            Err(_) => {
-                v.add("job_id", "not a job id (a UUID)");
-                None
-            }
-        };
-        v.check()?;
-        let job = job.ok_or_else(|| Status::invalid_argument("job_id: required"))?;
+        let job = job_id(&request.get_ref().job_id)?;
         let rx = self
             .state
             .parts()
@@ -112,6 +102,120 @@ impl JobsService for Api {
         tokio::spawn(stream_job(rx, tx, self.state.parts().shutdown.clone()));
         Ok(Response::new(Box::pin(ReceiverStream::new(out))))
     }
+
+    async fn purge_source(
+        &self,
+        request: Request<PurgeSourceRequest>,
+    ) -> Result<Response<PurgeJobResponse>, Status> {
+        let mut v = Violations::default();
+        let id = validate::source_id(&mut v, "source_id", &request.get_ref().source_id);
+        v.check()?;
+        let id = id.ok_or_else(|| Status::invalid_argument("source_id: required"))?;
+        let job = crate::purge::start_source(&self.state, id).await?;
+        Ok(Response::new(PurgeJobResponse {
+            job_id: job.to_string(),
+        }))
+    }
+
+    async fn purge_orphans(
+        &self,
+        _request: Request<PurgeOrphansRequest>,
+    ) -> Result<Response<PurgeJobResponse>, Status> {
+        // As the other graph calls: UNAVAILABLE until the shared store is connected.
+        self.state.backend()?;
+        let job = crate::purge::start_orphans(&self.state);
+        Ok(Response::new(PurgeJobResponse {
+            job_id: job.to_string(),
+        }))
+    }
+
+    async fn watch_purge(
+        &self,
+        request: Request<WatchPurgeRequest>,
+    ) -> Result<Response<Self::WatchPurgeStream>, Status> {
+        let job = job_id(&request.get_ref().job_id)?;
+        let rx = self
+            .state
+            .purges()
+            .watch(job)
+            .ok_or_else(|| Status::not_found(format!("purge job {job} is not known here")))?;
+        let (tx, out) = mpsc::channel(16);
+        tokio::spawn(stream_purge(rx, tx, self.state.parts().shutdown.clone()));
+        Ok(Response::new(Box::pin(ReceiverStream::new(out))))
+    }
+}
+
+/// A job id from a request.
+fn job_id(raw: &str) -> Result<Uuid, Status> {
+    let raw = raw.trim();
+    let mut v = Violations::default();
+    let job = match Uuid::parse_str(raw) {
+        Ok(j) => Some(j),
+        Err(_) if raw.is_empty() => {
+            v.add("job_id", "required");
+            None
+        }
+        Err(_) => {
+            v.add("job_id", "not a job id (a UUID)");
+            None
+        }
+    };
+    v.check()?;
+    job.ok_or_else(|| Status::invalid_argument("job_id: required"))
+}
+
+/// [`stream_job`] for a purge job.
+async fn stream_purge(
+    mut rx: watch::Receiver<PurgeView>,
+    tx: mpsc::Sender<Result<PurgeProgress, Status>>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        let view = rx.borrow_and_update().clone();
+        let last = matches!(view.phase, PurgePhase::Done | PurgePhase::Failed);
+        let sent = tokio::select! {
+            sent = tx.send(Ok(purge_progress(&view))) => sent.is_ok(),
+            _ = shutdown.wait_for(|s| *s) => false,
+        };
+        if !sent || last {
+            return;
+        }
+        tokio::select! {
+            changed = rx.changed() => if changed.is_err() { return },
+            () = tx.closed() => return,
+            _ = shutdown.wait_for(|s| *s) => return,
+        }
+    }
+}
+
+fn purge_progress(v: &PurgeView) -> PurgeProgress {
+    use purge_progress::State;
+    let state = match v.phase {
+        PurgePhase::Waiting => State::Waiting,
+        PurgePhase::Running => State::Running,
+        PurgePhase::Done => State::Done,
+        PurgePhase::Failed => State::Failed,
+    };
+    PurgeProgress {
+        job_id: v.job.to_string(),
+        source_id: v.source.map(|s| s.to_string()).unwrap_or_default(),
+        state: state as i32,
+        batches: v.batches,
+        examined: v.done.examined,
+        locations: v.done.locations,
+        records: v.done.records,
+        other_documents: v.done.other_documents,
+        companies: v.done.companies,
+        llm_jobs: v.llm_jobs,
+        error: v.error.clone().unwrap_or_default(),
+        at: unix_now(),
+    }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 /// Sends the job's state now and after every change, until its last state, the client going
@@ -158,8 +262,6 @@ fn progress(v: &ReprocessView) -> ReprocessProgress {
         failed: v.failed,
         pending: v.pending,
         error: v.error.clone().unwrap_or_default(),
-        at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)),
+        at: unix_now(),
     }
 }

@@ -346,7 +346,7 @@ anywhere.
 - **XMP and `w15:docId`** are read from `pdf.xmp_document_id`, `pdf.xmp_original_document_id`
   and `docx.w15_doc_id`, which quail does not emit yet (quail#123); until it does, same origin
   comes from `docx.rsid_root` only.
-- **The key index** (`similar_keys`, shared schema 15, instance schema 17) holds each
+- **The key index** (`similar_keys`, shared schema 16, instance schema 18) holds each
   document's keys (`kind`, 64 bits) with its masked SimHash, so a template match is checked
   without reading a record. A lookup reads at most 100 documents per key, in hash order,
   from the primary key. The keys are written with the sketch, and looked up with the band
@@ -504,11 +504,79 @@ are there for enrichment, and no document merges on a fuzzy match yet.
 
 - Each object ends `done`, `skipped` or `failed` with the reason and the attempts; the progress
   counters (`processed`, `failed`, `pending`) follow.
-- Transient failures (S3 5xx and 429, transport errors, the store) are retried after 2 s and 8 s:
-  three attempts in all. A file quail or hedgehog cannot read, a 404 or a too-large object is not
-  retried. An object that changed meanwhile keeps its newer state.
-- A deleted object's `located_at` edge becomes superseded with `valid_to`; the document, its
-  record and its other locations stay.
+- Transient failures (S3 5xx and 429, transport errors, the store, a node or record a purge
+  deleted under the write) are retried after 2 s and 8 s: three attempts in all. A file quail or
+  hedgehog cannot read, a 404 or a too-large object is not retried. An object that changed
+  meanwhile keeps its newer state.
+- A deleted object's `located_at` edge becomes superseded with `valid_to` and its `locations`
+  row goes; the document, its record and its other locations stay until a [purge](#purges).
+- A source in state `removed` (being purged) is ingested no more: a file of it that was queued
+  or in flight finishes without writing.
+
+## Purges
+
+Issue #168 (`doewood_model::purge`; the RPCs are in [api.md](api.md#purges)). A location is
+**live** while it has its `locations` row; an object deleted from its bucket loses it, and a
+source purge removes it. A purge deletes, a batch at a time (one transaction each, at most 200
+rows examined):
+
+- **Documents no live location holds** (of any source): the record (Postgres text, SQLite
+  JSON) with its search row (`tsvector` or FTS5, and the pgvector column, all in
+  `search_index`), its text (`document_texts`, issue #166) and its sketch and band rows
+  (`sketch_band_sizes` follows through its triggers), all by the foreign keys' cascade from
+  `records`; the Document node, and with it
+  every edge from or to it (`located_at`, `party`, `amends`, `cites`, `similar_to`) and its
+  number aliases. A live document's live `cites` or `amends` edge to a purged one goes back to
+  the pending node `ref:<number>` (made again when missing), as ingest wrote it before the
+  document arrived, so a later document with that number takes it again.
+- **Location nodes without a live row**: the source's locations, objects deleted from their
+  bucket, and an overwritten key's node once it has no row. Their `located_at` edges go with
+  them; a document that only they held is purged in the same batch.
+- **Pending reference nodes** a purged document cited, once no edge is left on them.
+- **Companies** a purged document named (a `party` edge) that no document names any more (no
+  `party` edge in any state, retracted ones included), and the companies merged into such a
+  company (the merge log's absorbed companies whose `merged_into` still names it). Their
+  aliases, enrichment state, proposals (and merge proposals naming them), leases and explorer
+  rows go too. A company a registry created (`origin: registry`) stays: it comes from a public
+  registry, not from the documents. The issue asks to purge a company only once no document
+  links it; a company never linked by a document is not touched.
+- **This instance's LLM queue rows** of the deleted records, after each batch. Another
+  instance's queue finds the record gone and skips the job, and the summary writer only
+  updates a stored record (`RecordStore::update_record`), so a summary finished after a purge
+  never brings a record back.
+
+What stays: the merge log and dismissals (no foreign keys, by design; undoing an entry whose
+companies are gone brings nothing of them back), the registry cache, `known_content` (an MD5
+ETag, a size and a hash, used only while the record exists), and the instance's
+`objects_seen` rows of live sources. A kept company keeps the names and aliases it learned;
+an alias's evidence may name a purged document's hash.
+
+**The explorer's counts.** Every edge a purge removes is a delete on `edges` (a cascade from its
+node), so the triggers log it to `company_graph_log` as any delete, and the folds keep
+`company_stats`, `company_links` and the document total exact (a deleted company's stats row
+goes with it). `purged_counts_match_a_count_from_scratch` (both backends; on Postgres two
+purges on two pools and a fold race) checks the folded counts against a count from scratch.
+
+**Against ingest of the same content.** A batch locks the records it may delete (`SELECT ...
+FOR UPDATE`, in hash order) and their Document nodes, then looks for live locations in a
+statement of its own, so it sees every location written by a statement that held the record.
+`upsert_location` reads the record under `FOR KEY SHARE` in the statement that writes the
+location row, before it writes the nodes, and returns whether it was there
+(`Located::record`). So either the purge sees the new location and keeps the document, or it
+deleted the record first: then the location is written for a missing record, the graph
+writer stops with `NOT_FOUND`, and the retry stores the record again, which the location now
+holds. Location nodes, pending nodes and companies are locked the same way before they are
+checked and deleted; a party edge written to a company being deleted fails its foreign key and
+is retried. On SQLite one writer runs every write, so a batch and an ingest write never
+interleave. The conformance case `purge_races` races `upsert_location` on one handle against a
+purge on another, 40 times, on both backends. A deadlock between a batch and an ingest write
+aborts one of them; both retry.
+
+**Several instances.** Batches lock what they delete, so purges on several instances, or a
+purge and a fold, never delete a row twice or count it twice. A source purge keeps its claim
+until the end, and refuses a source whose prefix overlaps another source or claim.
+Shared schema 15 and instance schema 17 add `locations_by_document` (`locations.document_id`):
+without it every node a purge deletes would read all of `locations` for the foreign key.
 
 ## Tests
 

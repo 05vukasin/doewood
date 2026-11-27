@@ -290,6 +290,10 @@ impl Reprocessor for Reprocess {
     fn watch(&self, job: Uuid) -> Option<watch::Receiver<ReprocessView>> {
         self.0.watch_job(job).map(forward)
     }
+
+    fn in_flight(&self, source: SourceId) -> usize {
+        self.0.in_flight(source)
+    }
 }
 
 /// Mirrors a job's status into the API's view until its last state.

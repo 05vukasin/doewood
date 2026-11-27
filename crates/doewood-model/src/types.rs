@@ -797,6 +797,9 @@ pub struct Located {
     pub document: Uuid,
     /// The Location node.
     pub location: Uuid,
+    /// Whether the document's record was stored when the location was written. `false` when
+    /// a purge deleted it meanwhile (issue #168): the writer must store it again.
+    pub record: bool,
 }
 
 /// What [`crate::GraphStore::end_location`] did.

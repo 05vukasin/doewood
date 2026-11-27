@@ -250,9 +250,13 @@ impl std::fmt::Display for IngestError {
 
 impl From<doewood_model::Error> for IngestError {
     fn from(e: doewood_model::Error) -> Self {
+        // A missing node or record is one deleted by a purge (issue #168) or a split while the
+        // file was written: the next attempt looks everything up again.
         let transient = matches!(
             e,
-            doewood_model::Error::Unavailable(_) | doewood_model::Error::Backend { .. }
+            doewood_model::Error::Unavailable(_)
+                | doewood_model::Error::Backend { .. }
+                | doewood_model::Error::NotFound(_)
         );
         Self {
             message: format!("store: {e}"),
@@ -739,6 +743,16 @@ impl Ingest {
         &self.inner.config
     }
 
+    /// How many of a source's objects are queued or being ingested now. Once a source is
+    /// removed none of its objects is queued, and those in flight finish without writing
+    /// (issue #168: a purge waits for that).
+    pub fn in_flight(&self, source: SourceId) -> usize {
+        lock(&self.inner.inflight)
+            .iter()
+            .filter(|(s, _)| *s == source)
+            .count()
+    }
+
     /// Counts since start.
     pub fn stats(&self) -> Stats {
         *lock(&self.inner.stats)
@@ -1218,7 +1232,8 @@ impl Ingest {
         if prior.is_some_and(|st| st.etag.as_deref() == etag && st.status != "pending") {
             return Ok(None);
         }
-        let Some(source) = source else {
+        // A removed source (one being purged, issue #168) is ingested no more.
+        let Some(source) = source.filter(|s| s.state != SourceState::Removed) else {
             return Ok(None);
         };
         let location = ObjectLocation {
