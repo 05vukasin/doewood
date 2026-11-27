@@ -1400,8 +1400,7 @@ impl SketchStore for PgStore {
                 signature: r.try_get(3).map_err(pg)?,
             });
         }
-        out.keyed
-            .sort_by(|a, b| (a.kind, a.blake3).cmp(&(b.kind, b.blake3)));
+        out.keyed.sort_by_key(|a| (a.kind, a.blake3));
         Ok(out)
     }
 }

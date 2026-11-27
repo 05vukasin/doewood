@@ -1418,7 +1418,7 @@ fn key_candidates(
             });
         }
     }
-    out.sort_by(|a, b| (a.kind, a.blake3).cmp(&(b.kind, b.blake3)));
+    out.sort_by_key(|a| (a.kind, a.blake3));
     Ok(out)
 }
 

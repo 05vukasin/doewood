@@ -1271,6 +1271,7 @@ pub async fn graph_batches<B: Backend + ?Sized>(s: &B) {
 /// # Panics
 ///
 /// When the backend misbehaves.
+#[allow(clippy::too_many_lines)]
 pub async fn similar_keys<B: Backend + ?Sized>(s: &B) {
     use crate::{SimilarKey, SimilarKeyKind as K, SimilarKeys};
     let key = |kind, key| SimilarKey { kind, key };
@@ -1294,7 +1295,8 @@ pub async fn similar_keys<B: Backend + ?Sized>(s: &B) {
         if n <= 132 {
             ks.push(tpl);
         }
-        let sketch = (n != 133).then_some((&[n][..], &[9_000 + u64::from(n)][..]));
+        let (sig, bands) = ([n], [9_000 + u64::from(n)]);
+        let sketch = (n != 133).then_some((&sig[..], &bands[..]));
         s.put_similarity(&hash(n), sketch, &keys(&ks, Some(u64::from(n))))
             .await
             .unwrap();

@@ -47,7 +47,7 @@ fn new_props(i: usize) -> serde_json::Value {
     } else {
         SimilarRelation::RelatedVersion
     });
-    if i % 5 == 0 {
+    if i.is_multiple_of(5) {
         e.relations.push(SimilarRelation::SameTemplate);
         e.masked_similarity = Some(0.9);
         e.template = Some(SimilarKeyKind::Headings);
@@ -144,11 +144,13 @@ async fn similar(ch: &Channel, blake3: &Blake3, limit: u32) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "a measurement (issue #169)"]
 async fn similar_documents_query_time() {
-    let sizes: Vec<usize> = std::env::var("DOEWOOD_BENCH_SIMILAR")
-        .ok()
-        .map(|v| v.split(',').filter_map(|n| n.trim().parse().ok()).collect())
-        .unwrap_or_else(|| vec![20, 100, 1000, 5000]);
-    println!("backend | edges | page | Neighbours, old props | SimilarDocuments, old props | SimilarDocuments, new props (median / p95 ms)");
+    let sizes: Vec<usize> = std::env::var("DOEWOOD_BENCH_SIMILAR").ok().map_or_else(
+        || vec![20, 100, 1000, 5000],
+        |v| v.split(',').filter_map(|n| n.trim().parse().ok()).collect(),
+    );
+    println!(
+        "backend | edges | page | Neighbours, old props | SimilarDocuments, old props | SimilarDocuments, new props (median / p95 ms)"
+    );
     for shared in Shared::all().await {
         let b = &shared.backend;
         let mut seeded = Vec::new();

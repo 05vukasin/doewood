@@ -1254,6 +1254,7 @@ async fn ingest_settings_round_trip_and_validation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn similar_documents_by_relation() {
     use doewood_model::{SimilarEdge, SimilarKeyKind, SimilarRelation as R};
+    use pb::SimilarRelation as P;
     for shared in Shared::all().await {
         let name = shared.name;
         let a = Instance::start("inst-a", Some(shared.backend.clone())).await;
@@ -1351,7 +1352,6 @@ async fn similar_documents_by_relation() {
             )
         };
         let h = |n: u8| format!("{n:02x}");
-        use pb::SimilarRelation as P;
         assert_eq!(
             got.documents.iter().map(short).collect::<Vec<_>>(),
             [

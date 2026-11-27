@@ -141,44 +141,52 @@ fn relation_to(r: SimilarRelation) -> pb::SimilarRelation {
     }
 }
 
+/// The request's document, relations (all when none, each once, in order) and page start.
+fn parse(
+    req: &pb::SimilarDocumentsRequest,
+) -> Result<(doewood_model::Blake3, Vec<SimilarRelation>, Option<Place>), Status> {
+    let mut v = Violations::default();
+    let blake3 = validate::blake3(&mut v, "blake3", &req.blake3);
+    let mut asked: Vec<SimilarRelation> = Vec::new();
+    for (i, r) in req.relations.iter().enumerate() {
+        match pb::SimilarRelation::try_from(*r)
+            .ok()
+            .and_then(relation_from)
+        {
+            Some(r) => asked.push(r),
+            None => v.add(format!("relations[{i}]"), format!("unknown value {r}")),
+        }
+    }
+    if req.limit > RECORDS_MAX_LIMIT {
+        v.add("limit", format!("at most {RECORDS_MAX_LIMIT}"));
+    }
+    let after = if req.page_token.is_empty() {
+        None
+    } else {
+        let p = Place::parse(&req.page_token);
+        if p.is_none() {
+            v.add("page_token", "not a token from a previous page");
+        }
+        p
+    };
+    v.check()?;
+    let Some(blake3) = blake3 else {
+        return Err(Status::invalid_argument("blake3: required"));
+    };
+    if asked.is_empty() {
+        asked = SimilarRelation::ALL.to_vec();
+    }
+    asked.sort();
+    asked.dedup();
+    Ok((blake3, asked, after))
+}
+
 impl Api {
     pub(crate) async fn similar_documents_rpc(
         &self,
         req: &pb::SimilarDocumentsRequest,
     ) -> Result<pb::SimilarDocumentsResponse, Status> {
-        let mut v = Violations::default();
-        let blake3 = validate::blake3(&mut v, "blake3", &req.blake3);
-        let mut asked: Vec<SimilarRelation> = Vec::new();
-        for (i, r) in req.relations.iter().enumerate() {
-            match pb::SimilarRelation::try_from(*r)
-                .ok()
-                .and_then(relation_from)
-            {
-                Some(r) => asked.push(r),
-                None => v.add(format!("relations[{i}]"), format!("unknown value {r}")),
-            }
-        }
-        if req.limit > RECORDS_MAX_LIMIT {
-            v.add("limit", format!("at most {RECORDS_MAX_LIMIT}"));
-        }
-        let after = if req.page_token.is_empty() {
-            None
-        } else {
-            let p = Place::parse(&req.page_token);
-            if p.is_none() {
-                v.add("page_token", "not a token from a previous page");
-            }
-            p
-        };
-        v.check()?;
-        let Some(blake3) = blake3 else {
-            return Err(Status::invalid_argument("blake3: required"));
-        };
-        if asked.is_empty() {
-            asked = SimilarRelation::ALL.to_vec();
-        }
-        asked.sort();
-        asked.dedup();
+        let (blake3, asked, after) = parse(req)?;
         let limit = records_limit(req.limit) as usize;
         let settings = self.state.db(doewood_store::Store::ingest_settings).await?;
         let b = self.state.backend()?;
@@ -188,57 +196,14 @@ impl Api {
             .await
             .map_err(error::model)?
             .ok_or_else(|| Status::not_found(format!("document {hex} is not known")))?;
-        let query = NeighbourQuery {
-            direction: Direction::Both,
-            edge_kinds: vec![EdgeKind::SimilarTo],
-            node_kind: Some(NodeKind::Document),
-            ..NeighbourQuery::default()
-        };
-        let mut entries: Vec<Entry> = Vec::new();
-        let (mut read, mut truncated, mut cursor) = (0usize, false, None);
-        loop {
-            let page = b
-                .neighbours_page(
-                    node.id,
-                    &query,
-                    cursor.as_ref(),
-                    RECORDS_MAX_LIMIT,
-                    RECORDS_PAGE_BYTES,
-                )
-                .await
-                .map_err(error::model)?;
-            let full = page_full(
-                &page,
-                RECORDS_MAX_LIMIT,
-                RECORDS_PAGE_BYTES,
-                doewood_model::neighbour_page_bytes,
-            );
-            cursor = page.last().map(|n| doewood_model::EdgeCursor::of(&n.edge));
-            for n in page {
-                if read == EDGES_READ_MAX {
-                    truncated = true;
-                    break;
-                }
-                read += 1;
-                // A pending reference or a node with another key is not a document hash.
-                if n.node.key.len() != 64 || n.node.key == hex {
-                    continue;
-                }
-                for rel in
-                    edge_relations(&n.edge.edge.props, settings.similar_near_copy_min_jaccard)
-                {
-                    if asked.contains(&rel.relation) {
-                        entries.push(Entry {
-                            other: n.node.key.clone(),
-                            rel,
-                        });
-                    }
-                }
-            }
-            if truncated || !full {
-                break;
-            }
-        }
+        let (entries, truncated) = read_entries(
+            &*b,
+            node.id,
+            &hex,
+            &asked,
+            settings.similar_near_copy_min_jaccard,
+        )
+        .await?;
         // Counts and crowds over every entry read.
         let crowd = settings.similar_crowd_size as usize;
         let relations: Vec<pb::SimilarRelationCount> = asked
@@ -293,6 +258,67 @@ impl Api {
             truncated,
         })
     }
+}
+
+/// The entries of `asked` relations from the live `similar_to` edges at `node` (the document
+/// `hex`), at most [`EDGES_READ_MAX`] edges read; whether there were more.
+async fn read_entries(
+    b: &dyn doewood_model::Backend,
+    node: uuid::Uuid,
+    hex: &str,
+    asked: &[SimilarRelation],
+    near_copy_min: f64,
+) -> Result<(Vec<Entry>, bool), Status> {
+    let query = NeighbourQuery {
+        direction: Direction::Both,
+        edge_kinds: vec![EdgeKind::SimilarTo],
+        node_kind: Some(NodeKind::Document),
+        ..NeighbourQuery::default()
+    };
+    let mut entries: Vec<Entry> = Vec::new();
+    let (mut read, mut truncated, mut cursor) = (0usize, false, None);
+    loop {
+        let page = b
+            .neighbours_page(
+                node,
+                &query,
+                cursor.as_ref(),
+                RECORDS_MAX_LIMIT,
+                RECORDS_PAGE_BYTES,
+            )
+            .await
+            .map_err(error::model)?;
+        let full = page_full(
+            &page,
+            RECORDS_MAX_LIMIT,
+            RECORDS_PAGE_BYTES,
+            doewood_model::neighbour_page_bytes,
+        );
+        cursor = page.last().map(|n| doewood_model::EdgeCursor::of(&n.edge));
+        for n in page {
+            if read == EDGES_READ_MAX {
+                truncated = true;
+                break;
+            }
+            read += 1;
+            // A pending reference or a node with another key is not a document hash.
+            if n.node.key.len() != 64 || n.node.key == hex {
+                continue;
+            }
+            for rel in edge_relations(&n.edge.edge.props, near_copy_min) {
+                if asked.contains(&rel.relation) {
+                    entries.push(Entry {
+                        other: n.node.key.clone(),
+                        rel,
+                    });
+                }
+            }
+        }
+        if truncated || !full {
+            break;
+        }
+    }
+    Ok((entries, truncated))
 }
 
 #[cfg(test)]
