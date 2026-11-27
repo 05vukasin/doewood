@@ -14,12 +14,13 @@ use async_trait::async_trait;
 use doewood_core::InstanceId;
 use doewood_model::{
     Backend, Blake3, Candidates, ClaimStore, Edge, EdgeCursor, EdgeKind, EdgeSource, Error,
-    GraphStore, LiveEdge, Located, LocationEnded, MERGE_CHAIN_MAX, Neighbour, NeighbourQuery, Node,
-    NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PartyDocument, PropsPatch, PurgeStore, Purged,
-    PutOutcome, Record, RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery,
-    SearchStore, Sketch, SketchStore, SourceClaim, SourceKey, StepVersions, StoredEdge, StoredText,
-    band_to_i64, merged_into, records_limit, sketch_limit, validate_alias, validate_batch_count,
-    validate_hashes, validate_node, validate_sketch, versions_from_json, versions_to_json,
+    GraphStore, KeyMatch, LiveEdge, Located, LocationEnded, MERGE_CHAIN_MAX, Neighbour,
+    NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PartyDocument,
+    PropsPatch, PurgeStore, Purged, PutOutcome, Record, RecordStore, Result, SKETCH_MAX_BANDS,
+    SearchDoc, SearchHit, SearchQuery, SearchStore, SimilarKey, SimilarKeys, Sketch, SketchStore,
+    SourceClaim, SourceKey, StepVersions, StoredEdge, StoredText, band_to_i64, merged_into,
+    records_limit, sketch_limit, validate_alias, validate_batch_count, validate_hashes,
+    validate_keys, validate_node, validate_sketch, versions_from_json, versions_to_json,
 };
 use rusqlite::types::Value as Sql;
 use rusqlite::{
@@ -1295,37 +1296,7 @@ impl SketchStore for Standalone {
         let bands: BTreeSet<i64> = bands.iter().map(|b| band_to_i64(*b)).collect();
         self.run(move |conn| {
             let tx = conn.transaction().map_err(sql)?;
-            let key = h.as_bytes().as_slice();
-            // Issue #74: an unchanged sketch writes nothing. The signature row is updated
-            // only when it differs, and only the bands that changed are deleted or inserted.
-            tx.prepare_cached(
-                "INSERT INTO sketches (blake3, signature, updated_at) VALUES (?1, ?2, ?3) \
-                 ON CONFLICT (blake3) DO UPDATE SET signature = excluded.signature, \
-                 updated_at = excluded.updated_at WHERE signature IS NOT excluded.signature",
-            )
-            .and_then(|mut cached| cached.execute(params![key, signature, now()]))
-            .map_err(sql)?;
-            let stored: BTreeSet<i64> = {
-                let mut stmt = tx
-                    .prepare_cached("SELECT band FROM sketch_bands WHERE blake3 = ?1")
-                    .map_err(sql)?;
-                let rows = stmt.query_map([key], |r| r.get(0)).map_err(sql)?;
-                rows.collect::<rusqlite::Result<_>>().map_err(sql)?
-            };
-            {
-                let mut delete = tx
-                    .prepare_cached("DELETE FROM sketch_bands WHERE band = ?1 AND blake3 = ?2")
-                    .map_err(sql)?;
-                for band in stored.difference(&bands) {
-                    delete.execute(params![band, key]).map_err(sql)?;
-                }
-                let mut insert = tx
-                    .prepare_cached("INSERT INTO sketch_bands (band, blake3) VALUES (?1, ?2)")
-                    .map_err(sql)?;
-                for band in bands.difference(&stored) {
-                    insert.execute(params![band, key]).map_err(sql)?;
-                }
-            }
+            put_sketch(&tx, &h, &signature, &bands)?;
             tx.commit().map_err(sql)
         })
         .await
@@ -1353,74 +1324,284 @@ impl SketchStore for Standalone {
         if bands.is_empty() {
             return Ok(Candidates::default());
         }
-        if bands.len() > SKETCH_MAX_BANDS {
-            return Err(Error::Invalid(format!(
-                "at most {SKETCH_MAX_BANDS} band keys per lookup"
-            )));
-        }
+        let bands = band_keys(bands)?;
         let (exclude, limit) = (*exclude, i64::from(sketch_limit(limit)));
-        let bands: Vec<i64> = bands.iter().map(|b| band_to_i64(*b)).collect();
-        self.read(move |conn| {
-            // Issue #148: the bands whose bucket is too large, one `sketch_band_sizes` row
-            // each; `u32::MAX` (no limit) skips the lookup.
-            let big: BTreeSet<i64> = if max_bucket == u32::MAX {
-                BTreeSet::new()
-            } else {
-                let marks = vec!["?"; bands.len()].join(", ");
-                let mut stmt = conn
-                    .prepare(&format!(
-                        "SELECT band FROM sketch_band_sizes WHERE band IN ({marks}) AND docs > ?"
-                    ))
-                    .map_err(sql)?;
-                let args = bands
-                    .iter()
-                    .map(|b| Sql::Integer(*b))
-                    .chain([Sql::Integer(i64::from(max_bucket))]);
-                let rows = stmt
-                    .query_map(params_from_iter(args), |r| r.get(0))
-                    .map_err(sql)?;
-                rows.collect::<rusqlite::Result<_>>().map_err(sql)?
+        self.read(move |conn| band_candidates(conn, &bands, &exclude, limit, max_bucket))
+            .await
+    }
+
+    async fn put_similarity(
+        &self,
+        blake3: &Blake3,
+        sketch: Option<(&[u8], &[u64])>,
+        keys: &SimilarKeys,
+    ) -> Result<()> {
+        if keys.keys.is_empty() {
+            return match sketch {
+                Some((signature, bands)) => self.put_sketch(blake3, signature, bands).await,
+                None => Ok(()),
             };
-            let kept: Vec<i64> = bands.iter().copied().filter(|b| !big.contains(b)).collect();
-            let skipped_bands = u32::try_from(big.len()).unwrap_or(u32::MAX);
-            if kept.is_empty() {
-                return Ok(Candidates {
-                    sketches: Vec::new(),
-                    skipped_bands,
-                });
+        }
+        validate_keys(&keys.keys)?;
+        if let Some((signature, bands)) = sketch {
+            validate_sketch(signature, bands)?;
+        }
+        let h = *blake3;
+        let sketch: Option<(Vec<u8>, BTreeSet<i64>)> = sketch.map(|(signature, bands)| {
+            (
+                signature.to_vec(),
+                bands.iter().map(|b| band_to_i64(*b)).collect(),
+            )
+        });
+        let keys = keys.clone();
+        self.run(move |conn| {
+            let tx = conn.transaction().map_err(sql)?;
+            if let Some((signature, bands)) = &sketch {
+                put_sketch(&tx, &h, signature, bands)?;
             }
-            let mut args: Vec<Sql> = kept.iter().map(|b| Sql::Integer(*b)).collect();
-            args.push(Sql::Blob(exclude.as_bytes().to_vec()));
-            args.push(Sql::Integer(limit));
-            let mut stmt = conn
-                .prepare(&sketch_candidates_sql(kept.len()))
-                .map_err(sql)?;
-            let rows = stmt
-                .query_map(params_from_iter(args), |r| {
-                    Ok((
-                        r.get::<_, Vec<u8>>(0)?,
-                        r.get::<_, Vec<u8>>(1)?,
-                        r.get::<_, i64>(2)?,
-                    ))
-                })
-                .map_err(sql)?;
-            let sketches = rows
-                .map(|row| {
-                    let (h, signature, shared) = row.map_err(sql)?;
-                    Ok(Sketch {
-                        blake3: Blake3::from_slice(&h)?,
-                        signature,
-                        shared_bands: u32::try_from(shared).unwrap_or(u32::MAX),
-                    })
-                })
-                .collect::<Result<_>>()?;
-            Ok(Candidates {
-                sketches,
-                skipped_bands,
-            })
+            put_keys(&tx, &h, &keys)?;
+            tx.commit().map_err(sql)
         })
         .await
     }
+
+    async fn similarity_candidates(
+        &self,
+        bands: &[u64],
+        keys: &[SimilarKey],
+        exclude: &Blake3,
+        limit: u32,
+        max_bucket: u32,
+    ) -> Result<Candidates> {
+        if keys.is_empty() {
+            return self
+                .sketch_candidates_within(bands, exclude, limit, max_bucket)
+                .await;
+        }
+        validate_keys(keys)?;
+        let bands = band_keys(bands)?;
+        let keys = keys.to_vec();
+        let (exclude, limit) = (*exclude, i64::from(sketch_limit(limit)));
+        self.read(move |conn| {
+            let mut out = if bands.is_empty() {
+                Candidates::default()
+            } else {
+                band_candidates(conn, &bands, &exclude, limit, max_bucket)?
+            };
+            out.keyed = key_candidates(conn, &keys, &exclude, limit)?;
+            Ok(out)
+        })
+        .await
+    }
+}
+
+/// Band keys for a lookup, as stored; at most [`SKETCH_MAX_BANDS`].
+fn band_keys(bands: &[u64]) -> Result<Vec<i64>> {
+    if bands.len() > SKETCH_MAX_BANDS {
+        return Err(Error::Invalid(format!(
+            "at most {SKETCH_MAX_BANDS} band keys per lookup"
+        )));
+    }
+    Ok(bands.iter().map(|b| band_to_i64(*b)).collect())
+}
+
+/// Stores a sketch in `tx` ([`SketchStore::put_sketch`]).
+fn put_sketch(
+    tx: &rusqlite::Transaction<'_>,
+    h: &Blake3,
+    signature: &[u8],
+    bands: &BTreeSet<i64>,
+) -> Result<()> {
+    let key = h.as_bytes().as_slice();
+    // Issue #74: an unchanged sketch writes nothing. The signature row is updated
+    // only when it differs, and only the bands that changed are deleted or inserted.
+    tx.prepare_cached(
+        "INSERT INTO sketches (blake3, signature, updated_at) VALUES (?1, ?2, ?3) \
+         ON CONFLICT (blake3) DO UPDATE SET signature = excluded.signature, \
+         updated_at = excluded.updated_at WHERE signature IS NOT excluded.signature",
+    )
+    .and_then(|mut cached| cached.execute(params![key, signature, now()]))
+    .map_err(sql)?;
+    let stored: BTreeSet<i64> = {
+        let mut stmt = tx
+            .prepare_cached("SELECT band FROM sketch_bands WHERE blake3 = ?1")
+            .map_err(sql)?;
+        let rows = stmt.query_map([key], |r| r.get(0)).map_err(sql)?;
+        rows.collect::<rusqlite::Result<_>>().map_err(sql)?
+    };
+    let mut delete = tx
+        .prepare_cached("DELETE FROM sketch_bands WHERE band = ?1 AND blake3 = ?2")
+        .map_err(sql)?;
+    for band in stored.difference(bands) {
+        delete.execute(params![band, key]).map_err(sql)?;
+    }
+    let mut insert = tx
+        .prepare_cached("INSERT INTO sketch_bands (band, blake3) VALUES (?1, ?2)")
+        .map_err(sql)?;
+    for band in bands.difference(&stored) {
+        insert.execute(params![band, key]).map_err(sql)?;
+    }
+    Ok(())
+}
+
+/// Stores a document's similarity keys in `tx` ([`SketchStore::put_similarity`], issue
+/// #169): as `put_sketch`, only the keys that changed are deleted or inserted, and the masked
+/// value is updated only where it differs.
+fn put_keys(tx: &rusqlite::Transaction<'_>, h: &Blake3, keys: &SimilarKeys) -> Result<()> {
+    let doc = h.as_bytes().as_slice();
+    let masked = keys.masked.map(band_to_i64);
+    let want: BTreeSet<(i16, i64)> = keys
+        .keys
+        .iter()
+        .map(|k| (k.kind.code(), band_to_i64(k.key)))
+        .collect();
+    let stored: BTreeSet<(i16, i64)> = {
+        let mut stmt = tx
+            .prepare_cached("SELECT kind, key FROM similar_keys WHERE blake3 = ?1")
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map([doc], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(sql)?;
+        rows.collect::<rusqlite::Result<_>>().map_err(sql)?
+    };
+    let mut delete = tx
+        .prepare_cached("DELETE FROM similar_keys WHERE kind = ?1 AND key = ?2 AND blake3 = ?3")
+        .map_err(sql)?;
+    for (kind, key) in stored.difference(&want) {
+        delete.execute(params![kind, key, doc]).map_err(sql)?;
+    }
+    tx.prepare_cached("UPDATE similar_keys SET masked = ?2 WHERE blake3 = ?1 AND masked IS NOT ?2")
+        .and_then(|mut cached| cached.execute(params![doc, masked]))
+        .map_err(sql)?;
+    let mut insert = tx
+        .prepare_cached(
+            "INSERT INTO similar_keys (kind, key, blake3, masked) VALUES (?1, ?2, ?3, ?4)",
+        )
+        .map_err(sql)?;
+    for (kind, key) in want.difference(&stored) {
+        insert
+            .execute(params![kind, key, doc, masked])
+            .map_err(sql)?;
+    }
+    Ok(())
+}
+
+/// The documents other than `exclude` sharing one of `keys`, at most `limit` per key in hash
+/// order (a range of the primary key each), with their masked `SimHash` and signature.
+fn key_candidates(
+    conn: &Connection,
+    keys: &[SimilarKey],
+    exclude: &Blake3,
+    limit: i64,
+) -> Result<Vec<KeyMatch>> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT k.blake3, k.masked, s.signature FROM similar_keys k \
+             LEFT JOIN sketches s ON s.blake3 = k.blake3 \
+             WHERE k.kind = ?1 AND k.key = ?2 AND k.blake3 <> ?3 ORDER BY k.blake3 LIMIT ?4",
+        )
+        .map_err(sql)?;
+    let mut out = Vec::new();
+    let distinct: BTreeSet<SimilarKey> = keys.iter().copied().collect();
+    for k in distinct {
+        let rows = stmt
+            .query_map(
+                params![
+                    k.kind.code(),
+                    band_to_i64(k.key),
+                    exclude.as_bytes().as_slice(),
+                    limit
+                ],
+                |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?,
+                        r.get::<_, Option<i64>>(1)?,
+                        r.get::<_, Option<Vec<u8>>>(2)?,
+                    ))
+                },
+            )
+            .map_err(sql)?;
+        for row in rows {
+            let (h, masked, signature) = row.map_err(sql)?;
+            #[allow(clippy::cast_sign_loss)]
+            out.push(KeyMatch {
+                blake3: Blake3::from_slice(&h)?,
+                kind: k.kind,
+                masked: masked.map(|m| m as u64),
+                signature,
+            });
+        }
+    }
+    out.sort_by_key(|a| (a.kind, a.blake3));
+    Ok(out)
+}
+
+/// [`SketchStore::sketch_candidates_within`] on `conn`, for band keys already converted.
+fn band_candidates(
+    conn: &Connection,
+    bands: &[i64],
+    exclude: &Blake3,
+    limit: i64,
+    max_bucket: u32,
+) -> Result<Candidates> {
+    // Issue #148: the bands whose bucket is too large, one `sketch_band_sizes` row
+    // each; `u32::MAX` (no limit) skips the lookup.
+    let big: BTreeSet<i64> = if max_bucket == u32::MAX {
+        BTreeSet::new()
+    } else {
+        let marks = vec!["?"; bands.len()].join(", ");
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT band FROM sketch_band_sizes WHERE band IN ({marks}) AND docs > ?"
+            ))
+            .map_err(sql)?;
+        let args = bands
+            .iter()
+            .map(|b| Sql::Integer(*b))
+            .chain([Sql::Integer(i64::from(max_bucket))]);
+        let rows = stmt
+            .query_map(params_from_iter(args), |r| r.get(0))
+            .map_err(sql)?;
+        rows.collect::<rusqlite::Result<_>>().map_err(sql)?
+    };
+    let kept: Vec<i64> = bands.iter().copied().filter(|b| !big.contains(b)).collect();
+    let skipped_bands = u32::try_from(big.len()).unwrap_or(u32::MAX);
+    if kept.is_empty() {
+        return Ok(Candidates {
+            skipped_bands,
+            ..Candidates::default()
+        });
+    }
+    let mut args: Vec<Sql> = kept.iter().map(|b| Sql::Integer(*b)).collect();
+    args.push(Sql::Blob(exclude.as_bytes().to_vec()));
+    args.push(Sql::Integer(limit));
+    let mut stmt = conn
+        .prepare(&sketch_candidates_sql(kept.len()))
+        .map_err(sql)?;
+    let rows = stmt
+        .query_map(params_from_iter(args), |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(sql)?;
+    let sketches = rows
+        .map(|row| {
+            let (h, signature, shared) = row.map_err(sql)?;
+            Ok(Sketch {
+                blake3: Blake3::from_slice(&h)?,
+                signature,
+                shared_bands: u32::try_from(shared).unwrap_or(u32::MAX),
+            })
+        })
+        .collect::<Result<_>>()?;
+    Ok(Candidates {
+        sketches,
+        skipped_bands,
+        ..Candidates::default()
+    })
 }
 
 #[async_trait]

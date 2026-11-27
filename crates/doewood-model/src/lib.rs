@@ -20,6 +20,7 @@ pub mod merge;
 pub mod proposal;
 mod props;
 pub mod purge;
+pub mod similar;
 pub mod text;
 mod traits;
 mod types;
@@ -51,6 +52,10 @@ pub use proposal::{
 };
 pub use props::{PATCH_MAX_DEPTH, PATCH_MAX_OPS, PropOp, PropsPatch};
 pub use purge::{PURGE_BATCH_MAX, Purged, purge_limit};
+pub use similar::{
+    KeyMatch, SIMILAR_MAX_KEYS, SimilarEdge, SimilarKey, SimilarKeyKind, SimilarKeys,
+    SimilarRelation, validate_keys,
+};
 pub use text::{
     BlockKind, DocumentText, StoredText, TEXT_MAX_BYTES, TextBlock, TextBuilder, TextOrigin,
     TextPage, TextZone,

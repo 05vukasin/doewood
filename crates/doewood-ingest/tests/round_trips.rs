@@ -7,7 +7,8 @@
 //! timing); prepares and the startup are not counted.
 //! Runs when `DOEWOOD_TEST_POSTGRES_URL` is set, in a schema of its own.
 //!
-//! `near_duplicate_corpus` (ignored) is the measurement of issues #126 and #148 on either store.
+//! `near_duplicate_corpus` (ignored) is the measurement of issues #126 and #148 on either store
+//! (`DOEWOOD_NEAR_DUP_KEYS` adds the similarity keys of issue #169).
 
 mod common;
 
@@ -16,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use doewood_ingest::company::{IdKind, Identifier};
-use doewood_ingest::facts::{Cite, DocFacts, Party};
+use doewood_ingest::facts::{Cite, DocFacts, Party, SimilarityFacts};
 use doewood_ingest::{GraphWriter, SimilarityConfig};
 use doewood_model::{
     Backend, Blake3, Edge, EdgeKind, EdgeSource, NodeKind, ObjectLocation, PropsPatch, SearchDoc,
@@ -457,8 +458,8 @@ async fn near_duplicate_corpus() {
     let max_bucket = u32::try_from(env_or("DOEWOOD_NEAR_DUP_MAX_BUCKET", 1000)).unwrap();
     println!("largest band bucket read: {max_bucket}");
     let settings = doewood_ingest::Similar {
-        min_jaccard: 0.8,
         max_bucket,
+        ..doewood_ingest::Similar::from(0.8)
     };
     let (b, counts, pg): (Arc<dyn Backend>, Option<Arc<Counts>>, _) =
         if let Ok(dir) = std::env::var("DOEWOOD_NEAR_DUP_SQLITE") {
@@ -489,11 +490,18 @@ async fn near_duplicate_corpus() {
     println!(
         "docs | graph write ms/doc | statements/doc | round trips/doc | similar_to/doc | bands skipped/doc | candidate query ms (candidates)"
     );
+    let keys = std::env::var_os("DOEWOOD_NEAR_DUP_KEYS").is_some();
+    println!("similarity keys (issue #169): {keys}");
     for i in 0..docs {
         let h = hash(i);
         let facts = DocFacts {
             format: "txt".into(),
             minhash: common::sketch(&common::near_duplicate_text(i, 4)),
+            similarity: if keys {
+                near_duplicate_keys(i)
+            } else {
+                SimilarityFacts::default()
+            },
             ..DocFacts::default()
         };
         b.put_record(&h, &empty_record(), &StepVersions::new())
@@ -588,6 +596,74 @@ async fn near_duplicate_corpus() {
             .await
             .unwrap();
     }
+}
+
+/// The similarity facts of document `i` of [`common::near_duplicate_text`] with 4 templates,
+/// as quail would give them (issue #169): a text key of its own, and for a template document
+/// its template's heading skeleton and a masked `SimHash` a bit or two from the template's.
+fn near_duplicate_keys(i: u64) -> SimilarityFacts {
+    let template = (i % 5 != 4).then_some(i % 4);
+    SimilarityFacts {
+        text_key: Some(i + 1),
+        text_chars: Some(2500),
+        masked: Some(template.map_or(i.wrapping_mul(0x9e37_79b9_7f4a_7c15), |t| {
+            (t + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (i % 3)
+        })),
+        headings: template.map(|t| 1000 + t),
+        ..SimilarityFacts::default()
+    }
+}
+
+/// A document with similarity keys (issue #169) costs no more round trips than one without:
+/// the keys are written with its sketch and looked up with its band candidates, each pair
+/// pipelined on one connection. Its `similar_to` edges are found through both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn similarity_keys_take_no_extra_round_trip() {
+    const ROUND_TRIPS_PER_DOC: u64 = 8;
+    let Some((b, counts, admin, schema)) = store().await else {
+        return;
+    };
+    let writer = GraphWriter::new(Arc::clone(&b), SimilarityConfig::default());
+    let mut seen = Vec::new();
+    for i in (0..60u64).filter(|i| i % 5 != 4) {
+        let h = Blake3::from_slice(blake3::hash(format!("trips/keys/{i}").as_bytes()).as_bytes())
+            .unwrap();
+        let facts = DocFacts {
+            format: "txt".into(),
+            minhash: common::sketch(&common::near_duplicate_text(i, 1)),
+            similarity: near_duplicate_keys(i),
+            ..DocFacts::default()
+        };
+        b.put_record(&h, &empty_record(), &StepVersions::new())
+            .await
+            .unwrap();
+        let before = counts.now();
+        let stats = writer
+            .write(&h, &at(&format!("keys/{i}.txt")), &facts, "x", 0.8)
+            .await
+            .unwrap();
+        seen.push((stats.similar, counts.since(before)));
+    }
+    println!("similar_to edges, then what the write took: {seen:?}");
+    for (similar, s) in &seen[10..] {
+        assert!(*similar >= 10, "{similar} similar documents");
+        // At most as many as without keys (the pipelined pairs can also let another of the
+        // write's statements share a round trip).
+        assert!(
+            s.round_trips <= ROUND_TRIPS_PER_DOC,
+            "{s:?} for {similar} edges"
+        );
+        // Two statements more: the keys' write and their lookup.
+        assert_eq!(
+            s.statements,
+            ROUND_TRIPS_PER_DOC + 2,
+            "{s:?} for {similar} edges"
+        );
+    }
+    admin
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
 }
 
 /// A document with many similar ones (issue #126) costs the same round trips as one with a

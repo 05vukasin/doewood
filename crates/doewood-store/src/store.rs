@@ -773,6 +773,7 @@ mod tests {
                 "search_index",
                 "secrets",
                 "settings",
+                "similar_keys",
                 "sketch_band_sizes",
                 "sketch_bands",
                 "sketches",

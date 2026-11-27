@@ -20,8 +20,10 @@
 //! - **References**: a cited number resolves to the document that has it as its own number
 //!   (an alias `number:<key>`); when that document is not known yet, the edge goes to a pending
 //!   Document node `ref:<key>`, and the edges move to the real document once it arrives.
-//! - **`similar_to`**: candidates from the LSH band index, each confirmed by its Jaccard
-//!   estimate. One edge per pair, from the smaller hash to the larger.
+//! - **`similar_to`**: candidates from the LSH band index and the exact-match key index
+//!   (issue #169), each relation confirmed by its threshold ([`Similar`]): identical, near
+//!   copy, related version, same template, same origin. One edge per pair, from the smaller
+//!   hash to the larger, its props naming the relations that hold.
 //! - **Search**: title, the summary card and keywords as the body, kind, date and amount.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -31,7 +33,8 @@ use std::time::{Duration, Instant};
 
 use doewood_model::{
     Backend, Blake3, Direction, Edge, EdgeKind, EdgeSource, EdgeState, NeighbourQuery, NodeKind,
-    ObjectLocation, PENDING_REF_PREFIX, PropsPatch, Result, SearchDoc, Sketch, merged_into,
+    ObjectLocation, PENDING_REF_PREFIX, PropsPatch, Result, SearchDoc, SimilarEdge, SimilarKeyKind,
+    SimilarRelation, merged_into,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -39,13 +42,14 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::company::{AliasKind, CompanyName, LadderStep};
-use crate::facts::{DocFacts, Party};
+use crate::facts::{DocFacts, Party, SimilarityFacts};
 
-/// How `similar_to` candidates are found. The least Jaccard estimate for an edge and the
-/// largest band bucket are runtime settings ([`Similar`]), passed to [`GraphWriter::write`].
+/// How `similar_to` candidates are found. The thresholds and the largest band bucket are
+/// runtime settings ([`Similar`]), passed to [`GraphWriter::write`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SimilarityConfig {
-    /// Most candidates looked at per document.
+    /// Most candidates looked at per document from the band index, and per key from the key
+    /// index.
     pub max_candidates: u32,
 }
 
@@ -59,11 +63,17 @@ impl Default for SimilarityConfig {
 
 /// The runtime `similar_to` settings ([`doewood_store::IngestSettings`]), read for every
 /// file and passed to [`GraphWriter::write`]. A bare `f64` is the least Jaccard estimate with
-/// the default largest band bucket.
+/// the other settings at their defaults.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Similar {
-    /// Least Jaccard estimate for an edge (`similar_min_jaccard`).
+    /// Least Jaccard estimate for an edge: a related version (`similar_min_jaccard`).
     pub min_jaccard: f64,
+    /// Least Jaccard estimate of a near copy (`similar_near_copy_min_jaccard`, issue #169).
+    pub near_copy_min_jaccard: f64,
+    /// Least masked similarity of one template (`similar_template_min_masked`).
+    pub template_min_masked: f64,
+    /// Shortest identical text, in characters (`similar_identical_min_chars`).
+    pub identical_min_chars: u32,
     /// Largest band bucket the candidate query reads (`similar_max_bucket`, issue #148).
     pub max_bucket: u32,
 }
@@ -72,7 +82,7 @@ impl From<f64> for Similar {
     fn from(min_jaccard: f64) -> Self {
         Self {
             min_jaccard,
-            max_bucket: doewood_store::DEFAULT_SIMILAR_MAX_BUCKET,
+            ..Self::from(doewood_store::IngestSettings::default())
         }
     }
 }
@@ -81,9 +91,74 @@ impl From<doewood_store::IngestSettings> for Similar {
     fn from(s: doewood_store::IngestSettings) -> Self {
         Self {
             min_jaccard: s.similar_min_jaccard,
+            near_copy_min_jaccard: s.similar_near_copy_min_jaccard,
+            template_min_masked: s.similar_template_min_masked,
+            identical_min_chars: s.similar_identical_min_chars,
             max_bucket: s.similar_max_bucket,
         }
     }
+}
+
+impl Similar {
+    /// The relations between a document and one candidate, as a `similar_to` edge's props
+    /// ([`SimilarEdge`]); `None` when none holds. `sig` and `own` are the document's
+    /// signature and similarity facts.
+    fn relate(&self, sig: Option<&[u8]>, own: &SimilarityFacts, c: &Found) -> Option<SimilarEdge> {
+        let raw = match (sig, c.signature.as_deref()) {
+            (Some(a), Some(b)) => Some(quail_sketch::jaccard_estimate(a, b)),
+            _ => None,
+        };
+        let masked = match (own.masked, c.masked) {
+            (Some(a), Some(b)) => Some(doewood_model::similar::masked_similarity(a, b)),
+            _ => None,
+        };
+        let mut e = SimilarEdge {
+            raw_similarity: raw,
+            masked_similarity: masked,
+            shared_bands: c.shared_bands,
+            ..SimilarEdge::default()
+        };
+        // One text relation, the strongest. The same text key is checked against the
+        // signatures when both are there (the key is 64 bits of quail's 128).
+        let long = own
+            .text_chars
+            .is_some_and(|n| n >= u64::from(self.identical_min_chars));
+        if c.text && long && raw.is_none_or(|r| r >= 1.0) {
+            e.relations.push(SimilarRelation::Identical);
+            e.chars = own.text_chars;
+        } else if let Some(r) = raw {
+            if r >= self.near_copy_min_jaccard {
+                e.relations.push(SimilarRelation::NearCopy);
+            } else if r >= self.min_jaccard {
+                e.relations.push(SimilarRelation::RelatedVersion);
+            }
+        }
+        if let (Some(kind), Some(m)) = (c.template, masked)
+            && m >= self.template_min_masked
+        {
+            e.relations.push(SimilarRelation::SameTemplate);
+            e.template = Some(kind);
+        }
+        if let Some(kind) = c.origin {
+            e.relations.push(SimilarRelation::SameOrigin);
+            e.origin = Some(kind);
+        }
+        (!e.relations.is_empty()).then_some(e)
+    }
+}
+
+/// A candidate of [`GraphWriter::similar`], from the band index, the key index or both.
+#[derive(Debug, Default)]
+struct Found {
+    signature: Option<Vec<u8>>,
+    shared_bands: Option<u32>,
+    masked: Option<u64>,
+    /// The same text key.
+    text: bool,
+    /// The first shared template key.
+    template: Option<SimilarKeyKind>,
+    /// The first shared origin id.
+    origin: Option<SimilarKeyKind>,
 }
 
 /// Most names and identifiers per kind a company's props keep.
@@ -267,8 +342,8 @@ impl GraphWriter {
     }
 
     /// Writes one document found at `location`. Its record must already be stored.
-    /// `name` is the file name, the title of last resort. `similar` is the least Jaccard
-    /// estimate for a `similar_to` edge and the largest band bucket read ([`Similar`]).
+    /// `name` is the file name, the title of last resort. `similar` holds the
+    /// `similar_to` thresholds and the largest band bucket read ([`Similar`]).
     pub async fn write(
         &self,
         blake3: &Blake3,
@@ -443,16 +518,25 @@ impl GraphWriter {
         settings: Similar,
         stats: &mut WriteStats,
     ) -> Result<()> {
-        let Some((sig, bands)) = &facts.minhash else {
+        let keys = facts.similarity.keys();
+        let sketch = facts
+            .minhash
+            .as_ref()
+            .map(|(sig, bands)| (sig.as_slice(), bands.as_slice()));
+        if sketch.is_none() && keys.keys.is_empty() {
             return Ok(());
-        };
+        }
         let b = &self.backend;
-        b.put_sketch(blake3, sig, bands).await?;
+        // The sketch and the keys (issue #169) are written, then read back, together: on
+        // Postgres each pair is one round trip, as the sketch alone was.
+        b.put_similarity(blake3, sketch, &keys).await?;
         // Bands whose bucket is larger than the setting are skipped (issue #148): on a
         // template-heavy corpus this changes which edges exist, and bounds the query.
+        let bands = sketch.map_or(&[][..], |(_, bands)| bands);
         let candidates = b
-            .sketch_candidates_within(
+            .similarity_candidates(
                 bands,
+                &keys.keys,
                 blake3,
                 self.similarity.max_candidates,
                 settings.max_bucket,
@@ -460,45 +544,75 @@ impl GraphWriter {
             .await?;
         stats.similar_buckets_skipped +=
             usize::try_from(candidates.skipped_bands).unwrap_or(usize::MAX);
-        let min_jaccard = settings.min_jaccard;
-        let found: Vec<(Sketch, f64)> = candidates
-            .sketches
+        // Band candidates first, in their order; then those found only by a key, by hash.
+        let mut order: Vec<Blake3> = Vec::new();
+        let mut found: BTreeMap<Blake3, Found> = BTreeMap::new();
+        for c in candidates.sketches {
+            order.push(c.blake3);
+            found.insert(
+                c.blake3,
+                Found {
+                    signature: Some(c.signature),
+                    shared_bands: Some(c.shared_bands),
+                    ..Found::default()
+                },
+            );
+        }
+        for m in candidates.keyed {
+            let f = found.entry(m.blake3).or_insert_with(|| {
+                order.push(m.blake3);
+                Found::default()
+            });
+            if f.signature.is_none() {
+                f.signature = m.signature;
+            }
+            f.masked = f.masked.or(m.masked);
+            match m.kind.relation() {
+                SimilarRelation::Identical => f.text = true,
+                SimilarRelation::SameTemplate => f.template = f.template.or(Some(m.kind)),
+                _ => f.origin = f.origin.or(Some(m.kind)),
+            }
+        }
+        let sig = sketch.map(|(sig, _)| sig);
+        let related: Vec<(Blake3, SimilarEdge)> = order
             .into_iter()
-            .map(|c| {
-                let score = quail_sketch::jaccard_estimate(sig, &c.signature);
-                (c, score)
+            .filter_map(|h| {
+                let e = settings.relate(sig, &facts.similarity, &found[&h])?;
+                Some((h, e))
             })
-            .filter(|(_, score)| *score >= min_jaccard)
             .collect();
-        if found.is_empty() {
+        if related.is_empty() {
             return Ok(());
         }
         // Issue #126: the candidates' Document nodes in one read (the few missing ones are
         // created one by one), then every edge in one batch, instead of two round trips per
-        // candidate. The same edges as before, from the same reads.
-        let keys: Vec<String> = found.iter().map(|(c, _)| c.blake3.to_hex()).collect();
-        let ids = b.node_ids(NodeKind::Document, &keys).await?;
-        let mut edges = Vec::with_capacity(found.len());
-        for ((c, score), (key, id)) in found.into_iter().zip(keys.iter().zip(ids)) {
-            let other = match id {
-                Some(id) => id,
-                None => b.ensure_node(NodeKind::Document, key).await?,
-            };
-            // One edge per pair, from the smaller hash to the larger.
-            let (src, dst) = if *blake3 < c.blake3 {
-                (doc, other)
-            } else {
-                (other, doc)
-            };
-            #[allow(clippy::cast_possible_truncation)]
-            edges.push(
-                Edge::new(src, dst, EdgeKind::SimilarTo, EdgeSource::Document)
-                    .with_props(json!({"score": score, "method": "minhash_lsh", "shared_bands": c.shared_bands}))
-                    .with_confidence(score.clamp(0.0, 1.0) as f32),
-            );
+        // candidate.
+        // Batches of at most `GRAPH_BATCH_MAX`: one, unless many keys each brought their
+        // full 100 matches.
+        for batch in related.chunks(doewood_model::GRAPH_BATCH_MAX) {
+            let keys: Vec<String> = batch.iter().map(|(h, _)| h.to_hex()).collect();
+            let ids = b.node_ids(NodeKind::Document, &keys).await?;
+            let mut edges = Vec::with_capacity(batch.len());
+            for ((h, e), (key, id)) in batch.iter().zip(keys.iter().zip(ids)) {
+                let other = match id {
+                    Some(id) => id,
+                    None => b.ensure_node(NodeKind::Document, key).await?,
+                };
+                // One edge per pair, from the smaller hash to the larger.
+                let (src, dst) = if blake3 < h {
+                    (doc, other)
+                } else {
+                    (other, doc)
+                };
+                edges.push(
+                    Edge::new(src, dst, EdgeKind::SimilarTo, EdgeSource::Document)
+                        .with_props(e.to_props())
+                        .with_confidence(e.confidence()),
+                );
+            }
+            b.upsert_edges(&edges).await?;
+            stats.similar += edges.len();
         }
-        b.upsert_edges(&edges).await?;
-        stats.similar += edges.len();
         Ok(())
     }
 

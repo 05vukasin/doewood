@@ -9,6 +9,8 @@ use serde::de::{Deserializer as _, IgnoredAny, MapAccess, Visitor};
 use serde_json::value::RawValue;
 use time::{Date, Month};
 
+use doewood_model::{SIMILAR_MAX_KEYS, SimilarKey, SimilarKeyKind, SimilarKeys};
+
 use crate::company::{IdKind, Identifier};
 
 /// Most bytes of a party mention's span apart from an identifier for it to belong to that
@@ -150,6 +152,17 @@ const KEYS: &[&str] = &[
     "party.alias_of",
     "sketch.minhash",
     "sketch.minhash_bands",
+    // Typed similarity (issue #169).
+    "sketch.text_key",
+    "text.chars",
+    "sketch.simhash_template",
+    "sketch.headings",
+    "docx.template",
+    "docx.attached_template",
+    "docx.rsid_root",
+    "docx.w15_doc_id",
+    "pdf.xmp_document_id",
+    "pdf.xmp_original_document_id",
 ];
 
 /// Whether [`DocFacts`] reads facts of this key: only those are read into quail values.
@@ -245,6 +258,116 @@ pub struct DocFacts {
     pub cites: Vec<Cite>,
     /// The `MinHash` signature and its LSH band keys.
     pub minhash: Option<(Vec<u8>, Vec<u64>)>,
+    /// What typed similarity reads besides the `MinHash` (issue #169).
+    pub similarity: SimilarityFacts,
+}
+
+/// The facts behind the typed similarity relations other than the `MinHash` ones (issue
+/// #169): the folded-text key and length (identical), the masked `SimHash`, template
+/// properties and heading skeleton (same template), and the document identity ids (same
+/// origin).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SimilarityFacts {
+    /// The first 64 bits of `sketch.text_key` (big-endian).
+    pub text_key: Option<u64>,
+    /// `text.chars`: characters of the text, whitespace excluded.
+    pub text_chars: Option<u64>,
+    /// `sketch.simhash_template`: the `SimHash` of the entity-masked words.
+    pub masked: Option<u64>,
+    /// `sketch.headings`: the heading skeleton digest.
+    pub headings: Option<u64>,
+    /// Template names: `docx.template` and the file name of `docx.attached_template`,
+    /// lowercased; Word's default `Normal` template is left out (nearly every document has
+    /// it).
+    pub templates: Vec<String>,
+    /// Document identity ids: XMP `DocumentID` / `OriginalDocumentID` (one namespace, so an
+    /// original's id meets its copies' `OriginalDocumentID`) and `w15:docId`, lowercased, a
+    /// GUID's braces dropped.
+    pub origins: Vec<(SimilarKeyKind, String)>,
+    /// `docx.rsid_root`.
+    pub rsid_root: Option<u64>,
+}
+
+impl SimilarityFacts {
+    /// The document's similarity keys, each once, with its masked `SimHash`.
+    pub fn keys(&self) -> SimilarKeys {
+        let mut keys = Vec::new();
+        if let Some(k) = self.text_key {
+            keys.push(SimilarKey {
+                kind: SimilarKeyKind::Text,
+                key: k,
+            });
+        }
+        for t in &self.templates {
+            keys.push(SimilarKey {
+                kind: SimilarKeyKind::TemplateProperty,
+                key: key_hash(SimilarKeyKind::TemplateProperty, t),
+            });
+        }
+        if let Some(h) = self.headings {
+            keys.push(SimilarKey {
+                kind: SimilarKeyKind::Headings,
+                key: h,
+            });
+        }
+        for (kind, id) in &self.origins {
+            keys.push(SimilarKey {
+                kind: *kind,
+                key: key_hash(*kind, id),
+            });
+        }
+        if let Some(r) = self.rsid_root {
+            keys.push(SimilarKey {
+                kind: SimilarKeyKind::OriginRsidRoot,
+                key: r,
+            });
+        }
+        keys.sort();
+        keys.dedup();
+        keys.truncate(SIMILAR_MAX_KEYS);
+        SimilarKeys {
+            keys,
+            masked: self.masked,
+        }
+    }
+}
+
+/// A text key's 64 bits: the first 8 bytes of BLAKE3 over the kind's name and the text, so
+/// equal texts of one kind give equal keys.
+fn key_hash(kind: SimilarKeyKind, text: &str) -> u64 {
+    let mut h = blake3::Hasher::new();
+    h.update(kind.as_str().as_bytes());
+    h.update(&[0]);
+    h.update(text.as_bytes());
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&h.finalize().as_bytes()[..8]);
+    u64::from_be_bytes(out)
+}
+
+/// A template name as a key: the file name (after the last `/` or `\`), trimmed and
+/// lowercased; `None` for an empty one and for Word's default `Normal` template.
+fn template_name(raw: &str) -> Option<String> {
+    let name = raw
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(raw)
+        .trim()
+        .to_lowercase();
+    let stem = name
+        .rsplit_once('.')
+        .map_or(name.as_str(), |(stem, _)| stem);
+    (!name.is_empty() && stem != "normal").then_some(name)
+}
+
+/// A document identity id as a key: trimmed and lowercased, a GUID's braces dropped;
+/// `None` when empty.
+fn origin_id(raw: &str) -> Option<String> {
+    let id = raw
+        .trim()
+        .trim_start_matches('{')
+        .trim_end_matches('}')
+        .trim();
+    (!id.is_empty()).then(|| id.to_lowercase())
 }
 
 impl DocFacts {
@@ -352,7 +475,59 @@ impl DocFacts {
                 d.minhash = Some((sig.to_vec(), bands));
             }
         }
+        d.similarity = similarity(&best, &all);
         d
+    }
+}
+
+/// [`SimilarityFacts`] from a record's facts (`best` is the most confident of a key, `all`
+/// every one).
+fn similarity<'a, B, A, I>(best: &B, all: &A) -> SimilarityFacts
+where
+    B: Fn(&'static str) -> Option<&'a FactView>,
+    A: Fn(&'static str) -> I,
+    I: Iterator<Item = &'a FactView>,
+{
+    let u64_of = |key: &'static str| match best(key).map(|f| &f.value) {
+        Some(Value::U64(x)) => Some(*x),
+        Some(Value::Int(x)) => u64::try_from(*x).ok(),
+        _ => None,
+    };
+    let text_key = match best("sketch.text_key").map(|f| &f.value) {
+        Some(Value::Bytes(b)) if b.len() >= 8 => {
+            let mut k = [0u8; 8];
+            k.copy_from_slice(&b[..8]);
+            Some(u64::from_be_bytes(k))
+        }
+        _ => None,
+    };
+    let mut templates: Vec<String> = ["docx.template", "docx.attached_template"]
+        .into_iter()
+        .flat_map(all)
+        .filter_map(|f| f.value.as_text().and_then(template_name))
+        .collect();
+    templates.sort();
+    templates.dedup();
+    let mut origins: Vec<(SimilarKeyKind, String)> = [
+        ("pdf.xmp_document_id", SimilarKeyKind::OriginXmp),
+        ("pdf.xmp_original_document_id", SimilarKeyKind::OriginXmp),
+        ("docx.w15_doc_id", SimilarKeyKind::OriginW15),
+    ]
+    .into_iter()
+    .flat_map(|(key, kind)| {
+        all(key).filter_map(move |f| f.value.as_text().and_then(origin_id).map(|id| (kind, id)))
+    })
+    .collect();
+    origins.sort();
+    origins.dedup();
+    SimilarityFacts {
+        text_key,
+        text_chars: u64_of("text.chars"),
+        masked: u64_of("sketch.simhash_template"),
+        headings: u64_of("sketch.headings"),
+        templates,
+        origins,
+        rsid_root: u64_of("docx.rsid_root").filter(|r| *r != 0),
     }
 }
 
@@ -775,6 +950,93 @@ mod tests {
             [("amends", "c-114-23"), ("references", "po-1")]
         );
         assert_eq!(d.minhash, Some((vec![1, 2, 3], vec![7, u64::MAX])));
+    }
+
+    #[test]
+    fn similarity_facts_and_keys() {
+        let mut text_key = vec![0u8; 16];
+        text_key[..8].copy_from_slice(&0x0102_0304_0506_0708u64.to_be_bytes());
+        let body = record(&[
+            fact("sketch.text_key", Value::Bytes(text_key.into()), 0, (0, 0)),
+            fact("text.chars", Value::Int(4321), 0, (0, 0)),
+            fact("sketch.simhash_template", Value::U64(99), 0, (0, 0)),
+            fact("sketch.headings", Value::U64(7), 0, (0, 0)),
+            fact("docx.template", Value::text("Invoice.dotx"), 0, (0, 0)),
+            fact(
+                "docx.attached_template",
+                Value::text("C:\\Users\\x\\Templates\\invoice.dotx"),
+                0,
+                (0, 0),
+            ),
+            fact("docx.rsid_root", Value::U64(0x00ab_cdef), 0, (0, 0)),
+            fact("docx.w15_doc_id", Value::text("{A1B2-C3}"), 0, (0, 0)),
+            fact("pdf.xmp_document_id", Value::text(" uuid:ABC "), 0, (0, 0)),
+            fact(
+                "pdf.xmp_original_document_id",
+                Value::text("uuid:abc"),
+                0,
+                (0, 0),
+            ),
+        ]);
+        let d = read(&body);
+        let s = &d.similarity;
+        assert_eq!(s.text_key, Some(0x0102_0304_0506_0708));
+        assert_eq!(
+            (s.text_chars, s.masked, s.headings, s.rsid_root),
+            (Some(4321), Some(99), Some(7), Some(0x00ab_cdef))
+        );
+        assert_eq!(s.templates, ["invoice.dotx"], "the same file name once");
+        assert_eq!(
+            s.origins,
+            [
+                (SimilarKeyKind::OriginXmp, "uuid:abc".to_owned()),
+                (SimilarKeyKind::OriginW15, "a1b2-c3".to_owned()),
+            ]
+        );
+        let keys = s.keys();
+        assert_eq!(keys.masked, Some(99));
+        let kinds: Vec<_> = keys.keys.iter().map(|k| k.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                SimilarKeyKind::Text,
+                SimilarKeyKind::TemplateProperty,
+                SimilarKeyKind::Headings,
+                SimilarKeyKind::OriginXmp,
+                SimilarKeyKind::OriginW15,
+                SimilarKeyKind::OriginRsidRoot,
+            ]
+        );
+        // Equal texts of a kind are equal keys, other kinds or texts are not.
+        assert_eq!(
+            key_hash(SimilarKeyKind::OriginXmp, "uuid:abc"),
+            key_hash(SimilarKeyKind::OriginXmp, "uuid:abc")
+        );
+        assert_ne!(
+            key_hash(SimilarKeyKind::OriginXmp, "uuid:abc"),
+            key_hash(SimilarKeyKind::OriginW15, "uuid:abc")
+        );
+        // Word's default template, an empty one and a zero rsid are no keys; nor is a short
+        // text key.
+        for t in ["Normal.dotm", "normal.dot", "/x/Normal.dotx", " ", "NORMAL"] {
+            assert_eq!(template_name(t), None, "{t}");
+        }
+        assert_eq!(
+            template_name("Normal Invoice.dotx").as_deref(),
+            Some("normal invoice.dotx")
+        );
+        assert_eq!(origin_id("{}"), None);
+        let body = record(&[
+            fact(
+                "sketch.text_key",
+                Value::Bytes(vec![1, 2, 3].into()),
+                0,
+                (0, 0),
+            ),
+            fact("docx.rsid_root", Value::U64(0), 0, (0, 0)),
+        ]);
+        assert_eq!(read(&body).similarity, SimilarityFacts::default());
+        assert!(SimilarityFacts::default().keys().keys.is_empty());
     }
 
     #[test]

@@ -121,6 +121,10 @@ pub(crate) fn ingest_settings(s: doewood_store::IngestSettings) -> pb::IngestSet
         similar_min_jaccard: s.similar_min_jaccard,
         summarize_max_concurrent: s.summarize_max_concurrent,
         similar_max_bucket: s.similar_max_bucket,
+        similar_near_copy_min_jaccard: s.similar_near_copy_min_jaccard,
+        similar_template_min_masked: s.similar_template_min_masked,
+        similar_identical_min_chars: s.similar_identical_min_chars,
+        similar_crowd_size: s.similar_crowd_size,
     }
 }
 

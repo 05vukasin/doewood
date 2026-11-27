@@ -1091,8 +1091,8 @@ async fn ingest_settings_round_trip_and_validation() {
             .into_inner()
     };
     let eq = |a: f64, b: f64| (a - b).abs() < f64::EPSILON;
-    // The default, before anything is set.
-    assert!(eq(get().await.similar_min_jaccard, 0.8));
+    // The default, before anything is set: the related-version bar of issue #169.
+    assert!(eq(get().await.similar_min_jaccard, 0.6));
 
     let set = config(&ch)
         .set_ingest_settings(pb::SetIngestSettingsRequest {
@@ -1197,7 +1197,297 @@ async fn ingest_settings_round_trip_and_validation() {
     let now = get().await;
     assert_eq!(now.similar_max_bucket, 250);
     assert_eq!(now.summarize_max_concurrent, 4);
+
+    // The other relations' thresholds and the crowd size (issue #169).
+    assert!(eq(now.similar_near_copy_min_jaccard, 0.9));
+    assert!(eq(now.similar_template_min_masked, 0.6));
+    assert_eq!(now.similar_identical_min_chars, 1000);
+    assert_eq!(now.similar_crowd_size, 50);
+    let set = config(&ch)
+        .set_ingest_settings(pb::SetIngestSettingsRequest {
+            similar_near_copy_min_jaccard: Some(0.95),
+            similar_template_min_masked: Some(0.7),
+            similar_identical_min_chars: Some(0),
+            similar_crowd_size: Some(7),
+            ..pb::SetIngestSettingsRequest::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(eq(set.similar_near_copy_min_jaccard, 0.95));
+    assert!(eq(set.similar_template_min_masked, 0.7));
+    assert_eq!(set.similar_identical_min_chars, 0);
+    assert_eq!(set.similar_crowd_size, 7);
+    assert_eq!(set.similar_max_bucket, 250);
+    let stored = a.store.ingest_settings().unwrap();
+    assert_eq!(stored.similar_crowd_size, 7);
+    assert!(eq(stored.similar_near_copy_min_jaccard, 0.95));
+    let err = config(&ch)
+        .set_ingest_settings(pb::SetIngestSettingsRequest {
+            similar_near_copy_min_jaccard: Some(0.0),
+            similar_template_min_masked: Some(1.5),
+            similar_identical_min_chars: Some(10_000_001),
+            similar_crowd_size: Some(0),
+            similar_max_bucket: Some(300),
+            ..pb::SetIngestSettingsRequest::default()
+        })
+        .await
+        .unwrap_err();
+    invalid(
+        &err,
+        &[
+            "similar_near_copy_min_jaccard",
+            "similar_template_min_masked",
+            "similar_identical_min_chars",
+            "similar_crowd_size",
+        ],
+    );
+    let now = get().await;
+    assert_eq!(now.similar_crowd_size, 7);
+    assert_eq!(now.similar_max_bucket, 250);
     a.stop().await;
+}
+
+/// `SimilarDocuments` (issue #169): one entry per document and relation from the
+/// `similar_to` edges both ways, an edge from before issue #169 read by its score, counts and
+/// crowds per relation, pages, and the errors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn similar_documents_by_relation() {
+    use doewood_model::{SimilarEdge, SimilarKeyKind, SimilarRelation as R};
+    use pb::SimilarRelation as P;
+    for shared in Shared::all().await {
+        let name = shared.name;
+        let a = Instance::start("inst-a", Some(shared.backend.clone())).await;
+        let mut graph = GraphServiceClient::new(a.channel().await);
+        let be = &shared.backend;
+        let doc = |n: u8| async move {
+            be.upsert_node(NodeKind::Document, &hash(n).to_hex(), &json!({}))
+                .await
+                .unwrap()
+        };
+        let me = doc(160).await;
+        let edge = |src, dst, props: serde_json::Value| async move {
+            be.upsert_edge(
+                &Edge::new(src, dst, EdgeKind::SimilarTo, EdgeSource::Document).with_props(props),
+            )
+            .await
+            .unwrap();
+        };
+        // 161: identical and same origin; 162: near copy (an edge from before issue #169,
+        // pointing at `me`); 163: related version and same template; 164 to 167: same
+        // template only, a crowd once the crowd size is 3.
+        let e = |relations: Vec<R>, raw: Option<f64>, masked: Option<f64>| SimilarEdge {
+            relations,
+            raw_similarity: raw,
+            masked_similarity: masked,
+            ..SimilarEdge::default()
+        };
+        let mut identical = e(vec![R::Identical, R::SameOrigin], Some(1.0), None);
+        identical.chars = Some(4000);
+        identical.origin = Some(SimilarKeyKind::OriginRsidRoot);
+        edge(me, doc(161).await, identical.to_props()).await;
+        edge(
+            doc(162).await,
+            me,
+            json!({"score": 0.95, "method": "minhash_lsh", "shared_bands": 30}),
+        )
+        .await;
+        let mut related = e(
+            vec![R::RelatedVersion, R::SameTemplate],
+            Some(0.7),
+            Some(0.61),
+        );
+        related.template = Some(SimilarKeyKind::Headings);
+        related.shared_bands = Some(9);
+        edge(me, doc(163).await, related.to_props()).await;
+        for n in 164..=167 {
+            let mut t = e(
+                vec![R::SameTemplate],
+                Some(0.2),
+                Some(0.6 + f64::from(n) / 1000.0),
+            );
+            t.template = Some(SimilarKeyKind::TemplateProperty);
+            edge(me, doc(n).await, t.to_props()).await;
+        }
+        // Edges of other kinds, and a retracted one, are not similar documents.
+        be.upsert_edge(
+            &Edge::new(
+                me,
+                doc(168).await,
+                EdgeKind::SimilarTo,
+                EdgeSource::Document,
+            )
+            .with_props(e(vec![R::NearCopy], Some(0.99), None).to_props())
+            .with_state(EdgeState::Retracted),
+        )
+        .await
+        .unwrap();
+        be.upsert_edge(&Edge::new(
+            me,
+            doc(169).await,
+            EdgeKind::Cites,
+            EdgeSource::Document,
+        ))
+        .await
+        .unwrap();
+
+        let ask = |relations: Vec<pb::SimilarRelation>, limit, token: &str, crowded| {
+            pb::SimilarDocumentsRequest {
+                blake3: hash(160).to_hex(),
+                relations: relations.into_iter().map(|r| r as i32).collect(),
+                limit,
+                page_token: token.to_owned(),
+                include_crowded: crowded,
+            }
+        };
+        let got = graph
+            .similar_documents(ask(vec![], 0, "", false))
+            .await
+            .unwrap()
+            .into_inner();
+        let short = |d: &pb::SimilarDocument| {
+            (
+                d.blake3[..2].to_owned(),
+                pb::SimilarRelation::try_from(d.relation).unwrap(),
+            )
+        };
+        let h = |n: u8| format!("{n:02x}");
+        assert_eq!(
+            got.documents.iter().map(short).collect::<Vec<_>>(),
+            [
+                (h(161), P::Identical),
+                (h(162), P::NearCopy),
+                (h(163), P::RelatedVersion),
+                (h(167), P::SameTemplate),
+                (h(166), P::SameTemplate),
+                (h(165), P::SameTemplate),
+                (h(164), P::SameTemplate),
+                (h(163), P::SameTemplate),
+                (h(161), P::SameOrigin),
+            ],
+            "{name}"
+        );
+        let first = &got.documents[0];
+        assert_eq!(first.method, "text_key");
+        assert_eq!(first.raw_similarity, Some(1.0));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&first.detail).unwrap(),
+            json!({"chars": 4000})
+        );
+        let old = &got.documents[1];
+        assert_eq!(
+            (old.method.as_str(), old.raw_similarity),
+            ("minhash_lsh", Some(0.95))
+        );
+        assert_eq!(old.masked_similarity, None);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&got.documents[7].detail).unwrap(),
+            json!({"template": "headings"})
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&got.documents[8].detail).unwrap(),
+            json!({"origin": "rsid_root"})
+        );
+        let counts: Vec<(P, u32, bool)> = got
+            .relations
+            .iter()
+            .map(|c| (P::try_from(c.relation).unwrap(), c.matches, c.crowded))
+            .collect();
+        assert_eq!(
+            counts,
+            [
+                (P::Identical, 1, false),
+                (P::NearCopy, 1, false),
+                (P::RelatedVersion, 1, false),
+                (P::SameTemplate, 5, false),
+                (P::SameOrigin, 1, false),
+            ]
+        );
+        assert!(got.next_page_token.is_empty() && !got.truncated);
+
+        // From the other end: 162's edge points at `me`, and `me` is its near copy.
+        let other = graph
+            .similar_documents(pb::SimilarDocumentsRequest {
+                blake3: hash(162).to_hex(),
+                ..pb::SimilarDocumentsRequest::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            other.documents.iter().map(short).collect::<Vec<_>>(),
+            [(h(160), P::NearCopy)]
+        );
+
+        // A crowd: with a crowd size of 3, the five template matches are counted, not listed,
+        // unless asked for.
+        config(&a.channel().await)
+            .set_ingest_settings(pb::SetIngestSettingsRequest {
+                similar_crowd_size: Some(3),
+                ..pb::SetIngestSettingsRequest::default()
+            })
+            .await
+            .unwrap();
+        let got = graph
+            .similar_documents(ask(vec![P::SameTemplate, P::NearCopy], 0, "", false))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            got.documents.iter().map(short).collect::<Vec<_>>(),
+            [(h(162), P::NearCopy)]
+        );
+        assert_eq!(
+            got.relations
+                .iter()
+                .map(|c| (P::try_from(c.relation).unwrap(), c.matches, c.crowded))
+                .collect::<Vec<_>>(),
+            [(P::NearCopy, 1, false), (P::SameTemplate, 5, true)]
+        );
+        // Pages of two over the crowd, asked for.
+        let mut seen = Vec::new();
+        let mut token = String::new();
+        loop {
+            let page = graph
+                .similar_documents(ask(vec![P::SameTemplate], 2, &token, true))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(page.documents.len() <= 2);
+            seen.extend(page.documents.iter().map(short));
+            if page.next_page_token.is_empty() {
+                break;
+            }
+            token = page.next_page_token;
+        }
+        assert_eq!(
+            seen,
+            [167, 166, 165, 164, 163].map(|n| (h(n), P::SameTemplate))
+        );
+
+        // Errors: a bad hash, relation, limit or token; an unknown document.
+        let err = graph
+            .similar_documents(pb::SimilarDocumentsRequest {
+                blake3: "nope".into(),
+                relations: vec![99],
+                limit: 1001,
+                page_token: "x".into(),
+                include_crowded: false,
+            })
+            .await
+            .unwrap_err();
+        invalid(&err, &["blake3", "relations[0]", "limit", "page_token"]);
+        let err = graph
+            .similar_documents(pb::SimilarDocumentsRequest {
+                blake3: hash(170).to_hex(),
+                ..pb::SimilarDocumentsRequest::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::NotFound, "{name}");
+        a.stop().await;
+        shared.drop_schema().await;
+    }
 }
 
 /// A throwaway self-signed certificate made for these tests (its key was discarded): not a

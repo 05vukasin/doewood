@@ -14,6 +14,13 @@ service GraphService {
   // first such edge (its `valid_from`, undated first, then its id); a page at a time, as
   // ListRecords.
   rpc CompanyDocuments(CompanyDocumentsRequest) returns (CompanyDocumentsResponse);
+  // The documents similar to one, by relation (issue #169): identical, near copy, related
+  // version, same template, same origin; read from its live `similar_to` edges. One entry per
+  // document and relation, by relation, then most similar first; a page at a time. With each
+  // page, every asked relation's match count, and whether it is a crowd (more matches than
+  // `similar_crowd_size`, as for a template), whose entries are left out unless asked for.
+  // NOT_FOUND for a document doewood does not know.
+  rpc SimilarDocuments(SimilarDocumentsRequest) returns (SimilarDocumentsResponse);
 
   // The explorer's reads (issue #172). Each is bounded: a page, or caps that end it with
   // `truncated`. Document counts, degrees and weights are kept by the store and trail the
@@ -86,7 +93,10 @@ enum EdgeKind {
   // Document -> Document.
   EDGE_KIND_AMENDS = 3;
   EDGE_KIND_CITES = 4;
-  // Document -> Document, with a `score` in the props.
+  // Document -> Document, from the smaller BLAKE3 to the larger. Props: `relations` (the
+  // SimilarRelation names that hold, issue #169), `score` (the raw MinHash estimate, when
+  // known), `method`, and the details SimilarDocuments reports. Edges from before issue #169
+  // have `score`, `method` and `shared_bands` only.
   EDGE_KIND_SIMILAR_TO = 5;
   // Company -> Company.
   EDGE_KIND_PARENT_OF = 6;
@@ -195,6 +205,73 @@ message NeighboursResponse {
   repeated Neighbour neighbours = 1;
   // Empty on the last page.
   string next_page_token = 2;
+}
+
+// How two documents are similar (issue #169). The text relations exclude each other (the
+// strongest one holds); same template and same origin are told apart from them.
+enum SimilarRelation {
+  SIMILAR_RELATION_UNSPECIFIED = 0;
+  // The same folded text (quail's `sketch.text_key`), at least `similar_identical_min_chars`
+  // characters long.
+  SIMILAR_RELATION_IDENTICAL = 1;
+  // Raw MinHash estimate at or above `similar_near_copy_min_jaccard`.
+  SIMILAR_RELATION_NEAR_COPY = 2;
+  // Raw MinHash estimate at or above `similar_min_jaccard`, below a near copy.
+  SIMILAR_RELATION_RELATED_VERSION = 3;
+  // Masked similarity (numbers, dates and names masked) at or above
+  // `similar_template_min_masked`, and a shared template property or heading skeleton.
+  SIMILAR_RELATION_SAME_TEMPLATE = 4;
+  // A shared document identity id: XMP `DocumentID`/`OriginalDocumentID`, `w15:docId` or
+  // `w:rsidRoot`.
+  SIMILAR_RELATION_SAME_ORIGIN = 5;
+}
+
+message SimilarDocumentsRequest {
+  // The document's BLAKE3, 64 hex characters.
+  string blake3 = 1;
+  // Only these relations; empty means all.
+  repeated SimilarRelation relations = 2;
+  // 1 to 1000; 0 means 50.
+  uint32 limit = 3;
+  // `next_page_token` of the previous page, with the same filters; empty for the first.
+  string page_token = 4;
+  // Also list the entries of a relation that is a crowd.
+  bool include_crowded = 5;
+}
+
+message SimilarDocument {
+  // The other document's BLAKE3.
+  string blake3 = 1;
+  SimilarRelation relation = 2;
+  // Raw MinHash Jaccard estimate, when both documents have a signature.
+  optional double raw_similarity = 3;
+  // Masked similarity (the cosine a SimHash of the masked words estimates), when known.
+  optional double masked_similarity = 4;
+  // How the relation was found: `text_key`, `minhash_lsh`, `masked_simhash` or `origin_id`.
+  string method = 5;
+  // What matched, as a JSON object: `shared_bands` (MinHash), `template` (`template_property`
+  // or `headings`), `origin` (`xmp`, `w15` or `rsid_root`), `chars` (identical).
+  string detail = 6;
+}
+
+message SimilarRelationCount {
+  SimilarRelation relation = 1;
+  // Documents in this relation (of the edges read, see `truncated`).
+  uint32 matches = 2;
+  // More matches than `similar_crowd_size`: the entries are left out unless
+  // `include_crowded` is set.
+  bool crowded = 3;
+}
+
+message SimilarDocumentsResponse {
+  repeated SimilarDocument documents = 1;
+  // Empty on the last page.
+  string next_page_token = 2;
+  // Every asked relation, in order, with its count.
+  repeated SimilarRelationCount relations = 3;
+  // The document has more `similar_to` edges than one call reads (10,000): the counts and
+  // entries are those of the first 10,000 in edge order.
+  bool truncated = 4;
 }
 
 message CompanyDocumentsRequest {

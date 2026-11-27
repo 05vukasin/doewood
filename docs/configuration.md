@@ -24,7 +24,11 @@ Set through the API, kept in `doewood.sqlite`, applied without a restart:
 | An AI provider's API key | `SetAiProvider` | secret `ai/<name>/api_key` (sealed, write-only) |
 | A `bedrock` provider's IAM credentials (access key id, secret access key, optional session token) | `SetAiProvider` | secret `ai/<name>/aws_credentials` (sealed, write-only) |
 | The default AI provider (the LLM queue's) | `SetAiProvider` (`make_default`; the first one set) | setting `ai.default_provider` |
-| Ingest: least MinHash Jaccard estimate for a `similar_to` edge (above 0, at most 1, default `0.8`). Read for every file, so a change applies to the next file ingested. Edges already written are kept; `ReprocessJob` with `force` compares a source's documents again (a lower value adds edges, a higher one removes none). | `SetIngestSettings`, read with `GetIngestSettings` | setting `ingest.similar_min_jaccard` |
+| Ingest: least MinHash Jaccard estimate for a `similar_to` edge, the `related_version` relation (above 0, at most 1, default `0.6`; `0.8` before issue #169). Read for every file, so a change applies to the next file ingested. Edges already written are kept; `ReprocessJob` with `force` compares a source's documents again (a lower value adds edges, a higher one removes none). | `SetIngestSettings`, read with `GetIngestSettings` | setting `ingest.similar_min_jaccard` |
+| Ingest: least MinHash Jaccard estimate of a `near_copy` (above 0, at most 1, default `0.9`; issue #169, see [ingest.md](ingest.md#similar-documents-by-relation)). Read for every file; `SimilarDocuments` also reads it for every call, to tell an edge from before issue #169 (a score only) a near copy or a related version. | `SetIngestSettings`, read with `GetIngestSettings` | setting `ingest.similar_near_copy_min_jaccard` |
+| Ingest: least masked similarity of a `same_template` pair, which also needs a shared template property or heading skeleton (above 0, at most 1, default `0.6`). Read for every file. | `SetIngestSettings`, read with `GetIngestSettings` | setting `ingest.similar_template_min_masked` |
+| Ingest: shortest text of an `identical` pair, in characters without whitespace (0 to 10000000, default `1000`; quail gives no text key below 400). Read for every file. | `SetIngestSettings`, read with `GetIngestSettings` | setting `ingest.similar_identical_min_chars` |
+| `SimilarDocuments`: matches in one relation above which a document is a crowd, counted but not listed unless asked for (1 to 1000, default `50`). Read for every call. | `SetIngestSettings`, read with `GetIngestSettings` | setting `ingest.similar_crowd_size` |
 | Ingest: the largest LSH band bucket the `similar_to` candidate query reads (10 to 1000000, default `1000`): a band key shared by more documents is skipped as template boilerplate, which changes which edges exist on template-heavy corpora (see [ingest.md](ingest.md)). Read for every file. | `SetIngestSettings`, read with `GetIngestSettings` | setting `ingest.similar_max_bucket` |
 | Ingest: `Summarize` calls that read and analyze a file at once (1 to 16, default `2`; OCR of a scanned page can take 0.6 to 1 GB). Read for every call, so a change applies to the next one. A call beyond it gets `RESOURCE_EXHAUSTED` at once. | `SetIngestSettings`, read with `GetIngestSettings` | setting `ingest.summarize_max_concurrent` |
 | API: calls in flight before new ones are shed with `UNAVAILABLE` (1 to 65536, default `256`). Applies to the next call. See [api.md](api.md#limits). | `SetApiSettings`, read with `GetApiSettings` | setting `api.max_calls_in_flight` |
@@ -142,11 +146,19 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
   5 minutes, then they retry with backoff) and find the schema migrated. The version is in
   the `doewood_schema` table. A database migrated by a newer doewood is
   refused (not ready) until this one is upgraded.
+- **Schema 16** (issue #169: the new empty table `similar_keys`, the exact-match keys of the
+  typed similarity relations, with its index; no existing row changes, so it migrates at once
+  on any size of database) is the current version. Documents ingested before it get keys when
+  they are ingested again (`ReprocessJob` with `force`); their `similar_to` edges keep working
+  as they are (see [ingest.md](ingest.md#similar-documents-by-relation)). As with every
+  schema, **all instances are upgraded together**: an older binary refuses schema 16. **Down
+  path** (every instance stopped): `DROP TABLE similar_keys; DELETE FROM doewood_schema WHERE
+  version = 16;`. The instance's own SQLite file goes to schema 18 with the same table.
 - **Schema 15** (issue #168: an index on `locations.document_id`, which a purge's node
   deletes need; an index only, built in the migration's transaction, about a second per
-  million locations, while writes to `locations` wait) is the current version. **Down path:**
+  million locations, while writes to `locations` wait) came before it. **Down path:**
   `DROP INDEX locations_by_document; DELETE FROM doewood_schema WHERE version = 15;`. As with
-  every schema, **all instances are upgraded together**. The instance's own SQLite file goes
+  every schema, **all instances are upgraded together**. The instance's own SQLite file went
   to schema 17 with the same index.
 - **Schema 11** (issue #141: the triggers behind `sketch_band_sizes` keep a row only for a
   band bucket of two or more documents, which cut the WAL of ingest by 12 to 29%; new
@@ -241,8 +253,8 @@ foreign keys it could break, as the runner declares per migration (issue #159): 
 for one that rebuilds a table, deletes rows or moves data (schemas 1 to 10); only the tables
 it fills for one that writes into new tables (schemas 11, 14 and 15); none for one that writes
 no rows and rebuilds nothing (schemas 12 and 17, an index; schema 13, a column with a default
-and a new table; schema 16, a new table). A violation rolls the migration back and the instance
-does not start.
+and a new table; schemas 16 and 18, a new table each, issues #166 and #169). A violation rolls
+the migration back and the instance does not start.
 A test holds each migration to its declaration.
 
 `doewood.sqlite` runs in WAL mode with `synchronous = NORMAL`, and a `journal_size_limit` of

@@ -293,10 +293,10 @@ the record is analyzed, and removed when a new analysis has no text. `GetDocumen
 - **`amends` / `cites`** from `ref.cites`. A cited number resolves to the document that has it as
   its own number (`ref.doc_number`); until that document is known, the edge goes to a pending
   Document node `ref:<number>`, and moves to the real document when it arrives.
-- **`similar_to`** from quail's MinHash LSH bands: candidates come from the band index (a lookup
-  by band key), each confirmed by its Jaccard estimate (the runtime setting
-  `similar_min_jaccard`, default 0.8, set with `ConfigService.SetIngestSettings`; it is read
-  for every file, so a change applies to the next file without a restart). A document's
+- **`similar_to`**, typed by relation (issue #169, [below](#similar-documents-by-relation)):
+  candidates come from quail's MinHash LSH bands (a lookup by band key) and from an index of
+  exact-match keys, each relation confirmed by its threshold (runtime settings, read for every
+  file, so a change applies to the next file without a restart). A document's
   candidates cost the same round trips however many there are (issue #126): their Document
   nodes are read in one statement (`GraphStore::node_ids`) and the edges written in one batch
   (`GraphStore::upsert_edges`: one transaction, one statement on Postgres).
@@ -316,6 +316,94 @@ the record is analyzed, and removed when a new analysis has no text. `GetDocumen
   edges already written are kept (`ReprocessJob` with `force` compares again).
 - **Search:** title (`ref.title`, else the card's, the file's own, the file name), body (the
   summary card, the extractive summary, keywords, sheet text), kind, date and amount.
+
+## Similar documents by relation
+
+Issue #169. A pair of documents has at most one `similar_to` edge, from the smaller BLAKE3 to
+the larger (ADR 0001 section 7). Its props name the relations that hold (`relations`), and
+`GraphService.SimilarDocuments` lists a document's similar documents by relation
+([api.md](api.md#similar-documents)). Everything comes from quail facts; nothing is sent
+anywhere.
+
+| relation | holds when | found through | setting (default) |
+|---|---|---|---|
+| `identical` | the same folded text: equal `sketch.text_key` (the words, whatever the bytes, spacing, case, diacritics or script), and the text (`text.chars`, whitespace excluded) at least the minimum length | the key index | `similar_identical_min_chars` (1000; quail gives no key below 400) |
+| `near_copy` | raw MinHash estimate (`sketch.minhash`) at or above the bar | the band index, and the key index's matches | `similar_near_copy_min_jaccard` (0.90) |
+| `related_version` | raw MinHash estimate at or above the bar, below a near copy | as near copy | `similar_min_jaccard` (0.60; 0.8 before issue #169) |
+| `same_template` | masked similarity at or above the bar, **and** a shared template property (`docx.template`, the file name of `docx.attached_template`; Word's `Normal` is left out) or heading skeleton (`sketch.headings`) | the key index | `similar_template_min_masked` (0.60) |
+| `same_origin` | a shared document identity id: XMP `DocumentID` or `OriginalDocumentID` (one namespace, so a copy's original id meets the original's id), `w15:docId`, or `w:rsidRoot` | the key index | none: the id is equal or not |
+
+- **The text relations exclude each other:** a pair is identical, else a near copy, else a
+  related version (the strongest that holds). `same_template` and `same_origin` hold on their
+  own, so a pair can be, say, a near copy of the same template. An identical pair whose
+  signatures differ (the text key is 64 bits of quail's 128) is not identical.
+- **Masked similarity** is quail's `sketch.simhash_template`, a 64-bit SimHash of the words
+  with numbers, dates, amounts, codes, names, URLs and e-mail addresses masked, compared as
+  the cosine it estimates: `cos(pi * hamming / 64)`. 1 is equal, 0 is unrelated (32 bits
+  apart); quail's own "same template" bar of 8 bits is 0.92, and 0.60 is 18 bits. On its own
+  it is too loose (two contracts in one language share most function words), so a template
+  also needs a shared exact key.
+- **XMP and `w15:docId`** are read from `pdf.xmp_document_id`, `pdf.xmp_original_document_id`
+  and `docx.w15_doc_id`, which quail does not emit yet (quail#123); until it does, same origin
+  comes from `docx.rsid_root` only.
+- **The key index** (`similar_keys`, shared schema 16, instance schema 18) holds each
+  document's keys (`kind`, 64 bits) with its masked SimHash, so a template match is checked
+  without reading a record. A lookup reads at most 100 documents per key, in hash order,
+  from the primary key. The keys are written with the sketch, and looked up with the band
+  candidates: on Postgres the two statements of each pair are pipelined, one round trip as
+  before, so a document costs the same round trips (one more statement each way when it has
+  keys). The rows go with their record (`ON DELETE CASCADE`), as the sketch does. A document
+  with no keys and no sketch skips all of it; a document with no keys never had its old keys
+  removed (only a new quail version could drop them for the same content).
+- **The edge props:** `relations`, `method` (of the first relation: `text_key`,
+  `minhash_lsh`, `masked_simhash` or `origin_id`), `score` (the raw
+  MinHash estimate, when both documents have a signature), `masked_similarity` (when both
+  have a masked SimHash the writer knew: one found only through the bands has none),
+  `shared_bands`, `template` (`template_property` or `headings`), `origin` (`xmp`, `w15` or
+  `rsid_root`), `chars` (identical). The confidence is the larger similarity, 1 for an
+  identical pair or a shared id alone.
+- **Edges from before issue #169** have `score`, `method` and `shared_bands` only; they keep
+  working without a migration: `SimilarDocuments` reads one as a near copy when its `score`
+  is at or above `similar_near_copy_min_jaccard`, else as a related version. `ReprocessJob`
+  with `force` writes them again with their relations (and the documents' keys).
+- **Thresholds apply to the next file;** edges already written are kept (`ReprocessJob` with
+  `force` compares again: a lower bar adds edges, a higher one removes none). Lowering
+  `similar_min_jaccard` to 0.60 adds the related versions between 0.60 and 0.80 that earlier
+  versions did not link.
+- **Crowds.** A document with more than `similar_crowd_size` (default 50) matches in one
+  relation, typically a template's thousands of documents, is a crowd in that relation:
+  `SimilarDocuments` counts it and leaves its entries out unless asked for, so one template
+  does not flood the answer. Ingest still writes at most 100 band candidates and 100 key
+  matches per key for a document.
+
+**Measurements (PR for issue #169).** 4-core server, test profile, Postgres 17
+(`pgvector/pgvector:pg17`) in Docker on an internal network, SQLite in memory.
+
+- `throughput` (2000 files, 4 workers, three runs each, two rounds; half the files are long
+  enough for a text key): Postgres 315 / 313 files/s before (`staging`), 285 / 314 after;
+  SQLite 423 / 412 before, 409 / 417 after (medians; round one's Postgres runs after the
+  change were 267 to 295, round two's 310 to 314, so the difference is within the runs'
+  spread). 11.1 statements per file before, 12.1 after (the keys' write and lookup, each
+  pipelined with the sketch's statement, so no round trip more); 2.9 to 3.0 s in Postgres
+  either way.
+- `near_duplicate_corpus` (2000 documents, 4 templates, `similar_min_jaccard` 0.8): without
+  keys 32.7 s before and 33.7 to 38.7 s after on Postgres, 30.1 s and 29.8 s on SQLite, the
+  same 139,800 edges. With keys (`DOEWOOD_NEAR_DUP_KEYS`: a text key each, a heading skeleton
+  and masked SimHash per template) 48.1 s on Postgres and 40.6 s on SQLite, for 197,837 edges
+  (same_template adds about 50 a document); the key lookup took 0.57 ms a document in
+  Postgres, the edge batch 8.2 ms.
+- Query time (`crates/doewood-api/tests/similar_bench.rs`, median ms through the API):
+
+  | edges at the document | Neighbours, page of 50 | SimilarDocuments, 50 | Neighbours, page of 1000 | SimilarDocuments, 1000 |
+  |---|---|---|---|---|
+  | 20, SQLite / Postgres | 1.1 / 1.5 | 1.8 / 3.3 | 2.6 / 2.8 | 3.2 / 3.4 |
+  | 100 | 4.3 / 4.1 | 8.0 / 7.2 | 7.7 / 7.5 | 7.5 / 5.8 |
+  | 1000 | 4.1 / 4.4 | 27 / 30 | 49 / 49 | 30 / 31 |
+  | 5000 | 4.7 / 6.9 | 167 / 203 | 49 / 49 | 164 / 176 |
+
+  SimilarDocuments reads every `similar_to` edge of the document (up to 10,000) to count and
+  sort them, so its cost grows with the document's degree, where a Neighbours page does not;
+  a template crowd's earliest documents are the expensive case.
 
 ## Company props
 

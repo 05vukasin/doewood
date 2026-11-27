@@ -145,15 +145,22 @@ The comments in the `.proto` files are the reference for every field. In short:
 
 - **GetIngestSettings** returns ingest's runtime settings, defaults filled in.
 - **SetIngestSettings** changes them; an unset field keeps its value. `similar_min_jaccard` is
-  the least MinHash Jaccard estimate for a `similar_to` edge: above 0 and at most 1 (default
-  0.8), anything else is `INVALID_ARGUMENT`. Ingest reads it for every file, so it applies to
+  the least MinHash Jaccard estimate for a `similar_to` edge, the "related version" relation
+  of issue #169: above 0 and at most 1 (default 0.6; 0.8 before issue #169), anything else is
+  `INVALID_ARGUMENT`. Ingest reads it for every file, so it applies to
   the next file without a restart. Edges already written are kept; `ReprocessJob` with
   `force: true` compares a source's documents again (a lower value adds edges, a higher one
   removes none). It replaces the old `DOEWOOD_SIMILAR_MIN_JACCARD` variable (see
   [configuration.md](configuration.md)). `similar_max_bucket` is the largest LSH band bucket
   the `similar_to` candidate query reads: 10 to 1000000 (default 1000), anything else is
   `INVALID_ARGUMENT`; a band key shared by more documents is skipped (issue #148, see
-  [ingest.md](ingest.md)). `summarize_max_concurrent` is how many `Summarize`
+  [ingest.md](ingest.md)). The other relations' thresholds (issue #169, see
+  [ingest.md](ingest.md#similar-documents-by-relation)), each read for every file:
+  `similar_near_copy_min_jaccard` (above 0, at most 1, default 0.9),
+  `similar_template_min_masked` (above 0, at most 1, default 0.6) and
+  `similar_identical_min_chars` (0 to 10000000, default 1000). `similar_crowd_size` (1 to
+  1000, default 50) is read for every `SimilarDocuments` call. A value out of range is
+  `INVALID_ARGUMENT`, and a refused request changes nothing. `summarize_max_concurrent` is how many `Summarize`
   calls read and analyze a file (or read a stored record) at once: 1 to 16 (default 2), anything else is
   `INVALID_ARGUMENT`. It is read for every `Summarize` call, so it applies to the next one;
   calls in flight keep running.
@@ -274,6 +281,11 @@ refused: the workbook has more than 1,600,000 cells ...`, and how to raise the c
   A token that is not one from a previous page is `INVALID_ARGUMENT`; an empty page still
   tells a missing node (`NOT_FOUND`) and, for CompanyDocuments, a node that is not a company
   (`INVALID_ARGUMENT`) apart. See [Pages of Neighbours and CompanyDocuments](#pages-of-neighbours-and-companydocuments).
+- **SimilarDocuments** (issue #169) lists the documents similar to one (by BLAKE3), by
+  relation: `identical`, `near_copy`, `related_version`, `same_template`, `same_origin`
+  (`relations`, empty means all; what each means is in
+  [ingest.md](ingest.md#similar-documents-by-relation)). See
+  [Similar documents](#similar-documents).
 - **Search** matches every word of `text` and every filter that is set (company, kind, date and
   amount ranges, source), with `limit` (up to 1000) and `offset`.
 - **The explorer's reads** (issue #172), for a visual graph explorer. Each is bounded, by a
@@ -661,7 +673,7 @@ grpcurl -plaintext -d '{"name": "local"}' 127.0.0.1:7443 doewood.v1.ConfigServic
 Ingest settings:
 
 ```sh
-grpcurl -plaintext -d '{"similar_min_jaccard": 0.85}' \
+grpcurl -plaintext -d '{"similar_min_jaccard": 0.65, "similar_near_copy_min_jaccard": 0.92}' \
     127.0.0.1:7443 doewood.v1.ConfigService/SetIngestSettings
 grpcurl -plaintext 127.0.0.1:7443 doewood.v1.ConfigService/GetIngestSettings
 ```
@@ -1152,6 +1164,49 @@ every company: 33 ms a page). SQLite reads a CompanyGraph's links per company as
 or as point probes, whichever is fewer (as one `IN` probe of every pair it took 1.0 s at
 2,000 companies).
 
+
+## Similar documents
+
+`GraphService.SimilarDocuments(blake3, relations[], limit, page_token, include_crowded)`
+(issue #169) reads the document's live `similar_to` edges, both ways, and gives one entry
+per other document and relation that holds: `{blake3, relation, raw_similarity,
+masked_similarity, method, detail}`.
+
+- `raw_similarity` is the raw MinHash Jaccard estimate and `masked_similarity` the masked
+  SimHash cosine, each when known; `method` is `text_key`, `minhash_lsh`, `masked_simhash` or
+  `origin_id`; `detail` is a JSON object: `shared_bands` (near copy, related version),
+  `template` (`template_property` or `headings`), `origin` (`xmp`, `w15`, `rsid_root`),
+  `chars` (identical).
+- **Order:** by relation (as listed above), then its own similarity high to low (the masked
+  one for `same_template`, the raw one for the others; unknown last), then the other, then
+  hash. `limit` is 1 to 1000 (0 means 50, more is `INVALID_ARGUMENT`); pass
+  `next_page_token` back as `page_token`, with the same filters, until it is empty. A token
+  is the last entry's place in the order, so entries added or removed between pages do not
+  shift the rest.
+- **Counts and crowds:** each page has every asked relation with its `matches` and
+  `crowded` (more matches than the runtime setting `similar_crowd_size`, default 50, read for
+  every call). A crowded relation's entries are left out, so one template's thousands of
+  documents do not flood the answer, unless `include_crowded` is set.
+- **Bounded:** a call reads at most 10,000 `similar_to` edges, a store page of 1000 at a
+  time; with more, `truncated` is set and the counts and entries are those of the first
+  10,000 in edge order. Ingest writes at most 100 band candidates and 100 matches per key for
+  a document, but a template's earliest documents can collect edges from all later ones.
+- **Edges from before issue #169** (props `score`, `method`, `shared_bands`) come back as a
+  near copy when `score` is at or above `similar_near_copy_min_jaccard`, else as a related
+  version.
+- A malformed hash, an unknown relation, a `limit` above 1000 or a token that is not one from
+  a previous page is `INVALID_ARGUMENT`; a document doewood does not know is `NOT_FOUND`.
+  Pending references (`ref:` nodes) are never entries.
+- The edges are still graph edges: `Neighbours`, `Subgraph` and `Path` follow `similar_to`
+  as before, and the props carry the relations. The explorer's counts (`company_graph_log`)
+  watch only `party` and corporate-event edges, so they are unchanged.
+
+```sh
+grpcurl -plaintext -d '{"blake3": "<64 hex>", "relations": ["SIMILAR_RELATION_NEAR_COPY"]}' \
+    127.0.0.1:7443 doewood.v1.GraphService/SimilarDocuments
+```
+
+Timings: see [ingest.md](ingest.md#similar-documents-by-relation) (a call costs about 30 ms at 1000 edges, 170 to 200 ms at 5000).
 
 ## Search by company
 

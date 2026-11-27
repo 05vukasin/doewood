@@ -89,6 +89,11 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("migrations/0017_locations_by_document.sql"),
         fk_check: FkCheck::Skip,
     },
+    // A new empty table (issue #169).
+    Migration {
+        sql: include_str!("migrations/0018_similar_keys.sql"),
+        fk_check: FkCheck::Skip,
+    },
 ];
 
 /// The schema version this binary writes.

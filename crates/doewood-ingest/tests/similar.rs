@@ -2,7 +2,9 @@
 //! writes the same edges as the per-candidate loop it had before (a node lookup, maybe a node
 //! insert, and an edge upsert for each candidate, with no stop band). No band bucket of this
 //! corpus is over the default `similar_max_bucket` (1000), so the stop band of issue #148
-//! skips nothing and the edges stay the same. On SQLite and, when
+//! skips nothing and the edges stay the same. Since issue #169 the props name the relation
+//! (near copy or related version by the score); the documents have no similarity keys, so
+//! the key index adds nothing. On SQLite and, when
 //! `DOEWOOD_TEST_POSTGRES_URL` is set, on Postgres in a schema of its own.
 
 mod common;
@@ -13,7 +15,8 @@ use doewood_core::MasterKey;
 use doewood_ingest::facts::DocFacts;
 use doewood_ingest::{GraphWriter, SimilarityConfig};
 use doewood_model::{
-    Backend, Blake3, Edge, EdgeKind, EdgeSource, NodeKind, ObjectLocation, StepVersions,
+    Backend, Blake3, Edge, EdgeKind, EdgeSource, NodeKind, ObjectLocation, SimilarEdge,
+    SimilarRelation, StepVersions,
 };
 use doewood_store::{Standalone, Store};
 use serde_json::json;
@@ -106,10 +109,21 @@ async fn write_old(b: &dyn Backend) {
             } else {
                 (other, doc)
             };
-            #[allow(clippy::cast_possible_truncation)]
+            // The props of issue #169: the same score, the relation it is.
+            let near = score >= doewood_store::DEFAULT_SIMILAR_NEAR_COPY_MIN_JACCARD;
+            let e = SimilarEdge {
+                relations: vec![if near {
+                    SimilarRelation::NearCopy
+                } else {
+                    SimilarRelation::RelatedVersion
+                }],
+                raw_similarity: Some(score),
+                shared_bands: Some(c.shared_bands),
+                ..SimilarEdge::default()
+            };
             let edge = Edge::new(src, dst, EdgeKind::SimilarTo, EdgeSource::Document)
-                .with_props(json!({"score": score, "method": "minhash_lsh", "shared_bands": c.shared_bands}))
-                .with_confidence(score.clamp(0.0, 1.0) as f32);
+                .with_props(e.to_props())
+                .with_confidence(e.confidence());
             b.upsert_edge(&edge).await.unwrap();
         }
     }
