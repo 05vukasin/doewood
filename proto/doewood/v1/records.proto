@@ -467,7 +467,10 @@ message CardField {
 }
 
 message FindDocumentsRequest {
-  // `card.kind`: `contract`, `invoice`, ...
+  // `card.kind`: `contract`, `invoice`, ... A family name finds its whole family: `contract`
+  // finds `msa`, `nda`, `lease`, `annex`, `amendment` and the other contract kinds, `invoice`
+  // finds `credit_note` and `pro_forma` (docs/api.md, "Kind families"). Any other kind finds
+  // itself only.
   string kind = 1;
   // The supplier or the customer company (a UUID; the document's `party` edge marked
   // `side: supplier` or `side: buyer`, as `ListPayments`).
@@ -508,6 +511,8 @@ message FindDocumentsRequest {
   uint32 page_size = 21;
   // `next_page_token` of the previous page; empty for the first.
   string page_token = 22;
+  // `kind` alone, not its family (`contract` then misses an `msa`).
+  bool kind_exact = 23;
 }
 
 message FindDocumentsResponse {
