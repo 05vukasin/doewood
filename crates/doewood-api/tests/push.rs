@@ -275,7 +275,10 @@ async fn put_object_streams_the_bytes_to_ingest() {
     assert_eq!(r.kind, "invoice");
     assert_eq!(r.blake3, record(&file).blake3.to_hex());
     assert_eq!(r.record.unwrap().body_json, r#"{"format":"text"}"#);
-    assert_eq!(fake.bytes.lock().unwrap().as_slice(), std::slice::from_ref(&file));
+    assert_eq!(
+        fake.bytes.lock().unwrap().as_slice(),
+        std::slice::from_ref(&file)
+    );
     {
         let h = fake.headers.lock().unwrap();
         assert_eq!(h[0].key, "drive/a.txt");
