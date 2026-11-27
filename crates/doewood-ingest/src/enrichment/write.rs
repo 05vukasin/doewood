@@ -167,7 +167,7 @@ pub(crate) async fn write(
         .await?;
     }
     // 5. Props.
-    update_props(b, me, f, &owned).await?;
+    update_props(b, s, f, &owned).await?;
     // 6. Proposals.
     out.proposed += proposals(b, me, f, g).await?;
     Ok(())
@@ -377,12 +377,12 @@ fn supersede(e: &Edge, until: Date) -> Edge {
 /// (issue #51): ingest's keys, and what it writes at the same moment, stay.
 async fn update_props(
     b: &dyn Backend,
-    me: Uuid,
+    s: &Subject,
     f: &Findings,
     owned: &BTreeSet<String>,
 ) -> Result<()> {
     // Every list and map the job keeps is there, empty if need be.
-    let mut patch = PropsPatch::new();
+    let mut patch = jurisdiction(PropsPatch::new(), s, f);
     for key in ["registry", "ids", "registry_ids"] {
         patch = patch.set_if_absent(&[key], json!({}));
     }
@@ -417,6 +417,34 @@ async fn update_props(
     }
     let at = super::unix_now();
     patch = patch.set(&["enriched_at"], json!(at));
-    b.update_live_props(me, &patch).await?;
+    b.update_live_props(s.id(), &patch).await?;
     Ok(())
+}
+
+/// The company's `jurisdiction` as one ISO 3166 code (issue #201). A stored value that is
+/// none (quail's `us|ca`, written before) is replaced by the registry's, else removed; a
+/// missing one, or a country the registry's subdivision refines (`US`, `US-CA`), takes the
+/// registry's.
+fn jurisdiction(patch: PropsPatch, s: &Subject, f: &Findings) -> PropsPatch {
+    let key = &["jurisdiction"];
+    let stored = s.node.props.get("jurisdiction").and_then(Value::as_str);
+    let registry = f.jurisdiction.as_deref();
+    let Some(raw) = stored else {
+        return match registry {
+            Some(r) => patch.set_if_absent(key, json!(r)),
+            None => patch,
+        };
+    };
+    match (doewood_enrich::jurisdiction::normalize(raw), registry) {
+        (None, Some(r)) => patch.set(key, json!(r)),
+        (None, None) => patch.remove(key),
+        (Some(code), Some(r))
+            if r.strip_prefix(code.as_str())
+                .is_some_and(|sub| sub.starts_with('-')) =>
+        {
+            patch.set(key, json!(r))
+        }
+        (Some(code), _) if code != raw => patch.set(key, json!(code)),
+        (Some(_), _) => patch,
+    }
 }

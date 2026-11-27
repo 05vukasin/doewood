@@ -7,6 +7,7 @@
 //! - [`fuzzy`]: the fuzzy name score and the jurisdiction veto (section 1.4).
 //! - [`fusion`]: noisy-OR evidence fusion and the decision gate (section 1.6).
 //! - [`group`]: stable `uuid5` group ids (section 1.7).
+//! - [`jurisdiction`]: a company's jurisdiction as one ISO 3166 code (issue #201).
 //!
 //! doewood-ingest applies the deterministic steps when it writes the graph; the store lookups
 //! (who owns a key) stay there.
@@ -16,6 +17,7 @@ pub mod fusion;
 pub mod fuzzy;
 pub mod group;
 pub mod id;
+pub mod jurisdiction;
 pub mod name;
 #[cfg(test)]
 mod testids;

@@ -4788,8 +4788,16 @@ pub async fn explorer<B: Backend + ?Sized>(s: &B) {
                "icon": {"domain": "alpha.example"}}),
     )
     .await;
-    let b = company("explore-b", json!({"name": "Explore Beta"})).await;
-    let c = company("explore-c", json!({"name": "explore gamma"})).await;
+    let b = company(
+        "explore-b",
+        json!({"name": "Explore Beta", "jurisdiction": "US-CA"}),
+    )
+    .await;
+    let c = company(
+        "explore-c",
+        json!({"name": "explore gamma", "jurisdiction": "USX"}),
+    )
+    .await;
     let d = company("explore-d", json!({"name": "Explore Delta"})).await;
     let e = company("explore-e", json!({"name": "Explore Echo"})).await;
     s.claim_alias(
@@ -4934,6 +4942,26 @@ pub async fn explorer<B: Backend + ?Sized>(s: &B) {
         })
         .await,
         BTreeSet::from([a])
+    );
+    // A country finds its subdivisions (`US` finds `US-CA`), not a longer code (issue #201).
+    for (j, want) in [("us", BTreeSet::from([b])), ("US-CA", BTreeSet::from([b]))] {
+        assert_eq!(
+            only(CompanyFilter {
+                jurisdiction: Some(j.to_owned()),
+                ..mine.clone()
+            })
+            .await,
+            want,
+            "{j}"
+        );
+    }
+    assert_eq!(
+        only(CompanyFilter {
+            jurisdiction: Some("US-C".to_owned()),
+            ..mine.clone()
+        })
+        .await,
+        BTreeSet::new()
     );
     assert_eq!(
         only(CompanyFilter {

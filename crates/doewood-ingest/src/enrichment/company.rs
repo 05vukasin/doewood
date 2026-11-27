@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use doewood_core::InstanceId;
-use doewood_enrich::{CompanyName, IdKind, Identifier};
+use doewood_enrich::{CompanyName, IdKind, Identifier, jurisdiction};
 use doewood_model::{
     Backend, DueCompany, EdgeKind, EdgeState, Error, MERGE_CHAIN_MAX, ProposalRequest, Result,
 };
@@ -148,6 +148,9 @@ pub(crate) struct Findings {
     pub warnings: Vec<Warning>,
     /// Each registry asked, and whether every request to it answered.
     pub asked: BTreeMap<&'static str, bool>,
+    /// The jurisdiction a registry states, as one ISO 3166 code (EDGAR's state of
+    /// incorporation, `US-CA`).
+    pub jurisdiction: Option<String>,
 }
 
 impl Findings {
@@ -894,6 +897,14 @@ impl<'a> Job<'a> {
             });
         }
         let acquisitions: Vec<&doewood_registry::edgar::Filing> = c.acquisitions().collect();
+        // `CA` here is California (`US-CA`), never Canada (issue #201).
+        let jurisdiction = c
+            .state_of_incorporation
+            .as_deref()
+            .and_then(jurisdiction::from_sec);
+        if f.jurisdiction.is_none() {
+            f.jurisdiction.clone_from(&jurisdiction);
+        }
         f.facts.insert(
             "edgar",
             json!({
@@ -902,6 +913,7 @@ impl<'a> Job<'a> {
                 "name": c.name,
                 "tickers": c.tickers,
                 "state_of_incorporation": c.state_of_incorporation,
+                "jurisdiction": jurisdiction,
                 "sic": c.sic,
                 "acquisitions": acquisitions.iter().take(20).map(|a| json!({
                     "accession": a.accession.plain(),
@@ -937,7 +949,11 @@ impl<'a> Job<'a> {
                     EdgeState::Proposed,
                     BEST_EFFORT,
                     &ev,
-                    &json!({"exhibit": x.exhibit_type, "jurisdiction": row.jurisdiction}),
+                    &json!({
+                        "exhibit": x.exhibit_type,
+                        "jurisdiction": row.jurisdiction.as_deref().and_then(jurisdiction::from_sec),
+                        "jurisdiction_as_written": row.jurisdiction,
+                    }),
                 ));
                 rows.push(parsed);
             }

@@ -1000,7 +1000,13 @@ impl GraphWriter {
         if let Some(f) = name.legal_form {
             patch = patch.set_if_absent(&["legal_form"], json!(f));
         }
-        if let Some(j) = &p.jurisdiction {
+        // One ISO 3166 code only: quail's candidate list for an `Inc.` (`us|ca`, the US or
+        // Canada) is no jurisdiction, and must not read as Canada (issue #201).
+        if let Some(j) = p
+            .jurisdiction
+            .as_deref()
+            .and_then(doewood_enrich::jurisdiction::normalize)
+        {
             patch = patch.set(&["jurisdiction"], json!(j));
         }
         patch = patch.add_to_set(&["quail_keys"], json!(p.quail_key), MAX_NAMES);

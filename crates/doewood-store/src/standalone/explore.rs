@@ -265,10 +265,13 @@ fn list_sql(
     }
     if let Some(j) = filter.jurisdiction_key() {
         args.push(Sql::Text(j));
+        let i = args.len();
+        // The country also finds its subdivisions: `US` finds `US-CA`.
         let _ = write!(
             s,
-            " AND upper(json_extract(n.props_json, '$.jurisdiction')) = ?{}",
-            args.len()
+            " AND (upper(json_extract(n.props_json, '$.jurisdiction')) = ?{i} \
+             OR substr(upper(json_extract(n.props_json, '$.jurisdiction')), 1, length(?{i}) + 1) \
+             = ?{i} || '-')"
         );
     }
     if let Some(has) = filter.has_identifier {

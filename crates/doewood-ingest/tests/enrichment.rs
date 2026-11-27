@@ -1500,6 +1500,15 @@ async fn edgar_subsidiaries_are_only_proposed() {
             "{name}"
         );
         assert_eq!(s.valid_from, Some(day(2026, Month::February, 20)));
+        // The exhibit's jurisdiction column, as ISO 3166-2 next to the text (issue #201).
+        assert_eq!(
+            (
+                &s.props["jurisdiction"],
+                &s.props["jurisdiction_as_written"]
+            ),
+            (&json!("US-DE"), &json!("Delaware")),
+            "{name}"
+        );
         let acq = edges(b, e, EdgeKind::Acquired).await;
         assert_eq!(acq.len(), 1, "{name}");
         assert_eq!(acq[0].1.edge.state, EdgeState::Proposed);
@@ -1512,6 +1521,140 @@ async fn edgar_subsidiaries_are_only_proposed() {
             renames[0].1.edge.valid_from,
             Some(day(2019, Month::August, 5))
         );
+    }
+    backends.drop_schema().await;
+}
+
+/// Issue #201: a US state is never stored as a country. G, "Fictive Golden Example Inc., a
+/// California corporation" in a document: quail guesses `us|ca` for an `Inc.` (the US or
+/// Canada), which ingest writes as no jurisdiction; EDGAR says G is incorporated in `CA`,
+/// which is California, `US-CA`. A `US` filter finds G, a `CA` (Canada) filter does not; M, a
+/// company quail places in Canada, stays `CA`. H has the `us|ca` an earlier version stored
+/// and nothing from a registry: the job removes it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_us_state_is_never_a_country() {
+    use doewood_ingest::facts::{DocFacts, Party};
+    use doewood_ingest::{GraphWriter, SimilarityConfig};
+    use doewood_model::{CompanyFilter, CompanyOrder, ObjectLocation, PropsPatch};
+
+    let mock = Mock::start(move |_, target| {
+        if target == "/edgar/data/submissions/CIK9990000201.json" {
+            return Reply::json(&json!({
+                "cik": "9990000201",
+                "name": "Fictive Golden Example Inc.",
+                "stateOfIncorporation": "CA",
+                "stateOfIncorporationDescription": "CA",
+                "filings": {"recent": {
+                    "accessionNumber": [], "filingDate": [], "reportDate": [], "form": [],
+                    "items": [], "primaryDocument": [], "primaryDocDescription": []
+                }}
+            }));
+        }
+        if target.starts_with("/wikidata/") {
+            return Reply::json(&empty_sparql());
+        }
+        Reply::status(404)
+    })
+    .await;
+    let party = |key: &str, surface: &str, jurisdiction: &str| Party {
+        quail_key: key.to_owned(),
+        surface: surface.to_owned(),
+        score: 0.9,
+        roles: vec!["party".to_owned()],
+        legal_form: None,
+        jurisdiction: Some(jurisdiction.to_owned()),
+        ids: Vec::new(),
+        mentions: vec![(Some(1), 0, 30)],
+    };
+    let node_of = async |b: &Arc<dyn Backend>, name: &str| {
+        let key = CompanyName::parse(name).unwrap().ladder_keys()[0].1.clone();
+        b.node_by_key(NodeKind::Company, &key)
+            .await
+            .unwrap()
+            .expect("the company")
+            .id
+    };
+    let backends = Backends::all().await;
+    for (name, b, store) in &backends.list {
+        settings(store, &[("gleif", false)], None);
+        let writer = GraphWriter::new(Arc::clone(b), SimilarityConfig::default());
+        let hash = Blake3([0x20; 32]);
+        b.put_record(
+            &hash,
+            &doewood_model::canonical::to_canonical(&json!({})).unwrap(),
+            &StepVersions::new(),
+        )
+        .await
+        .unwrap();
+        let facts = DocFacts {
+            format: "pdf".into(),
+            parties: vec![
+                party("g", "Fictive Golden Example Inc.", "us|ca"),
+                party("m", "Fictive Maple Example Ltd", "ca"),
+            ],
+            ..DocFacts::default()
+        };
+        let at = ObjectLocation {
+            endpoint: "http://objects.test:9000".into(),
+            bucket: "docs".into(),
+            key: "issue-201.pdf".into(),
+        };
+        writer
+            .write(&hash, &at, &facts, "issue-201.pdf", 0.8)
+            .await
+            .unwrap();
+        let g = node_of(b, "Fictive Golden Example Inc.").await;
+        let m = node_of(b, "Fictive Maple Example Ltd").await;
+        assert!(props(b, g).await.get("jurisdiction").is_none(), "{name}");
+        assert_eq!(props(b, m).await["jurisdiction"], "CA", "{name}");
+        b.claim_alias(
+            NodeKind::Company,
+            "reg:edgar:9990000201",
+            g,
+            &json!({"step": "test"}),
+        )
+        .await
+        .unwrap();
+        // As a version before issue #201 stored it.
+        b.update_props(g, &PropsPatch::new().set(&["jurisdiction"], json!("us|ca")))
+            .await
+            .unwrap();
+        let h = company(
+            b,
+            "Fictive Harbour Example Inc.",
+            "us|ca",
+            &[],
+            &[],
+            1,
+            None,
+        )
+        .await;
+
+        let job = job(b, store, &mock, "enrich-201");
+        pass(&job, b).await;
+        let gp = props(b, g).await;
+        assert_eq!(gp["jurisdiction"], "US-CA", "{name}: {gp}");
+        assert_eq!(gp["registry"]["edgar"]["state_of_incorporation"], "CA");
+        assert_eq!(gp["registry"]["edgar"]["jurisdiction"], "US-CA");
+        assert!(props(b, h).await.get("jurisdiction").is_none(), "{name}");
+        assert_eq!(props(b, m).await["jurisdiction"], "CA", "{name}");
+
+        let listed = async |j: &str| -> Vec<Uuid> {
+            let f = CompanyFilter {
+                name_prefix: Some("fictive ".to_owned()),
+                jurisdiction: Some(j.to_owned()),
+                ..CompanyFilter::default()
+            };
+            b.list_companies(&f, CompanyOrder::Name, None, 100, usize::MAX)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.node.id)
+                .collect()
+        };
+        assert_eq!(listed("US").await, [g], "{name}");
+        assert_eq!(listed("us-ca").await, [g], "{name}");
+        assert_eq!(listed("CA").await, [m], "{name}");
     }
     backends.drop_schema().await;
 }
