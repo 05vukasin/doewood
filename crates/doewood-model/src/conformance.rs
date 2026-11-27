@@ -1025,7 +1025,36 @@ pub async fn fact_ranking<B: Backend + ?Sized>(s: &B) {
         assert_eq!(penalty, [h(4), h(1)], "{kind}");
         // A word in the facts alone matches.
         assert_eq!(hits(ranked("liquidated", kind)).await, [h(4)], "{kind}");
+        // A word in no facts finds every body that has it (issue #198: Postgres reads its
+        // search table alone then); a word of the body and one of the facts find their
+        // document together.
+        assert_eq!(hits(ranked("kvorum", kind)).await.len(), 4, "{kind}");
+        assert_eq!(hits(ranked("kvorum otkazni", kind)).await, [h(2)], "{kind}");
+        assert_eq!(
+            hits(ranked("saradnji penalty", kind)).await,
+            [h(1)],
+            "{kind}"
+        );
     }
+    // Facts that go are no longer found.
+    s.index_document(&SearchDoc {
+        blake3: h(4),
+        title: "Service agreement".to_owned(),
+        body: "kvorum".to_owned(),
+        facts: String::new(),
+        kind: Some("rank_case".to_owned()),
+        date: None,
+        amount: None,
+    })
+    .await
+    .unwrap();
+    let found = s.search(&ranked("liquidated", false)).await.unwrap();
+    assert!(found.is_empty(), "{found:?}");
+    let found = s.search(&ranked("penalty", false)).await.unwrap();
+    assert_eq!(
+        found.iter().map(|hit| hit.blake3).collect::<Vec<_>>(),
+        [h(1)]
+    );
 }
 
 /// Records: insert, unchanged repeat, update, read back.

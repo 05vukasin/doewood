@@ -146,10 +146,27 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
   5 minutes, then they retry with backoff) and find the schema migrated. The version is in
   the `doewood_schema` table. A database migrated by a newer doewood is
   refused (not ready) until this one is upgraded.
+- **Schema 19** (issue #198: search's key facts move to the new table `search_facts`, one row
+  per document with key facts, with two GIN indexes; `search_index.facts` goes, the new
+  column `search_index.has_facts` marks the documents with facts, and the vector `tsv` is
+  schema 17's again, title and body) is the current version. The migration copies the facts
+  of schema 18's rows and rewrites `search_index` once, rebuilding its GIN index, inside the
+  migration's transaction (see [api.md](api.md#search-ranking-of-key-facts) for its time on
+  50,000 documents). Search results are those of schema 18. As with every schema, **all
+  instances are upgraded together**: an older binary refuses schema 19. **Down path** (every
+  instance stopped): `ALTER TABLE search_index ADD COLUMN facts text NOT NULL DEFAULT '';
+  UPDATE search_index s SET facts = f.facts FROM search_facts f WHERE f.blake3 = s.blake3;
+  DROP TABLE search_facts; ALTER TABLE search_index DROP COLUMN has_facts; ALTER TABLE
+  search_index DROP COLUMN tsv; ALTER TABLE search_index ADD COLUMN tsv tsvector GENERATED
+  ALWAYS AS (setweight(to_tsvector('simple', title), 'A') || setweight(to_tsvector('simple',
+  facts), 'A') || setweight(to_tsvector('simple', body), 'B')) STORED; CREATE INDEX
+  search_tsv ON search_index USING gin (tsv) WITH (gin_pending_list_limit = 256); DELETE
+  FROM doewood_schema WHERE version = 19;`. The instance's own SQLite file stays at schema
+  20.
 - **Schema 18** (issue #194: the new empty table `document_facts`, one row per document with
   key facts, with three indexes; and search's key facts: the new column `search_index.facts`
   and the full-text vector `tsv` dropped and added again with it, weight A beside the
-  title's) is the current version. The vector is a generated column, so the migration
+  title's) came before it. The vector is a generated column, so the migration
   rewrites `search_index` and rebuilds its GIN index once, inside the migration's
   transaction: 2.9 s for 50,000 documents in the measurement of [api.md](api.md#search-ranking-of-key-facts), so about a
   minute per million. Documents get their key facts when they are analyzed again: the
@@ -161,7 +178,7 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
   (setweight(to_tsvector('simple', title), 'A') || setweight(to_tsvector('simple', body),
   'B')) STORED; CREATE INDEX search_tsv ON search_index USING gin (tsv) WITH
   (gin_pending_list_limit = 256); DELETE FROM doewood_schema WHERE version = 18;`. The
-  instance's own SQLite file goes to schema 20 with the same table, the column, and the FTS5
+  instance's own SQLite file went to schema 20 with the same table, the column, and the FTS5
   index `search_fts` created again with a third column `facts` and rebuilt from
   `search_index` (0.3 s for 50,000 documents).
 - **Schema 17** (issue #193: the new empty table `payments`, one row per document with

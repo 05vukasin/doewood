@@ -1134,7 +1134,9 @@ document beside the record (see [ingest.md](ingest.md#key-facts)).
   row has `facts`, the card's text form (`notice: iso=P30D; days=30`, `penalty: percent=0.5;
   per=day`, one line per field) and the passages its fields were read from (`otkazni rok od 30
   dana`),
-  weighted above the body (Postgres: weight A in the `tsvector`, the body B;
+  weighted above the body (Postgres: weight A in the `tsvector`, the body B, in the table
+  `search_facts` of the documents with facts since schema 19, so a search whose words are in
+  no document's facts reads `search_index` alone, as before the facts;
   SQLite: a third FTS5 column, `bm25` weights title 10, body 1, facts 20: BM25 divides by a
   column's length against its average, and a card's facts are long next to the many documents
   without any, so they weigh twice the title to come out above it). So `otkazni rok`
@@ -1574,15 +1576,81 @@ cargo test --release -p doewood-store --lib fact_search_timings -- --ignored --n
 - **With facts**, a search costs what its matches cost: SQLite's common-word search grows
   12% (more text per document), a word that the facts add to 2,500 more documents costs those
   matches (`a word and a rare term`, whose `term` words the facts carry too), and a facts
-  phrase now matches 5,000 documents. Postgres ranks from the heap row's `tsvector`, which the
-  facts make larger, so a common word's search grows from 28 to 39 ms and a word in a quarter
-  of the documents from 10 to 31 ms (`ts_rank` reads every match's vector); a rare term is
-  unchanged. With a kind filter the quarter word stays at 13 ms.
+  phrase now matches 5,000 documents. Postgres schema 18 ranked from the heap row's
+  `tsvector`, which the facts made larger, so a common word's search grew from 28 to 39 ms and
+  a word in a quarter of the documents from 10 to 31 ms (`ts_rank` read every match's vector,
+  and the larger table tipped the plan to a sequential scan); a rare term was unchanged.
+  Schema 19 fixes that (below).
 - **The migration**: Postgres rewrites `search_index` and rebuilds its GIN index, 2.9 s for
   50,000 documents (127 MB with its indexes after the facts); SQLite builds the FTS5 index
   again from `search_index`, 0.3 s. Writing the facts (as reanalysis does) took 6.2 s and
   0.5 s for 25,000 documents.
 
+### Postgres schema 19: the facts in their own table
+
+Issue #198. Schema 18 kept every document's facts in its one search vector, so every match
+of a common word read the larger vector. Schema 19 keeps `search_index.tsv` as schema 17's
+vector, title and body, for every document, and puts each document with facts in a second
+table, `search_facts`, with its full vector (title A, body B, facts A) and a vector of the
+facts alone. `Search` first asks whether any document's facts hold any of its words (one
+lookup in `search_facts`' facts index, about 0.02 ms):
+
+- none: it reads `search_index` alone, exactly as schema 17 did. A document whose facts hold
+  none of the words ranks the same on its title and body as on its full vector: the facts come
+  after the body, so the body's positions are the same;
+- some: it reads the documents with facts from `search_facts` and the others from
+  `search_index` (`has_facts` false), as schema 18 read them all from one table.
+
+The results are schema 18's (words split between the body and the facts still find their
+document), and SQLite is unchanged. Options measured first on the same data (in-database p50
+of 40 runs, ms; schema 17 / 18 for reference were 6.6-9.3 / 23.5-32.7 for a word in a quarter
+and 26-27 / 29.5-35.6 for a word in most):
+
+| option | a word in a quarter | a word in most | `penalty` (most, and in the facts) | `otkazni rok` |
+|---|---|---|---|---|
+| 1. a facts vector column with its own GIN index, rank(body) + rank(facts) | 25.9 | 23.0 | 40.9 | 6.7 |
+| 1. the same in a separate table, joined | 8.8 | 23.1 | 58.4 | 19.7 |
+| 2. ranking only the first 1,000 matches | 1.4 | 1.0 | 0.9 | 1.9 |
+| 3. a deduplicated facts vector (`strip`, weights `{1, 0.2, 0.4, 1}`) | 23.6 | 29.2 | 19.0 | 4.7 |
+| schema 18 with sequential scans off | 11.8 | 36.5 | 38.6 | 4.7 |
+| chosen: schema 17's table, plus a facts table when the facts hold a word | 7.6 | 26.8 | 25.3 | 6.4 |
+
+Option 1 in one table keeps the table large; joined from a separate table it pays for the
+join on every search that the facts match. Option 2 is fast but ranks only an arbitrary 1,000
+of the matches, so the best document can be missed. Option 3 barely shrinks the vectors (the
+lexemes, not their positions, are most of them). Turning sequential scans off helps the
+quarter word and hurts the common one.
+
+`fact_search_timings` measures schema 19 after schema 18 on the same database (it adds a
+search for `penalty`, a word in most documents that the facts also hold). The schema 17 and
+18 columns here are that run's (the medians of three runs; for schema 17 and 18 the store
+finds an empty stand-in `search_facts`, so it runs their own query on `search_index`):
+
+| search, p50 (p99) ms | schema 17 | 18, facts | 19 | 19, facts written again |
+|---|---|---|---|---|
+| a rare term | 0.66 (0.9) | 1.12 (3.3) | 0.81 (1.7) | 0.62 (0.8) |
+| a word and a rare term | 0.90 (2.2) | 0.69 (1.0) | 1.16 (2.6) | 2.03 (3.0) |
+| a word in a quarter | 9.49 (12.3) | 31.4 (34.7) | 10.7 (15.1) | 8.91 (18.8) |
+| a word in a quarter, kind filter | 10.0 (13.6) | 11.3 (17.6) | 11.5 (17.8) | 9.78 (22.6) |
+| a word in most | 28.6 (42.9) | 36.7 (43.4) | 28.5 (47.5) | 28.3 (41.1) |
+| a word in most, kind filter | 21.6 (29.3) | 37.3 (58.5) | 21.4 (26.7) | 22.1 (28.9) |
+| `penalty` (most, and in the facts) | 27.5 (44.3) | 37.1 (50.2) | 26.1 (33.0) | 30.5 (37.2) |
+| `otkazni rok` (5,000 matches with facts) | 0.43 (0 hits) | 5.24 (8.3) | 5.31 (15.1) | 5.78 (11.0) |
+
+- **Common words are back at schema 17's cost**: a word in most documents 28.5 ms (17: 28.6),
+  a word in a quarter 10.7 ms right after the migration and 8.9 ms once the facts were written
+  again (17: 9.5; the three runs of schema 17 alone spread from 8.4 to 10.2).
+- **Words in the facts** cost what they cost in schema 18 or less: `penalty` 26-31 ms (18: 37),
+  `otkazni rok` 5.3 ms (18: 5.2). A word that is in some document's facts and in the body of
+  the others (`a word and a rare term`: `term` words are in the facts too) reads both tables,
+  about a millisecond more.
+- **Writing the facts again** (reanalysis) leaves `search_index` rows as they are when the
+  title, body and filters are unchanged; only `search_facts` rows are written.
+- **Size**: `search_index` 69 MB and `search_facts` 63 MB with their indexes (schema 18:
+  127 MB for both in one), for 25,000 documents with facts; every document with facts has its
+  title and body vector twice.
+- **The migration** copies the facts to `search_facts`, builds its two GIN indexes and
+  rewrites `search_index` once: MIGRATION_TIME for 50,000 documents.
 
 ## Tests
 
