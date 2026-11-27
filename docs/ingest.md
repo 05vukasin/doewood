@@ -238,6 +238,14 @@ Numbers are in [Sizing, Records](deploy.md#records).
     second does). Each key is a node alias: the first claim wins, and an identifier another
     company owns is refused and noted as a conflict, never moved. Fuzzy steps are not taken here;
     nothing merges on a fuzzy match.
+  - Within an instance, parties that could read or write the same key are matched one after
+    the other; unrelated parties are matched at the same time (issue #78). A document's parties
+    take a striped lock per identifier, ladder key (the form-blind one included) and learned
+    alias they use, in order, for the whole match. A form-blind match onto a company that has
+    no legal form yet is made again with no other party of the instance running, since any
+    party matched to that company can give it one. Across instances the alias claims decide,
+    as before. The reasoning is on `PartyLocks` in `crates/doewood-ingest/src/graph.rs`, and
+    `tests/party_locks.rs` checks it with several writers on both stores.
   - The `party` edge has quail's role and confidence, the match step, its reliability and the
     evidence (mentions, identifiers); the company keeps its names and identifiers. How each
     document matched is on its `party` edge only (issue #129): the company props no longer
