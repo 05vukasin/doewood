@@ -309,7 +309,11 @@ the job (`enrichment::feeds`), their clients in `doewood_registry::feeds`.
   the feed goes; an abandoned one expires), the feed's **cursor** and its next run. Another
   instance carries on from the cursor after a restart or a crash. The Companies House stream
   keeps its lease between connections; the others give it back after each run. An instance
-  where a feed is switched off never takes its lease.
+  where a feed is switched off never takes its lease. When `SetEnrichmentSettings` switches
+  a feed (or its registry) off, the next pass or tick that reads the settings shows it
+  `enabled: false, leader: false`, and the feed's loop stops a run in progress (its progress
+  dropped, the cursor kept) and gives the lease back at once, so another instance can take
+  it. On Postgres the lease is the cluster's; standalone it is in the instance's own file.
 - **Cursors.** `gleif`: the publication last applied (Unix seconds); the next run takes the
   shortest delta that reaches back to it (`IntraDay` 8 hours, `LastDay`, `LastWeek`,
   `LastMonth` 31 days). Further behind than a month, or on the first run, the latest

@@ -15,7 +15,8 @@ use std::time::Duration;
 use doewood_core::{InstanceId, MasterKey};
 use doewood_enrich::{CompanyName, IdKind, Identifier};
 use doewood_ingest::{
-    Enrichment, EnrichmentOptions, EnrichmentParts, Feed, FeedOptions, FeedTemplates, Templates,
+    Enrichment, EnrichmentOptions, EnrichmentParts, EnrichmentStats, Feed, FeedOptions,
+    FeedTemplates, Templates,
 };
 use doewood_model::{Backend, Blake3, Edge, EdgeKind, EdgeSource, NodeKind, StepVersions};
 use doewood_registry::favicon::{GuardOptions, GuardedClient, PublicOnly, SystemDns};
@@ -238,8 +239,17 @@ fn templates(mock: &Mock) -> (Templates, FeedTemplates) {
 }
 
 fn job(backend: &Arc<dyn Backend>, store: &Arc<Store>, mock: &Mock, instance: &str) -> Enrichment {
+    job_with(backend, store, templates(mock), instance, Arc::new(|_| {}))
+}
+
+fn job_with(
+    backend: &Arc<dyn Backend>,
+    store: &Arc<Store>,
+    (templates, feed_templates): (Templates, FeedTemplates),
+    instance: &str,
+    on_change: Arc<dyn Fn(EnrichmentStats) + Send + Sync>,
+) -> Enrichment {
     let (_tx, rx) = watch::channel(Some(Arc::clone(backend)));
-    let (templates, feed_templates) = templates(mock);
     Enrichment::new(EnrichmentParts {
         instance: InstanceId::new(instance).unwrap(),
         backend: rx,
@@ -271,7 +281,7 @@ fn job(backend: &Arc<dyn Backend>, store: &Arc<Store>, mock: &Mock, instance: &s
             },
             ..EnrichmentOptions::default()
         },
-        on_change: Arc::new(|_| {}),
+        on_change,
     })
 }
 
@@ -968,6 +978,108 @@ async fn apr_monthly_set_is_swapped_in() {
             (2, 1, 2),
             "{name} {s:?}"
         );
+    }
+    backends.drop_schema().await;
+}
+
+/// Waits (at most 10 s) until `cond` holds.
+async fn until<F: Future<Output = bool>>(what: &str, mut cond: impl FnMut() -> F) {
+    let waited = tokio::time::timeout(Duration::from_secs(10), async {
+        while !cond().await {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(waited.is_ok(), "timed out waiting: {what}");
+}
+
+/// Issue #174: a feed switched off shows off. With APR's download unanswered (a run in
+/// progress, the lease held), `SetEnrichmentSettings` switching the registry and its feed off
+/// shows the feed `enabled: false, leader: false` from the next pass on, in the counters
+/// `WatchProgress` carries too; the feed's loop stops the run and gives the lease back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_feed_switched_off_shows_off_and_gives_up_its_lease() {
+    // A registry that takes every request and never answers.
+    let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let silent_url = format!(
+        "http://127.0.0.1:{}/apr/companies",
+        silent.local_addr().unwrap().port()
+    );
+    let held = Arc::new(Mutex::new(Vec::new()));
+    let h2 = Arc::clone(&held);
+    tokio::spawn(async move {
+        while let Ok((sock, _)) = silent.accept().await {
+            h2.lock().unwrap().push(sock);
+        }
+    });
+    let mock = Mock::start(|_| Reply::status(404)).await;
+    let backends = Backends::all().await;
+    for (name, b, store) in &backends.list {
+        only(store, "apr");
+        let (mut t, feed_templates) = templates(&mock);
+        t.apr.url.clone_from(&silent_url);
+        let last: Arc<Mutex<Option<EnrichmentStats>>> = Arc::new(Mutex::new(None));
+        let l2 = Arc::clone(&last);
+        let job = job_with(
+            b,
+            store,
+            (t, feed_templates),
+            "feeds-switch",
+            Arc::new(move |s| *l2.lock().unwrap() = Some(s)),
+        );
+        let asked = held.lock().unwrap().len();
+        let (stop, rx) = watch::channel(false);
+        let handle = job.start(rx);
+        until("the apr run to start", || async {
+            job.feed_stats(Feed::Apr).leader && held.lock().unwrap().len() > asked
+        })
+        .await;
+        let s = job.feed_stats(Feed::Apr);
+        assert!(s.enabled && s.leader, "{name} {s:?}");
+        let st = b.feed_state("apr").await.unwrap().unwrap();
+        assert_eq!(st.owner.as_deref(), Some("feeds-switch"), "{name}");
+
+        store
+            .set_enrichment_settings(&EnrichmentSettingsPatch {
+                registries: RegistrySwitchesPatch {
+                    apr: Some(false),
+                    ..RegistrySwitchesPatch::default()
+                },
+                feeds: FeedSwitchesPatch {
+                    apr: Some(false),
+                    ..FeedSwitchesPatch::default()
+                },
+                ..EnrichmentSettingsPatch::default()
+            })
+            .unwrap();
+        pass(&job, b).await;
+        let s = job.feed_stats(Feed::Apr);
+        assert!(!s.enabled && !s.leader, "{name}: off after the pass {s:?}");
+        let shown = last.lock().unwrap().unwrap().feeds;
+        let shown = shown.iter().find(|f| f.feed == "apr").unwrap();
+        assert!(
+            !shown.enabled && !shown.leader,
+            "{name}: progress shows it off {shown:?}"
+        );
+        until("the apr lease to be given back", || async {
+            b.feed_state("apr")
+                .await
+                .unwrap()
+                .is_some_and(|st| st.owner.is_none())
+        })
+        .await;
+        let s = job.feed_stats(Feed::Apr);
+        assert_eq!(
+            (s.runs, s.enabled, s.leader),
+            (0, false, false),
+            "{name} {s:?}"
+        );
+
+        stop.send(true).unwrap();
+        handle.await.unwrap();
+        // The run was stopped: nothing saved, so the cursor stays empty.
+        let st = b.feed_state("apr").await.unwrap().unwrap();
+        assert_eq!((st.cursor.as_str(), st.owner), ("", None), "{name}");
     }
     backends.drop_schema().await;
 }
