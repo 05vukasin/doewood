@@ -47,6 +47,12 @@ service ConfigService {
   // base URL is required, `https://bedrock-runtime.<region>.amazonaws.com`: the region is read
   // from it.
   rpc SetAiProvider(SetAiProviderRequest) returns (AiProvider);
+  // Removes an AI provider with its sealed API key and IAM credentials. When it was the
+  // default there is no default afterwards, even if other providers remain (the next one set
+  // becomes the default): queued LLM jobs wait, and Summarize without a provider name answers
+  // FAILED_PRECONDITION. Summaries already in flight finish. Idempotent: an unknown provider
+  // is OK, with `removed` false.
+  rpc RemoveAiProvider(RemoveAiProviderRequest) returns (RemoveAiProviderResponse);
   // The configured AI providers (never their keys).
   rpc ListAiProviders(ListAiProvidersRequest) returns (ListAiProvidersResponse);
   // Ingest's settings, with the defaults filled in.
@@ -343,6 +349,18 @@ message AiProvider {
   int64 updated_at = 7;
   // Whether IAM credentials are stored (bedrock). They are never returned.
   bool aws_credentials_set = 8;
+}
+
+message RemoveAiProviderRequest {
+  // The provider's name, as ListAiProviders shows it.
+  string name = 1;
+}
+
+message RemoveAiProviderResponse {
+  // Whether a provider was removed (false: there was none of that name).
+  bool removed = 1;
+  // Whether it was the default: there is no default now.
+  bool was_default = 2;
 }
 
 message ListAiProvidersRequest {}

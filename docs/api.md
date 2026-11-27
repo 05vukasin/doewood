@@ -32,7 +32,7 @@ The S3 event webhook is not part of the gRPC API: it is on the ops server (see
 
 | service | RPCs |
 |---|---|
-| `ConfigService` | `AddSource`, `UpdateSource`, `PauseSource`, `ResumeSource`, `RemoveSource`, `ReleaseSourceClaim`, `ListSources`, `GetSource`, `SetLlmPolicy`, `SetSqsInlet`, `RemoveSqsInlet`, `SetAiProvider`, `ListAiProviders`, `GetIngestSettings`, `SetIngestSettings`, `GetEnrichmentSettings`, `SetEnrichmentSettings`, `GetApiSettings`, `SetApiSettings` |
+| `ConfigService` | `AddSource`, `UpdateSource`, `PauseSource`, `ResumeSource`, `RemoveSource`, `ReleaseSourceClaim`, `ListSources`, `GetSource`, `SetLlmPolicy`, `SetSqsInlet`, `RemoveSqsInlet`, `SetAiProvider`, `RemoveAiProvider`, `ListAiProviders`, `GetIngestSettings`, `SetIngestSettings`, `GetEnrichmentSettings`, `SetEnrichmentSettings`, `GetApiSettings`, `SetApiSettings` |
 | `JobsService` | `WatchProgress` (server stream), `ReprocessJob`, `WatchReprocess` (server stream) |
 | `RecordsService` | `GetRecord`, `ListRecords` |
 | `GraphService` | `GetNode`, `Neighbours`, `CompanyDocuments`, `ListMerges`, `MergeCompanies`, `UndoMerge`, `SplitCompany`, `DismissPair`, `ListDismissals`, `ListProposals`, `AcceptProposal`, `RejectProposal` |
@@ -128,6 +128,13 @@ The comments in the `.proto` files are the reference for every field. In short:
     alone, so a service can make it at every boot
     ([configuration.md](configuration.md#configuring-doewood-from-another-service)). Stored
     secrets are decrypted and compared in constant time, never returned.
+- **RemoveAiProvider** removes a provider by `name` with its sealed API key and IAM
+  credentials, for an application that switches its AI off at boot. When it was the default
+  (`was_default`) there is no default afterwards, even if other providers remain: queued LLM
+  jobs wait (the log says why), `Summarize` without a provider name is
+  `FAILED_PRECONDITION` and one naming the removed provider `NOT_FOUND`. Summaries already in
+  flight finish. The next provider set becomes the default, as the first one does. Idempotent:
+  an unknown provider is OK with `removed` false; a malformed name is `INVALID_ARGUMENT`.
 - **ListAiProviders** lists them with `api_key_set` and `aws_credentials_set`, never a secret,
   plus every preset name.
 
@@ -596,6 +603,7 @@ grpcurl -plaintext -d @ 127.0.0.1:7443 doewood.v1.ConfigService/SetAiProvider <<
  "base_url": "http://vllm:8000/v1", "make_default": true}
 EOF
 grpcurl -plaintext 127.0.0.1:7443 doewood.v1.ConfigService/ListAiProviders
+grpcurl -plaintext -d '{"name": "local"}' 127.0.0.1:7443 doewood.v1.ConfigService/RemoveAiProvider
 ```
 
 Ingest settings:

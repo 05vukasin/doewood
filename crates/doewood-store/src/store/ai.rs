@@ -345,6 +345,40 @@ impl Store {
         Ok(Applied { value, changed })
     }
 
+    /// Removes a provider with its sealed secrets (the API key and the IAM credentials), and
+    /// returns it as it was (`None`: there was none, and nothing changed).
+    ///
+    /// Issue #170: when it was the default there is no default afterwards, even if other
+    /// providers remain; the next provider set becomes the default, as the first one does.
+    /// Idempotent: an unknown or invalid name removes nothing. Secrets left without their
+    /// settings row are removed too.
+    pub fn remove_ai_provider(&self, name: &str) -> Result<Option<AiProvider>, StoreError> {
+        if !valid_provider_name(name) {
+            return Ok(None);
+        }
+        let before = self.ai_provider(name)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let mut removed = tx.execute(
+            "DELETE FROM settings WHERE key = ?1",
+            [format!("{PROVIDER_PREFIX}{name}")],
+        )?;
+        removed += tx.execute(
+            "DELETE FROM secrets WHERE name IN (?1, ?2)",
+            params![key_secret(name), aws_secret(name)],
+        )?;
+        tx.execute(
+            "DELETE FROM settings WHERE key = ?1 AND value_json = ?2",
+            params![
+                DEFAULT_AI_PROVIDER,
+                serde_json::Value::from(name).to_string()
+            ],
+        )?;
+        tx.commit()?;
+        drop(conn);
+        Ok(before.filter(|_| removed > 0))
+    }
+
     /// Every configured provider, by name.
     pub fn ai_providers(&self) -> Result<Vec<AiProvider>, StoreError> {
         let default = self.default_ai_provider()?;
@@ -576,6 +610,79 @@ mod tests {
         );
         assert!(store.ai_provider("nope").unwrap().is_none());
         assert!(store.ai_provider("Bad Name").unwrap().is_none());
+    }
+
+    /// Issue #170: a removed provider takes its sealed secrets with it; removing the default
+    /// leaves no default, and removing again (or an unknown name) changes nothing.
+    #[test]
+    fn remove_ai_provider_takes_its_secrets_and_the_default() {
+        let store = Store::open_in_memory(&MasterKey::from_bytes([5; 32])).unwrap();
+        let mut bedrock = input("bedrock", "bedrock");
+        bedrock.base_url = Some("https://bedrock-runtime.eu-central-1.amazonaws.com".into());
+        store
+            .apply_ai_provider(
+                &bedrock,
+                &KeyChange::Set(ApiKey::new("test-bearer-token").unwrap()),
+                &iam("AKIDTEST", "test-secret", Some("test-token")),
+                false,
+            )
+            .unwrap();
+        store
+            .set_ai_provider(&input("local", "ollama"), &KeyChange::Keep, false)
+            .unwrap();
+        assert_eq!(
+            store.default_ai_provider().unwrap().as_deref(),
+            Some("bedrock")
+        );
+        let secrets = |s: &Store| -> Vec<String> {
+            let conn = s.raw();
+            let mut stmt = conn
+                .prepare("SELECT name FROM secrets WHERE name LIKE 'ai/%' ORDER BY name")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            secrets(&store),
+            ["ai/bedrock/api_key", "ai/bedrock/aws_credentials"]
+        );
+
+        // Removing the default: its row, both secrets and the default go; the other stays.
+        let gone = store.remove_ai_provider("bedrock").unwrap().unwrap();
+        assert!(gone.is_default && gone.api_key_set && gone.aws_credentials_set);
+        assert!(secrets(&store).is_empty());
+        assert!(store.ai_api_key("bedrock").unwrap().is_none());
+        assert!(store.ai_aws_credentials("bedrock").unwrap().is_none());
+        assert!(store.ai_provider("bedrock").unwrap().is_none());
+        assert_eq!(store.default_ai_provider().unwrap(), None);
+        let left = store.ai_providers().unwrap();
+        assert_eq!(left.len(), 1);
+        assert!(left[0].name == "local" && !left[0].is_default);
+
+        // Idempotent: again, unknown and invalid names remove nothing.
+        assert!(store.remove_ai_provider("bedrock").unwrap().is_none());
+        assert!(store.remove_ai_provider("nope").unwrap().is_none());
+        assert!(store.remove_ai_provider("Bad Name").unwrap().is_none());
+        assert_eq!(store.ai_providers().unwrap(), left);
+
+        // The next provider set becomes the default, as the first one does.
+        let again = store
+            .set_ai_provider(&input("local", "ollama"), &KeyChange::Keep, false)
+            .unwrap();
+        assert!(again.is_default);
+
+        // Removing a provider that is not the default keeps the default.
+        store
+            .set_ai_provider(&input("openai", "openai"), &KeyChange::Keep, false)
+            .unwrap();
+        let gone = store.remove_ai_provider("openai").unwrap().unwrap();
+        assert!(!gone.is_default);
+        assert_eq!(
+            store.default_ai_provider().unwrap().as_deref(),
+            Some("local")
+        );
     }
 
     /// Every row a provider call may touch, with its timestamps, and the LLM jobs.

@@ -34,6 +34,10 @@ nothing comes from the environment ([configuration.md](configuration.md)).
   both are stored. IAM credentials are sealed and write-only too; `ListAiProviders` shows only
   `aws_credentials_set`. A change of key or credentials applies to the next call: the queue
   builds a new summarizer when the endpoint changes.
+  `ConfigService.RemoveAiProvider` removes a provider with its sealed key and credentials. If
+  it was the default there is no default until another provider is set (the next one set
+  becomes it): queued jobs wait, as without any provider, and `Summarize` without a provider
+  name is refused. Summaries already in flight finish.
 - **A policy per source** (`ConfigService.SetLlmPolicy`, or `llm_policy` in `AddSource`):
 
   | mode | queued at ingest | `Summarize` of its objects |
