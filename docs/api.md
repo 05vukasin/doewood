@@ -33,7 +33,7 @@ The S3 event webhook is not part of the gRPC API: it is on the ops server (see
 | service | RPCs |
 |---|---|
 | `ConfigService` | `AddSource`, `UpdateSource`, `PauseSource`, `ResumeSource`, `RemoveSource`, `ReleaseSourceClaim`, `ListSources`, `GetSource`, `SetLlmPolicy`, `SetSqsInlet`, `RemoveSqsInlet`, `SetAiProvider`, `ListAiProviders`, `GetIngestSettings`, `SetIngestSettings`, `GetEnrichmentSettings`, `SetEnrichmentSettings`, `GetApiSettings`, `SetApiSettings` |
-| `JobsService` | `WatchProgress` (server stream), `ReprocessJob`, `WatchReprocess` (server stream) |
+| `JobsService` | `WatchProgress` (server stream), `ReprocessJob`, `WatchReprocess` (server stream), `PurgeSource`, `PurgeOrphans`, `WatchPurge` (server stream) |
 | `RecordsService` | `GetRecord`, `ListRecords` |
 | `GraphService` | `GetNode`, `Neighbours`, `CompanyDocuments`, `ListMerges`, `MergeCompanies`, `UndoMerge`, `SplitCompany`, `DismissPair`, `ListDismissals`, `ListProposals`, `AcceptProposal`, `RejectProposal` |
 | `SearchService` | `Search` |
@@ -67,7 +67,10 @@ The comments in the `.proto` files are the reference for every field. In short:
   [sources](sources.md#claims)).
 - **RemoveSource** releases the claim, stops the scanner, and deletes the source with its
   progress and credentials. If the shared store is unreachable it fails with `UNAVAILABLE` and
-  removes nothing, so no claim is left behind.
+  removes nothing, so no claim is left behind. The source's records, locations and graph stay;
+  **PurgeSource** ([Purges](#purges)) removes a source together with them. A source being
+  purged (state `removed`) is refused by UpdateSource, PauseSource, ResumeSource and
+  RemoveSource with `FAILED_PRECONDITION`.
 - **ReleaseSourceClaim** (issue #24) deletes the claim on a source (`endpoint`, `bucket`,
   `prefix`, normalized as in `AddSource`) in the shared store, whichever instance holds it, so
   that another instance can add or resume the source. It is meant for an owner that is gone
@@ -381,6 +384,52 @@ Page tokens are opaque: pass `next_page_token` back as `page_token` until it com
 JOB=$(grpcurl -plaintext -d "{\"source_id\": \"$ID\"}" 127.0.0.1:7443 \
     doewood.v1.JobsService/ReprocessJob | jq -r .jobId)
 grpcurl -plaintext -d "{\"job_id\": \"$JOB\"}" 127.0.0.1:7443 doewood.v1.JobsService/WatchReprocess
+```
+
+### Purges
+
+Issue #168. Removing a source or deleting an object ends a location but keeps the record. A
+purge deletes what no live location holds any more, in bounded batches of one transaction
+each ([ingest.md](ingest.md#purges) has what goes and how it stays consistent with ingest;
+[deploy.md](deploy.md#privacy-and-deletion) the operator's view).
+
+- **PurgeSource** (`source_id`, a source of this instance) answers at once with a `job_id`.
+  The job marks the source `removed` (nothing scans or ingests it from then on; its claim is
+  kept, so no other instance adds it meanwhile), waits until ingest has let go of the files it
+  held of the source, removes every location under the source and purges the documents no
+  live location of any source holds any more, then the ended locations under its prefix (and
+  the documents only they held), and last removes the source as RemoveSource does (claim,
+  progress, credentials, SQS inlet). A second call while it runs answers with the same job.
+  - `FAILED_PRECONDITION` when another instance holds the source's claim (purge it there), or
+    when another source of this instance, or a claim of any instance, has an overlapping prefix
+    in the same bucket (its locations would go too; remove or purge that one first);
+    `UNAVAILABLE` while the shared store is not connected; `NOT_FOUND` for an unknown source.
+  - **Interrupted** (a restart, the database away for longer than the retries): the source
+    stays `removed` with what is left. A PurgeSource of it again carries on, and so does every
+    start of the instance (`resume_purges`, once the shared store answers).
+  - A source removed before this existed still has its live locations: add it again (paused)
+    and purge it.
+- **PurgeOrphans** answers at once with a `job_id`: the records no live location holds
+  (examined in hash order), then the Location nodes whose object is gone (key order), with what
+  they leave behind. One job per instance at a time (a second call answers with the running
+  one). Instances may run it at the same time on one Postgres: a record goes once, whichever
+  batch locks it first.
+- **WatchPurge** streams the job's progress: `STATE_WAITING` (for the shared store, or for
+  ingest), `STATE_RUNNING`, and last `STATE_DONE` or `STATE_FAILED` with `error`; then the
+  stream ends. The counts are totals so far: `batches`, `examined` (rows the batches looked
+  at), `locations` (Location nodes deleted), `records` (with their search rows, sketches and
+  Document nodes), `other_documents` (pending reference nodes left without edges),
+  `companies`, and `llm_jobs` (this instance's LLM queue rows of the deleted records). Jobs
+  live in the instance that started them, until it restarts (`NOT_FOUND` after that).
+
+A batch examines up to 200 rows. A batch that fails (a deadlock with ingest's writes, the
+database away) is tried again up to 6 times with a growing pause; every batch is idempotent.
+
+```sh
+JOB=$(grpcurl -plaintext -d "{\"source_id\": \"$ID\"}" 127.0.0.1:7443 \
+    doewood.v1.JobsService/PurgeSource | jq -r .jobId)
+grpcurl -plaintext -d "{\"job_id\": \"$JOB\"}" 127.0.0.1:7443 doewood.v1.JobsService/WatchPurge
+grpcurl -plaintext 127.0.0.1:7443 doewood.v1.JobsService/PurgeOrphans
 ```
 
 ### Summarize

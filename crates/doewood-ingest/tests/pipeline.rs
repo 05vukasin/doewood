@@ -802,6 +802,58 @@ async fn pipeline_end_to_end() {
     }
 }
 
+/// Issue #168: a purge that deleted the record before its location was written. The writer
+/// stops with NOT_FOUND (a transient failure for ingest), and the retry, with the record stored
+/// again, writes the document as usual.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_purged_before_its_location_is_written_again() {
+    let store = Arc::new(Store::open_in_memory(&MasterKey::from_bytes([7; 32])).unwrap());
+    for shared in Shared::all(&store).await {
+        let (name, b) = (shared.name, &shared.backend);
+        let writer = GraphWriter::new(Arc::clone(b), SimilarityConfig::default());
+        let h = Blake3([168; 32]);
+        let at = ObjectLocation {
+            endpoint: ENDPOINT.into(),
+            bucket: BUCKET.into(),
+            key: "purged/1.pdf".into(),
+        };
+        let err = writer
+            .write(&h, &at, &DocFacts::default(), "x.pdf", 0.8)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, doewood_model::Error::NotFound(_)),
+            "{name}: {err}"
+        );
+        b.put_record(
+            &h,
+            &doewood_model::canonical::to_canonical(&serde_json::json!({})).unwrap(),
+            &doewood_model::StepVersions::new(),
+        )
+        .await
+        .unwrap();
+        writer
+            .write(&h, &at, &DocFacts::default(), "x.pdf", 0.8)
+            .await
+            .unwrap();
+        // The location holds it now: an orphan purge keeps it.
+        let mut after = None;
+        loop {
+            let p = b
+                .purge_orphan_records(after.as_deref(), 1000)
+                .await
+                .unwrap();
+            assert!(!p.hashes.contains(&h), "{name}");
+            match p.next {
+                Some(n) => after = Some(n),
+                None => break,
+            }
+        }
+        assert!(b.get_record(&h).await.unwrap().is_some(), "{name}");
+        shared.drop_schema().await;
+    }
+}
+
 /// ADR 0002 section 1.8: a document a person split off a company, recording the pair as not
 /// the same, is not attached back to that company when it is written again (a reprocess).
 /// Without the dismissal the ladder attaches it again, by the name key the company kept.

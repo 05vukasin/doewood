@@ -142,11 +142,15 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
   5 minutes, then they retry with backoff) and find the schema migrated. The version is in
   the `doewood_schema` table. A database migrated by a newer doewood is
   refused (not ready) until this one is upgraded.
+- **Schema 14** (issue #168: an index on `locations.document_id`, which a purge's node
+  deletes need; an index only, built in the migration's transaction, about a second per
+  million locations, while writes to `locations` wait) is the current version. As with every
+  schema, **all instances are upgraded together**. The instance's own SQLite file goes to
+  schema 16 with the same index.
 - **Schema 11** (issue #141: the triggers behind `sketch_band_sizes` keep a row only for a
   band bucket of two or more documents, which cut the WAL of ingest by 12 to 29%; new
   functions only, no table or data changed, migrates in seconds, see
-  [deploy.md](deploy.md#postgres-wal-on-a-big-corpus-issue-141)) is the current version. As
-  with every schema, **all instances are upgraded together**.
+  [deploy.md](deploy.md#postgres-wal-on-a-big-corpus-issue-141)).
 - **Schema 10** (issue #112: `edges_by_dst` is rebuilt as `(dst, kind, coalesce(valid_from,
   '-infinity'), id)`, the order `Neighbours` and `CompanyDocuments` page in; see
   [api.md](api.md#pages-of-neighbours-and-companydocuments)) was the one before. The
@@ -229,8 +233,8 @@ migration can rebuild a table others reference). Before a migration commits it c
 foreign keys it could break, as the runner declares per migration (issue #159): every table
 for one that rebuilds a table, deletes rows or moves data (schemas 1 to 10); only the tables
 it fills for one that writes into new tables (schemas 11, 14 and 15); none for one that writes
-no rows and rebuilds nothing (schema 12, an index; schema 13, a column with a default and a new
-table). A violation rolls the migration back and the instance does not start.
+no rows and rebuilds nothing (schemas 12 and 16, an index; schema 13, a column with a default
+and a new table). A violation rolls the migration back and the instance does not start.
 A test holds each migration to its declaration.
 
 `doewood.sqlite` runs in WAL mode with `synchronous = NORMAL`, and a `journal_size_limit` of

@@ -32,6 +32,7 @@ mod merges;
 mod migrate;
 mod pages;
 mod proposals;
+mod purge;
 #[cfg(test)]
 mod tests;
 mod tls;

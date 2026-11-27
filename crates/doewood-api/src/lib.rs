@@ -37,6 +37,7 @@ mod merges;
 mod metrics;
 mod progress;
 mod proposals;
+mod purge;
 mod records;
 mod reprocess;
 mod search;
@@ -79,6 +80,7 @@ pub use limits::{
     MAX_CONNECTION_AGE_GRACE, MAX_CONNECTION_AGE_JITTER_PERCENT, TCP_KEEPALIVE,
 };
 pub use progress::{EnrichmentCounts, EventCounts, FeedCounts, Progress};
+pub use purge::resume_purges;
 pub use reprocess::{ReprocessPhase, ReprocessView, Reprocessor};
 pub use state::{ApiOptions, ApiParts, ApiState};
 pub use summarize::{BoxFuture, OnDemand, OnDemandError, OnDemandInput, OnDemandResult};

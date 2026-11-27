@@ -79,6 +79,11 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("migrations/0015_company_documents_total.sql"),
         fk_check: FkCheck::Tables(&["company_graph_totals"]),
     },
+    // An index only (issue #168).
+    Migration {
+        sql: include_str!("migrations/0016_locations_by_document.sql"),
+        fk_check: FkCheck::Skip,
+    },
 ];
 
 /// The schema version this binary writes.

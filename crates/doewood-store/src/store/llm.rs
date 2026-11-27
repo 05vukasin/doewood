@@ -237,6 +237,33 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// Deletes every source's jobs for the records `hashes` (they were purged, issue #168),
+    /// by the primary key of each source in one transaction. Returns how many went.
+    pub fn forget_llm_jobs(&self, hashes: &[[u8; 32]]) -> Result<u64, StoreError> {
+        if hashes.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let sources: Vec<String> = {
+            let mut stmt = tx.prepare_cached("SELECT id FROM sources")?;
+            stmt.query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let mut n = 0;
+        {
+            let mut delete =
+                tx.prepare_cached("DELETE FROM llm_jobs WHERE source_id = ?1 AND blake3 = ?2")?;
+            for source in &sources {
+                for h in hashes {
+                    n += delete.execute(params![source, &h[..]])? as u64;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
     /// How many of a source's jobs are in each status, and its latest failure.
     pub fn llm_counts(&self, source: SourceId) -> Result<LlmCounts, StoreError> {
         self.snapshot(|s| s.llm_counts(source))

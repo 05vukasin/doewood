@@ -1171,11 +1171,12 @@ async fn write_summary(
         steps.push(step);
     }
     let body = to_canonical(&body).map_err(|e| e.to_string())?;
-    backend
-        .put_record(blake3, &body, &record.versions)
-        .await
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    // An update only: a record purged while the model was writing stays gone (issue #168).
+    match backend.update_record(blake3, &body, &record.versions).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("the record is gone".to_owned()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Queues a document for a summary when its source's policy asks for one. Errors are
