@@ -11,6 +11,10 @@ pending sweep (objects_seen)┘                                         (cap)   
                                                                                               search
 ```
 
+Push sources ([ADR 0004](adr/0004-push-sources.md)) skip discovery, the queue and the fetch:
+an application hands the bytes to `IngestService.PutObject`, and the same analysis and writes
+run inside that call ([Push sources](#push-sources)).
+
 ## The queue
 
 - **Durable.** The work is the `objects_seen` rows with status `pending`. Events only make ingest
@@ -378,6 +382,40 @@ I/O, no store, no network.
 Ingest uses only the deterministic part so far: the fuzzy score, the fusion gate and group ids
 are there for enrichment, and no document merges on a fuzzy match yet.
 
+## Push sources
+
+A push source ([ADR 0004](adr/0004-push-sources.md), [sources.md](sources.md#push-sources)) has
+no scanner: `IngestService.PutObject` ([api.md](api.md#push-sources-ingestservice)) brings the
+bytes, and `doewood_ingest::pipeline::push` runs the steps above for them in the call:
+
+1. **Admission**, before a byte is read: the source must be an active push source this instance
+   owns, and the header's `size` must be within its `max_object_bytes`. The key is marked in
+   flight (a second put, move or remove of it meanwhile is `UNAVAILABLE`).
+2. **Memory budget.** A file over 16 MiB takes its share of the [memory budget](#memory) at once,
+   or the call is `RESOURCE_EXHAUSTED`. It does not wait in the budget's list, and it is refused
+   while S3 files wait there.
+3. **Worker slot.** The `DOEWOOD_INGEST_JOBS` slots are shared: an S3 worker holds one for each
+   job, a push holds one from its upload to the end of its analysis (an analysis past the
+   watchdog keeps it until it returns). A push waits at most 10 s for a slot, behind at most as
+   many other pushes as there are workers; else `RESOURCE_EXHAUSTED`. A waiting push takes the
+   next slot a worker frees (the slots are handed out in order), and pushes and S3 jobs
+   together never run more analyses than there are workers.
+4. **Analysis and writes**, as for an S3 object: the hash, the record (not analyzed again when
+   it is stored with the running step versions), the location `["push:<source id>", key]`, the
+   graph, search and a queued summary if the policy asks. The object's `objects_seen` row gets
+   its final status (`done`, `skipped` or `failed`) with the content's hash at once; there is no
+   `pending` row, so the sweep, the scanner and reprocessing never touch it.
+5. **Idempotence:** when the key's row holds the same hash and the record is current, nothing is
+   written and the call answers `PUT_STATUS_UNCHANGED`.
+
+`MoveLocation` writes the stored content's location at the new key (with its graph and search,
+no analysis) and ends the old key's `located_at` edge; `RemoveLocation` ends the key's edge, as
+an S3 delete does. Both update the `objects_seen` rows, so the progress counters follow.
+
+A push is not retried inside doewood: a transient failure is answered `UNAVAILABLE` and the
+application retries. A file quail or hedgehog cannot read is stored as for S3 (status
+`failed`) and answered `FAILED_PRECONDITION`.
+
 ## Status, retries, deletes
 
 - Each object ends `done`, `skipped` or `failed` with the reason and the attempts; the progress
@@ -416,6 +454,13 @@ are there for enrichment, and no document merges on a fuzzy match yet.
   ZIP, unknown, empty, broken PDF and XLSX): the record text is the `Value` tree's text byte for
   byte, `DocFacts` reads the same as reading every fact, and SQLite (and Postgres with
   `DOEWOOD_TEST_POSTGRES_URL`) store it and give that text back, a second write unchanged.
+- `tests/push.rs`: generated PDF, DOCX, XLSX and TXT files pushed into a push source on SQLite
+  (and Postgres with `DOEWOOD_TEST_POSTGRES_URL`): the record, location, graph and search as
+  for S3, idempotence (`UNCHANGED`, no second analysis, `REUSED` for the same content at
+  another key), a stale record analyzed again, move and remove (the old `located_at` edge
+  superseded), the checks (an S3 source, a paused one, a size over the cap or not the header's),
+  and shedding under load: with every worker slot or the memory budget taken a put is
+  `RESOURCE_EXHAUSTED`. No scanner runs for a push source (`doewood-api` tests).
 - `tests/minio_postgres.rs`: an S3 put in MinIO to a record in Postgres, with both
   `DOEWOOD_TEST_S3_ENDPOINT` and `DOEWOOD_TEST_POSTGRES_URL` set (CI's `ingest-e2e` job).
 

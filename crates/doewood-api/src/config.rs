@@ -2,7 +2,7 @@
 //! Every change applies without a restart; secrets are write-only.
 
 use doewood_core::{InstanceId, SourceId};
-use doewood_model::SourceKey;
+use doewood_model::{PUSH_ENDPOINT_PREFIX, SourceKey, push_endpoint};
 use doewood_store::{
     AI_PRESETS, AiProviderInput, ApiKey, ApiSettingsPatch, CredentialsChange,
     DEADLINE_SECONDS_LIMIT, IngestSettingsPatch, KeyChange, MAX_CALLS_IN_FLIGHT_LIMIT, NewSource,
@@ -25,7 +25,7 @@ use crate::pb::{
     SetLlmPolicyRequest, SetSqsInletRequest, Source, UpdateSourceRequest,
 };
 use crate::validate::{self, Violations};
-use crate::{Api, ApiState, claims, convert, enrichment, error};
+use crate::{Api, ApiState, claims, convert, enrichment, error, pb};
 
 /// Longest model name accepted.
 const MODEL_MAX_LEN: usize = 256;
@@ -107,6 +107,38 @@ fn aws_credentials(v: &mut Violations, req: &SetAiProviderRequest) -> Credential
     }
 }
 
+/// A push source's request (ADR 0004): only the size cap, the LLM policy and `paused`.
+fn check_add_push(req: &AddSourceRequest, id: SourceId) -> Result<NewSource, Status> {
+    let mut v = Violations::default();
+    for (field, set) in [
+        ("endpoint", !req.endpoint.is_empty()),
+        ("bucket", !req.bucket.is_empty()),
+        ("prefix", !req.prefix.is_empty()),
+        ("region", !req.region.is_empty()),
+        ("url_style", req.url_style != 0),
+        ("credentials", req.credentials.is_some()),
+        ("scan_interval_seconds", req.scan_interval_seconds != 0),
+        ("skip_known_copies", req.skip_known_copies),
+    ] {
+        if set {
+            v.add(field, "a push source has none: leave it unset");
+        }
+    }
+    let max_object_bytes =
+        validate::max_object_bytes(&mut v, "max_object_bytes", req.max_object_bytes);
+    let llm_policy = validate::llm_policy(&mut v, "llm_policy", req.llm_policy.as_ref());
+    v.check()?;
+    let mut new = NewSource::push(id);
+    new.max_object_bytes = max_object_bytes;
+    new.llm_policy = llm_policy;
+    new.state = if req.paused {
+        SourceState::Paused
+    } else {
+        SourceState::Active
+    };
+    Ok(new)
+}
+
 fn check_add(req: &AddSourceRequest) -> Result<(NewSource, Option<S3Credentials>), Status> {
     let mut v = Violations::default();
     let url_style = validate::url_style(&mut v, "url_style", req.url_style);
@@ -150,7 +182,13 @@ fn check_add(req: &AddSourceRequest) -> Result<(NewSource, Option<S3Credentials>
 /// starts its scanner when it is active. `ConfigService.AddSource` and the `doewood dev
 /// add-source` command both go through here.
 pub async fn add_source(state: &ApiState, req: &AddSourceRequest) -> Result<Source, Status> {
-    let (new, credentials) = check_add(req)?;
+    // A push source's endpoint holds its id (`push:<id>`), so the id comes first.
+    let id = SourceId::generate();
+    let (new, credentials) = match pb::SourceKind::try_from(req.kind) {
+        Ok(pb::SourceKind::Unspecified | pb::SourceKind::S3) => check_add(req)?,
+        Ok(pb::SourceKind::Push) => (check_add_push(req, id)?, None),
+        Err(_) => return Err(Status::invalid_argument("kind: unknown source kind")),
+    };
     let _guard = state.lock_sources().await;
     let (endpoint, bucket, prefix) = (new.endpoint.clone(), new.bucket.clone(), new.prefix.clone());
     if let Some(existing) = state
@@ -171,7 +209,7 @@ pub async fn add_source(state: &ApiState, req: &AddSourceRequest) -> Result<Sour
         .map_err(error::model)?;
     let added = state
         .db(move |s| {
-            let id = s.add_source(&new, credentials.as_ref())?;
+            let id = s.add_source_with_id(id, &new, credentials.as_ref())?;
             s.source(id)?
                 .ok_or_else(|| doewood_store::StoreError::NoSuchSource(id.to_string()))
         })
@@ -188,6 +226,7 @@ pub async fn add_source(state: &ApiState, req: &AddSourceRequest) -> Result<Sour
     };
     info!(
         source = %source.id,
+        kind = %source.kind(),
         bucket = %source.bucket,
         prefix = %source.prefix,
         state = %source.state,
@@ -202,10 +241,28 @@ pub async fn add_source(state: &ApiState, req: &AddSourceRequest) -> Result<Sour
 
 fn check_release(req: &ReleaseSourceClaimRequest) -> Result<(SourceKey, InstanceId), Status> {
     let mut v = Violations::default();
-    let endpoint = validate::http_url(&mut v, "endpoint", &req.endpoint);
-    // Any bucket a source could have been added with (path style accepts the most).
-    validate::bucket(&mut v, "bucket", &req.bucket, UrlStyle::Path);
-    validate::prefix(&mut v, "prefix", &req.prefix);
+    // A push source's claim (ADR 0004): `push:<id>`, no bucket, no prefix.
+    let push = req.endpoint.trim().starts_with(PUSH_ENDPOINT_PREFIX);
+    let endpoint = if push {
+        let id = validate::source_id(
+            &mut v,
+            "endpoint",
+            &req.endpoint.trim()[PUSH_ENDPOINT_PREFIX.len()..],
+        );
+        if !req.bucket.is_empty() || !req.prefix.is_empty() {
+            v.add(
+                "bucket",
+                "a push source's claim has no bucket and no prefix",
+            );
+        }
+        id.map(push_endpoint)
+    } else {
+        let endpoint = validate::http_url(&mut v, "endpoint", &req.endpoint);
+        // Any bucket a source could have been added with (path style accepts the most).
+        validate::bucket(&mut v, "bucket", &req.bucket, UrlStyle::Path);
+        validate::prefix(&mut v, "prefix", &req.prefix);
+        endpoint
+    };
     let owner = match InstanceId::new(req.owner.trim()) {
         Ok(o) => Some(o),
         Err(_) if req.owner.trim().is_empty() => {
@@ -398,6 +455,18 @@ impl ConfigService for Api {
         let (id, patch, key) = check_update(request.get_ref())?;
         let _guard = self.state.lock_sources().await;
         let current = self.state.source(id).await?;
+        if current.is_push()
+            && (patch.region.is_some()
+                || patch.url_style.is_some()
+                || patch.scan_interval.is_some()
+                || patch.skip_known_copies.is_some()
+                || !matches!(key, KeyUpdate::Keep))
+        {
+            return Err(Status::failed_precondition(format!(
+                "source {id} is a push source: only max_object_bytes (and the LLM policy, \
+                 SetLlmPolicy) can change"
+            )));
+        }
         if patch.url_style == Some(UrlStyle::VirtualHost) {
             let mut v = Violations::default();
             validate::bucket(&mut v, "url_style", &current.bucket, UrlStyle::VirtualHost);
@@ -542,6 +611,11 @@ impl ConfigService for Api {
     ) -> Result<Response<Source>, Status> {
         let (id, input, change) = check_sqs(request.get_ref())?;
         let _guard = self.state.lock_sources().await;
+        if self.state.source(id).await?.is_push() {
+            return Err(Status::failed_precondition(format!(
+                "source {id} is a push source: it has no bucket to send event notifications"
+            )));
+        }
         let source = self
             .state
             .db(move |s| {

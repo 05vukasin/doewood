@@ -70,6 +70,7 @@ impl AddSource {
             UrlStyle::Path
         };
         let request = AddSourceRequest {
+            kind: doewood_api::pb::SourceKind::S3 as i32,
             endpoint: self.endpoint,
             bucket: self.bucket,
             prefix: self.prefix,
@@ -145,6 +146,7 @@ async fn add(
         progress: Arc::new(Progress::new()),
         reprocess: None,
         summarize: None,
+        push: None,
         icons: None,
         options: ApiOptions::default(),
         shutdown: shutdown_rx,

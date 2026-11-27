@@ -75,8 +75,24 @@ impl FromStr for Blake3 {
     }
 }
 
+/// The endpoint of a push source (ADR 0004): `push:` and the source's id. A push source has
+/// no bucket and no prefix: its key and its locations are `push:<source id>` and the key the
+/// application gave.
+pub const PUSH_ENDPOINT_PREFIX: &str = "push:";
+
+/// The endpoint of the push source with this id (`push:<id>`).
+pub fn push_endpoint(id: impl fmt::Display) -> String {
+    format!("{PUSH_ENDPOINT_PREFIX}{id}")
+}
+
+/// Whether `endpoint` is a push source's (`push:<id>`), not an S3 URL.
+pub fn is_push_endpoint(endpoint: &str) -> bool {
+    endpoint.starts_with(PUSH_ENDPOINT_PREFIX)
+}
+
 /// A source's identity: an S3-compatible endpoint, a bucket and a prefix (`""` for the whole
-/// bucket). Instances claim sources by this key.
+/// bucket), or a push source's `push:<id>` with no bucket and no prefix (ADR 0004). Instances
+/// claim sources by this key.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SourceKey {
     endpoint: String,
@@ -86,7 +102,8 @@ pub struct SourceKey {
 
 impl SourceKey {
     /// Trims whitespace and trailing `/` from the endpoint, and whitespace from the bucket.
-    /// The prefix is kept as given. The endpoint and bucket must not be empty.
+    /// The prefix is kept as given. The endpoint and bucket must not be empty, except for a
+    /// push source (`push:<id>`, [`is_push_endpoint`]), which has neither bucket nor prefix.
     pub fn new(
         endpoint: impl AsRef<str>,
         bucket: impl AsRef<str>,
@@ -94,7 +111,17 @@ impl SourceKey {
     ) -> Result<Self, Error> {
         let endpoint = endpoint.as_ref().trim().trim_end_matches('/').to_owned();
         let bucket = bucket.as_ref().trim().to_owned();
-        if endpoint.is_empty() || bucket.is_empty() {
+        let prefix = prefix.into();
+        if is_push_endpoint(&endpoint) {
+            if endpoint.len() == PUSH_ENDPOINT_PREFIX.len()
+                || !bucket.is_empty()
+                || !prefix.is_empty()
+            {
+                return Err(Error::Invalid(
+                    "a push source is `push:<id>`, with no bucket and no prefix".to_owned(),
+                ));
+            }
+        } else if endpoint.is_empty() || bucket.is_empty() {
             return Err(Error::Invalid(
                 "a source needs an endpoint and a bucket".to_owned(),
             ));
@@ -102,8 +129,22 @@ impl SourceKey {
         Ok(Self {
             endpoint,
             bucket,
-            prefix: prefix.into(),
+            prefix,
         })
+    }
+
+    /// The key of the push source with this id: `push:<id>`, no bucket, no prefix.
+    pub fn push(id: impl fmt::Display) -> Self {
+        Self {
+            endpoint: push_endpoint(id),
+            bucket: String::new(),
+            prefix: String::new(),
+        }
+    }
+
+    /// Whether this is a push source's key.
+    pub fn is_push(&self) -> bool {
+        is_push_endpoint(&self.endpoint)
     }
 
     /// The endpoint URL, without a trailing `/`.
@@ -147,7 +188,8 @@ pub struct ObjectLocation {
 
 impl ObjectLocation {
     /// The location as stored: the endpoint and bucket normalized like [`SourceKey::new`],
-    /// so source filters match it. The endpoint, bucket and key must not be empty.
+    /// so source filters match it. The endpoint, bucket and key must not be empty (a push
+    /// location, `push:<id>`, has no bucket).
     pub fn checked(&self) -> Result<Self, Error> {
         let source = SourceKey::new(&self.endpoint, &self.bucket, "")?;
         if self.key.is_empty() {
@@ -161,7 +203,12 @@ impl ObjectLocation {
     }
 
     /// The key of the location's graph node: a JSON array, so no separator can be ambiguous.
+    /// `[endpoint, bucket, key]` for an S3 object, `["push:<source id>", key]` for a pushed
+    /// one (ADR 0004).
     pub fn node_key(&self) -> String {
+        if is_push_endpoint(&self.endpoint) && self.bucket.is_empty() {
+            return Value::from(vec![self.endpoint.as_str(), self.key.as_str()]).to_string();
+        }
         Value::from(vec![
             self.endpoint.as_str(),
             self.bucket.as_str(),
@@ -1084,6 +1131,30 @@ mod tests {
         assert_eq!(k.prefix(), "inbox/");
         assert!(SourceKey::new("", "b", "").is_err());
         assert!(SourceKey::new("http://x", " ", "").is_err());
+    }
+
+    #[test]
+    fn push_keys_have_no_bucket() {
+        let k = SourceKey::push("0190");
+        assert_eq!(k.endpoint(), "push:0190");
+        assert!(k.is_push() && k.bucket().is_empty() && k.prefix().is_empty());
+        assert_eq!(SourceKey::new("push:0190", "", "").unwrap(), k);
+        assert!(SourceKey::new("push:", "", "").is_err());
+        assert!(SourceKey::new("push:0190", "docs", "").is_err());
+        assert!(SourceKey::new("push:0190", "", "in/").is_err());
+        let at = ObjectLocation {
+            endpoint: "push:0190".into(),
+            bucket: String::new(),
+            key: "a/b.pdf".into(),
+        };
+        assert_eq!(at.checked().unwrap(), at);
+        assert_eq!(at.node_key(), r#"["push:0190","a/b.pdf"]"#);
+        let s3 = ObjectLocation {
+            endpoint: "http://m".into(),
+            bucket: "docs".into(),
+            key: "a".into(),
+        };
+        assert_eq!(s3.node_key(), r#"["http://m","docs","a"]"#);
     }
 
     #[test]

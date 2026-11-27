@@ -62,7 +62,7 @@ pub use store::objects::{
 pub use store::readers::{api_call, api_call_blocking};
 pub use store::sources::{
     DEFAULT_LLM_CONCURRENCY, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_SCAN_INTERVAL, LlmMode, LlmPolicy,
-    MAX_LLM_CONCURRENCY, MAX_LLM_KINDS, NewSource, ObjectCounts, S3Credentials, Source,
+    MAX_LLM_CONCURRENCY, MAX_LLM_KINDS, NewSource, ObjectCounts, S3Credentials, Source, SourceKind,
     SourcePatch, SourceState, UrlStyle, valid_kind,
 };
 pub use store::sqs::{

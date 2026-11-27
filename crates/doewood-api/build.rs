@@ -16,6 +16,7 @@ const FILES: &[&str] = &[
     "doewood/v1/graph.proto",
     "doewood/v1/search.proto",
     "doewood/v1/summarize.proto",
+    "doewood/v1/ingest.proto",
 ];
 
 /// The methods of the health and reflection services (tonic-health, tonic-reflection).

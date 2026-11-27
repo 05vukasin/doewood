@@ -38,6 +38,7 @@ The S3 event webhook is not part of the gRPC API: it is on the ops server (see
 | `GraphService` | `GetNode`, `Neighbours`, `CompanyDocuments`, `ListMerges`, `MergeCompanies`, `UndoMerge`, `SplitCompany`, `DismissPair`, `ListDismissals`, `ListProposals`, `AcceptProposal`, `RejectProposal` |
 | `SearchService` | `Search` |
 | `SummarizeService` | `Summarize` |
+| `IngestService` | `PutObject` (client stream), `MoveLocation`, `RemoveLocation` |
 
 The comments in the `.proto` files are the reference for every field. In short:
 
@@ -49,6 +50,12 @@ The comments in the `.proto` files are the reference for every field. In short:
   `source http://minio:9000/docs/in/ is already claimed by instance "doewood-1"`. The source is
   then stored with its credentials sealed, and an active source starts scanning at once, without
   a restart. `paused: true` adds it without scanning.
+- **Push sources** ([ADR 0004](adr/0004-push-sources.md)): `kind: SOURCE_KIND_PUSH` adds a
+  source without a bucket or scanner, whose files an application hands in with
+  [`IngestService.PutObject`](#push-sources-ingestservice). It takes only `max_object_bytes`,
+  `llm_policy` and `paused`; any S3 field set is `INVALID_ARGUMENT`. Its endpoint is
+  `push:<id>` with an empty bucket and prefix, and it is claimed by that key like any source.
+  `Source.kind` tells the kinds apart. See [sources.md](sources.md#push-sources).
 - The endpoint is normalized before the claim (scheme and host lowercased, the default port
   and a trailing `/` dropped), so `HTTP://MinIO:9000/` and `http://minio:9000` are one source.
 - `skip_known_copies` (off by default) records a new key whose single-part ETag and size match
@@ -383,6 +390,51 @@ JOB=$(grpcurl -plaintext -d "{\"source_id\": \"$ID\"}" 127.0.0.1:7443 \
 grpcurl -plaintext -d "{\"job_id\": \"$JOB\"}" 127.0.0.1:7443 doewood.v1.JobsService/WatchReprocess
 ```
 
+### Push sources: IngestService
+
+`IngestService` ([ADR 0004](adr/0004-push-sources.md)) serves push sources: the application has
+the bytes and gets the analysis back in the same call. Every call names an active push source
+that this instance owns; an S3 source, a paused one and one another instance owns are
+`FAILED_PRECONDITION`, an unknown one `NOT_FOUND`. See [ingest.md](ingest.md#push-sources).
+
+- **PutObject** is client-streamed: first a `header` (`source_id`, `key`, `name`, `mime_type`,
+  `size`), then the bytes in `chunk` messages that add up to `size` exactly. Each message is at
+  most the message limit (`DOEWOOD_API_MAX_MESSAGE_MIB`, 64 MiB by default); the file is at
+  most the source's `max_object_bytes` (else `FAILED_PRECONDITION`). The `key` (1 to 1024 bytes)
+  is the location's key; `name` (empty: the key's last `/` segment) gives the extension hint;
+  `mime_type` is informational, the format is read from the bytes.
+  - It analyzes the file as ingest analyzes an S3 object and stores the record, the location
+    `["push:<source_id>", key]`, the graph, search and the step versions; a summary is queued
+    if the source's LLM policy asks.
+  - The answer is the `record` (as `GetRecord` returns it), `blake3`, `kind`, `status` and
+    `skipped` (no extractor reads the format: identity only). `status` is
+    `PUT_STATUS_ANALYZED`, `PUT_STATUS_REUSED` (the content was stored already with the
+    running step versions: only the location was written) or `PUT_STATUS_UNCHANGED` (the key
+    held this content already: nothing was written). Putting the same bytes at the same key
+    again is therefore cheap and changes nothing.
+  - A file quail or hedgehog cannot read is stored as an S3 object would be (the record says
+    `failed`) and answered `FAILED_PRECONDITION` with the reason; a repeat put answers the
+    same. A malformed stream (no header first, a second header, more or fewer bytes than
+    `size`) is `INVALID_ARGUMENT`. Each message must arrive within 60 s, else
+    `DEADLINE_EXCEEDED`; the call has no server deadline, as `Summarize` has none.
+  - **Back-pressure.** Before a byte is read, the call takes its share of ingest's memory
+    budget and one of ingest's worker slots, which it shares with the S3 workers. It waits
+    for a slot at most 10 s, behind at most as many other pushes as there are workers.
+    Without a slot or budget it is answered `RESOURCE_EXHAUSTED` with the trailer
+    `grpc-retry-pushback-ms`; beyond `max_calls_in_flight` it is shed with `UNAVAILABLE`, as
+    every call. Both mean: nothing ran, retry with backoff. `UNAVAILABLE` also comes when the
+    shared store is away, or when a put, move or remove of the same key is in flight.
+- **MoveLocation** (`source_id`, `old_key`, `new_key`) gives the new key the stored content,
+  with the graph and search for it; nothing is analyzed. The old key's `located_at` edge is
+  ended (superseded), as for an S3 delete. The answer has the moved `record` and `blake3`.
+  `NOT_FOUND` when the old key holds no object.
+- **RemoveLocation** (`source_id`, `key`) ends the key's `located_at` edge, as for an S3
+  delete. The document, its record and its other locations stay. `removed` says whether the
+  key held an object; removing again is OK with `removed: false`.
+- `ReprocessJob` and `Summarize` by location are `FAILED_PRECONDITION` for a push source
+  (doewood keeps no bytes); `UpdateSource` takes only `max_object_bytes`, and `SetSqsInlet` is
+  refused.
+
 ### Summarize
 
 **Summarize** summarizes one file now, outside the LLM queue, and stores nothing (no record, no
@@ -423,7 +475,7 @@ jq -n --arg name report.pdf --rawfile b <(base64 -w0 report.pdf) '{name:$name, c
 | `DEADLINE_EXCEEDED` | the call ran longer than the server's deadline (`deadline_seconds`, default 60 s), or than the client's own deadline |
 | `CANCELLED` | the client's `grpc-timeout` ran out on the server side (the client usually reports its own `DEADLINE_EXCEEDED` first) |
 | `FAILED_PRECONDITION` | the shared database was migrated by a newer doewood. A merge of a dismissed pair or of a merged-away company; an undo that later merges depend on (named in the message), of an entry already undone, or of a split that dismissed its pair; a dismissal of two companies merged now. `Summarize` without a configured AI provider (or with one missing its key or base URL), of a source whose LLM policy is off, of a file without text, or of a file larger than ingest analyzes |
-| `RESOURCE_EXHAUSTED` | `Summarize` while as many calls as `summarize_max_concurrent` allows are reading or analyzing a file; retry later |
+| `RESOURCE_EXHAUSTED` | `Summarize` while as many calls as `summarize_max_concurrent` allows are reading or analyzing a file; `PutObject` while no ingest worker slot or memory budget is free (with `grpc-retry-pushback-ms`); retry later |
 | `OUT_OF_RANGE` | a message larger than the limit |
 | `INTERNAL` | anything else; the details are in the server log, not in the message |
 
@@ -449,6 +501,9 @@ to do:
   and provider call are bounded on their own and can take minutes, and its analyses have
   their own cap (`summarize_max_concurrent`, `RESOURCE_EXHAUSTED` beyond it). Give it a
   client deadline if you need one.
+- **`PutObject`** is the same: counted, no server deadline. Its upload waits at most 60 s for
+  each message, and its analysis has ingest's time limits; it shares ingest's worker slots and
+  memory budget (`RESOURCE_EXHAUSTED` with `grpc-retry-pushback-ms` when they are taken).
 - **Health checks** (`grpc.health.v1.Health`) are never shed nor given the deadline, so a
   probe answers under load.
 - **gRPC-Web** calls get the same limits and errors (the status in the response headers). The
@@ -574,6 +629,27 @@ grpcurl -plaintext -d @ 127.0.0.1:7443 doewood.v1.ConfigService/SetSqsInlet <<EO
 EOF
 grpcurl -plaintext -d "{\"source_id\": \"$ID\"}" 127.0.0.1:7443 doewood.v1.ConfigService/RemoveSqsInlet
 ```
+
+A push source, and a file put into it, then moved and removed. For a client stream grpcurl
+reads one JSON message after another: the header, then the bytes as base64 `chunk`s (one chunk
+here; split a file larger than the message limit into several):
+
+```sh
+PUSH=$(grpcurl -plaintext -d '{"kind": "SOURCE_KIND_PUSH", "llm_policy": {"mode": "LLM_MODE_OFF"}}' \
+    127.0.0.1:7443 doewood.v1.ConfigService/AddSource | jq -r .id)
+{ jq -n --arg s "$PUSH" --arg size "$(wc -c < report.pdf)" \
+    '{header: {source_id: $s, key: "drive/2026/report.pdf", mime_type: "application/pdf",
+               size: $size}}'
+  jq -n --rawfile b <(base64 -w0 report.pdf) '{chunk: $b}'
+} | grpcurl -plaintext -d @ 127.0.0.1:7443 doewood.v1.IngestService/PutObject
+grpcurl -plaintext -d "{\"source_id\": \"$PUSH\", \"old_key\": \"drive/2026/report.pdf\",
+    \"new_key\": \"drive/archive/report.pdf\"}" 127.0.0.1:7443 doewood.v1.IngestService/MoveLocation
+grpcurl -plaintext -d "{\"source_id\": \"$PUSH\", \"key\": \"drive/archive/report.pdf\"}" \
+    127.0.0.1:7443 doewood.v1.IngestService/RemoveLocation
+```
+
+The answer to `PutObject` has `"status": "PUT_STATUS_ANALYZED"`, the record, its `blake3` and
+`kind`; the same put again answers `PUT_STATUS_UNCHANGED`.
 
 An AI provider (the key is read from a variable, and never comes back):
 

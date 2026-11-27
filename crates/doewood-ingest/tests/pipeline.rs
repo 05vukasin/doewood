@@ -1932,6 +1932,7 @@ mod bench {
                 progress: Arc::clone(progress),
                 reprocess: None,
                 summarize: None,
+                push: None,
                 icons: None,
                 options: ApiOptions::default(),
                 shutdown: shutdown_rx.clone(),

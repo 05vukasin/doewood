@@ -88,7 +88,7 @@ impl Discovery {
         let discovery = Self::idle(store, events, shutdown, options)?;
         let to_scan: Vec<Source> = sources
             .into_iter()
-            .filter(|s| s.state.is_scanned())
+            .filter(|s| s.state.is_scanned() && !s.is_push())
             .collect();
         if to_scan.is_empty() {
             info!("no active sources: discovery is idle");
@@ -143,10 +143,10 @@ impl Discovery {
     }
 
     /// Starts the source's scanner unless one is running. Returns whether one started: not
-    /// when it already runs, when the source is not scanned (paused, removed), or after
-    /// shutdown.
+    /// when it already runs, when the source is not scanned (paused, removed, or a push
+    /// source, which has no bucket: ADR 0004), or after shutdown.
     pub fn start_source(&self, source: &Source) -> bool {
-        if !source.state.is_scanned() || *self.inner.shutdown.borrow() {
+        if !source.state.is_scanned() || source.is_push() || *self.inner.shutdown.borrow() {
             return false;
         }
         let mut state = self.state();

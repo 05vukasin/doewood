@@ -76,6 +76,10 @@ Each setting has exactly **one** source.
 
 ### 5. Sources and jobs
 
+> Amended by [ADR 0004](0004-push-sources.md): a source is also a **push** source, whose bytes an
+> application hands in through `IngestService.PutObject`. It has no scanner and no bucket; the
+> application owns discovery, moves and deletions. What follows describes S3 sources.
+
 - A source is an S3-compatible endpoint plus a bucket and an optional prefix. Every
   S3-compatible store works: AWS, MinIO, Ceph, R2, Wasabi.
 - **Discovery:**

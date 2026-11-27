@@ -52,6 +52,11 @@
 //!   analysis really ends (an overrun's too). Small files are not charged and never wait. A big
 //!   file that does not fit waits in a FIFO list of its own while its worker takes other work;
 //!   only when that list is full does a worker wait for the budget itself.
+//! - **Worker slots.** [`IngestConfig::jobs`] slots are shared by the workers and by
+//!   `IngestService.PutObject` ([`push`], ADR 0004): a worker takes one for each job, a push
+//!   for its upload and analysis. A push waits for a slot only briefly, behind at most
+//!   [`IngestConfig::jobs`] other pushes, and is refused with `RESOURCE_EXHAUSTED` beyond
+//!   that; it takes its share of the memory budget at once or is refused the same way.
 //! - **Shutdown** lets every worker finish the file in hand; pending objects stay pending.
 
 use std::borrow::Cow;
@@ -71,7 +76,7 @@ use doewood_store::{
     IngestOutcome, IngestSettings, KnownContent, Source, SourceState, Store, StoreError,
 };
 use serde_json::value::RawValue;
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -79,6 +84,8 @@ use uuid::Uuid;
 use crate::analyze::{Analysis, Analyzer, AnalyzerConfig, Outcome, content_hash};
 use crate::facts::DocFacts;
 use crate::graph::{GraphWriter, SimilarityConfig};
+
+pub mod push;
 
 /// Memory one worker is planned for: a file in memory (up to the source cap, usually far
 /// less), the engine's working set, and the extracted text.
@@ -452,6 +459,10 @@ struct Inner {
     analyzing: Arc<Analyzing>,
     /// Bytes of big files in flight.
     budget: Arc<Budget>,
+    /// The worker slots ([`IngestConfig::jobs`]), shared by the workers and the pushes.
+    slots: Arc<Semaphore>,
+    /// Pushes waiting for a slot now.
+    push_waiting: AtomicUsize,
     /// Runs on the blocking thread before each analysis (tests stall it there).
     #[cfg(test)]
     hook: Option<Hook>,
@@ -620,6 +631,23 @@ impl Budget {
         None
     }
 
+    /// A push's share (ADR 0004), at once or never: `Ok(None)` for a small file (not
+    /// charged), `Ok(Some(_))` when nothing waits and `size` (at most the whole budget) is
+    /// free, `Err(())` otherwise. A push never waits in the list: it is refused and retries.
+    fn try_charge(self: &Arc<Self>, size: u64) -> Result<Option<Arc<Charge>>, ()> {
+        if size <= self.small {
+            return Ok(None);
+        }
+        let cost = size.min(self.total);
+        let mut st = lock(&self.state);
+        if !st.waiting.is_empty() || st.free < cost {
+            return Err(());
+        }
+        st.free -= cost;
+        drop(st);
+        Ok(Some(self.charge(cost)))
+    }
+
     /// The oldest waiting job, if its share is free now.
     fn next_waiting(self: &Arc<Self>) -> Option<(Job, Arc<Charge>)> {
         let mut st = lock(&self.state);
@@ -711,6 +739,7 @@ impl Ingest {
     pub fn new(parts: IngestParts) -> Self {
         let c = &parts.config;
         let budget = Arc::new(Budget::new(c.memory_budget, c.small_file, c.jobs.max(1)));
+        let slots = Arc::new(Semaphore::new(c.jobs.max(1)));
         Self {
             inner: Arc::new(Inner {
                 store: parts.store,
@@ -724,6 +753,8 @@ impl Ingest {
                 inflight: Mutex::new(HashSet::new()),
                 analyzing: Arc::default(),
                 budget,
+                slots,
+                push_waiting: AtomicUsize::new(0),
                 #[cfg(test)]
                 hook: None,
                 sweep_now: Notify::new(),
@@ -1025,6 +1056,12 @@ impl Ingest {
                 self.drop_claimed(job, &owner).await;
                 continue;
             }
+            // A worker slot, shared with the pushes: free unless pushes hold some.
+            let _slot = tokio::select! {
+                biased;
+                _ = shutdown.wait_for(|s| *s) => return,
+                slot = Arc::clone(&self.inner.slots).acquire_owned() => slot.ok(),
+            };
             match job {
                 Job::Ingest {
                     source,
@@ -1273,7 +1310,7 @@ impl Ingest {
             (r.body, outcome)
         } else {
             let a = self
-                .analyze(bytes, blake3, key, charge.cloned(), overruns)
+                .analyze(bytes, blake3, key, charge.cloned(), None, overruns)
                 .await?;
             lock(&self.inner.stats).analyzed += 1;
             t = self.stage(t, |s| &mut s.analyze);
@@ -1397,14 +1434,15 @@ impl Ingest {
 
     /// Analyzes one file on a blocking thread, under the watchdog. Past it the file fails as
     /// before, and the analysis, which nothing can stop from outside, is added to `overruns`
-    /// (the worker bounds those): its bytes and its share of the memory budget are freed, and a
-    /// `WARN` logged, when it returns.
+    /// (the worker bounds those): its bytes, its share of the memory budget and `slot` (a
+    /// push's worker slot) are freed, and a `WARN` logged, when it returns.
     async fn analyze(
         &self,
         bytes: Vec<u8>,
         blake3: Blake3,
         key: &str,
         charge: Option<Arc<Charge>>,
+        slot: Option<OwnedSemaphorePermit>,
         overruns: &mut Overruns,
     ) -> Result<Analysis, IngestError> {
         let analyzer = Arc::clone(&self.inner.analyzer);
@@ -1416,6 +1454,7 @@ impl Ingest {
         let mut task = tokio::task::spawn_blocking(move || {
             let _counted = counted;
             let _charge = charge;
+            let _slot = slot;
             #[cfg(test)]
             if let Some(h) = hook {
                 h(&k);

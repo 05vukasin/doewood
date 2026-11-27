@@ -1,0 +1,114 @@
+// Push sources (ADR 0004): an application hands doewood the bytes of a file and gets the
+// analysis back in the same call. There is no scanner: the application owns discovery, moves
+// and deletions. Every call names a push source of this instance (AddSource with kind
+// SOURCE_KIND_PUSH) that is active and claimed by this instance.
+syntax = "proto3";
+
+package doewood.v1;
+
+import "doewood/v1/records.proto";
+
+service IngestService {
+  // Analyzes one file now and stores it as an S3 object would be: the record, the Location
+  // `["push:<source_id>", key]`, the graph, search and the step versions; a summary is queued
+  // if the source's LLM policy asks. Client-streamed: first a `header`, then the bytes in
+  // `chunk` messages (each at most the server's message size, DOEWOOD_API_MAX_MESSAGE_MIB, 64
+  // MiB by default), so a file is not limited to one message; the whole file is at most the
+  // source's `max_object_bytes`.
+  //
+  // Idempotent per (BLAKE3, key): the same content at the same key, with a current record,
+  // writes nothing (`PUT_STATUS_UNCHANGED`). Content stored before with the running step
+  // versions is not analyzed again (`PUT_STATUS_REUSED`).
+  //
+  // Errors: INVALID_ARGUMENT for a malformed request (no header first, bytes that do not
+  // match `size`), FAILED_PRECONDITION for a file that cannot be read or is too large, and for
+  // a source that is not a push source, paused or owned by another instance; NOT_FOUND for an
+  // unknown source; UNAVAILABLE (transient: the shared store, a call for the same key in
+  // flight) and RESOURCE_EXHAUSTED (no ingest worker slot or memory budget free now; it
+  // carries `grpc-retry-pushback-ms`) mean retry later.
+  rpc PutObject(stream PutObjectRequest) returns (PutObjectResponse);
+  // Moves a pushed object to another key: the new key gets its stored content (with the graph
+  // and search for it; nothing is analyzed), and the old key's `located_at` edge is ended
+  // (superseded), as for an S3 delete. NOT_FOUND when the old key holds no object.
+  rpc MoveLocation(MoveLocationRequest) returns (MoveLocationResponse);
+  // Removes a pushed object: its `located_at` edge is ended (superseded), as for an S3
+  // delete. The document, its record and its other locations stay. Idempotent.
+  rpc RemoveLocation(RemoveLocationRequest) returns (RemoveLocationResponse);
+}
+
+// The first message of a PutObject call.
+message PutObjectHeader {
+  // A push source of this instance.
+  string source_id = 1;
+  // The application's key for the file (a path or an id): 1 to 1024 bytes, no control
+  // characters. The location's key.
+  string key = 2;
+  // The file name; its extension is a hint for spreadsheet containers (the bytes decide the
+  // format). Empty means the key's last `/` segment. At most 1024 bytes.
+  string name = 3;
+  // The MIME type the application has for it, if any (at most 255 bytes). Informational: the
+  // format is read from the bytes, as for S3 objects.
+  string mime_type = 4;
+  // The exact number of bytes that follow, at least 1.
+  uint64 size = 5;
+  // Reserved for the document text (issue #166).
+  reserved 6;
+  reserved "want_text";
+}
+
+message PutObjectRequest {
+  oneof part {
+    // First, exactly once.
+    PutObjectHeader header = 1;
+    // Then the bytes, in order; they add up to `header.size`.
+    bytes chunk = 2;
+  }
+}
+
+// What PutObject did.
+enum PutStatus {
+  PUT_STATUS_UNSPECIFIED = 0;
+  // Analyzed now; the record was written.
+  PUT_STATUS_ANALYZED = 1;
+  // The content was stored already with the running step versions: not analyzed again; the
+  // location (and the graph and search for it) was written.
+  PUT_STATUS_REUSED = 2;
+  // The key held this content already, with a current record: nothing was written.
+  PUT_STATUS_UNCHANGED = 3;
+}
+
+message PutObjectResponse {
+  // The record, as GetRecord returns it.
+  Record record = 1;
+  // 64 lowercase hex digits (also `record.blake3`).
+  string blake3 = 2;
+  // The document's kind (`invoice`, `contract`, ...); empty when quail found none.
+  string kind = 3;
+  PutStatus status = 4;
+  // No extractor reads this format: the record holds the file's identity and format only
+  // (`skipped` in the source's progress).
+  bool skipped = 5;
+}
+
+message MoveLocationRequest {
+  string source_id = 1;
+  string old_key = 2;
+  // Another key; if it held another document, that location is superseded.
+  string new_key = 3;
+}
+
+message MoveLocationResponse {
+  // The moved document's record, as GetRecord returns it.
+  Record record = 1;
+  string blake3 = 2;
+}
+
+message RemoveLocationRequest {
+  string source_id = 1;
+  string key = 2;
+}
+
+message RemoveLocationResponse {
+  // Whether the key held an object; false when it was removed already or never put.
+  bool removed = 1;
+}
