@@ -449,6 +449,7 @@ DOEWOOD_TEST_POSTGRES_URL=postgres://... DOEWOOD_BENCH_JOBS=4 DOEWOOD_BENCH_FILE
 | server, Postgres 17.12 (issue #69) | 4, 7.6 GiB | 1 / 2 / 4 | 56 / 136 / 246 | medians of 3; 47 statements per file |
 | server, Postgres, `taskset -c 0,1` | 2 | 2 | 122 | median of 122, 115, 124 |
 | server, Postgres, fewer round trips (issue #103) | 4, 7.6 GiB | 1 / 2 / 4 | 61 / 194 / 277 | one run each; 44 / 150 / 206 for `main` in the same session; 11.3 statements per file (24.1 before) |
+| server, Postgres, party locks per key (issue #78) | 4, 7.6 GiB | 1 / 2 / 4 | 64 / 215 / 308 | medians of 3; 65 / 210 / 303 for `staging` run in turns with it |
 
 Server: Linux 7.0.0-30, rustc 1.97.1, commit `ba0b963` for the first rows, `f8c6e3a` (with
 the stage counters) for the issue #69 rows. Throughput grows less than linearly with workers

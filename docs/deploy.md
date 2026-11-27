@@ -583,8 +583,9 @@ Where the workers' time goes (4 workers, share of workers x wall time; the test 
 - **The company lock is not the bottleneck at 4 workers or fewer.** Workers wait for it 0 to
   7% of their time; it is held 1.5 to 1.8 ms per file on Postgres (round trips under the
   lock), so one instance cannot pass about 600 files/s through it, 2.5 times what 4 workers
-  reach here. It becomes the limit with more workers or cheaper files; narrowing it is #78
-  (a decision issue), and fewer round trips (above) also shorten the time it is held.
+  reach here. It becomes the limit with more workers or cheaper files; fewer round trips
+  (below) also shorten the time it is held. Issue #78 replaced it with locks per alias key
+  (see [below](#party-locks-per-alias-key-issue-78)).
 - More workers help both stores (1 to 4 workers: 2.9x SQLite, 4.4x Postgres, where workers
   mostly wait on the network). One SQLite worker is slower per file than two (every stage
   takes 20 to 30% longer; not explained yet).
@@ -632,6 +633,40 @@ What changed, with the same rows written:
 proxy that reads the wire protocol, and fails above the targets (each store call above is
 one round trip; the `throughput` mix is at most 15 statements and 14.5 round trips per
 document, 32.25 of each before).
+
+### Party locks per alias key (issue #78)
+
+The one instance-wide company lock (`GraphWriter::companies`) is now a lock per alias key: a
+document's parties take a striped lock for each identifier, ladder key and learned alias they
+use, in order, plus a shared `RwLock`, for the same span as before. A form-blind match onto a
+company without a legal form is made again with that `RwLock` held exclusively (the
+reasoning is on `PartyLocks` in `crates/doewood-ingest/src/graph.rs`).
+
+Postgres 17 (`pgvector/pgvector:pg17`, `pg_stat_statements` loaded) in a container on an
+`--internal` Docker network, test profile, `staging` at `d659ebf` (before) against this change
+(after). The two test binaries were built once and run in turns (before, after, before, ...)
+through `serial`, so a load change on the shared machine hits both. Medians of 3:
+
+| benchmark | workers | before | after | runs before / after |
+|---|---|---|---|---|
+| `throughput`, 2000 files, files/s | 1 | 65 | 64 | 62, 65, 66 / 64, 64, 69 |
+| `throughput`, 2000 files, files/s | 2 | 210 | 215 | 210, 212, 158 / 215, 223, 170 |
+| `throughput`, 2000 files, files/s | 4 | 303 | 308 | 233, 309, 303 / 244, 308, 326 |
+| `company_rows` `spread`, 3000 documents, docs/s | 4 | 72 | 217 | 61, 72, 72 / 217, 211, 226 |
+| `company_rows` `hot`, 3000 documents, docs/s | 4 | 104 | 105 | 104, 104, 104 / 113, 105, 99 |
+
+- **No measurable change in `throughput`.** Its workers waited 0.01 to 0.02 ms per file for
+  the lock before (it overlaps the other graph steps since #103), so nothing was waiting on it.
+- **3x on the graph alone when companies differ** (`company_rows` `spread`: every company on
+  at most two documents, written straight through `GraphWriter` by 4 writers). Waiting for
+  the lock went from 31 to 46 ms per document to 1.2 to 2.1 ms.
+- **No change when one company is on every document** (`hot`): every document shares that
+  supplier's keys, so they still run one after the other, as they must.
+- Several workers resolving overlapping parties at once give the graph of one worker
+  (`crates/doewood-ingest/tests/party_locks.rs`, SQLite and Postgres; 1000 shuffled rounds of
+  4 writers on each store passed). Each protection, removed on purpose (the form-blind
+  fallback, the learned aliases in the lock set, the form-blind key in it), made the tests
+  fail within 100 rounds.
 
 ### Similar documents on near-duplicate corpora (issue #126)
 
