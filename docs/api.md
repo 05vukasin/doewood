@@ -1616,8 +1616,10 @@ lookup in `search_facts`' facts index, about 0.02 ms):
 - some: it reads the documents with facts from `search_facts` and the others from
   `search_index` (`has_facts` false), as schema 18 read them all from one table.
 
-The results are schema 18's (words split between the body and the facts still find their
-document), and SQLite is unchanged. Options measured first on the same data (in-database p50
+The matches are schema 18's (words split between the body and the facts still find their
+document). The ranks are too, except that the facts now come after the body in the vector,
+which changes how near a title word and a body word count in a search of several words.
+SQLite is unchanged. Options measured first on the same data (in-database p50
 of 40 runs, ms; schema 17 / 18 for reference were 6.6-9.3 / 23.5-32.7 for a word in a quarter
 and 26-27 / 29.5-35.6 for a word in most):
 
