@@ -27,7 +27,8 @@ doewood-s3.workspace = true
 doewood-store.workspace = true
 # Text exposition only; no protobuf, no process collector.
 prometheus = { version = "0.14", default-features = false }
-tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+# `io-util`: `doewood health` speaks HTTP/1.1 over a plain `TcpStream` (no HTTP client).
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "io-util"] }
 tracing = "0.1"
 url = "2.5"
 uuid.workspace = true
@@ -36,7 +37,6 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["s
 [dev-dependencies]
 serde_json = "1"
 tempfile = "3.20"
-tokio = { version = "1.47", features = ["io-util"] }
 
 [lints]
 workspace = true

@@ -70,6 +70,6 @@ pub use store::sqs::{
 };
 pub use store::wal::{Checkpoint, CheckpointMode, WalPass, WalStats};
 pub use store::{
-    ANALYSIS_LIMIT, DEFAULT_READERS, MAX_READERS, Optimized, SECRET_MAX_LEN, STORE_FILE, Snapshot,
-    Store, default_readers, plan_readers,
+    ANALYSIS_LIMIT, Applied, DEFAULT_READERS, MAX_READERS, Optimized, SECRET_MAX_LEN, STORE_FILE,
+    Snapshot, Store, default_readers, plan_readers,
 };

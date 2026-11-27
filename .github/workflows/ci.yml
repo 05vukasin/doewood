@@ -150,6 +150,21 @@ jobs:
           done
           curl -sf 127.0.0.1:7444/healthz
           curl -sf 127.0.0.1:7444/readyz
+          # The image's HEALTHCHECK (`doewood health`) marks the container healthy; it probes
+          # every second during its start period, so this takes a few seconds at most.
+          health=none
+          for _ in $(seq 1 60); do
+            health="$(docker inspect --format '{{.State.Health.Status}}' dw)"
+            [ "$health" = healthy ] && break
+            sleep 1
+          done
+          if [ "$health" != healthy ]; then
+            docker inspect --format '{{json .State.Health}}' dw
+            exit 1
+          fi
+          docker exec dw doewood health
+          # And fails, with a reason, where nothing listens.
+          if docker exec -e DOEWOOD_OPS_LISTEN=127.0.0.1:1 dw doewood health; then exit 1; fi
           docker exec dw id
           test "$(docker exec dw id -u)" = 10001
           # OCR runs with the models of the image. Ingest is set up after the store is ready

@@ -81,6 +81,13 @@ ENV DOEWOOD_DATA_DIR=/data \
     GLIBC_TUNABLES=glibc.malloc.arena_max=2:glibc.malloc.mmap_threshold=131072
 VOLUME /data
 EXPOSE 7443 7444
+# `doewood health` asks /readyz on DOEWOOD_OPS_LISTEN (loopback when it binds 0.0.0.0) and
+# exits 0 on 200; the image has no curl. A start takes well under a second (docs/deploy.md,
+# Time to ready: about 0.15 s, 0.5 s with an uncached store or a first Postgres migration);
+# the 30 s start period also covers a slow disk or a shared Postgres still starting, and its
+# 1 s probes let Compose's `service_healthy` dependents start about a second after ready.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --start-interval=1s --retries=3 \
+    CMD ["/usr/local/bin/doewood", "health"]
 USER 10001:10001
 WORKDIR /data
 ENTRYPOINT ["/usr/local/bin/doewood"]
