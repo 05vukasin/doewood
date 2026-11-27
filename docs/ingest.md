@@ -186,11 +186,36 @@ more), so none of them can abort the instance with an out-of-memory error.
   | 4 workbooks at once, before | 1 | 1 each | 2.59 / 2.51 s | +696 / +717 MiB |
   | 4 workbooks at once, after | 4 | 1 each | 2.53 / 2.46 s | +667 / +666 MiB |
 
-  The read (calamine) stays on one thread; only the tables step is lent threads. With numbers
-  only, one workbook took 0.76 s before and 0.60 s after.
+  In that measurement the read (calamine) stayed on one thread; only the tables step was lent
+  threads. With numbers only, one workbook took 0.76 s before and 0.60 s after.
 
   ```
   DOEWOOD_BENCH_TEXT=1 DOEWOOD_BENCH_FILES=1 cargo test -p doewood-ingest --test sheet -- --ignored --nocapture lent_threads_measure
+  ```
+- **The read is lent threads too, and the tables keep only their shapes** (issue #183,
+  hedgehog `1a9811f`).
+  - The read borrows the free slots the same way, for its own call, and passes them as
+    `ReadOptions::threads` (with no loan, `Some(1)`). Before, hedgehog read a large sheet or
+    shared string table on up to 4 threads whatever the load. The loan is given back before
+    the normalizer borrows its own.
+  - The normalizer runs with `shapes_only: true`. doewood reads only the tables' shapes (title,
+    column names, row count, confidence), never their values, so hedgehog drops each sheet's
+    values once its tables are done instead of holding those of every sheet.
+  - The records are unchanged: the spreadsheet records of `cargo test -p doewood-ingest` and of
+    the two workbooks below are the same byte for byte before and after (the step timings
+    aside).
+
+  `sheets_measure` in `tests/sheet.rs` (one generated XLSX through `Analyzer::analyze`, every
+  other column text, 4 CPU slots all free; 4 vCPU server, test profile; medians of 3 runs,
+  through `serial`; RSS is the peak above the start, the file itself is in the start):
+
+  | workbook | wall, before / after | peak RSS, before / after |
+  |---|---|---|
+  | 4 sheets x 250,016 cells (1.0M) | 4.48 / 4.11 s | +250 / +230 MiB (-8 %) |
+  | 12 sheets x 260,000 cells (3.1M) | 13.79 / 12.53 s | +492 / +404 MiB (-18 %) |
+
+  ```
+  DOEWOOD_BENCH_SHEETS=12 DOEWOOD_BENCH_ROWS=10000 cargo test -p doewood-ingest --test sheet -- --ignored --nocapture --exact sheets_measure
   ```
 - **quail's limits** stay its defaults: 256 MiB decompressed and 64 MiB of text per file, 40
   million pixels a rendered page, which already fit a worker. OCR has its own budget (quail's

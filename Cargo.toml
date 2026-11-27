@@ -70,5 +70,5 @@ hayro-jbig2 = { git = "https://github.com/05vukasin/quail", rev = "5557ef5" }
 lingua = { git = "https://github.com/05vukasin/quail", rev = "5557ef5" }
 # hedgehog: calamine 0.37 with the fixes for hostile files its fuzzer found, and its
 # rust_xlsxwriter.
-calamine = { git = "https://github.com/05vukasin/hedgehog", rev = "fac6eba" }
-rust_xlsxwriter = { git = "https://github.com/05vukasin/hedgehog", rev = "fac6eba" }
+calamine = { git = "https://github.com/05vukasin/hedgehog", rev = "1a9811f" }
+rust_xlsxwriter = { git = "https://github.com/05vukasin/hedgehog", rev = "1a9811f" }

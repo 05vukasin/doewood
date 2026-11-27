@@ -23,7 +23,7 @@ pub const READ_ID: AnalyzerId = AnalyzerId::new("sheet.read", 1);
 /// The step that finds the tables.
 pub const TABLES_ID: AnalyzerId = AnalyzerId::new("sheet.tables", 1);
 /// The hedgehog revision doewood is built with (a step version for reprocessing).
-pub const HEDGEHOG_REV: &str = "fac6eba";
+pub const HEDGEHOG_REV: &str = "1a9811f";
 
 /// Fact keys of the `sheet.*` namespace.
 pub mod keys {
@@ -118,7 +118,7 @@ pub fn analyze(bytes: &[u8], name: &str, format: &str, deadline: Option<Instant>
 /// [`analyze`] with another cell cap: a workbook of more than `max_cells` cells (or shared
 /// strings) fails like any other refused file, with its identity facts kept
 /// (`sheet.read@1: file refused: the workbook has more than ... cells (limit ...); ...`, which
-/// says how to raise the cap). The normalizer runs on one thread.
+/// says how to raise the cap). The reader and the normalizer run on one thread.
 pub fn analyze_with(
     bytes: &[u8],
     name: &str,
@@ -129,10 +129,10 @@ pub fn analyze_with(
     analyze_on(bytes, name, format, deadline, max_cells, None)
 }
 
-/// [`analyze_with`], with the normalizer borrowing the free slots of `cpus` (at most
-/// [`MAX_SHEET_THREADS`] threads in all) for the length of its call. The caller holds its own
-/// slot ([`CpuSlots::enter`]). The output does not depend on the threads (hedgehog's
-/// determinism guarantee).
+/// [`analyze_with`], with the reader and then the normalizer each borrowing the free slots of
+/// `cpus` (at most [`MAX_SHEET_THREADS`] threads in all) for the length of its call. The caller
+/// holds its own slot ([`CpuSlots::enter`]). The output does not depend on the threads
+/// (hedgehog's determinism guarantee).
 pub fn analyze_on(
     bytes: &[u8],
     name: &str,
@@ -142,6 +142,8 @@ pub fn analyze_on(
     cpus: Option<&Arc<CpuSlots>>,
 ) -> SheetOutcome {
     let mut out = SheetOutcome::default();
+    // The read borrows the free slots too, for its call only (one thread without a loan).
+    let lent = cpus.map(|c| c.lend(MAX_SHEET_THREADS - 1));
     // Decompressed bytes keep hedgehog's limit (2 GiB): parts are read in chunks, not held.
     let options = ReadOptions {
         limits: hh_core::reader::Limits {
@@ -150,9 +152,11 @@ pub fn analyze_on(
             max_shared_strings: max_cells,
             ..hh_core::reader::Limits::default()
         },
+        threads: Some(lent.as_ref().map_or(1, crate::cpus::Lent::threads)),
         ..ReadOptions::default()
     };
     let read = guarded(|| hh_core::reader::open_bytes_with(bytes, Some(name), options));
+    drop(lent);
     let wb = match read {
         Ok(Ok(wb)) => wb,
         Ok(Err(e)) => {
@@ -226,9 +230,12 @@ fn tables(
     let lent = cpus.map(|c| c.lend(MAX_SHEET_THREADS - 1));
     let threads = lent.as_ref().map_or(1, crate::cpus::Lent::threads);
     out.threads = threads;
+    // Only the tables' shapes are read below, never their values: hedgehog drops each sheet's
+    // values once its tables are done, so the values of all sheets are never held at once.
     let opts = NormalizeOptions {
         deadline,
         threads: Some(threads),
+        shapes_only: true,
         ..NormalizeOptions::default()
     };
     let norm = guarded(|| hh_core::try_normalize_workbook(wb, &opts));
