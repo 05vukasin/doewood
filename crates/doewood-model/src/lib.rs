@@ -2,7 +2,7 @@
 //! records, the typed graph, source claims, company leases, search, the enrichment job's
 //! registry and favicon caches and company freshness, the merge log and dismissals (ADR 0002
 //! section 1.8), the enrichment proposals (issue #52), the explorer's bounded graph reads
-//! (issue #172), and the store traits that both backends implement.
+//! (issue #172), documents' text with block locations (issue #166), and the store traits that both backends implement.
 //!
 //! - **Shared mode:** `doewood-pg`, one Postgres database for every instance.
 //! - **Standalone mode:** `doewood-store`, the instance's own SQLite file.
@@ -20,6 +20,7 @@ pub mod merge;
 pub mod proposal;
 mod props;
 pub mod similar;
+pub mod text;
 mod traits;
 mod types;
 
@@ -52,6 +53,10 @@ pub use props::{PATCH_MAX_DEPTH, PATCH_MAX_OPS, PropOp, PropsPatch};
 pub use similar::{
     KeyMatch, SIMILAR_MAX_KEYS, SimilarEdge, SimilarKey, SimilarKeyKind, SimilarKeys,
     SimilarRelation, validate_keys,
+};
+pub use text::{
+    BlockKind, DocumentText, StoredText, TEXT_MAX_BYTES, TextBlock, TextBuilder, TextOrigin,
+    TextPage, TextZone,
 };
 pub use traits::{
     Backend, CacheStore, ClaimStore, FeedStore, FreshnessStore, GraphStore, MergeStore,

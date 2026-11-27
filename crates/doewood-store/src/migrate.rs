@@ -79,9 +79,14 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("migrations/0015_company_documents_total.sql"),
         fk_check: FkCheck::Tables(&["company_graph_totals"]),
     },
+    // A new empty table (issue #166).
+    Migration {
+        sql: include_str!("migrations/0016_document_texts.sql"),
+        fk_check: FkCheck::Skip,
+    },
     // A new empty table (issue #169).
     Migration {
-        sql: include_str!("migrations/0016_similar_keys.sql"),
+        sql: include_str!("migrations/0017_similar_keys.sql"),
         fk_check: FkCheck::Skip,
     },
 ];

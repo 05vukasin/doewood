@@ -36,7 +36,7 @@ impl SheetFormat {
 /// Where a file goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Route {
-    /// quail: PDF, DOCX, text (CSV included), images, and everything it only identifies.
+    /// quail: PDF, DOCX, PPTX, HTML, text (CSV included), images, and everything it only identifies.
     Quail(Format),
     /// hedgehog, after quail's identity layer.
     Sheet(SheetFormat),

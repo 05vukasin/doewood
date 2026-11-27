@@ -18,7 +18,7 @@ use doewood_model::{
     NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PartyDocument,
     PropsPatch, PutOutcome, Record, RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit,
     SearchQuery, SearchStore, SimilarKey, SimilarKeys, Sketch, SketchStore, SourceClaim, SourceKey,
-    StepVersions, StoredEdge, band_to_i64, merged_into, records_limit, sketch_limit,
+    StepVersions, StoredEdge, StoredText, band_to_i64, merged_into, records_limit, sketch_limit,
     validate_alias, validate_batch_count, validate_hashes, validate_keys, validate_node,
     validate_sketch, versions_from_json, versions_to_json,
 };
@@ -667,6 +667,56 @@ impl RecordStore for Standalone {
                     .collect()
             },
         )
+        .await
+    }
+
+    async fn put_document_text(&self, blake3: &Blake3, body: &RawValue) -> Result<()> {
+        let (h, body) = (*blake3, body.get().to_owned());
+        self.run(move |conn| {
+            // Unchanged text is not written again (`updated_at` stays). A missing record is a
+            // foreign key error: `NotFound`.
+            conn.prepare_cached(
+                "INSERT INTO document_texts (blake3, body, updated_at) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT (blake3) DO UPDATE SET body = excluded.body, \
+                 updated_at = excluded.updated_at WHERE document_texts.body <> excluded.body",
+            )
+            .and_then(|mut cached| cached.execute(params![h.as_bytes().as_slice(), body, now()]))
+            .map_err(sql)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn delete_document_text(&self, blake3: &Blake3) -> Result<()> {
+        let h = *blake3;
+        self.run(move |conn| {
+            conn.prepare_cached("DELETE FROM document_texts WHERE blake3 = ?1")
+                .and_then(|mut cached| cached.execute([h.as_bytes().as_slice()]))
+                .map_err(sql)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_document_text(&self, blake3: &Blake3) -> Result<Option<StoredText>> {
+        let h = *blake3;
+        self.read(move |conn| {
+            let row: Option<(String, i64)> = conn
+                .prepare_cached("SELECT body, updated_at FROM document_texts WHERE blake3 = ?1")
+                .and_then(|mut cached| {
+                    cached.query_row([h.as_bytes().as_slice()], |r| Ok((r.get(0)?, r.get(1)?)))
+                })
+                .optional()
+                .map_err(sql)?;
+            row.map(|(body, updated_at)| {
+                Ok(StoredText {
+                    blake3: h,
+                    body: raw_json(body)?,
+                    updated_at,
+                })
+            })
+            .transpose()
+        })
         .await
     }
 }

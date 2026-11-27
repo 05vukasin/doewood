@@ -146,19 +146,24 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
   5 minutes, then they retry with backoff) and find the schema migrated. The version is in
   the `doewood_schema` table. A database migrated by a newer doewood is
   refused (not ready) until this one is upgraded.
-- **Schema 14** (issue #169: the new empty table `similar_keys`, the exact-match keys of the
+- **Schema 15** (issue #169: the new empty table `similar_keys`, the exact-match keys of the
   typed similarity relations, with its index; no existing row changes, so it migrates at once
   on any size of database) is the current version. Documents ingested before it get keys when
   they are ingested again (`ReprocessJob` with `force`); their `similar_to` edges keep working
   as they are (see [ingest.md](ingest.md#similar-documents-by-relation)). As with every
-  schema, **all instances are upgraded together**: an older binary refuses schema 14. **Down
+  schema, **all instances are upgraded together**: an older binary refuses schema 15. **Down
   path** (every instance stopped): `DROP TABLE similar_keys; DELETE FROM doewood_schema WHERE
-  version = 14;`. The instance's own SQLite file goes to schema 16 with the same table.
-  Schemas 12 and 13 (issues #172 and #181, the explorer's counts) came before it.
+  version = 15;`. The instance's own SQLite file goes to schema 17 with the same table.
 - **Schema 11** (issue #141: the triggers behind `sketch_band_sizes` keep a row only for a
   band bucket of two or more documents, which cut the WAL of ingest by 12 to 29%; new
   functions only, no table or data changed, migrates in seconds, see
-  [deploy.md](deploy.md#postgres-wal-on-a-big-corpus-issue-141)) was before those.
+  [deploy.md](deploy.md#postgres-wal-on-a-big-corpus-issue-141)) came before schemas 12 and
+  13 (the company graph, issues #172 and #181).
+- **Schema 14** (issue #166: a new, empty table `document_texts` for the documents' text,
+  lz4 like `records.body`; see [api.md](api.md#document-text)) came before schema 15. Nothing
+  else changes. **Down path:** `DROP TABLE document_texts; DELETE FROM doewood_schema WHERE
+  version = 14;`. The instance's own SQLite file went to schema 16 with the same table. As
+  with every schema, **all instances are upgraded together**.
 - **Schema 10** (issue #112: `edges_by_dst` is rebuilt as `(dst, kind, coalesce(valid_from,
   '-infinity'), id)`, the order `Neighbours` and `CompanyDocuments` page in; see
   [api.md](api.md#pages-of-neighbours-and-companydocuments)) was the one before. The
@@ -242,7 +247,7 @@ foreign keys it could break, as the runner declares per migration (issue #159): 
 for one that rebuilds a table, deletes rows or moves data (schemas 1 to 10); only the tables
 it fills for one that writes into new tables (schemas 11, 14 and 15); none for one that writes
 no rows and rebuilds nothing (schema 12, an index; schema 13, a column with a default and a new
-table; schema 16, a new empty table, issue #169). A violation rolls the migration back and the instance does not start.
+table; schemas 16 and 17, a new table each, issues #166 and #169). A violation rolls the migration back and the instance does not start.
 A test holds each migration to its declaration.
 
 `doewood.sqlite` runs in WAL mode with `synchronous = NORMAL`, and a `journal_size_limit` of

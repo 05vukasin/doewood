@@ -1,4 +1,4 @@
--- doewood shared store, schema 14: the exact-match keys of typed similarity (issue #169).
+-- doewood shared store, schema 15: the exact-match keys of typed similarity (issue #169).
 -- One new empty table; no existing rows change. Older instances refuse this schema, so every
 -- instance is upgraded together.
 --
