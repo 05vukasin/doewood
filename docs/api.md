@@ -333,6 +333,17 @@ bounded by the message limit (`DOEWOOD_API_MAX_MESSAGE_MIB`, default 64 MiB), an
 source's `max_object_bytes`; a file larger than ingest analyzes (512 MiB) is
 `FAILED_PRECONDITION`.
 
+A local file, sent as `content`. It needs only a configured provider: no source and no LLM
+policy. `bytes` fields are base64 in grpcurl's JSON, and `-d @` reads the request from stdin:
+
+```sh
+jq -n --arg name report.pdf --rawfile b <(base64 -w0 report.pdf) '{name:$name, content:$b}' \
+  | grpcurl -plaintext -d @ 127.0.0.1:7443 doewood.v1.SummarizeService/Summarize
+```
+
+`"provider": "<name>"` in the request picks a provider other than the default. On macOS,
+`base64 -w0` is `base64 -i report.pdf`.
+
 ## Errors
 
 | code | when |
@@ -497,7 +508,7 @@ An AI provider (the key is read from a variable, and never comes back):
 
 ```sh
 grpcurl -plaintext -d @ 127.0.0.1:7443 doewood.v1.ConfigService/SetAiProvider <<EOF
-{"preset": "anthropic", "model": "claude-sonnet-4-5", "api_key": "$ANTHROPIC_API_KEY"}
+{"preset": "anthropic", "model": "claude-haiku-5-5", "api_key": "$ANTHROPIC_API_KEY"}
 EOF
 grpcurl -plaintext -d @ 127.0.0.1:7443 doewood.v1.ConfigService/SetAiProvider <<'EOF'
 {"name": "local", "preset": "openai_compatible", "model": "qwen2.5-7b-instruct",
