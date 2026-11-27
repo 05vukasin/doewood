@@ -98,7 +98,7 @@ are not, because the API cannot set them:
 The two per-call limits of the API (calls in flight, the server deadline) are runtime
 settings, above. The connection limits are neither settings nor variables but fixed values,
 because hyper and the listener take them once, when the server starts, before the API could
-set anything, and a new bootstrap variable would extend ADR 0001's table (issue #21):
+set anything, and nothing about a deployment calls for changing them:
 
 | limit | value |
 |---|---|
