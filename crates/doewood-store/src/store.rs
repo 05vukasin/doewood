@@ -748,6 +748,7 @@ mod tests {
                 "company_proposals",
                 "company_registry_due",
                 "company_stats",
+                "document_facts",
                 "document_texts",
                 "edges",
                 "favicons",

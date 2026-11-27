@@ -146,14 +146,31 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
   5 minutes, then they retry with backoff) and find the schema migrated. The version is in
   the `doewood_schema` table. A database migrated by a newer doewood is
   refused (not ready) until this one is upgraded.
+- **Schema 18** (issue #194: the new empty table `document_facts`, one row per document with
+  key facts, with three indexes; and search's key facts: the new column `search_index.facts`
+  and the full-text vector `tsv` dropped and added again with it, weight A beside the
+  title's) is the current version. The vector is a generated column, so the migration
+  rewrites `search_index` and rebuilds its GIN index once, inside the migration's
+  transaction: SCHEMA18_TIME. Documents get their key facts when they are analyzed again: the
+  new quail steps `contract.facts` and `card.facts` change the analyzer plan, so every stored
+  record is (see [ingest.md](ingest.md#key-facts)). As with every schema, **all instances are
+  upgraded together**: an older binary refuses schema 18. **Down path** (every instance
+  stopped): `DROP TABLE document_facts; ALTER TABLE search_index DROP COLUMN facts CASCADE;
+  ALTER TABLE search_index ADD COLUMN tsv tsvector GENERATED ALWAYS AS
+  (setweight(to_tsvector('simple', title), 'A') || setweight(to_tsvector('simple', body),
+  'B')) STORED; CREATE INDEX search_tsv ON search_index USING gin (tsv) WITH
+  (gin_pending_list_limit = 256); DELETE FROM doewood_schema WHERE version = 18;`. The
+  instance's own SQLite file goes to schema 20 with the same table, the column, and the FTS5
+  index `search_fts` created again with a third column `facts` and rebuilt from
+  `search_index` (SQLITE20_TIME).
 - **Schema 17** (issue #193: the new empty table `payments`, one row per document with
   payment facts, with an index by category; no existing row changes, so it migrates at once
-  on any size of database) is the current version. Documents get their row when they are
+  on any size of database) came before it. Documents get their row when they are
   analyzed again: the new quail step `payment.extract` changes the analyzer plan, so every
   stored record is (see [ingest.md](ingest.md#payments)). As with every schema, **all
   instances are upgraded together**: an older binary refuses schema 17. **Down path** (every
   instance stopped): `DROP TABLE payments; DELETE FROM doewood_schema WHERE version = 17;`.
-  The instance's own SQLite file goes to schema 19 with the same table.
+  The instance's own SQLite file went to schema 19 with the same table.
 - **Schema 16** (issue #169: the new empty table `similar_keys`, the exact-match keys of the
   typed similarity relations, with its index; no existing row changes, so it migrates at once
   on any size of database) came before it. Documents ingested before it get keys when

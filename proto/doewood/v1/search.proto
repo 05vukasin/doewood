@@ -10,8 +10,10 @@ service SearchService {
 }
 
 message SearchRequest {
-  // Words to match in the title or body: documents containing every word. Empty matches
-  // every document. Only plain words are portable across backends.
+  // Words to match in the title, the body or the key facts (the key-facts card's text and
+  // the passages its fields were read from, weighted above the body, issue #194): documents
+  // containing every word. Empty matches every document. Only plain words are portable
+  // across backends.
   string text = 1;
   // Only documents with a live `party` edge to this company node (a UUID).
   string company_id = 2;

@@ -323,6 +323,7 @@ async fn seed(a: &Instance, backend: &Arc<dyn Backend>, docs: usize) -> Seeded {
                         blake3: hash(i),
                         title,
                         body: words.join(" "),
+                        facts: String::new(),
                         kind: Some("invoice".into()),
                         date: None,
                         amount: Some(100.0),

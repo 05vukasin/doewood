@@ -32,7 +32,7 @@ const PUT: &str = "INSERT INTO payments (blake3, subject, category, category_lab
 
 /// The live `party` edge of document `d` marked `side`: the most confident, then the
 /// smallest company id.
-fn side(side: &str) -> String {
+pub(super) fn side(side: &str) -> String {
     format!(
         "(SELECT e.dst FROM edges e WHERE e.src = d.id AND e.kind = 'party' \
          AND e.state NOT IN ('retracted', 'superseded') \
@@ -44,7 +44,7 @@ fn side(side: &str) -> String {
 /// The payments (`t`: the table or subquery) whose document has a live `party` edge to the
 /// company `?` marked `side` (a candidate set from `edges_by_dst`; unhex gives NULL for `ref:`
 /// placeholders).
-fn by_company(t: &str, side: &str) -> String {
+pub(super) fn by_company(t: &str, side: &str) -> String {
     format!(
         "{t}.blake3 IN (SELECT unhex(g.key) FROM edges f JOIN nodes g ON g.id = f.src \
          WHERE f.dst = ? AND f.kind = 'party' AND g.kind = 'document' \
@@ -59,11 +59,11 @@ const FROM: &str = "FROM payments p \
 const COLUMNS: &str = "p.blake3, p.subject, p.category, p.category_label, p.amount, p.basis, \
      p.currency, p.period, p.day, p.supplier_name, p.buyer_name, p.conf, p.detail";
 
-fn day_text(d: Date) -> String {
+pub(super) fn day_text(d: Date) -> String {
     format!("{:04}-{:02}-{:02}", d.year(), u8::from(d.month()), d.day())
 }
 
-fn day_from(text: Option<String>) -> Result<Option<Date>> {
+pub(super) fn day_from(text: Option<String>) -> Result<Option<Date>> {
     let Some(t) = text else { return Ok(None) };
     let bad = || backend(format!("stored payment day {t:?} is invalid"));
     let mut parts = t.splitn(3, '-');

@@ -16,12 +16,13 @@ use uuid::Uuid;
 use crate::{
     Blake3, CacheRow, Candidates, CompanyCursor, CompanyFilter, CompanyLink, CompanyOrder,
     CompanyRow, DismissRequest, Dismissal, DismissalQuery, DueCompany, Edge, EdgeCursor,
-    Enrichment, FeedState, Folded, IconRow, LiveEdge, Located, LocationEnded, MergeEntry,
-    MergeQuery, MergeRequest, Neighbour, NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation,
-    OwnedAlias, PartyDocument, Payment, PaymentFilter, PaymentRow, Proposal, ProposalQuery,
-    ProposalRequest, PropsPatch, Purged, PutOutcome, Record, ResolveRequest, Result, SearchDoc,
-    SearchHit, SearchQuery, SimilarKey, SimilarKeys, Sketch, SourceClaim, SourceKey, Spend,
-    SpendGroup, SplitRequest, StepVersions, StoredText, UndoOutcome, UndoRequest,
+    Enrichment, FactFilter, FactRow, FeedState, Folded, FoundDocument, IconRow, LiveEdge, Located,
+    LocationEnded, MergeEntry, MergeQuery, MergeRequest, Neighbour, NeighbourQuery, Node,
+    NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PartyDocument, Payment, PaymentFilter,
+    PaymentRow, Proposal, ProposalQuery, ProposalRequest, PropsPatch, Purged, PutOutcome, Record,
+    ResolveRequest, Result, SearchDoc, SearchHit, SearchQuery, SimilarKey, SimilarKeys, Sketch,
+    SourceClaim, SourceKey, Spend, SpendGroup, SplitRequest, StepVersions, StoredText, UndoOutcome,
+    UndoRequest,
 };
 
 /// quail and hedgehog records, keyed by BLAKE3.
@@ -691,6 +692,38 @@ pub trait PaymentStore: Send + Sync {
     ) -> Result<Spend>;
 }
 
+/// Key facts (issue #194, see [`crate::keyfacts`]): one row per record in the
+/// `document_facts` index table (the card, the highlights, the searchable fields), and the
+/// search over it. A row goes with its record.
+#[async_trait]
+pub trait FactStore: Send + Sync {
+    /// Inserts or replaces the key-facts row of its record (`row.columns.blake3`); writing the
+    /// same row again changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::NotFound`] when no record `row.columns.blake3` is stored;
+    /// [`crate::Error::Invalid`] when [`FactRow::validate`] fails.
+    async fn put_document_facts(&self, row: &FactRow) -> Result<()>;
+
+    /// Removes the key-facts row of `blake3`, if any (a record re-analyzed into none).
+    async fn delete_document_facts(&self, blake3: &Blake3) -> Result<()>;
+
+    /// The key-facts row of `blake3`, if any.
+    async fn get_document_facts(&self, blake3: &Blake3) -> Result<Option<FactRow>>;
+
+    /// One page of the documents whose facts match `filter`, ordered by hash, after `after`:
+    /// at most `limit` ([`crate::facts_limit`]). Each carries the companies its document's
+    /// live `party` edges mark as supplier and buyer ([`crate::SIDE_PROP`]; the most
+    /// confident edge, then the smallest company id, when there are several).
+    async fn find_documents(
+        &self,
+        filter: &FactFilter,
+        after: Option<&Blake3>,
+        limit: u32,
+    ) -> Result<Vec<FoundDocument>>;
+}
+
 /// A complete backend: everything the service needs from its store.
 #[async_trait]
 pub trait Backend:
@@ -706,6 +739,7 @@ pub trait Backend:
     + ProposalStore
     + PurgeStore
     + PaymentStore
+    + FactStore
 {
     /// `postgres` or `sqlite`.
     fn name(&self) -> &'static str;

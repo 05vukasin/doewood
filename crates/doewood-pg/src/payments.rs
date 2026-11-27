@@ -33,7 +33,7 @@ const PUT: &str = "INSERT INTO payments (blake3, subject, category, category_lab
 
 /// The live `party` edge of document `d` marked `side`: the most confident, then the
 /// smallest company id.
-fn side(side: &str) -> String {
+pub(crate) fn side(side: &str) -> String {
     format!(
         "(SELECT e.dst FROM edges e WHERE e.src = d.id AND e.kind = 'party' \
          AND e.state NOT IN ('retracted', 'superseded') AND e.props->>'side' = '{side}' \
@@ -43,7 +43,7 @@ fn side(side: &str) -> String {
 
 /// The payments whose document has a live `party` edge to `company` marked `side` (a
 /// candidate set from `edges_by_dst`; the chosen edge is checked after).
-fn by_company(side: &str, company: &str) -> String {
+pub(crate) fn by_company(side: &str, company: &str) -> String {
     format!(
         "p.blake3 IN (SELECT CASE WHEN g.key ~ '^[0-9a-f]{{64}}$' THEN decode(g.key, 'hex') END \
          FROM edges f JOIN nodes g ON g.id = f.src WHERE f.dst = {company} AND f.kind = 'party' \

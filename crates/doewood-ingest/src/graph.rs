@@ -375,6 +375,11 @@ impl GraphWriter {
             blake3: *blake3,
             title,
             body: facts.body.clone(),
+            facts: facts
+                .key_facts
+                .as_ref()
+                .map(|k| k.search_text.clone())
+                .unwrap_or_default(),
             kind: facts.kind.clone(),
             date: facts.date,
             amount: facts.amount,
@@ -385,10 +390,11 @@ impl GraphWriter {
         // similar documents. Each step keeps its own order. All of them finish before the
         // first error, in this order, is returned.
         let (mut stats, mut refs, mut similar) = Default::default();
-        let (props, indexed, paid, refs_done, parties, similar_done) = tokio::join!(
+        let (props, indexed, paid, carded, refs_done, parties, similar_done) = tokio::join!(
             b.update_props(doc, &patch),
             b.index_document(&search),
             self.payment(blake3, facts),
+            self.key_facts(blake3, facts),
             async {
                 self.numbers(doc, &hex, facts, &mut refs).await?;
                 self.cites(doc, &hex, facts, &mut refs).await
@@ -399,6 +405,7 @@ impl GraphWriter {
         props?;
         indexed?;
         paid?;
+        carded?;
         refs_done?;
         parties?;
         similar_done?;
@@ -429,6 +436,16 @@ impl GraphWriter {
             buyer.map(|i| &facts.parties[i]),
         )?;
         self.backend.put_payment(&row).await
+    }
+
+    /// The document's key-facts row (issue #194), rebuilt from its facts. A document without
+    /// card or highlight facts costs nothing here: ingest removes the row of a record that
+    /// changed before it writes the graph (`pipeline::put_text`), so none is left over.
+    async fn key_facts(&self, blake3: &Blake3, facts: &DocFacts) -> Result<()> {
+        let Some(k) = &facts.key_facts else {
+            return Ok(());
+        };
+        self.backend.put_document_facts(&k.row(*blake3)?).await
     }
 
     /// The document's own numbers become its aliases; pending references to them move here.

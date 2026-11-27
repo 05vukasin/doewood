@@ -9,15 +9,15 @@ use deadpool_postgres::{GenericClient, Object, Pool, PoolError};
 use doewood_core::InstanceId;
 use doewood_model::{
     Backend, Blake3, Candidates, ClaimStore, Edge, EdgeCursor, EdgeKind, EdgeSource, Error,
-    GraphStore, KeyMatch, LiveEdge, Located, LocationEnded, MERGE_CHAIN_MAX, Neighbour,
-    NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PartyDocument, Payment,
-    PaymentFilter, PaymentRow, PaymentStore, PropsPatch, PurgeStore, Purged, PutOutcome, Record,
-    RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore,
-    SimilarKey, SimilarKeyKind, SimilarKeys, Sketch, SketchStore, SourceClaim, SourceKey, Spend,
-    SpendGroup, StepVersions, StoredEdge, StoredText, band_to_i64, merged_into, record_page_bytes,
-    records_limit, sketch_limit, validate_alias, validate_alias_count, validate_batch_count,
-    validate_hashes, validate_keys, validate_node, validate_sketch, versions_from_json,
-    versions_to_json,
+    FactFilter, FactRow, FactStore, FoundDocument, GraphStore, KeyMatch, LiveEdge, Located,
+    LocationEnded, MERGE_CHAIN_MAX, Neighbour, NeighbourQuery, Node, NodeAlias, NodeKind,
+    ObjectLocation, OwnedAlias, PartyDocument, Payment, PaymentFilter, PaymentRow, PaymentStore,
+    PropsPatch, PurgeStore, Purged, PutOutcome, Record, RecordStore, Result, SKETCH_MAX_BANDS,
+    SearchDoc, SearchHit, SearchQuery, SearchStore, SimilarKey, SimilarKeyKind, SimilarKeys,
+    Sketch, SketchStore, SourceClaim, SourceKey, Spend, SpendGroup, StepVersions, StoredEdge,
+    StoredText, band_to_i64, merged_into, record_page_bytes, records_limit, sketch_limit,
+    validate_alias, validate_alias_count, validate_batch_count, validate_hashes, validate_keys,
+    validate_node, validate_sketch, versions_from_json, versions_to_json,
 };
 use futures_util::future::try_join_all;
 use serde_json::Value;
@@ -1701,18 +1701,20 @@ impl SearchStore for PgStore {
     async fn index_document(&self, doc: &SearchDoc) -> Result<()> {
         let c = client(&self.pool).await?;
         c.exec(
-            "INSERT INTO search_index (blake3, title, body, kind, doc_date, amount) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
+            "INSERT INTO search_index (blake3, title, body, facts, kind, doc_date, amount) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
              ON CONFLICT (blake3) DO UPDATE SET title = EXCLUDED.title, body = EXCLUDED.body, \
-             kind = EXCLUDED.kind, doc_date = EXCLUDED.doc_date, amount = EXCLUDED.amount, \
-             indexed_at = now() \
-             WHERE (search_index.title, search_index.body, search_index.kind, \
-             search_index.doc_date, search_index.amount) IS DISTINCT FROM \
-             (EXCLUDED.title, EXCLUDED.body, EXCLUDED.kind, EXCLUDED.doc_date, EXCLUDED.amount)",
+             facts = EXCLUDED.facts, kind = EXCLUDED.kind, doc_date = EXCLUDED.doc_date, \
+             amount = EXCLUDED.amount, indexed_at = now() \
+             WHERE (search_index.title, search_index.body, search_index.facts, \
+             search_index.kind, search_index.doc_date, search_index.amount) IS DISTINCT FROM \
+             (EXCLUDED.title, EXCLUDED.body, EXCLUDED.facts, EXCLUDED.kind, EXCLUDED.doc_date, \
+             EXCLUDED.amount)",
             &[
                 &doc.blake3.as_bytes().as_slice(),
                 &doc.title,
                 &doc.body,
+                &doc.facts,
                 &doc.kind,
                 &doc.date,
                 &doc.amount,
@@ -1850,6 +1852,30 @@ impl PaymentStore for PgStore {
 
     async fn supplier_spend(&self, supplier: Option<Uuid>, group: SpendGroup) -> Result<Spend> {
         crate::payments::spend(&self.pool, supplier, group).await
+    }
+}
+
+#[async_trait]
+impl FactStore for PgStore {
+    async fn put_document_facts(&self, row: &FactRow) -> Result<()> {
+        crate::keyfacts::put(&self.pool, row).await
+    }
+
+    async fn delete_document_facts(&self, blake3: &Blake3) -> Result<()> {
+        crate::keyfacts::delete(&self.pool, blake3).await
+    }
+
+    async fn get_document_facts(&self, blake3: &Blake3) -> Result<Option<FactRow>> {
+        crate::keyfacts::get(&self.pool, blake3).await
+    }
+
+    async fn find_documents(
+        &self,
+        filter: &FactFilter,
+        after: Option<&Blake3>,
+        limit: u32,
+    ) -> Result<Vec<FoundDocument>> {
+        crate::keyfacts::find(&self.pool, filter, after, limit).await
     }
 }
 

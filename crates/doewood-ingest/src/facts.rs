@@ -12,6 +12,7 @@ use time::{Date, Month};
 use doewood_model::{SIMILAR_MAX_KEYS, SimilarKey, SimilarKeyKind, SimilarKeys};
 
 use crate::company::{IdKind, Identifier};
+use crate::keyfacts::KeyFacts;
 use crate::payment::PaymentFacts;
 
 /// Most bytes of a party mention's span apart from an identifier for it to belong to that
@@ -170,6 +171,8 @@ const KEYS: &[&str] = &[
 fn wanted(key: &str) -> bool {
     KEYS.contains(&key)
         || crate::payment::PAYMENT_KEYS.contains(&key)
+        || key.starts_with("card.")
+        || key.ends_with(".highlight")
         || IdKind::from_fact_key(key).is_some()
 }
 
@@ -265,6 +268,8 @@ pub struct DocFacts {
     pub similarity: SimilarityFacts,
     /// What is paid for and how much (issue #193).
     pub payment: Option<PaymentFacts>,
+    /// The key-facts card and every highlight (issue #194).
+    pub key_facts: Option<KeyFacts>,
 }
 
 /// The facts behind the typed similarity relations other than the `MinHash` ones (issue
@@ -482,6 +487,7 @@ impl DocFacts {
         }
         d.similarity = similarity(&best, &all);
         d.payment = PaymentFacts::read(r.facts.iter().map(|f| (f.key.as_str(), &f.value, f.conf)));
+        d.key_facts = KeyFacts::read(r.facts.iter().map(|f| (f.key.as_str(), &f.value, f.conf)));
         d
     }
 }

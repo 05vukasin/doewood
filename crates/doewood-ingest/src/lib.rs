@@ -21,6 +21,7 @@ pub mod cpus;
 pub mod enrichment;
 pub mod facts;
 pub mod graph;
+pub mod keyfacts;
 pub mod llm;
 pub mod payment;
 pub mod pipeline;

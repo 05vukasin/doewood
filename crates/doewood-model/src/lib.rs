@@ -3,7 +3,8 @@
 //! registry and favicon caches and company freshness, the merge log and dismissals (ADR 0002
 //! section 1.8), the enrichment proposals (issue #52), the explorer's bounded graph reads
 //! (issue #172), documents' text with block locations (issue #166), payments per document and
-//! spend per supplier (issue #193), and the store traits that both backends implement.
+//! spend per supplier (issue #193), key-facts cards, highlights and the fact index (issue
+//! #194), and the store traits that both backends implement.
 //!
 //! - **Shared mode:** `doewood-pg`, one Postgres database for every instance.
 //! - **Standalone mode:** `doewood-store`, the instance's own SQLite file.
@@ -17,6 +18,7 @@ mod enrichment;
 mod error;
 pub mod explore;
 mod feed;
+pub mod keyfacts;
 pub mod merge;
 pub mod payment;
 pub mod proposal;
@@ -41,6 +43,12 @@ pub use explore::{
 pub use feed::{
     FEED_BATCH_MAX, FEED_CURSOR_MAX_LEN, FEED_NAME_MAX_LEN, FeedState, validate_batch,
     validate_cursor, validate_feed,
+};
+pub use keyfacts::{
+    BlockHighlight, CARD_MAX_BYTES, Card, CardAdvance, CardDuration, CardEvidence, CardHighlight,
+    CardLiabilityCap, CardParty, CardPenalty, CardSla, FACT_HIGHLIGHTS_MAX, FACTS_MAX_LIMIT,
+    FactColumns, FactFilter, FactRow, FoundDocument, facts_limit, fold, format_day, parse_day,
+    parse_units,
 };
 pub use merge::{
     DismissRequest, Dismissal, DismissalQuery, EVIDENCE_MAX_BYTES, MERGE_CHAIN_MAX,
@@ -69,7 +77,7 @@ pub use text::{
     TextPage, TextZone,
 };
 pub use traits::{
-    Backend, CacheStore, ClaimStore, FeedStore, FreshnessStore, GraphStore, MergeStore,
+    Backend, CacheStore, ClaimStore, FactStore, FeedStore, FreshnessStore, GraphStore, MergeStore,
     PaymentStore, ProposalStore, PurgeStore, RecordStore, SearchStore, SketchStore, sketch_limit,
 };
 pub use types::{
