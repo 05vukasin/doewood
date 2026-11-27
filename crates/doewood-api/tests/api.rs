@@ -2203,7 +2203,7 @@ async fn key_facts_card_text_and_find() {
         // Find: filters, pages, the supplier through its edge.
         let find = |req: pb::FindDocumentsRequest| {
             let mut r = records.clone();
-            async move { r.find_documents(req).await.map(|r| r.into_inner()) }
+            async move { r.find_documents(req).await.map(tonic::Response::into_inner) }
         };
         let blake3s = |r: &pb::FindDocumentsResponse| {
             r.documents

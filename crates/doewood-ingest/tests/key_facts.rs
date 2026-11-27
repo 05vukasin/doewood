@@ -312,7 +312,7 @@ const LETTER: &str = "DOPIS\n\nPoštovani, pitali ste koliki je otkazni rok i da
                       ćemo razmotriti na sledećem sastanku.\n";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
 async fn key_facts_through_ingest() {
     for kind in ["sqlite", "postgres"] {
         let store = Arc::new(Store::open_in_memory(&MasterKey::from_bytes([5; 32])).unwrap());

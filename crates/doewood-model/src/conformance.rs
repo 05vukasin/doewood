@@ -59,8 +59,9 @@ pub async fn run<B: Backend + ?Sized>(a: &B, b: &B) {
     live_writes(a, b).await;
     explorer(a).await;
     payments(a).await;
-    document_facts(a).await;
-    fact_ranking(a).await;
+    // Boxed: the suite's future is large (many filters held across awaits).
+    Box::pin(document_facts(a)).await;
+    Box::pin(fact_ranking(a)).await;
     purge_overlaps(a, b).await;
     purge_races(a, b).await;
     // Last: it purges every orphan the cases before left.

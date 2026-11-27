@@ -419,6 +419,17 @@ async fn fact_search_timings() {
             }
         }
     };
+    // The words alone straight on a reader, as schema 19 was timed above.
+    let direct = |label: &str| {
+        let conn = store.reader();
+        for (name, w) in words {
+            let (p50, p99) = timings(&queries(w, false), |q| {
+                super::text_search(&conn, &q.words(), q).unwrap();
+            });
+            println!("facts: {label}, {name}, on a reader: p50 {p50:.2} ms, p99 {p99:.2} ms");
+        }
+    };
+    direct("schema 20, no facts");
     run("schema 20, no facts").await;
     let t = Instant::now();
     let changed = store.conn().execute(SEED_FACTS, []).unwrap();
@@ -426,6 +437,7 @@ async fn fact_search_timings() {
         "facts: {changed} documents got facts in {:.2} s",
         t.elapsed().as_secs_f64()
     );
+    direct("schema 20, facts on every 2nd");
     run("schema 20, facts on every 2nd").await;
 }
 

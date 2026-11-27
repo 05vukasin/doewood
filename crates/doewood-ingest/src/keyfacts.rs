@@ -143,10 +143,9 @@ impl KeyFacts {
                     }
                 }
                 // Search weights the passages the card's fields were read from: a fact that did
-                // not make the card (a cue in a letter that only talks about a clause) stays
-                // in the body's weight.
-                // The parties, numbers and accounts are in the card's text already, and their
-                // passages are long: a long column ranks lower (BM25 normalises by length).
+                // not make the card (a cue in a letter that only talks about a clause) keeps
+                // the body's weight. The parties, numbers and accounts are in the card's text
+                // already, and their passages are long (BM25 ranks a long column lower).
                 if k.strip_prefix("card.")
                     .is_some_and(|f| !NOT_QUOTED.contains(&f))
                     && !quote.trim().is_empty()

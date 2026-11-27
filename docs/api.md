@@ -1546,7 +1546,43 @@ page. See [deploy.md](deploy.md#search-on-a-big-corpus-issue-140) for the measur
 
 ## Search ranking of key facts
 
-MEASUREMENT_PLACEHOLDER
+Measured with generated corpora (issue #194), release build, the 4 vCPU server, 50,000
+documents shaped as `api_load` seeds them (20 of 24 common words and 20 of 5,000 rare terms
+each, every 4th with `quarter`), 20 hits a page, medians and p99 of 60 searches; then every
+2nd document got about 250 bytes of facts (a card's text form and two passages, `otkazni
+rok` in every 10th). Postgres 17 (`pgvector/pgvector:pg17`) on an `--internal` Docker
+network (`fact_search_timings` in `crates/doewood-pg/src/tests/fact_search.rs`, through
+`PgStore::search`); SQLite on disk, one reader (`fact_search_timings` in
+`crates/doewood-store/src/standalone/search_scale.rs`, the words-alone query):
+
+```
+DOEWOOD_TEST_POSTGRES_URL=... cargo test --release -p doewood-pg --lib fact_search_timings \
+  -- --ignored --nocapture
+cargo test --release -p doewood-store --lib fact_search_timings -- --ignored --nocapture
+```
+
+| search, p50 (p99) ms | Postgres schema 17 | 18, no facts | 18, facts | SQLite schema 19 | 20, no facts | 20, facts |
+|---|---|---|---|---|---|---|
+| a rare term | 0.63 (1.25) | 0.41 (2.03) | 0.45 (0.48) | 0.23 (0.25) | 0.22 (0.31) | 0.22 (0.28) |
+| a word and a rare term | 0.73 (2.20) | 0.59 (1.00) | 0.55 (3.94) | 1.40 (1.54) | 1.40 (1.50) | 2.37 (2.58) |
+| a word in a quarter | 9.82 (12.3) | 10.3 (21.8) | 31.5 (41.3) | 8.09 (10.0) | 8.13 (8.54) | 8.07 (10.1) |
+| a word in most | 27.9 (48.7) | 27.2 (52.0) | 39.0 (50.5) | 25.7 (31.8) | 25.7 (31.2) | 28.7 (33.8) |
+| `otkazni rok` (5,000 matches with facts) | 0.23 (0 hits) | 0.33 (0 hits) | 9.01 (13.7) | 0.07 (0 hits) | 0.06 (0 hits) | 9.72 (13.6) |
+
+- **The schema change alone costs nothing**: with no facts written yet every search takes what
+  it took before, on both stores.
+- **With facts**, a search costs what its matches cost: SQLite's common-word search grows
+  12% (more text per document), a word that the facts add to 2,500 more documents costs those
+  matches (`a word and a rare term`, whose `term` words the facts carry too), and a facts
+  phrase now matches 5,000 documents. Postgres ranks from the heap row's `tsvector`, which the
+  facts make larger, so a common word's search grows from 28 to 39 ms and a word in a quarter
+  of the documents from 10 to 31 ms (`ts_rank` reads every match's vector); a rare term is
+  unchanged. With a kind filter the quarter word stays at 13 ms.
+- **The migration**: Postgres rewrites `search_index` and rebuilds its GIN index, 2.9 s for
+  50,000 documents (127 MB with its indexes after the facts); SQLite builds the FTS5 index
+  again from `search_index`, 0.3 s. Writing the facts (as reanalysis does) took 6.2 s and
+  0.5 s for 25,000 documents.
+
 
 ## Tests
 

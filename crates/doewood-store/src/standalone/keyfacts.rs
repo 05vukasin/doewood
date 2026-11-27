@@ -175,6 +175,7 @@ pub(super) fn get(conn: &mut Connection, blake3: &Blake3) -> Result<Option<FactR
     .transpose()
 }
 
+#[allow(clippy::too_many_lines)] // one clause per filter
 pub(super) fn find(
     conn: &mut Connection,
     filter: &FactFilter,

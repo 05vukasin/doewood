@@ -151,7 +151,8 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
   and the full-text vector `tsv` dropped and added again with it, weight A beside the
   title's) is the current version. The vector is a generated column, so the migration
   rewrites `search_index` and rebuilds its GIN index once, inside the migration's
-  transaction: SCHEMA18_TIME. Documents get their key facts when they are analyzed again: the
+  transaction: 2.9 s for 50,000 documents in the measurement of [api.md](api.md#search-ranking-of-key-facts), so about a
+  minute per million. Documents get their key facts when they are analyzed again: the
   new quail steps `contract.facts` and `card.facts` change the analyzer plan, so every stored
   record is (see [ingest.md](ingest.md#key-facts)). As with every schema, **all instances are
   upgraded together**: an older binary refuses schema 18. **Down path** (every instance
@@ -162,7 +163,7 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
   (gin_pending_list_limit = 256); DELETE FROM doewood_schema WHERE version = 18;`. The
   instance's own SQLite file goes to schema 20 with the same table, the column, and the FTS5
   index `search_fts` created again with a third column `facts` and rebuilt from
-  `search_index` (SQLITE20_TIME).
+  `search_index` (0.3 s for 50,000 documents).
 - **Schema 17** (issue #193: the new empty table `payments`, one row per document with
   payment facts, with an index by category; no existing row changes, so it migrates at once
   on any size of database) came before it. Documents get their row when they are
