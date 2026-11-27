@@ -29,7 +29,7 @@ doewood-s3.workspace = true
 doewood-store.workspace = true
 # hedgehog for spreadsheets. Its patched calamine and rust_xlsxwriter are patched in at the
 # workspace root, because `[patch]` does not carry over to dependents.
-hh_core = { git = "https://github.com/05vukasin/hedgehog", rev = "fac6eba" }
+hh_core = { git = "https://github.com/05vukasin/hedgehog", rev = "1a9811f" }
 # quail: `quail-cli` is a library too, and its `registry` module wires every extractor and
 # analyzer. OCR is added here (feature `ocr`) so the model directory comes from doewood's
 # configuration, not from the process environment.

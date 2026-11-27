@@ -523,7 +523,7 @@ checksum = "776dfebd015e2d8732c684a2c71003674ccb49457b539b9e82151ba38e96dd7c"
 [[package]]
 name = "calamine"
 version = "0.37.0"
-source = "git+https://github.com/05vukasin/hedgehog?rev=fac6eba#fac6ebae769f6ca23305dd04950b741c2c5a0187"
+source = "git+https://github.com/05vukasin/hedgehog?rev=1a9811f#1a9811f29e460f5d3aa2a6f6d82698cd78889476"
 dependencies = [
  "atoi_simd",
  "byteorder",
@@ -534,7 +534,7 @@ dependencies = [
  "memchr",
  "quick-xml",
  "serde",
- "zip 9.8.2",
+ "zip",
 ]
 
 [[package]]
@@ -1257,7 +1257,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
- "zip 9.8.2",
+ "zip",
 ]
 
 [[package]]
@@ -1314,7 +1314,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "zip 9.8.2",
+ "zip",
 ]
 
 [[package]]
@@ -1961,14 +1961,14 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 [[package]]
 name = "hh_core"
 version = "0.5.0"
-source = "git+https://github.com/05vukasin/hedgehog?rev=fac6eba#fac6ebae769f6ca23305dd04950b741c2c5a0187"
+source = "git+https://github.com/05vukasin/hedgehog?rev=1a9811f#1a9811f29e460f5d3aa2a6f6d82698cd78889476"
 dependencies = [
  "calamine",
  "libc",
  "memchr",
  "rust_xlsxwriter",
  "rustc-hash",
- "zip 9.8.2",
+ "zip",
 ]
 
 [[package]]
@@ -3275,7 +3275,7 @@ dependencies = [
  "unicode-bidi",
  "unicode-normalization",
  "unicode-properties",
- "zip 9.8.2",
+ "zip",
 ]
 
 [[package]]
@@ -3952,7 +3952,7 @@ source = "git+https://github.com/05vukasin/quail?rev=8610d87#8610d87a865eca4944a
 dependencies = [
  "quail-core",
  "quick-xml",
- "zip 9.8.2",
+ "zip",
 ]
 
 [[package]]
@@ -4436,10 +4436,10 @@ dependencies = [
 [[package]]
 name = "rust_xlsxwriter"
 version = "0.99.1"
-source = "git+https://github.com/05vukasin/hedgehog?rev=fac6eba#fac6ebae769f6ca23305dd04950b741c2c5a0187"
+source = "git+https://github.com/05vukasin/hedgehog?rev=1a9811f#1a9811f29e460f5d3aa2a6f6d82698cd78889476"
 dependencies = [
  "tempfile",
- "zip 8.6.0",
+ "zip",
  "zmij",
 ]
 
@@ -5495,12 +5495,6 @@ checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 
 [[package]]
 name = "typed-path"
-version = "0.12.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54ec2755506471f54baf5e4bb5499d8e510cc1caf271270e778a736bd2d7336c"
-
-[[package]]
-name = "typed-path"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ce898823d8cd0f028662d2f349694b1af0a5cc9be83f1d213a00d3147445e1e"
@@ -6172,20 +6166,6 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "8.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
-dependencies = [
- "crc32fast",
- "flate2",
- "indexmap",
- "memchr",
- "typed-path 0.12.4",
- "zopfli",
-]
-
-[[package]]
-name = "zip"
 version = "9.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d8dbe089cf6b0448b78f5fc50139ab5aaa40d08ac07cdc1baf2c13add35fcce"
@@ -6198,7 +6178,7 @@ dependencies = [
  "libc",
  "memchr",
  "nix",
- "typed-path 0.13.0",
+ "typed-path",
  "windows-sys 0.61.2",
  "zeroize",
  "zopfli",
