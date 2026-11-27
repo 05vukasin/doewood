@@ -966,6 +966,29 @@ on an internal Docker network; 4-core server, median of 9 runs after a warm-up.
 | Subgraph from the biggest hub, depth 2, defaults (truncated at 200 nodes) | 8.6 ms | 8.8 ms |
 | Path between two small companies, depth 4 (found, 4 edges) | 4.3 ms | 3.5 ms |
 
+**Cost to ingest** (the triggers are on the write path). `throughput` (`crates/doewood-ingest/tests/pipeline.rs`,
+release, `DOEWOOD_BENCH_FILES=2000`), `staging` at `f38f6b6` (before) against this change
+(after), runs interleaved before/after, through `serial`, Postgres in a `--rm` container on an
+internal network; files/s, median of 3 (the runs in brackets):
+
+| store | workers | before | after |
+|---|---|---|---|
+| Postgres | 1 | 98 (97, 98, 102) | 99 (99, 103, 96) |
+| Postgres | 4 | 440 (450, 440, 433) | 430 (430, 425, 438) |
+| SQLite | 1 | 160 (167, 148, 160) | 167 (178, 157, 167) |
+| SQLite | 4 | 582 (582, 543, 601) | 577 (548, 577, 604) |
+
+The differences are within run-to-run noise (-2.3 % to +4 %). After a run the log holds 500
+rows (0.16 to 0.21 MiB on Postgres with its index, 0.08 MiB on SQLite), folded in 0.01 s.
+That mix has few parties (a quarter of a `party` edge a file), so the triggers alone were also
+timed on Postgres with party-heavy writes: one `INSERT ... ON CONFLICT` of a document's three
+party edges per transaction, triggers off and on, interleaved, 5,000 documents a run, median
+of 6: new edges 683 vs 729 µs a document (+46 µs, three log rows of about 125 bytes each
+with the index), rewrites of the same edges (nothing logged) 643 vs 671 µs. At three parties
+a document that is about 0.5 % of a file's worker time in `throughput` on Postgres. The
+background fold keeps up with far more than ingest writes: 28,000 log rows a second on
+Postgres and 39,000 on SQLite (the first-fold row above).
+
 Before the counts were kept, the same aggregation per read took 540 ms for the document
 counts and 650 to 770 ms for the pairs on Postgres alone. Two query plans needed care: on
 SQLite the listing joins `company_stats` first (`CROSS JOIN`; left to the planner it read
