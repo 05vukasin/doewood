@@ -19,8 +19,8 @@ use crate::{
     Enrichment, FeedState, Folded, IconRow, LiveEdge, Located, LocationEnded, MergeEntry,
     MergeQuery, MergeRequest, Neighbour, NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation,
     OwnedAlias, PartyDocument, Proposal, ProposalQuery, ProposalRequest, PropsPatch, PutOutcome,
-    Record, ResolveRequest, Result, SearchDoc, SearchHit, SearchQuery, Sketch, SourceClaim,
-    SourceKey, SplitRequest, StepVersions, UndoOutcome, UndoRequest,
+    Record, ResolveRequest, Result, SearchDoc, SearchHit, SearchQuery, SimilarKey, SimilarKeys,
+    Sketch, SourceClaim, SourceKey, SplitRequest, StepVersions, UndoOutcome, UndoRequest,
 };
 
 /// quail and hedgehog records, keyed by BLAKE3.
@@ -409,6 +409,31 @@ pub trait SketchStore: Send + Sync {
     async fn sketch_candidates_within(
         &self,
         bands: &[u64],
+        exclude: &Blake3,
+        limit: u32,
+        max_bucket: u32,
+    ) -> Result<Candidates>;
+
+    /// [`SketchStore::put_sketch`] (when `sketch` is set) and the document's similarity keys
+    /// (issue #169): its stored keys become `keys.keys`, each with `keys.masked`. Its record
+    /// must exist. With no keys it is `put_sketch` alone (and nothing without a sketch
+    /// either). On Postgres the two statements are pipelined: one round trip, as before.
+    async fn put_similarity(
+        &self,
+        blake3: &Blake3,
+        sketch: Option<(&[u8], &[u64])>,
+        keys: &SimilarKeys,
+    ) -> Result<()>;
+
+    /// [`SketchStore::sketch_candidates_within`], plus in [`Candidates::keyed`] the
+    /// documents other than `exclude` that share one of `keys`: at most `limit` per key (0
+    /// means 100, at most 1000), each key's by hash, with their masked `SimHash` and
+    /// signature. With no keys it is `sketch_candidates_within` alone. On Postgres the two
+    /// queries are pipelined: one round trip.
+    async fn similarity_candidates(
+        &self,
+        bands: &[u64],
+        keys: &[SimilarKey],
         exclude: &Blake3,
         limit: u32,
         max_bucket: u32,

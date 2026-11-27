@@ -721,6 +721,40 @@ impl ConfigService for Api {
                 ),
             );
         }
+        for (field, x) in [
+            (
+                "similar_near_copy_min_jaccard",
+                req.similar_near_copy_min_jaccard,
+            ),
+            (
+                "similar_template_min_masked",
+                req.similar_template_min_masked,
+            ),
+        ] {
+            if let Some(x) = x
+                && !valid_min_jaccard(x)
+            {
+                v.add(field, "must be above 0 and at most 1");
+            }
+        }
+        if let Some(n) = req.similar_identical_min_chars
+            && !doewood_store::valid_identical_min_chars(n)
+        {
+            let r = doewood_store::SIMILAR_IDENTICAL_MIN_CHARS_RANGE;
+            v.add(
+                "similar_identical_min_chars",
+                format!("must be {} to {}", r.start(), r.end()),
+            );
+        }
+        if let Some(n) = req.similar_crowd_size
+            && !doewood_store::valid_crowd_size(n)
+        {
+            let r = doewood_store::SIMILAR_CROWD_SIZE_RANGE;
+            v.add(
+                "similar_crowd_size",
+                format!("must be {} to {}", r.start(), r.end()),
+            );
+        }
         if let Some(n) = req.summarize_max_concurrent
             && !valid_summarize_max_concurrent(n)
         {
@@ -738,6 +772,10 @@ impl ConfigService for Api {
             similar_min_jaccard: req.similar_min_jaccard,
             similar_max_bucket: req.similar_max_bucket,
             summarize_max_concurrent: req.summarize_max_concurrent,
+            similar_near_copy_min_jaccard: req.similar_near_copy_min_jaccard,
+            similar_template_min_masked: req.similar_template_min_masked,
+            similar_identical_min_chars: req.similar_identical_min_chars,
+            similar_crowd_size: req.similar_crowd_size,
         };
         let settings = self
             .state
@@ -746,6 +784,10 @@ impl ConfigService for Api {
         info!(
             similar_min_jaccard = settings.similar_min_jaccard,
             similar_max_bucket = settings.similar_max_bucket,
+            similar_near_copy_min_jaccard = settings.similar_near_copy_min_jaccard,
+            similar_template_min_masked = settings.similar_template_min_masked,
+            similar_identical_min_chars = settings.similar_identical_min_chars,
+            similar_crowd_size = settings.similar_crowd_size,
             summarize_max_concurrent = settings.summarize_max_concurrent,
             "ingest settings set"
         );

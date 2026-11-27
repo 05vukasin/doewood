@@ -880,6 +880,9 @@ pub struct Candidates {
     pub sketches: Vec<Sketch>,
     /// Distinct band keys skipped because their bucket was too large.
     pub skipped_bands: u32,
+    /// The documents sharing one of the looked-up similarity keys (issue #169), at most the
+    /// limit per key, each key's matches by hash; a document sharing two keys is there twice.
+    pub keyed: Vec<crate::KeyMatch>,
 }
 
 /// Most band keys one sketch carries.

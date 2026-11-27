@@ -40,6 +40,7 @@ mod proposals;
 mod records;
 mod reprocess;
 mod search;
+mod similar;
 mod state;
 mod summarize;
 mod validate;

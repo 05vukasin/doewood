@@ -9,12 +9,13 @@ use deadpool_postgres::{GenericClient, Object, Pool, PoolError};
 use doewood_core::InstanceId;
 use doewood_model::{
     Backend, Blake3, Candidates, ClaimStore, Edge, EdgeCursor, EdgeKind, EdgeSource, Error,
-    GraphStore, LiveEdge, Located, LocationEnded, MERGE_CHAIN_MAX, Neighbour, NeighbourQuery, Node,
-    NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PartyDocument, PropsPatch, PutOutcome, Record,
-    RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore, Sketch,
-    SketchStore, SourceClaim, SourceKey, StepVersions, StoredEdge, band_to_i64, merged_into,
-    record_page_bytes, records_limit, sketch_limit, validate_alias, validate_alias_count,
-    validate_batch_count, validate_hashes, validate_node, validate_sketch, versions_from_json,
+    GraphStore, KeyMatch, LiveEdge, Located, LocationEnded, MERGE_CHAIN_MAX, Neighbour,
+    NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PartyDocument,
+    PropsPatch, PutOutcome, Record, RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit,
+    SearchQuery, SearchStore, SimilarKey, SimilarKeyKind, SimilarKeys, Sketch, SketchStore,
+    SourceClaim, SourceKey, StepVersions, StoredEdge, band_to_i64, merged_into, record_page_bytes,
+    records_limit, sketch_limit, validate_alias, validate_alias_count, validate_batch_count,
+    validate_hashes, validate_keys, validate_node, validate_sketch, versions_from_json,
     versions_to_json,
 };
 use futures_util::future::try_join_all;
@@ -143,6 +144,30 @@ const PUT_SKETCH: &str = "WITH sketch AS (INSERT INTO sketches (blake3, signatur
      gone AS (DELETE FROM sketch_bands WHERE blake3 = $1 AND band <> ALL($3::bigint[])) \
      INSERT INTO sketch_bands (band, blake3) \
      SELECT DISTINCT b, $1::bytea FROM unnest($3::bigint[]) AS b ON CONFLICT DO NOTHING";
+
+/// [`SketchStore::put_similarity`]'s keys in one statement (issue #169): `$1` the document,
+/// `$2`/`$3` the keys' kinds and values, `$4` its masked `SimHash`. Keys no longer in the list
+/// are deleted, new ones inserted, and the masked value updated only where it differs, so an
+/// unchanged document writes nothing (as `put_sketch`, issue #74). The three parts touch
+/// different rows: an existing key conflicts and is left to the update.
+const PUT_KEYS: &str = "WITH k AS (SELECT DISTINCT kind, key FROM unnest($2::smallint[], $3::bigint[]) \
+     AS k(kind, key)), \
+     gone AS (DELETE FROM similar_keys s WHERE s.blake3 = $1 \
+     AND NOT EXISTS (SELECT 1 FROM k WHERE k.kind = s.kind AND k.key = s.key)), \
+     masked AS (UPDATE similar_keys SET masked = $4 WHERE blake3 = $1 \
+     AND masked IS DISTINCT FROM $4::bigint) \
+     INSERT INTO similar_keys (kind, key, blake3, masked) SELECT kind, key, $1, $4 FROM k \
+     ON CONFLICT DO NOTHING";
+
+/// The documents other than `$3` sharing a key (`$1` kinds, `$2` values), at most `$4` per
+/// key in hash order (a range of the primary key each), with their masked `SimHash` and
+/// signature (issue #169).
+const KEY_CANDIDATES: &str = "SELECT m.kind, m.blake3, m.masked, s.signature \
+     FROM unnest($1::smallint[], $2::bigint[]) AS k(kind, key) \
+     CROSS JOIN LATERAL (SELECT x.kind, x.blake3, x.masked FROM similar_keys x \
+     WHERE x.kind = k.kind AND x.key = k.key AND x.blake3 <> $3 \
+     ORDER BY x.blake3 LIMIT $4) m \
+     LEFT JOIN sketches s ON s.blake3 = m.blake3";
 
 /// One [`GraphStore::claim_alias`]: a no-op update on conflict, so the stored row always comes
 /// back.
@@ -1290,40 +1315,152 @@ impl SketchStore for PgStore {
         if bands.is_empty() {
             return Ok(Candidates::default());
         }
-        if bands.len() > SKETCH_MAX_BANDS {
-            return Err(Error::Invalid(format!(
-                "at most {SKETCH_MAX_BANDS} band keys per lookup"
-            )));
-        }
-        let bands: Vec<i64> = bands.iter().map(|b| band_to_i64(*b)).collect();
+        let bands = band_keys(bands)?;
         let c = client(&self.pool).await?;
-        let rows = c
-            .rows(
-                SKETCH_CANDIDATES_WITHIN,
-                &[
-                    &bands,
-                    &exclude.as_bytes().as_slice(),
-                    &i64::from(sketch_limit(limit)),
-                    &i64::from(max_bucket),
-                ],
+        band_candidates(&c, &bands, exclude, limit, max_bucket).await
+    }
+
+    async fn put_similarity(
+        &self,
+        blake3: &Blake3,
+        sketch: Option<(&[u8], &[u64])>,
+        keys: &SimilarKeys,
+    ) -> Result<()> {
+        if keys.keys.is_empty() {
+            return match sketch {
+                Some((signature, bands)) => self.put_sketch(blake3, signature, bands).await,
+                None => Ok(()),
+            };
+        }
+        validate_keys(&keys.keys)?;
+        if let Some((signature, bands)) = sketch {
+            validate_sketch(signature, bands)?;
+        }
+        let key = blake3.as_bytes().as_slice();
+        let (kinds, values) = key_columns(&keys.keys);
+        let masked = keys.masked.map(band_to_i64);
+        let c = client(&self.pool).await?;
+        // Sent together on one connection: one round trip (issue #169).
+        let key_params: [&(dyn ToSql + Sync); 4] = [&key, &kinds, &values, &masked];
+        let put_keys = c.exec(PUT_KEYS, &key_params);
+        match sketch {
+            Some((signature, bands)) => {
+                let bands: Vec<i64> = bands.iter().map(|b| band_to_i64(*b)).collect();
+                let sketch_params: [&(dyn ToSql + Sync); 3] = [&key, &signature, &bands];
+                let put_sketch = c.exec(PUT_SKETCH, &sketch_params);
+                futures_util::future::try_join(put_sketch, put_keys).await?;
+            }
+            None => {
+                put_keys.await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn similarity_candidates(
+        &self,
+        bands: &[u64],
+        keys: &[SimilarKey],
+        exclude: &Blake3,
+        limit: u32,
+        max_bucket: u32,
+    ) -> Result<Candidates> {
+        if keys.is_empty() {
+            return self
+                .sketch_candidates_within(bands, exclude, limit, max_bucket)
+                .await;
+        }
+        validate_keys(keys)?;
+        let bands = band_keys(bands)?;
+        let (kinds, values) = key_columns(keys);
+        let excluded = exclude.as_bytes().as_slice();
+        let per_key = i64::from(sketch_limit(limit));
+        let c = client(&self.pool).await?;
+        // Sent together on one connection: one round trip (issue #169).
+        let key_params: [&(dyn ToSql + Sync); 4] = [&kinds, &values, &excluded, &per_key];
+        let keyed = c.rows(KEY_CANDIDATES, &key_params);
+        let (mut out, rows) = if bands.is_empty() {
+            (Candidates::default(), keyed.await?)
+        } else {
+            futures_util::future::try_join(
+                band_candidates(&c, &bands, exclude, limit, max_bucket),
+                keyed,
             )
-            .await?;
-        let mut out = Candidates::default();
+            .await?
+        };
         for r in &rows {
-            out.skipped_bands =
-                u32::try_from(r.try_get::<_, i64>(0).map_err(pg)?).unwrap_or(u32::MAX);
-            let Some(h) = r.try_get::<_, Option<&[u8]>>(1).map_err(pg)? else {
+            // Only the kinds asked for come back.
+            let Some(kind) = SimilarKeyKind::from_code(r.try_get(0).map_err(pg)?) else {
                 continue;
             };
-            out.sketches.push(Sketch {
-                blake3: Blake3::from_slice(h)?,
-                signature: r.try_get(2).map_err(pg)?,
-                shared_bands: u32::try_from(r.try_get::<_, i64>(3).map_err(pg)?)
-                    .unwrap_or(u32::MAX),
+            out.keyed.push(KeyMatch {
+                blake3: Blake3::from_slice(r.try_get::<_, &[u8]>(1).map_err(pg)?)?,
+                kind,
+                masked: r.try_get::<_, Option<i64>>(2).map_err(pg)?.map(i64_to_band),
+                signature: r.try_get(3).map_err(pg)?,
             });
         }
+        out.keyed
+            .sort_by(|a, b| (a.kind, a.blake3).cmp(&(b.kind, b.blake3)));
         Ok(out)
     }
+}
+
+/// Band keys for a lookup, as stored; at most [`SKETCH_MAX_BANDS`].
+fn band_keys(bands: &[u64]) -> Result<Vec<i64>> {
+    if bands.len() > SKETCH_MAX_BANDS {
+        return Err(Error::Invalid(format!(
+            "at most {SKETCH_MAX_BANDS} band keys per lookup"
+        )));
+    }
+    Ok(bands.iter().map(|b| band_to_i64(*b)).collect())
+}
+
+/// The kinds and values of similarity keys, as the statements take them.
+fn key_columns(keys: &[SimilarKey]) -> (Vec<i16>, Vec<i64>) {
+    keys.iter()
+        .map(|k| (k.kind.code(), band_to_i64(k.key)))
+        .unzip()
+}
+
+/// The stored 64 bits back as unsigned.
+#[allow(clippy::cast_sign_loss)]
+fn i64_to_band(x: i64) -> u64 {
+    x as u64
+}
+
+/// [`SketchStore::sketch_candidates_within`] on `c`, for band keys already converted.
+async fn band_candidates(
+    c: &Object,
+    bands: &[i64],
+    exclude: &Blake3,
+    limit: u32,
+    max_bucket: u32,
+) -> Result<Candidates> {
+    let rows = c
+        .rows(
+            SKETCH_CANDIDATES_WITHIN,
+            &[
+                &bands,
+                &exclude.as_bytes().as_slice(),
+                &i64::from(sketch_limit(limit)),
+                &i64::from(max_bucket),
+            ],
+        )
+        .await?;
+    let mut out = Candidates::default();
+    for r in &rows {
+        out.skipped_bands = u32::try_from(r.try_get::<_, i64>(0).map_err(pg)?).unwrap_or(u32::MAX);
+        let Some(h) = r.try_get::<_, Option<&[u8]>>(1).map_err(pg)? else {
+            continue;
+        };
+        out.sketches.push(Sketch {
+            blake3: Blake3::from_slice(h)?,
+            signature: r.try_get(2).map_err(pg)?,
+            shared_bands: u32::try_from(r.try_get::<_, i64>(3).map_err(pg)?).unwrap_or(u32::MAX),
+        });
+    }
+    Ok(out)
 }
 
 #[async_trait]

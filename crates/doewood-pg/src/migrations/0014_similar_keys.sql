@@ -1,0 +1,20 @@
+-- doewood shared store, schema 14: the exact-match keys of typed similarity (issue #169).
+-- One new empty table; no existing rows change. Older instances refuse this schema, so every
+-- instance is upgraded together.
+--
+-- A document's keys: the first 64 bits of its folded-text key, its template property, its
+-- heading skeleton and its document identity ids (`kind`, doewood-model `SimilarKeyKind`),
+-- each with the document's masked SimHash (`sketch.simhash_template`), so a template match
+-- is checked without reading a record. A lookup reads one key's documents in hash order
+-- from the primary key, never every document. The rows go with their record. Documents
+-- ingested before this schema get keys when they are ingested again (`ReprocessJob` with
+-- `force`); their `similar_to` edges keep working as they are.
+CREATE TABLE similar_keys (
+    kind   smallint NOT NULL,
+    key    bigint NOT NULL,
+    blake3 bytea NOT NULL REFERENCES records (blake3) ON DELETE CASCADE,
+    masked bigint,
+    PRIMARY KEY (kind, key, blake3)
+);
+
+CREATE INDEX similar_keys_by_doc ON similar_keys (blake3);

@@ -41,6 +41,7 @@ pub async fn run<B: Backend + ?Sized>(a: &B, b: &B) {
     records_by_source(a).await;
     sketches(a).await;
     stop_bands(a).await;
+    similar_keys(a).await;
     aliases(a).await;
     alias_batches(a).await;
     graph_batches(a).await;
@@ -1259,6 +1260,148 @@ pub async fn graph_batches<B: Backend + ?Sized>(s: &B) {
     ));
     // A missing end fails the call.
     assert!(s.upsert_edges(&[edge(a, Uuid::now_v7(), 6)]).await.is_err());
+}
+
+/// [`crate::SketchStore::put_similarity`] and [`crate::SketchStore::similarity_candidates`]
+/// (issue #169): keys are stored with the masked `SimHash`, replaced as a set, matched by kind
+/// and value (never the document itself), at most the limit per key in hash order, with the
+/// candidates' signatures; with no keys they are `put_sketch` and
+/// `sketch_candidates_within`.
+///
+/// # Panics
+///
+/// When the backend misbehaves.
+pub async fn similar_keys<B: Backend + ?Sized>(s: &B) {
+    use crate::{SimilarKey, SimilarKeyKind as K, SimilarKeys};
+    let key = |kind, key| SimilarKey { kind, key };
+    let keys = |ks: &[SimilarKey], masked| SimilarKeys {
+        keys: ks.to_vec(),
+        masked,
+    };
+    let (text, tpl, origin) = (
+        key(K::Text, u64::MAX - 1),
+        key(K::Headings, 77),
+        key(K::OriginRsidRoot, 77),
+    );
+    for n in 131..=136 {
+        s.put_record(&hash(n), &raw(&json!({"n": n})), &versions("1"))
+            .await
+            .unwrap();
+    }
+    // 131 to 134 share the text key; 131 and 132 a heading skeleton; 133 has no sketch.
+    for n in 131..=134 {
+        let mut ks = vec![text];
+        if n <= 132 {
+            ks.push(tpl);
+        }
+        let sketch = (n != 133).then_some((&[n][..], &[9_000 + u64::from(n)][..]));
+        s.put_similarity(&hash(n), sketch, &keys(&ks, Some(u64::from(n))))
+            .await
+            .unwrap();
+    }
+    // The same value under another kind is another key.
+    s.put_similarity(&hash(135), None, &keys(&[origin], None))
+        .await
+        .unwrap();
+    let ask = [text, tpl, origin, key(K::OriginXmp, 5)];
+    let got = s
+        .similarity_candidates(&[], &ask, &hash(131), 0, 1000)
+        .await
+        .unwrap();
+    assert!(got.sketches.is_empty());
+    let seen: Vec<_> = got
+        .keyed
+        .iter()
+        .map(|m| (m.kind, m.blake3, m.masked, m.signature.clone()))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (K::Text, hash(132), Some(132), Some(vec![132])),
+            (K::Text, hash(133), Some(133), None),
+            (K::Text, hash(134), Some(134), Some(vec![134])),
+            (K::Headings, hash(132), Some(132), Some(vec![132])),
+            (K::OriginRsidRoot, hash(135), None, None),
+        ]
+    );
+    // At most `limit` per key, by hash; with bands, the band candidates too.
+    let got = s
+        .similarity_candidates(&[9_134], &ask, &hash(131), 1, 1000)
+        .await
+        .unwrap();
+    assert_eq!(
+        got.keyed
+            .iter()
+            .map(|m| (m.kind, m.blake3))
+            .collect::<Vec<_>>(),
+        [
+            (K::Text, hash(132)),
+            (K::Headings, hash(132)),
+            (K::OriginRsidRoot, hash(135)),
+        ]
+    );
+    assert_eq!(got.sketches.len(), 1);
+    assert_eq!(got.sketches[0].blake3, hash(134));
+    // Replaced as a set: 132 drops the text key and gets a new masked value; written twice,
+    // nothing changes.
+    for _ in 0..2 {
+        s.put_similarity(&hash(132), Some((&[132], &[9_132])), &keys(&[tpl], Some(7)))
+            .await
+            .unwrap();
+    }
+    let got = s
+        .similarity_candidates(&[], &[text, tpl], &hash(131), 0, 1000)
+        .await
+        .unwrap();
+    assert_eq!(
+        got.keyed
+            .iter()
+            .map(|m| (m.kind, m.blake3, m.masked))
+            .collect::<Vec<_>>(),
+        [
+            (K::Text, hash(133), Some(133)),
+            (K::Text, hash(134), Some(134)),
+            (K::Headings, hash(132), Some(7)),
+        ]
+    );
+    // With no keys: the sketch alone, stored and found as before.
+    s.put_similarity(
+        &hash(136),
+        Some((&[136], &[9_134])),
+        &SimilarKeys::default(),
+    )
+    .await
+    .unwrap();
+    let plain = s
+        .similarity_candidates(&[9_134], &[], &hash(131), 0, 1000)
+        .await
+        .unwrap();
+    assert_eq!(
+        plain,
+        s.sketch_candidates_within(&[9_134], &hash(131), 0, 1000)
+            .await
+            .unwrap()
+    );
+    assert_eq!(plain.sketches.len(), 2);
+    s.put_similarity(&hash(136), None, &SimilarKeys::default())
+        .await
+        .unwrap();
+    // Too many keys; keys of a document without a record.
+    let many = vec![text; crate::SIMILAR_MAX_KEYS + 1];
+    assert!(matches!(
+        s.put_similarity(&hash(131), None, &keys(&many, None)).await,
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        s.similarity_candidates(&[], &many, &hash(131), 0, 1000)
+            .await,
+        Err(Error::Invalid(_))
+    ));
+    assert!(
+        s.put_similarity(&hash(137), None, &keys(&[text], None))
+            .await
+            .is_err()
+    );
 }
 
 /// [`crate::SketchStore::sketch_candidates_within`] (issue #148): a band whose bucket holds

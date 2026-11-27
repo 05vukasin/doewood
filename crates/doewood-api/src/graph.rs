@@ -1,5 +1,6 @@
 //! `GraphService`: nodes, neighbours and a company's documents, the merge log (in
-//! `merges`), enrichment proposals (in `proposals`) and the explorer's reads (in `explore`).
+//! `merges`), enrichment proposals (in `proposals`), the explorer's reads (in `explore`) and
+//! similar documents by relation (in `similar`).
 
 use doewood_model::{
     EdgeCursor, EdgeKind, NODE_KEY_MAX_LEN, NeighbourQuery, NodeKind, RECORDS_MAX_LIMIT,
@@ -224,6 +225,15 @@ impl GraphService for Api {
             documents: docs.iter().map(|d| convert::node(&d.node)).collect(),
             next_page_token,
         }))
+    }
+
+    async fn similar_documents(
+        &self,
+        request: Request<pb::SimilarDocumentsRequest>,
+    ) -> Result<Response<pb::SimilarDocumentsResponse>, Status> {
+        Ok(Response::new(
+            self.similar_documents_rpc(request.get_ref()).await?,
+        ))
     }
 
     async fn list_companies(

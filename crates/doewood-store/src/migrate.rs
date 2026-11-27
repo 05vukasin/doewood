@@ -79,6 +79,11 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("migrations/0015_company_documents_total.sql"),
         fk_check: FkCheck::Tables(&["company_graph_totals"]),
     },
+    // A new empty table (issue #169).
+    Migration {
+        sql: include_str!("migrations/0016_similar_keys.sql"),
+        fk_check: FkCheck::Skip,
+    },
 ];
 
 /// The schema version this binary writes.

@@ -354,7 +354,8 @@ message ListAiProvidersResponse {
 }
 
 message IngestSettings {
-  // Least MinHash Jaccard estimate for a `similar_to` edge: above 0, at most 1. Default 0.8.
+  // Least MinHash Jaccard estimate for a `similar_to` edge, the "related version" relation
+  // (issue #169): above 0, at most 1. Default 0.6 (0.8 before issue #169).
   double similar_min_jaccard = 1;
   // On-demand `Summarize` analyses (with the object read before them) that run at once: 1 to
   // 16. Default 2. A call beyond it is refused at once with RESOURCE_EXHAUSTED.
@@ -363,6 +364,17 @@ message IngestSettings {
   // documents is skipped as a template's boilerplate (the "stop band"). 10 to 1000000.
   // Default 1000.
   uint32 similar_max_bucket = 3;
+  // Least MinHash Jaccard estimate of a near copy: above 0, at most 1. Default 0.9.
+  double similar_near_copy_min_jaccard = 4;
+  // Least masked similarity of two documents of one template: above 0, at most 1. Default
+  // 0.6. A template also needs a shared template property or heading skeleton.
+  double similar_template_min_masked = 5;
+  // Shortest text two identical documents need, in characters without whitespace: 0 to
+  // 10000000. Default 1000. (quail gives no text key below 400.)
+  uint32 similar_identical_min_chars = 6;
+  // Matches in one relation above which a document is a crowd in SimilarDocuments: 1 to 1000.
+  // Default 50.
+  uint32 similar_crowd_size = 7;
 }
 
 message GetIngestSettingsRequest {}
@@ -376,6 +388,16 @@ message SetIngestSettingsRequest {
   // 10 to 1000000; anything else is INVALID_ARGUMENT. Unset keeps the stored value. Applies
   // to the next file; edges already written are kept.
   optional uint32 similar_max_bucket = 3;
+  // Above 0 and at most 1; anything else is INVALID_ARGUMENT. Unset keeps the stored value.
+  // The thresholds apply to the next file; edges already written are kept.
+  optional double similar_near_copy_min_jaccard = 4;
+  // Above 0 and at most 1; anything else is INVALID_ARGUMENT. Unset keeps the stored value.
+  optional double similar_template_min_masked = 5;
+  // 0 to 10000000; anything else is INVALID_ARGUMENT. Unset keeps the stored value.
+  optional uint32 similar_identical_min_chars = 6;
+  // 1 to 1000; anything else is INVALID_ARGUMENT. Unset keeps the stored value. Applies to
+  // the next SimilarDocuments call.
+  optional uint32 similar_crowd_size = 7;
 }
 
 // The API server's runtime limits. The connection limits (streams per connection, keepalive,

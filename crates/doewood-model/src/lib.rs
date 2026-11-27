@@ -19,6 +19,7 @@ mod feed;
 pub mod merge;
 pub mod proposal;
 mod props;
+pub mod similar;
 mod traits;
 mod types;
 
@@ -48,6 +49,10 @@ pub use proposal::{
     Resolution, ResolveRequest, proposals_limit, registry_record_alias,
 };
 pub use props::{PATCH_MAX_DEPTH, PATCH_MAX_OPS, PropOp, PropsPatch};
+pub use similar::{
+    KeyMatch, SIMILAR_MAX_KEYS, SimilarEdge, SimilarKey, SimilarKeyKind, SimilarKeys,
+    SimilarRelation, validate_keys,
+};
 pub use traits::{
     Backend, CacheStore, ClaimStore, FeedStore, FreshnessStore, GraphStore, MergeStore,
     ProposalStore, RecordStore, SearchStore, SketchStore, sketch_limit,
