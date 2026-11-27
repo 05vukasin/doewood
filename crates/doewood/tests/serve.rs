@@ -318,12 +318,11 @@ fn health_fails_when_nothing_listens() {
     let started = Instant::now();
     let (ok, why) = health(tmp.path(), &addr.to_string());
     assert!(!ok);
-    assert!(
-        why.starts_with(&format!(
-            "doewood health: not ready: cannot connect to {addr}"
-        )),
-        "{why}"
-    );
+    // The reason depends on the platform and on timing: a refused connection (Linux), the
+    // 2 s limit ending a refused connection first (Windows), or a reset when another test took
+    // the freed port meanwhile (macOS). Every one is a failure (issue #28).
+    assert!(why.starts_with("doewood health: not ready: "), "{why}");
+    assert!(!why.trim_end().contains('\n'), "{why}");
     assert!(started.elapsed() < Duration::from_secs(5));
     // It creates nothing: no data directory, no key.
     assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);

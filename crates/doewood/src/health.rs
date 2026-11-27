@@ -147,7 +147,15 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
         let err = check(addr, TIMEOUT).await.unwrap_err();
-        assert!(err.starts_with("cannot connect to"), "{err}");
+        // Refused on Linux and macOS; on Windows the refusal can take longer than the 2 s
+        // limit, and a reset is possible when another test took the freed port (issue #28).
+        assert!(
+            err.starts_with("cannot connect to")
+                || err.contains("did not answer within")
+                || err.starts_with("cannot read from")
+                || err.starts_with("cannot send to"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
