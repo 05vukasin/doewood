@@ -492,8 +492,8 @@ impl Source {
     }
 }
 
-/// Credentials for an S3-compatible store. Every field is zeroized on drop, and `Debug` prints
-/// none of them.
+/// AWS-style credentials: for an S3-compatible store, an SQS inlet, or a Bedrock AI provider
+/// (IAM credentials). Every field is zeroized on drop, and `Debug` prints none of them.
 #[derive(Clone, PartialEq, Eq)]
 pub struct S3Credentials {
     access_key_id: Zeroizing<String>,
@@ -559,9 +559,15 @@ impl S3Credentials {
     }
 
     pub(crate) fn encode(&self) -> Zeroizing<Vec<u8>> {
+        self.encode_as(CREDENTIALS_FORMAT)
+    }
+
+    /// The sealed form, tagged with `format` (one tag per use, so a secret is never read as
+    /// another kind).
+    pub(crate) fn encode_as(&self, format: &str) -> Zeroizing<Vec<u8>> {
         let mut out = Zeroizing::new(Vec::new());
         for part in [
-            CREDENTIALS_FORMAT,
+            format,
             self.access_key_id(),
             self.secret_access_key(),
             self.session_token().unwrap_or(""),
@@ -573,10 +579,15 @@ impl S3Credentials {
     }
 
     pub(crate) fn decode(name: &str, bytes: &[u8]) -> Result<Self, StoreError> {
-        let bad = || StoreError::InvalidSource(format!("secret {name:?} is not S3 credentials"));
+        Self::decode_as(CREDENTIALS_FORMAT, name, bytes)
+    }
+
+    /// Reads [`Self::encode_as`] with the same `format`.
+    pub(crate) fn decode_as(format: &str, name: &str, bytes: &[u8]) -> Result<Self, StoreError> {
+        let bad = || StoreError::InvalidSource(format!("secret {name:?} is not AWS credentials"));
         let text = std::str::from_utf8(bytes).map_err(|_| bad())?;
         let mut parts = text.split('\n');
-        if parts.next() != Some(CREDENTIALS_FORMAT) {
+        if parts.next() != Some(format) {
             return Err(bad());
         }
         let (Some(key), Some(secret), Some(token), Some(""), None) = (

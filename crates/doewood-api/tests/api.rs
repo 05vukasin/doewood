@@ -817,6 +817,7 @@ async fn ai_providers_are_write_only() {
             api_key: "multi\nline".into(),
             clear_api_key: true,
             make_default: false,
+            ..pb::SetAiProviderRequest::default()
         })
         .await
         .unwrap_err();
@@ -845,6 +846,163 @@ async fn ai_providers_are_write_only() {
         .await
         .unwrap_err();
     invalid(&err, &["base_url"]);
+    a.stop().await;
+}
+
+/// Issue #145: Bedrock IAM credentials are write-only (only `aws_credentials_set` comes
+/// back), bedrock-only, the key pair both or neither; the same call again changes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bedrock_iam_credentials_are_write_only() {
+    const AWS_ID: &str = "AKIDTESTAPI0123";
+    const AWS_SECRET: &str = "test-aws-secret-key-4567";
+    const AWS_TOKEN: &str = "test-aws-session-token-89";
+    let a = Instance::start("inst-a", Some(Shared::sqlite().backend)).await;
+    let ch = a.channel().await;
+    let bedrock = || pb::SetAiProviderRequest {
+        preset: "bedrock".into(),
+        model: "test.model-v1:0".into(),
+        base_url: "https://bedrock-runtime.eu-west-2.amazonaws.com".into(),
+        ..pb::SetAiProviderRequest::default()
+    };
+    let with_creds = || pb::SetAiProviderRequest {
+        aws_access_key_id: AWS_ID.into(),
+        aws_secret_access_key: AWS_SECRET.into(),
+        aws_session_token: AWS_TOKEN.into(),
+        ..bedrock()
+    };
+    let no_leak = |what: &str, text: &str| {
+        for s in [AWS_ID, AWS_SECRET, AWS_TOKEN] {
+            assert!(!text.contains(s), "{what} leaks a secret: {text}");
+        }
+    };
+    // Neither a bearer token nor IAM credentials.
+    let err = config(&ch).set_ai_provider(bedrock()).await.unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert!(
+        err.message().contains("IAM credentials"),
+        "{}",
+        err.message()
+    );
+
+    let set = config(&ch)
+        .set_ai_provider(with_creds())
+        .await
+        .unwrap()
+        .into_inner();
+    no_leak("SetAiProvider", &format!("{set:?}"));
+    assert!(set.aws_credentials_set && !set.api_key_set);
+    let stored = a.store.ai_aws_credentials("bedrock").unwrap().unwrap();
+    assert_eq!(
+        (
+            stored.access_key_id(),
+            stored.secret_access_key(),
+            stored.session_token()
+        ),
+        (AWS_ID, AWS_SECRET, Some(AWS_TOKEN))
+    );
+    // The same call again: nothing written.
+    let again = config(&ch)
+        .set_ai_provider(with_creds())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(again.updated_at, set.updated_at);
+    // Empty fields keep the credentials.
+    let kept = config(&ch)
+        .set_ai_provider(bedrock())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(kept.aws_credentials_set);
+    let list = config(&ch)
+        .list_ai_providers(pb::ListAiProvidersRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    no_leak("ListAiProviders", &format!("{list:?}"));
+    assert!(list.providers[0].aws_credentials_set);
+
+    // Validation: half a pair, a token alone, clear with values, another preset, line
+    // breaks. No message echoes a value.
+    let cases: [(pb::SetAiProviderRequest, &[&str]); 6] = [
+        (
+            pb::SetAiProviderRequest {
+                aws_secret_access_key: String::new(),
+                ..with_creds()
+            },
+            &["aws_secret_access_key"],
+        ),
+        (
+            pb::SetAiProviderRequest {
+                aws_access_key_id: String::new(),
+                ..with_creds()
+            },
+            &["aws_access_key_id"],
+        ),
+        (
+            pb::SetAiProviderRequest {
+                aws_session_token: AWS_TOKEN.into(),
+                ..bedrock()
+            },
+            &["aws_session_token"],
+        ),
+        (
+            pb::SetAiProviderRequest {
+                clear_aws_credentials: true,
+                ..with_creds()
+            },
+            &["clear_aws_credentials"],
+        ),
+        (
+            pb::SetAiProviderRequest {
+                preset: "openai".into(),
+                base_url: String::new(),
+                ..with_creds()
+            },
+            &["aws_access_key_id"],
+        ),
+        (
+            pb::SetAiProviderRequest {
+                aws_secret_access_key: format!("{AWS_SECRET}\nmore"),
+                ..with_creds()
+            },
+            &["aws_secret_access_key"],
+        ),
+    ];
+    for (req, fields) in cases {
+        let err = config(&ch).set_ai_provider(req).await.unwrap_err();
+        invalid(&err, fields);
+        no_leak("an error", err.message());
+    }
+    assert!(
+        a.store
+            .ai_provider("bedrock")
+            .unwrap()
+            .unwrap()
+            .aws_credentials_set
+    );
+
+    // Clearing the only credential is refused; with a bearer token it applies.
+    let clear = || pb::SetAiProviderRequest {
+        clear_aws_credentials: true,
+        ..bedrock()
+    };
+    let err = config(&ch).set_ai_provider(clear()).await.unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
+    config(&ch)
+        .set_ai_provider(pb::SetAiProviderRequest {
+            api_key: API_KEY.into(),
+            ..bedrock()
+        })
+        .await
+        .unwrap();
+    let cleared = config(&ch)
+        .set_ai_provider(clear())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!cleared.aws_credentials_set && cleared.api_key_set);
+    assert!(a.store.ai_aws_credentials("bedrock").unwrap().is_none());
     a.stop().await;
 }
 
