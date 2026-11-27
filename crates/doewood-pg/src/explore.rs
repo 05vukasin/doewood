@@ -1,7 +1,7 @@
 //! The explorer's reads on Postgres (issue #172): the company graph's fold, the company
 //! listing and the links between companies, as on SQLite (`doewood-store`,
-//! `standalone/explore.rs`). See `doewood_model::explore` for the rules and schema 12 for
-//! the tables and triggers.
+//! `standalone/explore.rs`). See `doewood_model::explore` for the rules and schemas 12 and
+//! 13 for the tables and triggers.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -148,6 +148,14 @@ pub(crate) async fn fold(pool: &Pool, max_rows: u32) -> Result<Folded> {
         )
         .await?;
     }
+    if delta.documents_total != 0 {
+        tx.exec(
+            "UPDATE company_graph_totals SET documents = greatest(0, documents + $1) \
+             WHERE id = 1",
+            &[&delta.documents_total],
+        )
+        .await?;
+    }
     tx.exec("DELETE FROM company_graph_log WHERE id = ANY($1)", &[&ids])
         .await?;
     let more: bool = tx
@@ -160,6 +168,20 @@ pub(crate) async fn fold(pool: &Pool, max_rows: u32) -> Result<Folded> {
         rows: ids.len() as u64,
         more,
     })
+}
+
+/// The document total as last folded.
+pub(crate) async fn documents_total(pool: &Pool) -> Result<u64> {
+    let c = client(pool).await?;
+    let n: Option<i64> = c
+        .opt(
+            "SELECT documents FROM company_graph_totals WHERE id = 1",
+            &[],
+        )
+        .await?
+        .map(|r| r.try_get(0).map_err(pg))
+        .transpose()?;
+    Ok(u64::try_from(n.unwrap_or(0)).unwrap_or(0))
 }
 
 /// The company listing's query and its arguments. The inner query finds the page's companies

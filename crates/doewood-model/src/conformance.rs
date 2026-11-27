@@ -3557,6 +3557,9 @@ pub async fn explorer<B: Backend + ?Sized>(s: &B) {
     let company = async |key: &str, props: serde_json::Value| {
         s.upsert_node(NodeKind::Company, key, &props).await.unwrap()
     };
+    // The document total is the whole graph's: earlier cases wrote documents too.
+    fold_all(s).await;
+    let total0 = s.company_documents_total().await.unwrap();
     let a = company(
         "explore-a",
         json!({"name": "Explore Alpha", "names": ["Explore Alpha", "EA Ltd"],
@@ -3643,6 +3646,9 @@ pub async fn explorer<B: Backend + ?Sized>(s: &B) {
     .unwrap();
     fold_all(s).await;
     assert!(!s.fold_company_graph(100).await.unwrap().more);
+    // d0, d1, d2, d3 and d5 once each, though d1 names three companies (and A twice); d4's
+    // only edge is retracted.
+    assert_eq!(s.company_documents_total().await.unwrap(), total0 + 5);
 
     let mine = CompanyFilter {
         name_prefix: Some("EXPLORE ".to_owned()),
@@ -3803,9 +3809,17 @@ pub async fn explorer<B: Backend + ?Sized>(s: &B) {
             .documents
     };
     assert_eq!(count_of_b().await, 2);
+    assert_eq!(
+        s.company_documents_total().await.unwrap(),
+        total0 + 4,
+        "d3 lost its last party edge"
+    );
+    let g = explore::company_graph(s, &mine, 1, 10, 100).await.unwrap();
+    assert_eq!(g.documents_total, total0 + 4);
     s.upsert_edge(&d3b).await.unwrap();
     fold_all(s).await;
     assert_eq!(count_of_b().await, 3);
+    assert_eq!(s.company_documents_total().await.unwrap(), total0 + 5);
 
     // Subgraph: A's neighbours (four documents and C by the event), then the caps.
     let sub = |seeds: Vec<Uuid>, depth: u32| SubgraphQuery {

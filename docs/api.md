@@ -268,6 +268,10 @@ refused: the workbook has more than 1,600,000 cells ...`, and how to raise the c
     or that have a live corporate-event edge (`events`: the edges themselves, with dates,
     source and evidence; at most 50 read per company). A document with more than 32 distinct
     parties (a register, not a deal) links none of them, but counts for each.
+    `documents_total` is the number of documents with a live party edge in the whole graph,
+    each once however many companies it names (so not the sum of the companies' counts), and
+    not narrowed by the filter or the caps. A link names no document ids: Subgraph from its
+    two companies at depth 1 shows the documents they share (within its caps).
   - **Subgraph** walks from 1 to 100 seeds up to `depth` 3 over live edges either way, only
     through `node_kinds` and `edge_kinds` when given, and only over edges that hold on `as_of`
     when given. Caps: `limit` nodes (default 200, at most 2000), `max_edges` (default 1000, at
@@ -279,9 +283,9 @@ refused: the workbook has more than 1,600,000 cells ...`, and how to raise the c
     smaller side a level at a time, within 5000 visited nodes and 20000 edges a level.
     `truncated` says a cap cut it, so a shorter path (or one, when none came back) may exist;
     no paths and `truncated: false` means there is none within `max_depth`.
-  - Document counts, degrees and weights are counted by the store, not on each read, and trail
-    the edges by a few seconds: `stale: true` says a large change (a bulk ingest) is still
-    being counted. A missing seed or path end is `NOT_FOUND`.
+  - Document counts, the document total, degrees and weights are counted by the store, not
+    on each read, and trail the edges by a few seconds: `stale: true` says a large change (a
+    bulk ingest) is still being counted. A missing seed or path end is `NOT_FOUND`.
 
 Dates are `YYYY-MM-DD` strings; JSON props and evidence are strings holding JSON.
 
@@ -925,13 +929,19 @@ schema 14:
   most 20 batches; past that they answer with `stale: true`). After a bulk load the first
   fold counts everything; the upgrade to these schemas logs every live edge, so the first fold
   after it builds the counts.
+- **The document total** (issue #181; `company_graph_totals`, one row, shared schema 13 and
+  instance schema 15) is kept by the same fold: a batch's documents that gained their first
+  live party edge add one, those that lost their last take one away. The upgrade counts it
+  once from the edges less the log rows not yet folded (on Postgres under the folds' lock),
+  so the folds after it keep it exact.
 - A document with more than 32 distinct parties links none of them (it still counts for
   each), which also bounds a fold's work per document to 496 pairs. A pair keeps at most 16
   role counts.
 - The tests compare the folded counts with a count from scratch on generated data with
   retractions, deletions and moved edges (`folded_counts_match_a_count_from_scratch`, both
-  backends; on Postgres also with two writers and two folders racing), and the conformance
-  case `explorer` checks them through a merge.
+  backends; on Postgres also with two writers and two folders racing; the document total
+  too, also when the upgrade to it finds log rows not yet folded), and the conformance case
+  `explorer` checks them through a merge.
 
 **Reads.** `ListCompanies` reads `company_stats` in `(documents, id)` or `(degree, id)` index
 order, or `nodes_company_name` (the lowercased name, partial on companies) for the name

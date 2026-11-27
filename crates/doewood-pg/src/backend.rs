@@ -1194,6 +1194,10 @@ impl GraphStore for PgStore {
         crate::explore::fold(&self.pool, max_rows).await
     }
 
+    async fn company_documents_total(&self) -> Result<u64> {
+        crate::explore::documents_total(&self.pool).await
+    }
+
     async fn list_companies(
         &self,
         filter: &doewood_model::CompanyFilter,

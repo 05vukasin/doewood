@@ -1,6 +1,6 @@
 //! The explorer's reads on SQLite (issue #172): the company graph's fold, the company
 //! listing and the links between companies. See `doewood_model::explore` for the rules and
-//! schema 14 for the tables.
+//! schemas 14 and 15 for the tables.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -203,7 +203,27 @@ fn apply(conn: &Connection, delta: &FoldDelta) -> Result<()> {
             .execute(params![company.to_string(), documents, degree])
             .map_err(sql)?;
     }
+    if delta.documents_total != 0 {
+        conn.prepare_cached(
+            "UPDATE company_graph_totals SET documents = max(0, documents + ?1) WHERE id = 1",
+        )
+        .map_err(sql)?
+        .execute([delta.documents_total])
+        .map_err(sql)?;
+    }
     Ok(())
+}
+
+/// The document total as last folded.
+pub(super) fn documents_total(conn: &Connection) -> Result<u64> {
+    let n: i64 = conn
+        .prepare_cached("SELECT documents FROM company_graph_totals WHERE id = 1")
+        .map_err(sql)?
+        .query_row([], |r| r.get(0))
+        .optional()
+        .map_err(sql)?
+        .unwrap_or(0);
+    Ok(u64::try_from(n).unwrap_or(0))
 }
 
 /// The company listing's query, its arguments and the column of the name key.

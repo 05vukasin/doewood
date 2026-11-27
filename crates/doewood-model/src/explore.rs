@@ -14,6 +14,10 @@
 //! A fold reads, in one snapshot, every log row of a batch's nodes and their live edges now.
 //! What was counted for a node before is then its edges now minus the logged changes, and
 //! the counts move by the difference ([`fold_deltas`]).
+//!
+//! **The document total** (issue #181) is kept the same way: the number of documents with at
+//! least one live `party` edge, each once however many companies it names. A fold moves it
+//! by the batch's documents that gained their first party or lost their last.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -409,6 +413,8 @@ impl LinkState {
 /// How a fold moves the counts.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FoldDelta {
+    /// The change in documents with a live `party` edge, each once (the document total).
+    pub documents_total: i64,
     /// Company to its change in documents.
     pub documents: BTreeMap<Uuid, i64>,
     /// Pair `(a, b)`, `a < b`, to its change.
@@ -468,6 +474,9 @@ fn pair(x: Uuid, y: Uuid) -> ((Uuid, Uuid), bool) {
 
 /// Adds `sign` times what `node`'s counted edges contribute.
 fn contribute(delta: &mut FoldDelta, node: Uuid, c: &Counted, sign: i64) {
+    if !c.party.is_empty() {
+        delta.documents_total += sign;
+    }
     for &company in c.party.keys() {
         *delta.documents.entry(company).or_default() += sign;
     }
@@ -999,6 +1008,9 @@ pub struct CompanyGraph {
     pub links: Vec<CompanyLink>,
     /// The live corporate-event edges between the companies, by the link they belong to.
     pub events: BTreeMap<(Uuid, Uuid), Vec<StoredEdge>>,
+    /// Documents with a live `party` edge in the whole graph, each once, as last folded (not
+    /// narrowed by the filter or the caps).
+    pub documents_total: u64,
     /// More companies matched than the limit, more links than their cap, or a company had
     /// more events than read.
     pub truncated: bool,
@@ -1084,10 +1096,12 @@ pub async fn company_graph<S: crate::GraphStore + ?Sized>(
             }
         }
     }
+    let documents_total = store.company_documents_total().await?;
     Ok(CompanyGraph {
         companies,
         links,
         events,
+        documents_total,
         truncated,
         stale,
     })
@@ -1176,6 +1190,56 @@ mod tests {
         // 11 lost the link to 10 and gained the one to 12.
         assert!(!plan.stats.contains_key(&id(11)));
         assert_eq!(plan.stats[&id(12)], (1, 1));
+    }
+
+    /// Issue #181: a document counts once in the total, however many companies it names, and
+    /// only when it gains its first party edge or loses its last.
+    #[test]
+    fn the_document_total_counts_a_document_once() {
+        let new = fold_deltas(
+            &[
+                log(1, 10, "buyer", 1),
+                log(1, 11, "supplier", 1),
+                log(1, 12, "signatory", 1),
+                log(2, 10, "buyer", 1),
+            ],
+            &[
+                member(1, 10, "buyer"),
+                member(1, 11, "supplier"),
+                member(1, 12, "signatory"),
+                member(2, 10, "buyer"),
+            ],
+        );
+        assert_eq!(new.documents_total, 2);
+        // One of three parties retracted, and an edge moved: still counted.
+        let d = fold_deltas(
+            &[
+                log(1, 12, "signatory", -1),
+                log(2, 10, "buyer", -1),
+                log(2, 11, "buyer", 1),
+            ],
+            &[
+                member(1, 10, "buyer"),
+                member(1, 11, "supplier"),
+                member(2, 11, "buyer"),
+            ],
+        );
+        assert_eq!(d.documents_total, 0);
+        // The last party edge retracted: the document leaves the total.
+        let d = fold_deltas(&[log(2, 11, "buyer", -1)], &[]);
+        assert_eq!(d.documents_total, -1);
+        // A corporate event is no document.
+        let d = fold_deltas(
+            &[LogEntry {
+                party: false,
+                ..log(20, 10, "parent_of", 1)
+            }],
+            &[Member {
+                party: false,
+                ..member(20, 10, "parent_of")
+            }],
+        );
+        assert_eq!(d.documents_total, 0);
     }
 
     #[test]

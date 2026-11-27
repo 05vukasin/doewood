@@ -227,8 +227,8 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
 migration can rebuild a table others reference). Before a migration commits it checks the
 foreign keys it could break, as the runner declares per migration (issue #159): every table
 for one that rebuilds a table, deletes rows or moves data (schemas 1 to 10); only the tables
-it fills for one that writes into new tables (schemas 11 and 14); none for one that writes no
-rows and rebuilds nothing (schema 12, an index; schema 13, a column with a default and a new
+it fills for one that writes into new tables (schemas 11, 14 and 15); none for one that writes
+no rows and rebuilds nothing (schema 12, an index; schema 13, a column with a default and a new
 table). A violation rolls the migration back and the instance does not start.
 A test holds each migration to its declaration.
 

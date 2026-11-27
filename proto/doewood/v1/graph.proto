@@ -564,6 +564,9 @@ message CompanyGraphResponse {
   bool truncated = 3;
   // As in ListCompaniesResponse.
   bool stale = 4;
+  // Documents with a live party edge in the whole graph, each once however many companies
+  // it names; not narrowed by the filter or the caps. Kept with the other counts (no scan).
+  uint64 documents_total = 5;
 }
 
 message SubgraphRequest {

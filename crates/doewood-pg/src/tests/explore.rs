@@ -1,6 +1,7 @@
 //! Issue #172 on generated data, as on SQLite (`doewood-store`, `standalone/explore_scale.rs`):
 //! the company graph's counts, folded from the log (also while writers and other folds run),
-//! match a count from scratch; and an ignored test times the explorer's reads.
+//! match a count from scratch (and the document total of issue #181, also across the upgrade
+//! to schema 13); and an ignored test times the explorer's reads.
 
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -145,6 +146,24 @@ async fn stored(c: &tokio_postgres::Client) -> Counts {
     (stats, pairs)
 }
 
+/// Every party edge of one document in 16 retracted, so those leave the document total.
+const RETRACT_DOCS: &str = "UPDATE edges SET state = 'retracted' WHERE kind = 'party' \
+     AND src IN (SELECT id FROM nodes WHERE kind = 'document' AND key LIKE '%0')";
+
+/// The documents with a live party edge, from scratch; and as folded.
+async fn totals(c: &tokio_postgres::Client) -> (i64, i64) {
+    let r = c
+        .query_one(
+            "SELECT (SELECT count(DISTINCT src) FROM edges WHERE kind = 'party' \
+             AND state NOT IN ('retracted', 'superseded')), \
+             (SELECT documents FROM company_graph_totals)",
+            &[],
+        )
+        .await
+        .unwrap();
+    (r.get(0), r.get(1))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn folded_counts_match_a_count_from_scratch() {
     let Some(url) = test_url() else { return };
@@ -156,6 +175,7 @@ async fn folded_counts_match_a_count_from_scratch() {
     // folders.
     s.fold_company_graph(2000).await.unwrap();
     c.batch_execute(CHURN).await.unwrap();
+    c.batch_execute(RETRACT_DOCS).await.unwrap();
     let companies: Vec<Uuid> = c
         .query(
             "SELECT id FROM nodes WHERE kind = 'company' ORDER BY key LIMIT 40",
@@ -218,6 +238,56 @@ async fn folded_counts_match_a_count_from_scratch() {
     assert!(want_pairs.len() > 1000, "{}", want_pairs.len());
     assert_eq!(pairs, want_pairs);
     assert_eq!(stats, want_stats);
+    let (want, got) = totals(&c).await;
+    assert_eq!(got, want);
+    let documents: i64 = c
+        .query_one("SELECT count(*) FROM nodes WHERE kind = 'document'", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        got < documents - 150,
+        "retractions lower the total: {got} of {documents}"
+    );
+    db.drop_schema().await;
+}
+
+/// Issue #181: the upgrade to schema 13 counts the total as folded so far, so the folds after
+/// it keep it exact, though the log still holds rows of documents folded before (and churned
+/// since) and of documents never folded.
+#[tokio::test]
+async fn schema_13_counts_the_total_with_log_rows_pending() {
+    let Some(url) = test_url() else { return };
+    let db = Scratch::new(&url).await;
+    let c = db.client().await;
+    {
+        let s = db.store().await;
+        c.batch_execute(&seed(3000, 300, false)).await.unwrap();
+        // Fold a part as schema 12 would (the total's row aside), then go back to schema 12.
+        s.fold_company_graph(2000).await.unwrap();
+    }
+    c.batch_execute(
+        "DROP TABLE company_graph_totals; DELETE FROM doewood_schema WHERE version = 13;",
+    )
+    .await
+    .unwrap();
+    c.batch_execute(CHURN).await.unwrap();
+    c.batch_execute(RETRACT_DOCS).await.unwrap();
+    let pending: i64 = c
+        .query_one("SELECT count(*) FROM company_graph_log", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(pending > 1000, "{pending}");
+    let s = db.store().await;
+    while s.fold_company_graph(500).await.unwrap().more {}
+    let (want, got) = totals(&c).await;
+    assert_eq!(got, want);
+    assert_eq!(
+        s.company_documents_total().await.unwrap(),
+        u64::try_from(want).unwrap()
+    );
+    assert_eq!(stored(&c).await, from_scratch(&c).await);
     db.drop_schema().await;
 }
 

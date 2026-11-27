@@ -1130,6 +1130,10 @@ impl GraphStore for Standalone {
         self.run(move |conn| explore::fold(conn, max_rows)).await
     }
 
+    async fn company_documents_total(&self) -> Result<u64> {
+        self.read(|conn| explore::documents_total(conn)).await
+    }
+
     async fn list_companies(
         &self,
         filter: &doewood_model::CompanyFilter,
