@@ -267,7 +267,9 @@ impl Store {
                  AND blake3 = ?2 AND status <> 'deleted')",
             )?;
             for id in allowed {
-                if stmt.query_row(params![id.to_string(), &blake3[..]], |r| r.get::<_, bool>(0))? {
+                if stmt.query_row(params![id.to_string(), &blake3[..]], |r| {
+                    r.get::<_, bool>(0)
+                })? {
                     return Ok(Some(id));
                 }
             }
@@ -406,9 +408,13 @@ mod tests {
         assert_eq!(store.on_demand_source_of(&other).unwrap(), None);
         // A deleted object no longer counts.
         store
-            .record_objects(id, &[ObjectChange::Delete {
+            .record_objects(
+                id,
+                &[ObjectChange::Delete {
                     key: "a.txt".into(),
-                }], None)
+                }],
+                None,
+            )
             .unwrap();
         assert_eq!(store.on_demand_source_of(&held).unwrap(), None);
     }

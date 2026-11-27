@@ -893,7 +893,10 @@ async fn summarize_by_blake3_reads_the_stored_record() {
         delay: Duration::ZERO,
     });
     let r = h.summaries.summarize(stored(), None).await.unwrap();
-    assert!(r.extractive && r.provider.is_empty() && !r.digest.is_empty(), "{r:?}");
+    assert!(
+        r.extractive && r.provider.is_empty() && !r.digest.is_empty(),
+        "{r:?}"
+    );
     assert!(r.warnings.iter().any(|w| w.contains("500")), "{r:?}");
     mock.set(good());
 
