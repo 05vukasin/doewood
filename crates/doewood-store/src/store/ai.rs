@@ -4,6 +4,9 @@
 //!
 //! - The settings row `ai.provider.<name>` holds the preset, model and base URL (no secret).
 //! - The secret `ai/<name>/api_key` holds the key. It is write-only, like every secret.
+//! - The secret `ai/<name>/aws_credentials` holds a `bedrock` provider's IAM credentials (access
+//!   key id, secret access key, optional session token), sealed as one value. Write-only too; a
+//!   bearer token (`api_key`) wins over them when both are set, as in quail.
 //! - The settings row `ai.default_provider` names the provider used when a request names none.
 
 use std::fmt;
@@ -12,7 +15,7 @@ use rusqlite::{OptionalExtension as _, params};
 use zeroize::Zeroizing;
 
 use super::{Applied, Store, now, write_sealed_tx};
-use crate::StoreError;
+use crate::{CredentialsChange, S3Credentials, StoreError};
 
 /// The provider presets: the names quail's `ApiConfig` and hedgehog use.
 pub const AI_PRESETS: &[&str] = &[
@@ -34,6 +37,12 @@ const PROVIDER_PREFIX: &str = "ai.provider.";
 /// Largest API key accepted, in bytes.
 const API_KEY_MAX_LEN: usize = 8 * 1024;
 
+/// The only preset that takes IAM credentials.
+const BEDROCK: &str = "bedrock";
+
+/// Format tag of sealed Bedrock IAM credentials.
+const AWS_CREDENTIALS_FORMAT: &str = "doewood.bedrock.v1";
+
 /// A configured AI provider, as the API shows it: never the key, only whether one is set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AiProvider {
@@ -47,6 +56,8 @@ pub struct AiProvider {
     pub base_url: Option<String>,
     /// Whether an API key is stored.
     pub api_key_set: bool,
+    /// Whether IAM credentials are stored (`bedrock` only).
+    pub aws_credentials_set: bool,
     /// Whether requests that name no provider use this one.
     pub is_default: bool,
     /// When it last changed (Unix seconds).
@@ -114,30 +125,52 @@ fn key_secret(name: &str) -> String {
     format!("ai/{name}/api_key")
 }
 
+fn aws_secret(name: &str) -> String {
+    format!("ai/{name}/aws_credentials")
+}
+
+/// A sealed secret row: nonce and ciphertext.
+type SealedRow = Option<(Vec<u8>, Vec<u8>)>;
+
+/// See [`Store::secret_plan`].
+struct SecretPlan {
+    same_key: bool,
+    same_aws: bool,
+    aws_plain: Option<Zeroizing<Vec<u8>>>,
+}
+
 impl Store {
-    /// Adds or replaces a provider. The first provider configured becomes the default, and
-    /// `make_default` makes this one the default. See [`Store::apply_ai_provider`].
+    /// Adds or replaces a provider, keeping its IAM credentials. The first provider configured
+    /// becomes the default, and `make_default` makes this one the default. See
+    /// [`Store::apply_ai_provider`].
     pub fn set_ai_provider(
         &self,
         provider: &AiProviderInput,
         key: &KeyChange,
         make_default: bool,
     ) -> Result<AiProvider, StoreError> {
-        self.apply_ai_provider(provider, key, make_default)
+        self.apply_ai_provider(provider, key, &CredentialsChange::Keep, make_default)
             .map(|a| a.value)
     }
 
-    /// [`Store::set_ai_provider`], and whether it changed anything.
+    /// [`Store::set_ai_provider`] with a change to the IAM credentials (`aws`), and whether it
+    /// changed anything.
     ///
-    /// Idempotent (issue #144): a service that pushes the same settings at every boot writes
-    /// nothing, so `updated_at` stays and callers wake nothing. The call is a no-op when the
-    /// stored preset, model and base URL are the same, the key is the same (the stored key is
-    /// decrypted and compared: it is sealed with a random nonce, so the ciphertext differs at
-    /// every write), and the default is already where `make_default` would put it.
+    /// IAM credentials are for the `bedrock` preset only: setting them on another preset is an
+    /// error, and a provider moved to another preset loses the stored ones. A `bedrock`
+    /// provider must end up with an API key (bearer token) or IAM credentials.
+    ///
+    /// Idempotent (issues #144, #145): a service that pushes the same settings at every boot
+    /// writes nothing, so `updated_at` stays and callers wake nothing. The call is a no-op when
+    /// the stored preset, model and base URL are the same, the key and the IAM credentials are
+    /// the same (the stored values are decrypted and compared in constant time: they are sealed
+    /// with a random nonce, so the ciphertext differs at every write), and the default is
+    /// already where `make_default` would put it.
     pub fn apply_ai_provider(
         &self,
         provider: &AiProviderInput,
         key: &KeyChange,
+        aws: &CredentialsChange,
         make_default: bool,
     ) -> Result<Applied<AiProvider>, StoreError> {
         provider.validate()?;
@@ -149,6 +182,7 @@ impl Store {
         });
         let setting = format!("{PROVIDER_PREFIX}{}", provider.name);
         let secret = key_secret(&provider.name);
+        let aws_name = aws_secret(&provider.name);
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let stored: Option<String> = tx
@@ -173,25 +207,13 @@ impl Store {
             .as_deref()
             .and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok())
             .is_some_and(|v| v == value);
-        let sealed_row: Option<(Vec<u8>, Vec<u8>)> = tx
-            .query_row(
-                "SELECT nonce, ciphertext FROM secrets WHERE name = ?1",
-                [&secret],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let same_key = match key {
-            KeyChange::Keep => true,
-            KeyChange::Clear => sealed_row.is_none(),
-            // A key that cannot be opened is written again.
-            KeyChange::Set(k) => sealed_row.is_some_and(|(nonce, ct)| {
-                self.cipher
-                    .open(&secret, &nonce, &ct)
-                    .is_ok_and(|plain| same_bytes(&plain, k.expose().as_bytes()))
-            }),
-        };
+        let SecretPlan {
+            same_key,
+            same_aws,
+            aws_plain,
+        } = self.secret_plan(&tx, provider, key, aws)?;
         let same_default = default.is_some() && (!make_default || is_default);
-        if same_settings && same_key && same_default {
+        if same_settings && same_key && same_aws && same_default {
             drop(tx);
             drop(conn);
             return self.applied_provider(&provider.name, false);
@@ -212,6 +234,14 @@ impl Store {
             }
             _ => {}
         }
+        if !same_aws {
+            if let Some(plain) = &aws_plain {
+                let (nonce, ct) = self.cipher.seal(&aws_name, plain)?;
+                write_sealed_tx(&tx, &aws_name, &nonce, &ct, now)?;
+            } else {
+                tx.execute("DELETE FROM secrets WHERE name = ?1", [&aws_name])?;
+            }
+        }
         if !same_default {
             tx.execute(
                 "INSERT INTO settings (key, value_json, updated_at) VALUES (?1, ?2, ?3) \
@@ -227,6 +257,81 @@ impl Store {
         tx.commit()?;
         drop(conn);
         self.applied_provider(&provider.name, true)
+    }
+
+    /// What [`Store::apply_ai_provider`] does with the sealed secrets: whether the key and the
+    /// IAM credentials stay as stored (decrypted and compared in constant time, never the
+    /// ciphertext), and the IAM credentials to seal. Refuses IAM credentials on another preset
+    /// and a `bedrock` provider left with neither secret.
+    fn secret_plan(
+        &self,
+        tx: &rusqlite::Connection,
+        provider: &AiProviderInput,
+        key: &KeyChange,
+        aws: &CredentialsChange,
+    ) -> Result<SecretPlan, StoreError> {
+        let bedrock = provider.preset == BEDROCK;
+        if !bedrock && matches!(aws, CredentialsChange::Set(_)) {
+            return Err(StoreError::InvalidSource(
+                "IAM credentials are for the bedrock preset only".to_owned(),
+            ));
+        }
+        let secret = key_secret(&provider.name);
+        let aws_name = aws_secret(&provider.name);
+        let aws_plain = match aws {
+            CredentialsChange::Set(c) => Some(c.encode_as(AWS_CREDENTIALS_FORMAT)),
+            CredentialsChange::Keep | CredentialsChange::Clear => None,
+        };
+        let sealed = |name: &str| -> Result<SealedRow, StoreError> {
+            Ok(tx
+                .query_row(
+                    "SELECT nonce, ciphertext FROM secrets WHERE name = ?1",
+                    [name],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?)
+        };
+        // Whether the sealed row holds `plain` (a value that cannot be opened is written again).
+        let holds = |name: &str, row: &SealedRow, plain: &[u8]| {
+            row.as_ref().is_some_and(|(nonce, ct)| {
+                self.cipher
+                    .open(name, nonce, ct)
+                    .is_ok_and(|stored| same_bytes(&stored, plain))
+            })
+        };
+        let key_row = sealed(&secret)?;
+        let aws_row = sealed(&aws_name)?;
+        let same_key = match key {
+            KeyChange::Keep => true,
+            KeyChange::Clear => key_row.is_none(),
+            KeyChange::Set(k) => holds(&secret, &key_row, k.expose().as_bytes()),
+        };
+        // Another preset drops stored IAM credentials (a provider moved off bedrock).
+        let clear_aws = matches!(aws, CredentialsChange::Clear) || !bedrock;
+        let same_aws = match &aws_plain {
+            Some(plain) => holds(&aws_name, &aws_row, plain),
+            None => !clear_aws || aws_row.is_none(),
+        };
+        if bedrock {
+            let key_after = match key {
+                KeyChange::Keep => key_row.is_some(),
+                KeyChange::Set(_) => true,
+                KeyChange::Clear => false,
+            };
+            let aws_after = aws_plain.is_some() || (!clear_aws && aws_row.is_some());
+            if !key_after && !aws_after {
+                return Err(StoreError::InvalidSource(
+                    "the bedrock preset needs an API key (bearer token) or IAM credentials \
+                     (an access key id and a secret access key)"
+                        .to_owned(),
+                ));
+            }
+        }
+        Ok(SecretPlan {
+            same_key,
+            same_aws,
+            aws_plain,
+        })
     }
 
     fn applied_provider(
@@ -256,8 +361,11 @@ impl Store {
         rows.into_iter()
             .map(|(key, value, updated_at)| {
                 let name = key[PROVIDER_PREFIX.len()..].to_owned();
-                let api_key_set = self.secret_exists(&key_secret(&name))?;
-                provider_from(name, &value, updated_at, api_key_set, default.as_deref())
+                let set = SecretsSet {
+                    api_key: self.secret_exists(&key_secret(&name))?,
+                    aws_credentials: self.secret_exists(&aws_secret(&name))?,
+                };
+                provider_from(name, &value, updated_at, set, default.as_deref())
             })
             .collect()
     }
@@ -279,15 +387,11 @@ impl Store {
             return Ok(None);
         };
         let default = self.default_ai_provider()?;
-        let api_key_set = self.secret_exists(&key_secret(name))?;
-        provider_from(
-            name.to_owned(),
-            &value,
-            updated_at,
-            api_key_set,
-            default.as_deref(),
-        )
-        .map(Some)
+        let set = SecretsSet {
+            api_key: self.secret_exists(&key_secret(name))?,
+            aws_credentials: self.secret_exists(&aws_secret(name))?,
+        };
+        provider_from(name.to_owned(), &value, updated_at, set, default.as_deref()).map(Some)
     }
 
     /// The name of the default provider, if any is configured.
@@ -307,13 +411,30 @@ impl Store {
             .map_err(|_| StoreError::InvalidSource(format!("the key of {name:?} is not UTF-8")))?;
         ApiKey::new(text).map(Some)
     }
+
+    /// Decrypts a `bedrock` provider's IAM credentials: like [`Store::ai_api_key`], the LLM
+    /// connector's path only, never the API's.
+    pub fn ai_aws_credentials(&self, name: &str) -> Result<Option<S3Credentials>, StoreError> {
+        let secret = aws_secret(name);
+        let Some(plain) = self.reveal(&secret)? else {
+            return Ok(None);
+        };
+        S3Credentials::decode_as(AWS_CREDENTIALS_FORMAT, &secret, &plain).map(Some)
+    }
+}
+
+/// Which secrets a provider has.
+#[derive(Clone, Copy)]
+struct SecretsSet {
+    api_key: bool,
+    aws_credentials: bool,
 }
 
 fn provider_from(
     name: String,
     value: &str,
     updated_at: i64,
-    api_key_set: bool,
+    set: SecretsSet,
     default: Option<&str>,
 ) -> Result<AiProvider, StoreError> {
     let bad = || StoreError::BadSetting(format!("{PROVIDER_PREFIX}{name}"));
@@ -328,7 +449,8 @@ fn provider_from(
         preset: text("preset").ok_or_else(bad)?,
         model: text("model").ok_or_else(bad)?,
         base_url: text("base_url"),
-        api_key_set,
+        api_key_set: set.api_key,
+        aws_credentials_set: set.aws_credentials,
         updated_at,
         name,
     })
@@ -495,6 +617,7 @@ mod tests {
     /// Issue #144: the same settings again (a service configuring doewood at every boot)
     /// write nothing; a changed key, model, base URL or default applies at once.
     #[test]
+    #[allow(clippy::too_many_lines)] // one scenario, in order
     fn set_ai_provider_is_idempotent() {
         use crate::{LlmJobStatus, NewSource};
 
@@ -505,7 +628,9 @@ mod tests {
         let mut mock = input("mock", "openai_compatible");
         mock.base_url = Some("http://127.0.0.1:9/v1".into());
         let key = || KeyChange::Set(ApiKey::new("test-key-1").unwrap());
-        let first = store.apply_ai_provider(&mock, &key(), true).unwrap();
+        let first = store
+            .apply_ai_provider(&mock, &key(), &CredentialsChange::Keep, true)
+            .unwrap();
         assert!(first.changed && first.value.is_default && first.value.api_key_set);
         // Jobs in every state: pending, failed after a call, done.
         let (a, b, c) = ([1; 32], [2; 32], [3; 32]);
@@ -524,7 +649,9 @@ mod tests {
         // The same call, three times, with make_default and without (it is the default),
         // and with the key kept.
         for (k, make_default) in [(key(), true), (key(), false), (KeyChange::Keep, true)] {
-            let again = store.apply_ai_provider(&mock, &k, make_default).unwrap();
+            let again = store
+                .apply_ai_provider(&mock, &k, &CredentialsChange::Keep, make_default)
+                .unwrap();
             assert!(!again.changed, "{k:?} {make_default}");
             assert_eq!(again.value.updated_at, 1000);
             assert_eq!(snapshot(&store, source), before);
@@ -539,14 +666,21 @@ mod tests {
 
         // A new key applies.
         let k2 = KeyChange::Set(ApiKey::new("test-key-2").unwrap());
-        let changed = store.apply_ai_provider(&mock, &k2, true).unwrap();
+        let changed = store
+            .apply_ai_provider(&mock, &k2, &CredentialsChange::Keep, true)
+            .unwrap();
         assert!(changed.changed);
         assert!(changed.value.updated_at > 1000);
         assert_eq!(
             store.ai_api_key("mock").unwrap().unwrap().expose(),
             "test-key-2"
         );
-        assert!(!store.apply_ai_provider(&mock, &k2, true).unwrap().changed);
+        assert!(
+            !store
+                .apply_ai_provider(&mock, &k2, &CredentialsChange::Keep, true)
+                .unwrap()
+                .changed
+        );
         // So do a new model and a new base URL.
         let edits: [fn(&mut AiProviderInput); 2] = [
             |m| m.model = "test-model-2".into(),
@@ -556,7 +690,7 @@ mod tests {
             change(&mut mock);
             backdate(&store);
             let changed = store
-                .apply_ai_provider(&mock, &KeyChange::Keep, true)
+                .apply_ai_provider(&mock, &KeyChange::Keep, &CredentialsChange::Keep, true)
                 .unwrap();
             assert!(changed.changed);
             assert_eq!(changed.value.model, mock.model);
@@ -566,13 +700,13 @@ mod tests {
         // Clearing the key changes it once.
         assert!(
             store
-                .apply_ai_provider(&mock, &KeyChange::Clear, true)
+                .apply_ai_provider(&mock, &KeyChange::Clear, &CredentialsChange::Keep, true)
                 .unwrap()
                 .changed
         );
         assert!(
             !store
-                .apply_ai_provider(&mock, &KeyChange::Clear, true)
+                .apply_ai_provider(&mock, &KeyChange::Clear, &CredentialsChange::Keep, true)
                 .unwrap()
                 .changed
         );
@@ -581,7 +715,12 @@ mod tests {
         let other = input("other", "openai");
         let set = |make_default| {
             store
-                .apply_ai_provider(&other, &KeyChange::Keep, make_default)
+                .apply_ai_provider(
+                    &other,
+                    &KeyChange::Keep,
+                    &CredentialsChange::Keep,
+                    make_default,
+                )
                 .unwrap()
         };
         assert!(set(false).changed && !set(false).changed);
@@ -596,6 +735,149 @@ mod tests {
             store.pending_llm_jobs(10).unwrap().len(),
             1,
             "no job touched"
+        );
+    }
+
+    fn iam(id: &str, secret: &str, token: Option<&str>) -> CredentialsChange {
+        CredentialsChange::Set(S3Credentials::new(id, secret, token.map(str::to_owned)).unwrap())
+    }
+
+    /// Issue #145: Bedrock IAM credentials are sealed, write-only and bedrock-only, and follow
+    /// the #144 rule: the same values again write nothing, a changed one applies at once.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one scenario, in order
+    fn bedrock_iam_credentials_are_sealed_and_idempotent() {
+        use crate::NewSource;
+
+        let store = Store::open_in_memory(&MasterKey::from_bytes([5; 32])).unwrap();
+        let source = store
+            .add_source(&NewSource::new("http://127.0.0.1:9000", "docs"), None)
+            .unwrap();
+        store.queue_llm_job(source, &[1; 32], None).unwrap();
+        let mut bedrock = input("bedrock", "bedrock");
+        bedrock.base_url = Some("https://bedrock-runtime.eu-west-2.amazonaws.com".into());
+        // Neither a key nor IAM credentials: refused, nothing written.
+        let none =
+            store.apply_ai_provider(&bedrock, &KeyChange::Keep, &CredentialsChange::Keep, true);
+        assert!(none.unwrap_err().to_string().contains("IAM credentials"));
+        assert!(store.ai_providers().unwrap().is_empty());
+        // IAM credentials on another preset: refused.
+        assert!(
+            store
+                .apply_ai_provider(
+                    &input("openai", "openai"),
+                    &KeyChange::Keep,
+                    &iam("AKIDTEST01", "test-secret-01", None),
+                    false,
+                )
+                .is_err()
+        );
+
+        let creds = || iam("AKIDTEST01", "test-secret-01", Some("test-token-01"));
+        let first = store
+            .apply_ai_provider(&bedrock, &KeyChange::Keep, &creds(), true)
+            .unwrap();
+        assert!(first.changed);
+        assert!(first.value.aws_credentials_set && !first.value.api_key_set);
+        assert!(!format!("{:?}", first.value).contains("AKIDTEST01"));
+        // Sealed: the ciphertext holds none of the values; only the connector path opens it.
+        let ct: Vec<u8> = store
+            .raw()
+            .query_row(
+                "SELECT ciphertext FROM secrets WHERE name = 'ai/bedrock/aws_credentials'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        for v in ["AKIDTEST01", "test-secret-01", "test-token-01"] {
+            assert!(!ct.windows(v.len()).any(|w| w == v.as_bytes()), "{v}");
+        }
+        let opened = store.ai_aws_credentials("bedrock").unwrap().unwrap();
+        assert_eq!(
+            (
+                opened.access_key_id(),
+                opened.secret_access_key(),
+                opened.session_token()
+            ),
+            ("AKIDTEST01", "test-secret-01", Some("test-token-01"))
+        );
+
+        // The same credentials again (and kept): nothing written, the queue untouched.
+        backdate(&store);
+        let before = snapshot(&store, source);
+        for aws in [creds(), CredentialsChange::Keep] {
+            let again = store
+                .apply_ai_provider(&bedrock, &KeyChange::Keep, &aws, true)
+                .unwrap();
+            assert!(!again.changed, "{aws:?}");
+            assert_eq!(again.value.updated_at, 1000);
+            assert_eq!(snapshot(&store, source), before);
+        }
+        // Each value that changes applies at once: the key id, the secret, the session token
+        // (changed, then dropped).
+        for (i, next) in [
+            iam("AKIDTEST02", "test-secret-01", Some("test-token-01")),
+            iam("AKIDTEST02", "test-secret-02", Some("test-token-01")),
+            iam("AKIDTEST02", "test-secret-02", Some("test-token-02")),
+            iam("AKIDTEST02", "test-secret-02", None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            backdate(&store);
+            let changed = store
+                .apply_ai_provider(&bedrock, &KeyChange::Keep, &next, true)
+                .unwrap();
+            assert!(changed.changed && changed.value.updated_at > 1000, "{i}");
+            let CredentialsChange::Set(want) = &next else {
+                unreachable!()
+            };
+            assert_eq!(&store.ai_aws_credentials("bedrock").unwrap().unwrap(), want);
+            backdate(&store);
+            let again = store
+                .apply_ai_provider(&bedrock, &KeyChange::Keep, &next, true)
+                .unwrap();
+            assert!(!again.changed, "{i}");
+        }
+        assert_eq!(
+            store.pending_llm_jobs(10).unwrap().len(),
+            1,
+            "no job touched"
+        );
+
+        // With a bearer token too, clearing the IAM credentials changes once; without the
+        // token, clearing the last credential is refused.
+        let token = || KeyChange::Set(ApiKey::new("test-bearer-1").unwrap());
+        let both = store
+            .apply_ai_provider(&bedrock, &token(), &CredentialsChange::Keep, true)
+            .unwrap();
+        assert!(both.changed && both.value.api_key_set && both.value.aws_credentials_set);
+        let clear = |key: &KeyChange| {
+            store.apply_ai_provider(&bedrock, key, &CredentialsChange::Clear, true)
+        };
+        let cleared = clear(&KeyChange::Keep).unwrap();
+        assert!(cleared.changed && !cleared.value.aws_credentials_set);
+        assert!(store.ai_aws_credentials("bedrock").unwrap().is_none());
+        assert!(!clear(&KeyChange::Keep).unwrap().changed);
+        assert!(clear(&KeyChange::Clear).is_err());
+        assert!(store.ai_provider("bedrock").unwrap().unwrap().api_key_set);
+
+        // A provider moved to another preset loses its IAM credentials, once.
+        store
+            .apply_ai_provider(&bedrock, &KeyChange::Keep, &creds(), true)
+            .unwrap();
+        let mut moved = bedrock.clone();
+        moved.preset = "openai".into();
+        moved.base_url = None;
+        let m = store
+            .apply_ai_provider(&moved, &KeyChange::Keep, &CredentialsChange::Keep, true)
+            .unwrap();
+        assert!(m.changed && !m.value.aws_credentials_set && m.value.api_key_set);
+        assert!(
+            !store
+                .apply_ai_provider(&moved, &KeyChange::Keep, &CredentialsChange::Keep, true)
+                .unwrap()
+                .changed
         );
     }
 

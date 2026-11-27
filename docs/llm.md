@@ -26,7 +26,13 @@ nothing comes from the environment ([configuration.md](configuration.md)).
   self-hosted or fine-tuned model is `openai_compatible` or `vllm` with its URL. The key is
   sealed with the master key and never returned. The queue uses the **default** provider;
   `Summarize` may name another. `bedrock` needs `base_url`
-  `https://bedrock-runtime.<region>.amazonaws.com`: its region is read from it.
+  `https://bedrock-runtime.<region>.amazonaws.com`: its region is read from it. It
+  authenticates with a bearer token (`api_key`, a Bedrock API key) or with IAM credentials
+  (`aws_access_key_id`, `aws_secret_access_key`, optional `aws_session_token`), which sign
+  each request with SigV4 (quail's `Endpoint::resolve_with_aws`). The bearer token wins when
+  both are stored. IAM credentials are sealed and write-only too; `ListAiProviders` shows only
+  `aws_credentials_set`. A change of key or credentials applies to the next call: the queue
+  builds a new summarizer when the endpoint changes.
 - **A policy per source** (`ConfigService.SetLlmPolicy`, or `llm_policy` in `AddSource`):
 
   | mode | queued at ingest | `Summarize` of its objects |

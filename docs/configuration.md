@@ -22,6 +22,7 @@ Set through the API, kept in `doewood.sqlite`, applied without a restart:
 | A source's LLM policy: mode (`off` (default), `all`, `kinds`, `on_demand`), kinds, concurrency (1 to 64, default 2), daily token budget (tokens per UTC day, unset: no limit) | `SetLlmPolicy`, `AddSource` | `sources.policy_json` |
 | AI providers: preset, model, base URL | `SetAiProvider` | setting `ai.provider.<name>` |
 | An AI provider's API key | `SetAiProvider` | secret `ai/<name>/api_key` (sealed, write-only) |
+| A `bedrock` provider's IAM credentials (access key id, secret access key, optional session token) | `SetAiProvider` | secret `ai/<name>/aws_credentials` (sealed, write-only) |
 | The default AI provider (the LLM queue's) | `SetAiProvider` (`make_default`; the first one set) | setting `ai.default_provider` |
 | Ingest: least MinHash Jaccard estimate for a `similar_to` edge (above 0, at most 1, default `0.8`). Read for every file, so a change applies to the next file ingested. Edges already written are kept; `ReprocessJob` with `force` compares a source's documents again (a lower value adds edges, a higher one removes none). | `SetIngestSettings`, read with `GetIngestSettings` | setting `ingest.similar_min_jaccard` |
 | Ingest: the largest LSH band bucket the `similar_to` candidate query reads (10 to 1000000, default `1000`): a band key shared by more documents is skipped as template boilerplate, which changes which edges exist on template-heavy corpora (see [ingest.md](ingest.md)). Read for every file. | `SetIngestSettings`, read with `GetIngestSettings` | setting `ingest.similar_max_bucket` |
@@ -396,9 +397,11 @@ idempotent, so the service makes them at every boot.
 2. **`ConfigService.SetAiProvider` with `make_default: true`.** The same preset, model, base
    URL, key and default again change nothing: nothing is written (`updated_at` stays), no LLM
    job is queued again or reset, the queue is not woken, and no second provider appears. A
-   different key, model, base URL or default applies at once, to the next summary. The key is
-   compared with the stored one after decryption, never returned. An empty `api_key` keeps the
-   stored key; `clear_api_key` deletes it.
+   different key, IAM credentials, model, base URL or default applies at once, to the next
+   summary. The key and the IAM credentials are compared with the stored ones after decryption
+   (in constant time), never returned. An empty `api_key` keeps the stored key;
+   `clear_api_key` deletes it. Empty IAM fields keep the stored credentials;
+   `clear_aws_credentials` deletes them.
 3. **`ConfigService.SetLlmPolicy`** for each source that should get summaries (`ListSources`
    lists them). The same policy again is a no-op too; a different one applies at once.
 
@@ -408,6 +411,7 @@ required for every preset):
 | env | preset | other fields |
 |---|---|---|
 | `AI_PROVIDER=bedrock` | `bedrock` | `base_url=https://bedrock-runtime.<AWS_REGION>.amazonaws.com`, `api_key=<AWS_BEARER_TOKEN_BEDROCK>`, `model=<AI_CHAT_MODEL>` |
+| `AI_PROVIDER=bedrock` with IAM credentials (instead of `AWS_BEARER_TOKEN_BEDROCK`) | `bedrock` | `base_url=https://bedrock-runtime.<AWS_REGION>.amazonaws.com`, `aws_access_key_id=<AWS_ACCESS_KEY_ID>`, `aws_secret_access_key=<AWS_SECRET_ACCESS_KEY>`, `aws_session_token=<AWS_SESSION_TOKEN>` (temporary credentials only), `model=<AI_CHAT_MODEL>` |
 | `anthropic` | `anthropic` | `api_key=<ANTHROPIC_API_KEY>`, `model=<AI_CHAT_MODEL>` |
 | `openai-compatible` | `openai_compatible` | `base_url=<OPENAI_COMPATIBLE_BASE_URL>`, `api_key=<OPENAI_COMPATIBLE_API_KEY>`, `model=<AI_CHAT_MODEL>` |
 | `none` | no call | |
@@ -472,7 +476,24 @@ if os.environ.get("AI_PROVIDER", "none") == "openai-compatible":
     )
 ```
 
-`provider` is the stored provider: `api_key_set`, `is_default` and `updated_at`, never the key.
+`provider` is the stored provider: `api_key_set`, `aws_credentials_set`, `is_default` and
+`updated_at`, never a secret.
+
+With IAM credentials, pass them instead of `api_key`. When both are set, the bearer token
+wins. Temporary credentials (an assumed role) expire: send the new ones when they rotate.
+They apply at once.
+
+```python
+config.SetAiProvider(pb.SetAiProviderRequest(
+    preset="bedrock",
+    model=os.environ["AI_CHAT_MODEL"],
+    base_url=f"https://bedrock-runtime.{os.environ['AWS_REGION']}.amazonaws.com",
+    aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+    aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+    aws_session_token=os.environ.get("AWS_SESSION_TOKEN", ""),
+    make_default=True,
+), timeout=10)
+```
 
 ### Compose example
 

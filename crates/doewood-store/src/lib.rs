@@ -12,8 +12,9 @@
 //! - Secrets are sealed with XChaCha20-Poly1305 under the master key and are **write-only**
 //!   through the public API: they can be set, deleted and tested for, never read back. The
 //!   exceptions are the connectors' access paths ([`Store::source_credentials`] for the S3
-//!   client, [`Store::sqs_credentials`] for the SQS inlet, [`Store::ai_api_key`] for the LLM,
-//!   [`Store::enrichment_config`] for the enrichment job), which the API never calls.
+//!   client, [`Store::sqs_credentials`] for the SQS inlet, [`Store::ai_api_key`] and
+//!   [`Store::ai_aws_credentials`] for the LLM, [`Store::enrichment_config`] for the
+//!   enrichment job), which the API never calls.
 
 mod crypto;
 mod error;

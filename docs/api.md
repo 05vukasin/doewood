@@ -18,8 +18,9 @@ changes go to a new package (`doewood.v2`), never into v1.
   file sent to `Summarize`. Larger messages are refused (`OUT_OF_RANGE`).
 - **Limits** on streams per connection, keepalive, connection age, calls in flight and a
   server deadline: see [Limits](#limits).
-- **Secrets are write-only.** S3 credentials and AI API keys are sealed with the master key;
-  no response and no error carries one, only `credentials_set` or `api_key_set`. Error
+- **Secrets are write-only.** S3 credentials, AI API keys and Bedrock IAM credentials are
+  sealed with the master key; no response and no error carries one, only `credentials_set`,
+  `api_key_set` or `aws_credentials_set`. Error
   messages never echo a value that may hold a secret (an endpoint with `user:password@`, a
   key), nor a presigned URL.
 
@@ -112,11 +113,23 @@ The comments in the `.proto` files are the reference for every field. In short:
   side by side under other names. An empty `api_key` keeps the stored key; `clear_api_key`
   deletes it. The first provider set becomes the default; `make_default` moves the default.
   The LLM queue uses the default provider. For `bedrock`, `base_url` is required
-  (`https://bedrock-runtime.<region>.amazonaws.com`): the region is read from it. The call is
-  idempotent: the same preset, model, base URL, key and default again write nothing (the
-  `updated_at` it returns stays), requeue no job and leave the queue alone, so a service can
-  make it at every boot ([configuration.md](configuration.md#configuring-doewood-from-another-service)).
-- **ListAiProviders** lists them with `api_key_set`, never the key, plus every preset name.
+  (`https://bedrock-runtime.<region>.amazonaws.com`): the region is read from it.
+  - **Bedrock authentication:** `api_key` is a bearer token (a Bedrock API key). Instead, or
+    as well, `bedrock` takes IAM credentials: `aws_access_key_id` and `aws_secret_access_key`
+    (both or neither) and, for temporary credentials, `aws_session_token`. They are sealed and
+    write-only like `api_key` and replaced as one unit: a new pair without a token drops the
+    stored token. All three empty keep the stored credentials; `clear_aws_credentials` deletes
+    them. Requests are signed with SigV4 (service `bedrock`, the base URL's region). When both
+    a bearer token and IAM credentials are stored, the bearer token wins, as in quail. A
+    `bedrock` provider needs one of them, and IAM fields on another preset are
+    `INVALID_ARGUMENT`; a provider moved to another preset loses its IAM credentials.
+  - **Idempotent:** the same preset, model, base URL, key, IAM credentials and default again
+    write nothing (the `updated_at` it returns stays), requeue no job and leave the queue
+    alone, so a service can make it at every boot
+    ([configuration.md](configuration.md#configuring-doewood-from-another-service)). Stored
+    secrets are decrypted and compared in constant time, never returned.
+- **ListAiProviders** lists them with `api_key_set` and `aws_credentials_set`, never a secret,
+  plus every preset name.
 
 ### Ingest settings
 

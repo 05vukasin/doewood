@@ -10,7 +10,7 @@ rust-version.workspace = true
 # Pure: no I/O, no store, no network. Registry clients (ADR 0002 section 2) come later.
 [dependencies]
 # quail's check-digit code (LEI, IBAN, PIB, MB, OIB, EU VAT), reused rather than copied.
-quail-signals = { git = "https://github.com/05vukasin/quail", rev = "8610d87" }
+quail-signals = { git = "https://github.com/05vukasin/quail", rev = "5557ef5" }
 unicode-normalization = "0.1"
 uuid = { workspace = true, features = ["v5"] }
 

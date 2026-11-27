@@ -32,6 +32,81 @@ const MODEL_MAX_LEN: usize = 256;
 /// Longest API key accepted.
 const API_KEY_MAX_LEN: usize = 8 * 1024;
 
+/// `SetAiProvider`'s IAM credentials (issue #145): bedrock only, the key pair both or neither,
+/// the session token only with the pair. Never echoes a value.
+fn aws_credentials(v: &mut Violations, req: &SetAiProviderRequest) -> CredentialsChange {
+    let (id, secret, token) = (
+        req.aws_access_key_id.as_str(),
+        req.aws_secret_access_key.as_str(),
+        req.aws_session_token.as_str(),
+    );
+    let any = !(id.is_empty() && secret.is_empty() && token.is_empty());
+    if req.clear_aws_credentials && any {
+        v.add(
+            "clear_aws_credentials",
+            "cannot be combined with aws_access_key_id, aws_secret_access_key or aws_session_token",
+        );
+        return CredentialsChange::Keep;
+    }
+    if (any || req.clear_aws_credentials) && req.preset != "bedrock" {
+        let field = if any {
+            "aws_access_key_id"
+        } else {
+            "clear_aws_credentials"
+        };
+        v.add(field, "IAM credentials are for the bedrock preset only");
+        return CredentialsChange::Keep;
+    }
+    if req.clear_aws_credentials {
+        return CredentialsChange::Clear;
+    }
+    if !any {
+        return CredentialsChange::Keep;
+    }
+    let mut ok = true;
+    for (name, value, max) in [
+        ("aws_access_key_id", id, 1024),
+        ("aws_secret_access_key", secret, 4096),
+        ("aws_session_token", token, 8192),
+    ] {
+        if value.len() > max {
+            v.add(name, format!("longer than {max} bytes"));
+            ok = false;
+        } else if value.contains(char::is_control) {
+            v.add(name, "must not contain control characters or line breaks");
+            ok = false;
+        }
+    }
+    match (id.is_empty(), secret.is_empty()) {
+        (true, true) => {
+            v.add(
+                "aws_session_token",
+                "only with aws_access_key_id and aws_secret_access_key",
+            );
+            ok = false;
+        }
+        (true, false) => {
+            v.add("aws_access_key_id", "required with aws_secret_access_key");
+            ok = false;
+        }
+        (false, true) => {
+            v.add("aws_secret_access_key", "required with aws_access_key_id");
+            ok = false;
+        }
+        (false, false) => {}
+    }
+    if !ok {
+        return CredentialsChange::Keep;
+    }
+    let token = (!token.is_empty()).then(|| token.to_owned());
+    if let Ok(c) = S3Credentials::new(id, secret, token) {
+        CredentialsChange::Set(c)
+    } else {
+        v.add("aws_access_key_id", "invalid credentials");
+        CredentialsChange::Keep
+    }
+}
+
 fn check_add(req: &AddSourceRequest) -> Result<(NewSource, Option<S3Credentials>), Status> {
     let mut v = Violations::default();
     let url_style = validate::url_style(&mut v, "url_style", req.url_style);
@@ -566,6 +641,7 @@ impl ConfigService for Api {
         if req.clear_api_key && !req.api_key.is_empty() {
             v.add("clear_api_key", "cannot be combined with api_key");
         }
+        let aws = aws_credentials(&mut v, &req);
         v.check()?;
         let key = if req.clear_api_key {
             KeyChange::Clear
@@ -583,7 +659,7 @@ impl ConfigService for Api {
         let make_default = req.make_default;
         let applied = self
             .state
-            .db(move |s| s.apply_ai_provider(&input, &key, make_default))
+            .db(move |s| s.apply_ai_provider(&input, &key, &aws, make_default))
             .await?;
         let provider = applied.value;
         if applied.changed {
@@ -591,6 +667,7 @@ impl ConfigService for Api {
                 provider = %provider.name,
                 preset = %provider.preset,
                 api_key_set = provider.api_key_set,
+                aws_credentials_set = provider.aws_credentials_set,
                 "AI provider set"
             );
             self.state.llm_settings_changed();
