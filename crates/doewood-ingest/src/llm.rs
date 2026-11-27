@@ -19,7 +19,8 @@
 //!   summary, and the error shows in the source's progress. Without a configured provider the
 //!   jobs wait.
 //! - **Providers** are the runtime settings `ConfigService.SetAiProvider` stores (preset,
-//!   model, base URL, the API key sealed in the store). The queue uses the default provider.
+//!   model, base URL, the API key and for `bedrock` the IAM credentials, sealed in the store).
+//!   The queue uses the default provider.
 //!   The process environment is never read (ADR 0001, section 3).
 //! - **`Summarize`** ([`Summaries::summarize`]) skips the queue and stores nothing: it reads
 //!   the file (the bytes given, or an object of a source whose policy is not `off`), analyzes
@@ -42,7 +43,7 @@ use doewood_model::canonical::to_canonical;
 use doewood_model::{Backend, Blake3};
 use doewood_store::{LlmJob, LlmJobStatus, LlmPolicy, Source, Store, StoreError, utc_day};
 use quail_core::{AnalyzerId, Evidence, Fact, FactKey, Value};
-use quail_summary::api::{Connect, Limiter};
+use quail_summary::api::{AwsCredentials, Connect, Limiter};
 use quail_summary::extractive::SubjectMethod;
 use quail_summary::summarizer::checked_or_fallback;
 use quail_summary::{
@@ -607,7 +608,7 @@ impl Summaries {
     /// the provider's settings do not change.
     async fn provider(&self, name: Option<&str>) -> Result<Arc<Provider>, SummarizeError> {
         let name = name.map(str::to_owned);
-        let (provider, key) = self
+        let (provider, (key, aws)) = self
             .db(move |s| {
                 let name = match name {
                     Some(n) => Some(n),
@@ -617,14 +618,14 @@ impl Summaries {
                     return Ok(None);
                 };
                 let provider = s.ai_provider(&name)?;
-                let key = match &provider {
-                    Some(_) => s.ai_api_key(&name)?,
-                    None => None,
+                let secrets = match &provider {
+                    Some(_) => secrets_of(s, &name)?,
+                    None => (None, None),
                 };
-                Ok(Some((name, provider, key)))
+                Ok(Some((name, provider, secrets)))
             })
             .await?
-            .map(|(name, p, key)| (p.ok_or(name), key))
+            .map(|(name, p, secrets)| (p.ok_or(name), secrets))
             .ok_or_else(|| {
                 SummarizeError::NoProvider(
                     "no AI provider is configured: add one with ConfigService.SetAiProvider"
@@ -634,8 +635,7 @@ impl Summaries {
         let provider = provider.map_err(|name| {
             SummarizeError::NotFound(format!("AI provider {name:?} is not configured"))
         })?;
-        let endpoint = endpoint(&provider, key.as_ref().map(|k| Secret::new(k.expose())))
-            .map_err(SummarizeError::NoProvider)?;
+        let endpoint = endpoint(&provider, key, aws).map_err(SummarizeError::NoProvider)?;
         let mut cache = lock(&self.inner.providers);
         if let Some(p) = cache.get(&provider.name)
             && same_endpoint(&p.endpoint, &endpoint)
@@ -845,9 +845,31 @@ struct Called {
     check: (u32, Vec<String>),
 }
 
+/// A provider's sealed secrets, opened, as quail takes them: the API key (bearer token) and
+/// the IAM credentials.
+fn secrets_of(
+    s: &Store,
+    name: &str,
+) -> Result<(Option<Secret>, Option<AwsCredentials>), StoreError> {
+    let key = s.ai_api_key(name)?.map(|k| Secret::new(k.expose()));
+    let aws = s.ai_aws_credentials(name)?.map(|c| {
+        let creds = AwsCredentials::new(c.access_key_id(), c.secret_access_key());
+        match c.session_token() {
+            Some(t) => creds.with_session_token(t),
+            None => creds,
+        }
+    });
+    Ok((key, aws))
+}
+
 /// quail's endpoint for a configured provider. The process environment is never read: every
-/// setting comes from the store.
-fn endpoint(p: &doewood_store::AiProvider, key: Option<Secret>) -> Result<Endpoint, String> {
+/// setting comes from the store. For `bedrock`, a bearer token (`key`) wins over IAM
+/// credentials (`aws`), which sign each request with `SigV4`.
+fn endpoint(
+    p: &doewood_store::AiProvider,
+    key: Option<Secret>,
+    aws: Option<AwsCredentials>,
+) -> Result<Endpoint, String> {
     let region = if p.preset == "bedrock" {
         let url = p.base_url.as_deref().ok_or_else(|| {
             format!(
@@ -874,9 +896,15 @@ fn endpoint(p: &doewood_store::AiProvider, key: Option<Secret>) -> Result<Endpoi
         region,
     };
     let none: [(&str, &str); 0] = [];
-    Endpoint::resolve(&connect, &Env::from_map(none)).map_err(|e| {
+    Endpoint::resolve_with_aws(&connect, aws, &Env::from_map(none)).map_err(|e| {
         let msg = e.to_string();
-        if msg.contains("needs an API key") {
+        if msg.contains("needs an API key") && p.preset == "bedrock" {
+            format!(
+                "AI provider {:?} (bedrock) has no API key (bearer token) and no IAM \
+                 credentials: set one with ConfigService.SetAiProvider",
+                p.name
+            )
+        } else if msg.contains("needs an API key") {
             format!(
                 "AI provider {:?} ({}) has no API key: set one with ConfigService.SetAiProvider",
                 p.name, p.preset
@@ -914,6 +942,7 @@ fn same_endpoint(a: &Endpoint, b: &Endpoint) -> bool {
         && a.base_url == b.base_url
         && a.model == b.model
         && a.key == b.key
+        && a.aws == b.aws
         && a.region == b.region
 }
 
@@ -1249,5 +1278,199 @@ mod tests {
             {"key": "summary.llm", "value": {"t": "record", "v": {"method": {"t": "text", "v": "llm"}}}, "conf": 0.8, "src": {"name": "summary.llm", "version": 5}}
         ]}));
         assert!(has_summary(&done));
+    }
+
+    /// A Bedrock provider configured through the store, shaped as a test of the request.
+    fn bedrock_store(key: Option<&str>) -> (Store, doewood_store::AiProvider) {
+        use doewood_store::{AiProviderInput, ApiKey, CredentialsChange, KeyChange, S3Credentials};
+        let store = Store::open_in_memory(&doewood_core::MasterKey::from_bytes([7; 32])).unwrap();
+        let input = AiProviderInput {
+            name: "bedrock".into(),
+            preset: "bedrock".into(),
+            model: "test.model-v1:0".into(),
+            base_url: Some("https://bedrock-runtime.eu-west-2.amazonaws.com".into()),
+        };
+        let key = key.map_or(KeyChange::Keep, |k| KeyChange::Set(ApiKey::new(k).unwrap()));
+        let creds = S3Credentials::new(
+            "AKIDMOCK0123456789",
+            "mock/SECRET/access/key/0123456789",
+            Some("mock-SESSION-token-0123456789".into()),
+        )
+        .unwrap();
+        let p = store
+            .apply_ai_provider(&input, &key, &CredentialsChange::Set(creds), true)
+            .unwrap()
+            .value;
+        (store, p)
+    }
+
+    /// Issue #145: stored IAM credentials reach quail, which signs with SigV4; a bearer token
+    /// wins over them; and the provider cache sees a change of credentials.
+    #[test]
+    fn bedrock_iam_credentials_resolve() {
+        let (store, p) = bedrock_store(None);
+        let (key, aws) = secrets_of(&store, "bedrock").unwrap();
+        let ep = endpoint(&p, key, aws).unwrap();
+        assert!(ep.key.is_none());
+        let aws = ep.aws.clone().unwrap();
+        assert_eq!(aws.access_key_id.expose(), "AKIDMOCK0123456789");
+        assert_eq!(ep.region.as_deref(), Some("eu-west-2"));
+        assert!(!format!("{ep:?}").contains("AKIDMOCK"));
+        let other = Endpoint {
+            aws: Some(AwsCredentials::new("AKIDMOCK0123456789", "another-secret")),
+            ..ep.clone()
+        };
+        assert!(same_endpoint(&ep, &ep.clone()));
+        assert!(
+            !same_endpoint(&ep, &other),
+            "new credentials rebuild the summarizer"
+        );
+
+        let (store, p) = bedrock_store(Some("test-bearer-token"));
+        let (key, aws) = secrets_of(&store, "bedrock").unwrap();
+        assert!(aws.is_some());
+        let ep = endpoint(&p, key, aws).unwrap();
+        assert_eq!(ep.key.unwrap().expose(), "test-bearer-token");
+        assert!(ep.aws.is_none(), "the bearer token wins");
+    }
+
+    /// Requests a mock server saw: the request line and the headers (names lowercased).
+    type SeenRequests = Arc<Mutex<Vec<(String, Vec<(String, String)>)>>>;
+
+    /// A mock Bedrock Converse server on 127.0.0.1 (an ephemeral port) that answers every
+    /// request with one grounded reply.
+    fn mock_bedrock() -> (std::net::SocketAddr, SeenRequests) {
+        use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = SeenRequests::default();
+        let log = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            let reply = serde_json::json!({
+                "output": {"message": {"role": "assistant", "content": [{"text":
+                    r#"{"summary": "A maintenance agreement between Northwind Traders and Contoso Ltd.", "subject": "printer maintenance", "title_en": "Maintenance Agreement"}"#}]}},
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 100, "outputTokens": 20, "totalTokens": 120}
+            })
+            .to_string();
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() || line.is_empty() {
+                    continue;
+                }
+                let mut headers = Vec::new();
+                let mut len = 0usize;
+                loop {
+                    let mut h = String::new();
+                    if reader.read_line(&mut h).is_err() {
+                        break;
+                    }
+                    let h = h.trim_end();
+                    if h.is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = h.split_once(':') {
+                        let (k, v) = (k.trim().to_ascii_lowercase(), v.trim().to_owned());
+                        if k == "content-length" {
+                            len = v.parse().unwrap_or(0);
+                        }
+                        headers.push((k, v));
+                    }
+                }
+                let mut body = vec![0u8; len];
+                let _ = reader.read_exact(&mut body);
+                lock(&log).push((line.trim_end().to_owned(), headers));
+                let mut out = stream;
+                let _ = write!(
+                    out,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                let _ = out.flush();
+            }
+        });
+        (addr, seen)
+    }
+
+    /// Issue #145, end to end against a local mock Bedrock server (127.0.0.1, never AWS): the
+    /// endpoint doewood builds from the store is pointed at the mock before any call, and the
+    /// request carries a SigV4 `Authorization` header (its shape, as quail's tests check it)
+    /// and the session token.
+    #[test]
+    fn bedrock_iam_requests_are_signed() {
+        let (store, p) = bedrock_store(None);
+        let (key, aws) = secrets_of(&store, "bedrock").unwrap();
+        let ep = endpoint(&p, key, aws).unwrap();
+        let (addr, seen) = mock_bedrock();
+        let ep = Endpoint {
+            base_url: format!("http://{addr}"),
+            ..ep
+        };
+        let cfg = ApiConfig {
+            call_timeout: Duration::from_secs(5),
+            timeout: Duration::from_secs(20),
+            ..ApiConfig::default()
+        };
+        let card = FileCard {
+            kind: Some("contract".into()),
+            lang: Some("en".into()),
+            ..FileCard::default()
+        };
+        let text = "MAINTENANCE AGREEMENT between Northwind Traders and Contoso Ltd for the \
+                    office printers.";
+        let input = SummaryInput {
+            card: &card,
+            card_text: "kind: contract",
+            subject: None,
+            text_head: text,
+            lang: Some("en"),
+            deadline: None,
+            document: None,
+        };
+        let _ = ApiSummarizer::new(ep, cfg).summarize(&input);
+        let seen = lock(&seen).clone();
+        assert!(!seen.is_empty(), "the mock was called");
+        let (line, headers) = &seen[0];
+        assert_eq!(line, "POST /model/test.model-v1%3A0/converse HTTP/1.1");
+        let header = |n: &str| {
+            headers
+                .iter()
+                .find(|(k, _)| k == n)
+                .map(|(_, v)| v.as_str())
+        };
+        let auth = header("authorization").unwrap();
+        let rest = auth
+            .strip_prefix("AWS4-HMAC-SHA256 ")
+            .unwrap_or_else(|| panic!("{auth}"));
+        let parts: Vec<&str> = rest.split(", ").collect();
+        assert_eq!(parts.len(), 3, "{auth}");
+        let credential = parts[0].strip_prefix("Credential=").unwrap();
+        let scope: Vec<&str> = credential.split('/').collect();
+        let date = header("x-amz-date").unwrap();
+        assert_eq!(
+            scope,
+            [
+                "AKIDMOCK0123456789",
+                &date[..8],
+                "eu-west-2",
+                "bedrock",
+                "aws4_request"
+            ]
+        );
+        let signed = parts[1].strip_prefix("SignedHeaders=").unwrap();
+        for must in ["host", "x-amz-date", "x-amz-security-token"] {
+            assert!(signed.split(';').any(|s| s == must), "{must} in {signed}");
+        }
+        let signature = parts[2].strip_prefix("Signature=").unwrap();
+        assert_eq!(signature.len(), 64);
+        assert!(signature.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(
+            header("x-amz-security-token"),
+            Some("mock-SESSION-token-0123456789")
+        );
+        assert!(!auth.contains("mock/SECRET"), "the secret is never sent");
     }
 }

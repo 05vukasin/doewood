@@ -110,6 +110,7 @@ pub(crate) fn ai_provider(p: &AiProvider) -> pb::AiProvider {
         model: p.model.clone(),
         base_url: p.base_url.clone().unwrap_or_default(),
         api_key_set: p.api_key_set,
+        aws_credentials_set: p.aws_credentials_set,
         is_default: p.is_default,
         updated_at: p.updated_at,
     }

@@ -108,14 +108,15 @@ impl SqsInletInput {
     }
 }
 
-/// What to do with an inlet's own credentials.
+/// What to do with stored AWS credentials: an SQS inlet's own (cleared, the source's are
+/// used), or a Bedrock provider's IAM credentials.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CredentialsChange {
-    /// Keep them (or keep using the source's, if there are none).
+    /// Keep them, or keep having none.
     Keep,
     /// Replace them.
     Set(S3Credentials),
-    /// Delete them: the source's credentials are used.
+    /// Delete them.
     Clear,
 }
 
