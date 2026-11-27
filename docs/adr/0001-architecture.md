@@ -59,6 +59,20 @@ Each setting has exactly **one** source.
   | `DOEWOOD_POSTGRES_URL` | none: standalone |
   | `DOEWOOD_MASTER_KEY` | generated into `<data>/master.key` (mode 0600), with a loud warning that this is for development only |
   | `DOEWOOD_INSTANCE_ID` | the hostname, which is the StatefulSet pod name |
+  | `DOEWOOD_OPS_LISTEN` | `127.0.0.1:7444` (health, readiness, metrics) |
+  | `DOEWOOD_API_MAX_MESSAGE_MIB` | `64` |
+  | `DOEWOOD_INGEST_JOBS` | from the CPUs and memory |
+  | `DOEWOOD_INGEST_BUDGET_MIB` | from the workers and memory |
+  | `DOEWOOD_INGEST_MAX_CELLS` | from the workers and memory |
+  | `DOEWOOD_OCR_JOBS` | from the memory |
+  | `DOEWOOD_OCR_MODELS` | `<data>/ocr-models` |
+
+  Only two kinds of value may be bootstrap: where the process connects and who it is (the first
+  six rows), and what the process is sized to or how its image is laid out (the rest), which
+  are read once at start, before the API is up, and belong with the deployment's CPU and memory
+  limits or the image. Anything that changes what ingest writes is a runtime setting.
+  [docs/configuration.md](../configuration.md#bootstrap-variables) gives each one's range and
+  why it is not a runtime setting.
 
 - A missing or invalid optional value never fails the build or the start. The service starts with
   what it has and reports what is not configured.
