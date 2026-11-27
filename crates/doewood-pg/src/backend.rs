@@ -103,8 +103,9 @@ pub(crate) const FEW_PARTIES: &str = "WITH lim AS (SELECT greatest(1000, \
 /// not written again.
 const INDEX_DOCUMENT: &str = "WITH d AS (DELETE FROM search_facts WHERE blake3 = $1 AND $4 = ''), \
      f AS (INSERT INTO search_facts (blake3, title, kind, doc_date, amount, facts, tsv) \
-     SELECT $1::bytea, $2::text, $5::text, $6::date, $7::float8, $4::text, setweight(to_tsvector('simple', $2), 'A') \
-     || setweight(to_tsvector('simple', $3), 'B') || setweight(to_tsvector('simple', $4), 'A') \
+     SELECT $1::bytea, $2::text, $5::text, $6::date, $7::float8, $4::text, \
+     setweight(to_tsvector('simple', $2), 'A') || setweight(to_tsvector('simple', $3), 'B') \
+     || setweight(to_tsvector('simple', $4), 'A') \
      WHERE $4 <> '' \
      ON CONFLICT (blake3) DO UPDATE SET title = EXCLUDED.title, kind = EXCLUDED.kind, \
      doc_date = EXCLUDED.doc_date, amount = EXCLUDED.amount, facts = EXCLUDED.facts, \

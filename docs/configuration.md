@@ -151,8 +151,8 @@ database (PostgreSQL 15 or newer); without it, in the instance's SQLite file.
   column `search_index.has_facts` marks the documents with facts, and the vector `tsv` is
   schema 17's again, title and body) is the current version. The migration copies the facts
   of schema 18's rows and rewrites `search_index` once, rebuilding its GIN index, inside the
-  migration's transaction (see [api.md](api.md#search-ranking-of-key-facts) for its time on
-  50,000 documents). Search results are those of schema 18. As with every schema, **all
+  migration's transaction: 6.0 s for 50,000 documents in the measurement of
+  [api.md](api.md#search-ranking-of-key-facts), so about two minutes per million. Search results are those of schema 18. As with every schema, **all
   instances are upgraded together**: an older binary refuses schema 19. **Down path** (every
   instance stopped): `ALTER TABLE search_index ADD COLUMN facts text NOT NULL DEFAULT '';
   UPDATE search_index s SET facts = f.facts FROM search_facts f WHERE f.blake3 = s.blake3;

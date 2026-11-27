@@ -1060,7 +1060,7 @@ pub async fn fact_ranking<B: Backend + ?Sized>(s: &B) {
         // search table alone then); a word of the body and one of the facts find their
         // document together.
         assert_eq!(hits(ranked("kvorum", kind)).await.len(), 4, "{kind}");
-        assert_eq!(hits(ranked("kvorum otkazni", kind)).await, [h(2)], "{kind}");
+        assert_eq!(hits(ranked("kvorum strana", kind)).await, [h(2)], "{kind}");
         assert_eq!(
             hits(ranked("saradnji penalty", kind)).await,
             [h(1)],

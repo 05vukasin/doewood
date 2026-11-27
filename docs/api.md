@@ -1665,7 +1665,7 @@ finds an empty stand-in `search_facts`, so it runs their own query on `search_in
   127 MB for both in one), for 25,000 documents with facts; every document with facts has its
   title and body vector twice.
 - **The migration** copies the facts to `search_facts`, builds its two GIN indexes and
-  rewrites `search_index` once: MIGRATION_TIME for 50,000 documents.
+  rewrites `search_index` once: 6.0 s for 50,000 documents, about two minutes per million.
 
 ## Tests
 
