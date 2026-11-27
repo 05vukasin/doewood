@@ -733,6 +733,58 @@ async fn without_a_provider_jobs_wait() {
     h.stop().await;
 }
 
+/// Issue #170: after the default provider is removed there is no default: queued jobs wait
+/// (nothing is sent), `Summarize` says no provider is configured, and the next provider set
+/// becomes the default and lets the jobs go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removed_default_provider_leaves_jobs_waiting() {
+    let mock = Mock::start(good());
+    let h = Harness::start(Some(&mock.url()), Duration::from_secs(10));
+    let gone = h.store.remove_ai_provider("mock").unwrap().unwrap();
+    assert!(gone.is_default);
+    h.summaries.notify();
+    let s = h.source("removed", LlmMode::All, 2, None);
+    h.put(s, &[("a.txt", agreement(410))]).await;
+    h.ingested(&[s]).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(h.store.llm_counts(s).unwrap().pending, 1);
+    assert_eq!(h.summaries.calls(), 0);
+    let content = || SummarizeInput::Content {
+        bytes: agreement(411),
+        name: "a.txt".into(),
+    };
+    let err = h.summaries.summarize(content(), None).await.unwrap_err();
+    assert!(matches!(err, SummarizeError::NoProvider(_)), "{err:?}");
+    let err = h
+        .summaries
+        .summarize(content(), Some("mock"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SummarizeError::NotFound(_)), "{err:?}");
+    assert_eq!(mock.count(), 0);
+
+    // Set again without make_default: the only provider becomes the default.
+    let back = h
+        .store
+        .set_ai_provider(
+            &AiProviderInput {
+                name: "mock".into(),
+                preset: "openai_compatible".into(),
+                model: "test-model".into(),
+                base_url: Some(mock.url()),
+            },
+            &KeyChange::Set(ApiKey::new("test-key").unwrap()),
+            false,
+        )
+        .unwrap();
+    assert!(back.is_default);
+    h.summaries.notify();
+    h.until("summarized", |h| h.store.llm_counts(s).unwrap().done == 1)
+        .await;
+    assert_eq!(mock.count(), 1);
+    h.stop().await;
+}
+
 /// `Summarize` skips the queue and stores nothing; it needs a provider, and a source whose
 /// policy is not `off`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
