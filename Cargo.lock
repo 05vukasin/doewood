@@ -1851,7 +1851,7 @@ dependencies = [
 [[package]]
 name = "hayro"
 version = "0.9.0"
-source = "git+https://github.com/05vukasin/quail?rev=a1d7db8#a1d7db8e99008a1916d2cfdc64672a0229b265c1"
+source = "git+https://github.com/05vukasin/quail?rev=387af90#387af90b02195ca6d624716eeec7d2e49a4b1c72"
 dependencies = [
  "ab_glyph_rasterizer",
  "bytemuck",
@@ -1899,7 +1899,7 @@ dependencies = [
 [[package]]
 name = "hayro-interpret"
 version = "0.9.0"
-source = "git+https://github.com/05vukasin/quail?rev=a1d7db8#a1d7db8e99008a1916d2cfdc64672a0229b265c1"
+source = "git+https://github.com/05vukasin/quail?rev=387af90#387af90b02195ca6d624716eeec7d2e49a4b1c72"
 dependencies = [
  "bitflags",
  "hayro-cmap",
@@ -1915,7 +1915,7 @@ dependencies = [
 [[package]]
 name = "hayro-jbig2"
 version = "0.4.0"
-source = "git+https://github.com/05vukasin/quail?rev=a1d7db8#a1d7db8e99008a1916d2cfdc64672a0229b265c1"
+source = "git+https://github.com/05vukasin/quail?rev=387af90#387af90b02195ca6d624716eeec7d2e49a4b1c72"
 dependencies = [
  "fearless_simd 1.2.0",
  "hayro-ccitt",
@@ -1939,7 +1939,7 @@ checksum = "bc2d80da85f31c3fdc0366431f44cfd645a9da1e242ed1f4a61f213d9765660f"
 [[package]]
 name = "hayro-syntax"
 version = "0.9.0"
-source = "git+https://github.com/05vukasin/quail?rev=a1d7db8#a1d7db8e99008a1916d2cfdc64672a0229b265c1"
+source = "git+https://github.com/05vukasin/quail?rev=387af90#387af90b02195ca6d624716eeec7d2e49a4b1c72"
 dependencies = [
  "flate2",
  "hayro-ccitt",
@@ -2511,7 +2511,7 @@ dependencies = [
 [[package]]
 name = "jpeg-decoder"
 version = "0.3.2"
-source = "git+https://github.com/05vukasin/quail?rev=a1d7db8#a1d7db8e99008a1916d2cfdc64672a0229b265c1"
+source = "git+https://github.com/05vukasin/quail?rev=387af90#387af90b02195ca6d624716eeec7d2e49a4b1c72"
 
 [[package]]
 name = "js-sys"
@@ -2599,7 +2599,7 @@ checksum = "d4a5ff6bcca6c4867b1c4fd4ef63e4db7436ef363e0ad7531d1558856bae64f4"
 [[package]]
 name = "lingua"
 version = "1.8.0"
-source = "git+https://github.com/05vukasin/quail?rev=a1d7db8#a1d7db8e99008a1916d2cfdc64672a0229b265c1"
+source = "git+https://github.com/05vukasin/quail?rev=387af90#387af90b02195ca6d624716eeec7d2e49a4b1c72"
 dependencies = [
  "counter",
  "dashmap",
@@ -3972,7 +3972,7 @@ dependencies = [
 [[package]]
 name = "quail-clauses"
 version = "0.1.0"
-source = "git+https://github.com/05vukasin/quail?rev=a1d7db8#a1d7db8e99008a1916d2cfdc64672a0229b265c1"
+source = "git+https://github.com/05vukasin/quail?rev=387af90#387af90b02195ca6d624716eeec7d2e49a4b1c72"
 dependencies = [
  "quail-core",
 ]
@@ -3980,7 +3980,7 @@ dependencies = [
 [[package]]
 name = "quail-cli"
 version = "0.1.0"
-source = "git+https://github.com/05vukasin/quail?rev=a1d7db8#a1d7db8e99008a1916d2cfdc64672a0229b265c1"
+source = "git+https://github.com/05vukasin/quail?rev=387af90#387af90b02195ca6d624716eeec7d2e49a4b1c72"
 dependencies = [
  "clap",
  "ctrlc",
@@ -3993,6 +3993,7 @@ dependencies = [
  "quail-io",
  "quail-items",
  "quail-parties",
+ "quail-payment",
  "quail-pdf",
  "quail-pptx",
  "quail-refs",
@@ -4008,7 +4009,7 @@ dependencies = [
 [[package]]
 name = "quail-core"
 version = "0.1.0"
-source = "git+https://github.com/05vukasin/quail?rev=a1d7db8#a1d7db8e99008a1916d2cfdc64672a0229b265c1"
+source = "git+https://github.com/05vukasin/quail?rev=387af90#387af90b02195ca6d624716eeec7d2e49a4b1c72"
 dependencies = [
  "serde",
  "thiserror",
@@ -4017,7 +4018,7 @@ dependencies = [
 [[package]]
 name = "quail-docx"
 version = "0.1.0"
-source = "git+https://github.com/05vukasin/quail?rev=a1d7db8#a1d7db8e99008a1916d2cfdc64672a0229b265c1"
+source = "git+https://github.com/05vukasin/quail?rev=387af90#387af90b02195ca6d624716eeec7d2e49a4b1c72"
 dependencies = [
  "quail-core",
  "quail-ooxml",
@@ -4027,7 +4028,7 @@ dependencies = [
 [[package]]
 name = "quail-engine"
 version = "0.1.0"
-source = "git+https://github.com/05vukasin/quail?rev=a1d7db8#a1d7db8e99008a1916d2cfdc64672a0229b265c1"
+source = "git+https://github.com/05vukasin/quail?rev=387af90#387af90b02195ca6d624716eeec7d2e49a4b1c72"
 dependencies = [
  "blake3",
  "crossbeam-channel",
@@ -4038,7 +4039,7 @@ dependencies = [
 [[package]]
 name = "quail-hash"
 version = "0.1.0"
-source = "git+https://github.com/05vukasin/quail?rev=a1d7db8#a1d7db8e99008a1916d2cfdc64672a0229b265c1"
+source = "git+https://github.com/05vukasin/quail?rev=387af90#387af90b02195ca6d624716eeec7d2e49a4b1c72"
 dependencies = [
  "blake3",
  "fastcdc",
@@ -4049,7 +4050,7 @@ dependencies = [
 [[package]]
 name = "quail-html"
 version = "0.1.0"
-source = "git+https://github.com/05vukasin/quail?rev=a1d7db8#a1d7db8e99008a1916d2cfdc64672a0229b265c1"
+source = "git+https://github.com/05vukasin/quail?rev=387af90#387af90b02195ca6d624716eeec7d2e49a4b1c72"
 dependencies = [
  "chardetng",
  "encoding_rs",
@@ -4060,7 +4061,7 @@ dependencies = [
 [[package]]
 name = "quail-io"
 version = "0.1.0"
-source = "git+https://github.com/05vukasin/quail?rev=a1d7db8#a1d7db8e99008a1916d2cfdc64672a0229b265c1"
+source = "git+https://github.com/05vukasin/quail?rev=387af90#387af90b02195ca6d624716eeec7d2e49a4b1c72"
 dependencies = [
  "globset",
  "quail-core",
@@ -4071,7 +4072,7 @@ dependencies = [
 [[package]]
 name = "quail-items"
 version = "0.1.0"
-source = "git+https://github.com/05vukasin/quail?rev=a1d7db8#a1d7db8e99008a1916d2cfdc64672a0229b265c1"
+source = "git+https://github.com/05vukasin/quail?rev=387af90#387af90b02195ca6d624716eeec7d2e49a4b1c72"
 dependencies = [
  "quail-core",
  "quail-text",
@@ -4080,7 +4081,7 @@ dependencies = [
 [[package]]
 name = "quail-ocr"
 version = "0.1.0"
-source = "git+https://github.com/05vukasin/quail?rev=a1d7db8#a1d7db8e99008a1916d2cfdc64672a0229b265c1"
+source = "git+https://github.com/05vukasin/quail?rev=387af90#387af90b02195ca6d624716eeec7d2e49a4b1c72"
 dependencies = [
  "blake3",
  "image",
@@ -4094,7 +4095,7 @@ dependencies = [
 [[package]]
 name = "quail-ooxml"
 version = "0.1.0"
-source = "git+https://github.com/05vukasin/quail?rev=a1d7db8#a1d7db8e99008a1916d2cfdc64672a0229b265c1"
+source = "git+https://github.com/05vukasin/quail?rev=387af90#387af90b02195ca6d624716eeec7d2e49a4b1c72"
 dependencies = [
  "quail-core",
  "quick-xml",
@@ -4104,7 +4105,7 @@ dependencies = [
 [[package]]
 name = "quail-parties"
 version = "0.1.0"
-source = "git+https://github.com/05vukasin/quail?rev=a1d7db8#a1d7db8e99008a1916d2cfdc64672a0229b265c1"
+source = "git+https://github.com/05vukasin/quail?rev=387af90#387af90b02195ca6d624716eeec7d2e49a4b1c72"
 dependencies = [
  "blake2",
  "quail-core",
@@ -4113,9 +4114,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "quail-payment"
+version = "0.1.0"
+source = "git+https://github.com/05vukasin/quail?rev=387af90#387af90b02195ca6d624716eeec7d2e49a4b1c72"
+dependencies = [
+ "quail-core",
+ "quail-text",
+]
+
+[[package]]
 name = "quail-pdf"
 version = "0.1.0"
-source = "git+https://github.com/05vukasin/quail?rev=a1d7db8#a1d7db8e99008a1916d2cfdc64672a0229b265c1"
+source = "git+https://github.com/05vukasin/quail?rev=387af90#387af90b02195ca6d624716eeec7d2e49a4b1c72"
 dependencies = [
  "hayro",
  "hayro-interpret",
@@ -4128,7 +4138,7 @@ dependencies = [
 [[package]]
 name = "quail-pptx"
 version = "0.1.0"
-source = "git+https://github.com/05vukasin/quail?rev=a1d7db8#a1d7db8e99008a1916d2cfdc64672a0229b265c1"
+source = "git+https://github.com/05vukasin/quail?rev=387af90#387af90b02195ca6d624716eeec7d2e49a4b1c72"
 dependencies = [
  "quail-core",
  "quail-ooxml",
@@ -4138,7 +4148,7 @@ dependencies = [
 [[package]]
 name = "quail-refs"
 version = "0.1.0"
-source = "git+https://github.com/05vukasin/quail?rev=a1d7db8#a1d7db8e99008a1916d2cfdc64672a0229b265c1"
+source = "git+https://github.com/05vukasin/quail?rev=387af90#387af90b02195ca6d624716eeec7d2e49a4b1c72"
 dependencies = [
  "quail-core",
  "quail-text",
@@ -4148,7 +4158,7 @@ dependencies = [
 [[package]]
 name = "quail-signals"
 version = "0.1.0"
-source = "git+https://github.com/05vukasin/quail?rev=a1d7db8#a1d7db8e99008a1916d2cfdc64672a0229b265c1"
+source = "git+https://github.com/05vukasin/quail?rev=387af90#387af90b02195ca6d624716eeec7d2e49a4b1c72"
 dependencies = [
  "quail-core",
  "quail-text",
@@ -4157,7 +4167,7 @@ dependencies = [
 [[package]]
 name = "quail-sketch"
 version = "0.1.0"
-source = "git+https://github.com/05vukasin/quail?rev=a1d7db8#a1d7db8e99008a1916d2cfdc64672a0229b265c1"
+source = "git+https://github.com/05vukasin/quail?rev=387af90#387af90b02195ca6d624716eeec7d2e49a4b1c72"
 dependencies = [
  "blake2b_simd",
  "fancy-regex",
@@ -4170,7 +4180,7 @@ dependencies = [
 [[package]]
 name = "quail-summary"
 version = "0.1.0"
-source = "git+https://github.com/05vukasin/quail?rev=a1d7db8#a1d7db8e99008a1916d2cfdc64672a0229b265c1"
+source = "git+https://github.com/05vukasin/quail?rev=387af90#387af90b02195ca6d624716eeec7d2e49a4b1c72"
 dependencies = [
  "blake3",
  "quail-core",
@@ -4183,7 +4193,7 @@ dependencies = [
 [[package]]
 name = "quail-text"
 version = "0.1.0"
-source = "git+https://github.com/05vukasin/quail?rev=a1d7db8#a1d7db8e99008a1916d2cfdc64672a0229b265c1"
+source = "git+https://github.com/05vukasin/quail?rev=387af90#387af90b02195ca6d624716eeec7d2e49a4b1c72"
 dependencies = [
  "chardetng",
  "encoding_rs",
@@ -4197,7 +4207,7 @@ dependencies = [
 [[package]]
 name = "quail-worker"
 version = "0.1.0"
-source = "git+https://github.com/05vukasin/quail?rev=a1d7db8#a1d7db8e99008a1916d2cfdc64672a0229b265c1"
+source = "git+https://github.com/05vukasin/quail?rev=387af90#387af90b02195ca6d624716eeec7d2e49a4b1c72"
 dependencies = [
  "crossbeam-channel",
  "nix",
