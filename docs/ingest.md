@@ -315,7 +315,11 @@ the record is analyzed, and removed when a new analysis has no text. `GetDocumen
   `doewood_ingest_similar_buckets_skipped_total`. The setting applies to the next file;
   edges already written are kept (`ReprocessJob` with `force` compares again).
 - **Search:** title (`ref.title`, else the card's, the file's own, the file name), body (the
-  summary card, the extractive summary, keywords, sheet text), kind, date and amount.
+  summary card, the extractive summary, keywords, sheet text), key facts (the key-facts
+  card's text and the passages its fields were read from, issue #194; weighted above the
+  body), kind, date and amount.
+- **Key facts** (issue #194, [below](#key-facts)): the document's key-facts row (card,
+  highlights, searchable fields).
 - **Payments** (issue #193, [below](#payments)): the document's payment row, and
   `side: supplier` / `side: buyer` on its `party` edges.
 
@@ -364,6 +368,52 @@ is sent anywhere.
   stated"; quail states `one_off` on invoices).
 - **Not yet:** the optional LLM refinement of the subject and category (issue #195). It
   would run only under a source's LLM policy with a configured provider, off by default.
+
+## Key facts
+
+Issue #194: every key fact of a contract or invoice is made findable by an AI. quail's
+`contract.facts@1` (parties and identifiers, term, renewal, notice, payment terms, penalties,
+guarantees, liability, law and disputes, annexes) and `card.facts@1` (the normalised
+key-facts card, one canonical value per field: quail's `docs/keys.md`, CONTRACT and CARD)
+run in the analyzer plan in every profile (quail #129, in quail-cli's default steps), after
+OCR when the deep profile OCRs a scan. Each fact has a `<namespace>.highlight` (`key`, `page`,
+`block`, `start`, `end`, `quote`, the fact's `conf`) in quail's block numbering, the one of the
+stored document text. They are rules over the text, nothing is sent anywhere.
+
+- **The steps change the plan**, so `quail.plan` changes and every stored record is stale:
+  `ReprocessJob` (and any ingest of a file) analyzes it again, and the new record has its
+  card and highlights. Spreadsheets (hedgehog) have none.
+- **The index row.** When the graph writer writes a document, it reads the `card.*` facts
+  (the most confident of each key) and every `*.highlight` fact from the record
+  (`DocFacts::key_facts`) and stores one row in `document_facts` (shared schema 18, instance
+  schema 20):
+  - the card (`doewood_model::Card`) as canonical JSON, each field with its confidence and at
+    most 8 highlights with their quotes (at most 512 bytes each), at most 64 KiB; a field
+    whose value does not have the shape doewood reads is left out, the others kept, and the
+    fields of a newer quail are kept as read;
+  - every highlight of the record, of every namespace (`doewood_model::BlockHighlight`: key,
+    page, block, characters, confidence; duplicates dropped, at most 1024 and 256 KiB), for
+    `GetDocumentText`;
+  - the searchable fields for `FindDocuments`: kind, number, subject, the supplier's and
+    customer's names (and folded for contains matches: lowercase, `č ć š ž đ` as `c c s z
+    dj`), category, amount (units of 10^-4, exact), currency, period, signed, `ends` and
+    `notice_due` (derived: the stated end, else start or signing date plus the term; the end
+    minus the notice period), auto-renewal, has a penalty, has a guarantee, governing law,
+    court.
+
+  A record without card or highlight facts has no row. The row is rebuilt each time the
+  document is written; a record that changed loses its old row first (beside its payment
+  row, the two deletes sent together), so a document without key facts costs no extra
+  statement in the graph writer. The row
+  goes with its record (`ON DELETE CASCADE`, so a purge removes it, issue #168).
+- **Search** gets the card's text form and the passages its fields were read from (the
+  `card.highlight` quotes; at most 16 KiB) in the
+  search row's `facts`, ranked above the body (see [api.md](api.md#key-facts)).
+- **Supplier and customer companies** are the ones payments use: the document's `party` edges
+  marked `side: supplier` and `side: buyer` (see [Payments](#payments)).
+- **Highlights** carry quail's block numbering, the one of `GetDocumentText`; the tests check
+  every card highlight's quote against the stored text, and every highlight's block and
+  characters (`tests/key_facts.rs`).
 
 ## Similar documents by relation
 

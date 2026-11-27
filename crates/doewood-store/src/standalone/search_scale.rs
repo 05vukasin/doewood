@@ -315,3 +315,132 @@ fn text_search_timings() {
         );
     }
 }
+
+/// The key facts every 2nd document of [`seed_api_load`]'s gets (issue #194): a card's text
+/// form and two highlighted passages, about 250 bytes, with `otkazni rok` in every 10th.
+const SEED_FACTS: &str = "UPDATE search_index SET facts = \
+     'kind: contract' || char(10) || 'notice: iso=P30D; days=30' || char(10) \
+     || 'penalty: percent=0.5; per=day' || char(10) || 'amount: ' || (rowid * 37 % 100000) \
+     || '.00 RSD' || char(10) || 'governing_law: RS' || char(10) \
+     || CASE WHEN rowid % 10 = 0 THEN 'Svaka strana može otkazati ugovor uz otkazni rok od 30 dana.' \
+        ELSE 'Ugovor se zaključuje na period od 12 meseci.' END || char(10) \
+     || 'Ugovorna kazna iznosi 0,5% za svaki dan kašnjenja, term' || (rowid * 11 % 5000) \
+     WHERE rowid % 2 = 0";
+
+/// Issue #194: search before and after the key facts joined the FTS index (schema 19 against
+/// 20), on `DOEWOOD_BENCH_DOCS` documents (default 50,000) shaped as `api_load` seeds them, in
+/// a store on disk: words alone and with a kind filter, before the migration, after it with
+/// no facts yet, and after every 2nd document got about 250 bytes of facts; and the
+/// migration's time. See docs/api.md, "Search ranking of key facts".
+#[tokio::test]
+#[ignore = "a measurement; run by hand"]
+#[allow(clippy::too_many_lines)]
+async fn fact_search_timings() {
+    let n: u32 = std::env::var("DOEWOOD_BENCH_DOCS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50_000);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(crate::STORE_FILE);
+    let mut conn = Connection::open(&path).unwrap();
+    assert_eq!(crate::migrate::migrate_to(&mut conn, 19).unwrap(), 19);
+    seed_api_load(&conn, n);
+    let words = [
+        ("a rare term", "term125"),
+        ("a word and a rare term", "invoice term250"),
+        ("a word in a quarter of the documents", "quarter"),
+        ("a word in most documents", "annex"),
+        ("two words of the facts", "otkazni rok"),
+    ];
+    let queries = |w: &str, kind: bool| {
+        let mut q = text(w, 20, 0);
+        if kind {
+            q.kind = Some("invoice".to_owned());
+        }
+        vec![q; 20]
+    };
+    let schema_19 = TEXT_SEARCH_19.as_str();
+    let phrase = |q: &SearchQuery| {
+        q.words()
+            .iter()
+            .map(|w| format!("\"{w}\""))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let old = |conn: &Connection, q: &SearchQuery| {
+        let mut stmt = conn.prepare_cached(schema_19).unwrap();
+        stmt.query_map(params![phrase(q), q.effective_limit(), q.offset], |r| {
+            r.get::<_, Vec<u8>>(0)
+        })
+        .unwrap()
+        .count()
+    };
+    for (name, w) in words {
+        let (p50, p99) = timings(&queries(w, false), |q| {
+            old(&conn, q);
+        });
+        println!("facts: schema 19, {name}: p50 {p50:.2} ms, p99 {p99:.2} ms");
+    }
+    let t = Instant::now();
+    assert_eq!(crate::migrate::migrate_to(&mut conn, 20).unwrap(), 20);
+    println!(
+        "facts: migration to schema 20 ({n} documents): {:.2} s",
+        t.elapsed().as_secs_f64()
+    );
+    drop(conn);
+    let store = Arc::new(Store::open(&path, &MasterKey::from_bytes([1; 32])).unwrap());
+    let s = Standalone::new(Arc::clone(&store));
+    let run = |label: &'static str| {
+        let s = &s;
+        async move {
+            for (name, w) in words {
+                for kind in [false, true] {
+                    let qs = queries(w, kind);
+                    for q in &qs {
+                        s.search(q).await.unwrap();
+                    }
+                    let mut ms = Vec::new();
+                    for _ in 0..3 {
+                        for q in &qs {
+                            let t = Instant::now();
+                            s.search(q).await.unwrap();
+                            ms.push(t.elapsed().as_secs_f64() * 1000.0);
+                        }
+                    }
+                    ms.sort_by(f64::total_cmp);
+                    let hits = s.search(&qs[0]).await.unwrap().len();
+                    println!(
+                        "facts: {label}, {name}{}: p50 {:.2} ms, p99 {:.2} ms ({hits} hits)",
+                        if kind { ", kind filter" } else { "" },
+                        ms[ms.len() / 2],
+                        ms[ms.len() * 99 / 100]
+                    );
+                }
+            }
+        }
+    };
+    // The words alone straight on a reader, as schema 19 was timed above.
+    let direct = |label: &str| {
+        let conn = store.reader();
+        for (name, w) in words {
+            let (p50, p99) = timings(&queries(w, false), |q| {
+                super::text_search(&conn, &q.words(), q).unwrap();
+            });
+            println!("facts: {label}, {name}, on a reader: p50 {p50:.2} ms, p99 {p99:.2} ms");
+        }
+    };
+    direct("schema 20, no facts");
+    run("schema 20, no facts").await;
+    let t = Instant::now();
+    let changed = store.conn().execute(SEED_FACTS, []).unwrap();
+    println!(
+        "facts: {changed} documents got facts in {:.2} s",
+        t.elapsed().as_secs_f64()
+    );
+    direct("schema 20, facts on every 2nd");
+    run("schema 20, facts on every 2nd").await;
+}
+
+/// [`super::TEXT_SEARCH`] as schema 19 ran it: two FTS columns, weights 10 and 1.
+static TEXT_SEARCH_19: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| super::TEXT_SEARCH.replace("10.0, 1.0, 20.0", "10.0, 1.0"));

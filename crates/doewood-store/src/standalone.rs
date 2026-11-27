@@ -14,14 +14,15 @@ use async_trait::async_trait;
 use doewood_core::InstanceId;
 use doewood_model::{
     Backend, Blake3, Candidates, ClaimStore, Edge, EdgeCursor, EdgeKind, EdgeSource, Error,
-    GraphStore, KeyMatch, LiveEdge, Located, LocationEnded, MERGE_CHAIN_MAX, Neighbour,
-    NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PartyDocument, Payment,
-    PaymentFilter, PaymentRow, PaymentStore, PropsPatch, PurgeStore, Purged, PutOutcome, Record,
-    RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore,
-    SimilarKey, SimilarKeys, Sketch, SketchStore, SourceClaim, SourceKey, Spend, SpendGroup,
-    StepVersions, StoredEdge, StoredText, band_to_i64, merged_into, records_limit, sketch_limit,
-    validate_alias, validate_batch_count, validate_hashes, validate_keys, validate_node,
-    validate_sketch, versions_from_json, versions_to_json,
+    FactFilter, FactRow, FactStore, FoundDocument, GraphStore, KeyMatch, LiveEdge, Located,
+    LocationEnded, MERGE_CHAIN_MAX, Neighbour, NeighbourQuery, Node, NodeAlias, NodeKind,
+    ObjectLocation, OwnedAlias, PartyDocument, Payment, PaymentFilter, PaymentRow, PaymentStore,
+    PropsPatch, PurgeStore, Purged, PutOutcome, Record, RecordStore, Result, SKETCH_MAX_BANDS,
+    SearchDoc, SearchHit, SearchQuery, SearchStore, SimilarKey, SimilarKeys, Sketch, SketchStore,
+    SourceClaim, SourceKey, Spend, SpendGroup, StepVersions, StoredEdge, StoredText, band_to_i64,
+    merged_into, records_limit, sketch_limit, validate_alias, validate_batch_count,
+    validate_hashes, validate_keys, validate_node, validate_sketch, versions_from_json,
+    versions_to_json,
 };
 use rusqlite::types::Value as Sql;
 use rusqlite::{
@@ -42,6 +43,7 @@ mod explore;
 #[cfg(test)]
 mod explore_scale;
 mod feeds;
+mod keyfacts;
 mod merges;
 mod pages;
 mod payments;
@@ -1760,20 +1762,22 @@ impl SearchStore for Standalone {
         let doc = doc.clone();
         self.run(move |conn| {
             conn.prepare_cached(
-                "INSERT INTO search_index (blake3, title, body, kind, doc_date, amount, \
-                 indexed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                "INSERT INTO search_index (blake3, title, body, facts, kind, doc_date, amount, \
+                 indexed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
                  ON CONFLICT (blake3) DO UPDATE SET title = excluded.title, \
-                 body = excluded.body, kind = excluded.kind, doc_date = excluded.doc_date, \
-                 amount = excluded.amount, indexed_at = excluded.indexed_at \
+                 body = excluded.body, facts = excluded.facts, kind = excluded.kind, \
+                 doc_date = excluded.doc_date, amount = excluded.amount, \
+                 indexed_at = excluded.indexed_at \
                  WHERE title IS NOT excluded.title OR body IS NOT excluded.body \
-                 OR kind IS NOT excluded.kind OR doc_date IS NOT excluded.doc_date \
-                 OR amount IS NOT excluded.amount",
+                 OR facts IS NOT excluded.facts OR kind IS NOT excluded.kind \
+                 OR doc_date IS NOT excluded.doc_date OR amount IS NOT excluded.amount",
             )
             .and_then(|mut cached| {
                 cached.execute(params![
                     doc.blake3.as_bytes().as_slice(),
                     doc.title,
                     doc.body,
+                    doc.facts,
                     doc.kind,
                     doc.date.map(julian),
                     doc.amount,
@@ -1808,7 +1812,7 @@ impl SearchStore for Standalone {
                     .join(" ");
                 args.push(Sql::Text(phrase));
                 "SELECT s.blake3, s.title, s.kind, s.doc_date, s.amount, \
-                 -bm25(search_fts, 10.0, 1.0) AS score \
+                 -bm25(search_fts, 10.0, 1.0, 20.0) AS score \
                  FROM search_fts JOIN search_index s ON s.rowid = search_fts.rowid \
                  WHERE search_fts MATCH ?"
                     .to_owned()
@@ -1909,7 +1913,7 @@ fn text_search(conn: &Connection, words: &[String], q: &SearchQuery) -> Result<V
 /// page reaches the cut is minus infinity (`-9e999`), which lets every match through.
 /// Materialized, each match is scored once, and the cut compares the very same values.
 const TEXT_SEARCH: &str = "WITH m AS MATERIALIZED (SELECT rowid AS id, \
-     -bm25(search_fts, 10.0, 1.0) AS score FROM search_fts WHERE search_fts MATCH ?1) \
+     -bm25(search_fts, 10.0, 1.0, 20.0) AS score FROM search_fts WHERE search_fts MATCH ?1) \
      SELECT s.blake3, s.title, s.kind, s.doc_date, s.amount, m.score \
      FROM m JOIN search_index s ON s.rowid = m.id \
      WHERE m.score >= coalesce((SELECT score FROM m ORDER BY score DESC \
@@ -1976,6 +1980,36 @@ impl PaymentStore for Standalone {
 
     async fn supplier_spend(&self, supplier: Option<Uuid>, group: SpendGroup) -> Result<Spend> {
         self.read(move |conn| payments::spend(conn, supplier, group))
+            .await
+    }
+}
+
+#[async_trait]
+impl FactStore for Standalone {
+    async fn put_document_facts(&self, row: &FactRow) -> Result<()> {
+        row.validate()?;
+        let row = row.clone();
+        self.run(move |conn| keyfacts::put(conn, &row)).await
+    }
+
+    async fn delete_document_facts(&self, blake3: &Blake3) -> Result<()> {
+        let h = *blake3;
+        self.run(move |conn| keyfacts::delete(conn, &h)).await
+    }
+
+    async fn get_document_facts(&self, blake3: &Blake3) -> Result<Option<FactRow>> {
+        let h = *blake3;
+        self.read(move |conn| keyfacts::get(conn, &h)).await
+    }
+
+    async fn find_documents(
+        &self,
+        filter: &FactFilter,
+        after: Option<&Blake3>,
+        limit: u32,
+    ) -> Result<Vec<FoundDocument>> {
+        let (filter, after) = (filter.clone(), after.copied());
+        self.read(move |conn| keyfacts::find(conn, &filter, after.as_ref(), limit))
             .await
     }
 }
@@ -2161,6 +2195,7 @@ mod tests {
                     blake3: hash,
                     title: format!("t{i}"),
                     body: "b".into(),
+                    facts: String::new(),
                     kind: None,
                     date: None,
                     amount: None,

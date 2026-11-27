@@ -28,6 +28,7 @@ mod convert;
 mod enrichment;
 mod explore;
 mod feeds;
+mod keyfacts;
 mod merges;
 mod migrate;
 mod pages;

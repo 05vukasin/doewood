@@ -99,6 +99,12 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("migrations/0019_payments.sql"),
         fk_check: FkCheck::Skip,
     },
+    // A new empty table, a column with a default, and search's FTS index created again with
+    // a third column and rebuilt from `search_index` (issue #194).
+    Migration {
+        sql: include_str!("migrations/0020_document_facts.sql"),
+        fk_check: FkCheck::Skip,
+    },
 ];
 
 /// The schema version this binary writes.
@@ -220,12 +226,15 @@ mod tests {
     fn migrations_declare_what_they_check() {
         for (version, m) in (1..).zip(MIGRATIONS) {
             let own = own_statements(m.sql);
-            let rebuilds = ["DROP TABLE", "RENAME", "DELETE FROM"]
-                .iter()
-                .any(|k| own.contains(k));
+            // An FTS index dropped and created again (issue #194) is an index rebuilt from
+            // its content table: it has no foreign keys and no table references it.
+            let fts = targets(&own, "CREATE VIRTUAL TABLE");
+            let rebuilds = ["RENAME", "DELETE FROM"].iter().any(|k| own.contains(k))
+                || targets(&own, "DROP TABLE").iter().any(|t| !fts.contains(t));
             let writes: Vec<&str> = ["INSERT INTO", "INSERT OR", "REPLACE INTO", "UPDATE "]
                 .iter()
                 .flat_map(|k| targets(&own, k))
+                .filter(|t| !fts.contains(t))
                 .collect();
             match m.fk_check {
                 FkCheck::Whole => {}
@@ -252,6 +261,14 @@ mod tests {
         let own = own_statements(sql);
         assert_eq!(targets(&own, "INSERT INTO"), ["C"]);
         assert!(own.contains("DROP TABLE") && !own.contains("NOPE"));
+        let own = own_statements(
+            "DROP TABLE f; CREATE VIRTUAL TABLE f USING fts5 (a); \
+             INSERT INTO f (f) VALUES ('rebuild');",
+        );
+        assert_eq!(
+            targets(&own, "CREATE VIRTUAL TABLE"),
+            targets(&own, "DROP TABLE")
+        );
     }
 
     /// A test schema: `parent` and `child` (with a foreign key), and one child row.

@@ -1,7 +1,10 @@
 //! `RecordsService`: records by hash, and by source a page at a time; a document's text with
-//! block locations a page of blocks at a time (issue #166); payments per document and spend
-//! per supplier (issue #193, in [`crate::payments`]).
+//! block locations a page of blocks at a time (issue #166), with the highlights of the facts
+//! over each block (issue #194); payments per document and spend per supplier (issue #193, in
+//! [`crate::payments`]); key-facts cards and the documents found by their key facts (issue
+//! #194, in [`crate::keyfacts`]).
 
+use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 
 use doewood_model::{
@@ -11,6 +14,7 @@ use tonic::{Request, Response, Status};
 
 use crate::pb::records_service_server::RecordsService;
 use crate::pb::{
+    DocumentCard, FindDocumentsRequest, FindDocumentsResponse, GetDocumentCardRequest,
     GetDocumentTextRequest, GetDocumentTextResponse, GetRecordRequest, ListPaymentsRequest,
     ListPaymentsResponse, ListRecordsRequest, ListRecordsResponse, Record, SupplierSpendRequest,
     SupplierSpendResponse,
@@ -112,13 +116,21 @@ impl RecordsService for Api {
         let Some(hash) = hash else {
             return Err(Status::invalid_argument("blake3: required"));
         };
-        let stored = self
-            .state
-            .backend()?
-            .get_document_text(&hash)
-            .await
+        let backend = self.state.backend()?;
+        let (stored, facts) = tokio::join!(backend.get_document_text(&hash), async {
+            if req.skip_highlights {
+                Ok(None)
+            } else {
+                backend.get_document_facts(&hash).await
+            }
+        });
+        let stored = stored
             .map_err(error::model)?
             .ok_or_else(|| Status::not_found(format!("no document text for {hash}")))?;
+        let mut highlights = match facts.map_err(error::model)? {
+            Some(row) => crate::keyfacts::by_block(row.highlights().map_err(error::model)?),
+            None => BTreeMap::new(),
+        };
         let from = match token {
             None => 0,
             Some((at, _)) if at != stored.updated_at => {
@@ -139,7 +151,7 @@ impl RecordsService for Api {
             0 => TEXT_DEFAULT_PAGE_SIZE,
             n => n as usize,
         };
-        let (pages, end) = text_page(&text, from, limit, TEXT_PAGE_BYTES);
+        let (pages, end) = text_page(&text, from, limit, TEXT_PAGE_BYTES, &mut highlights);
         let next_page_token = if end < total {
             format!("{}.{end}", stored.updated_at)
         } else {
@@ -170,6 +182,20 @@ impl RecordsService for Api {
     ) -> Result<Response<SupplierSpendResponse>, Status> {
         crate::payments::spend(self, request).await
     }
+
+    async fn get_document_card(
+        &self,
+        request: Request<GetDocumentCardRequest>,
+    ) -> Result<Response<DocumentCard>, Status> {
+        crate::keyfacts::get_card(self, request).await
+    }
+
+    async fn find_documents(
+        &self,
+        request: Request<FindDocumentsRequest>,
+    ) -> Result<Response<FindDocumentsResponse>, Status> {
+        crate::keyfacts::find(self, request).await
+    }
 }
 
 /// Largest `page_size` of `GetDocumentText`, in blocks.
@@ -190,12 +216,14 @@ fn parse_text_token(token: &str) -> Option<(i64, usize)> {
 
 /// The blocks `from..end` of `text` (at most `limit`, ending with the block that brings their
 /// bytes to `max_bytes`), grouped by page, and `end`. A page without blocks goes with the
-/// response that holds the block after it, or with the last response.
+/// response that holds the block after it, or with the last response. Each block takes its
+/// highlights out of `highlights` (by block index).
 fn text_page(
     text: &DocumentText,
     from: usize,
     limit: usize,
     max_bytes: usize,
+    highlights: &mut BTreeMap<u32, Vec<crate::pb::BlockHighlight>>,
 ) -> (Vec<crate::pb::TextPage>, usize) {
     let total = text.block_count();
     // Where each page's blocks start among all the blocks.
@@ -218,7 +246,8 @@ fn text_page(
         while starts[pos + 1] <= v.index {
             pos += 1;
         }
-        let b = text_block(v.index, v.page, v.block, v.heading_path);
+        let mut b = text_block(v.index, v.page, v.block, v.heading_path);
+        b.highlights = highlights.remove(&b.index).unwrap_or_default();
         bytes +=
             b.text.len() + b.sheet.len() + b.heading_path.iter().map(String::len).sum::<usize>();
         blocks[pos].push(b);
@@ -261,6 +290,7 @@ fn text_block(
         zone: b.zone.map(|z| z.as_str().to_owned()).unwrap_or_default(),
         level: b.level.map_or(0, u32::from),
         table: b.table,
+        highlights: Vec::new(),
     }
 }
 
@@ -306,7 +336,7 @@ mod tests {
         ] {
             let (mut from, mut blocks, mut pages) = (0, Vec::new(), Vec::new());
             loop {
-                let (page, end) = text_page(&text, from, limit, max_bytes);
+                let (page, end) = text_page(&text, from, limit, max_bytes, &mut BTreeMap::new());
                 assert!(
                     end > from || end == text.block_count(),
                     "{limit} {max_bytes}"
@@ -340,7 +370,7 @@ mod tests {
         let mut b = TextBuilder::new("pdf.extract", "1", TEXT_MAX_BYTES);
         b.page(0, None, TextOrigin::None);
         b.page(1, None, TextOrigin::None);
-        let (pages, end) = text_page(&b.finish(), 0, 200, 1 << 20);
+        let (pages, end) = text_page(&b.finish(), 0, 200, 1 << 20, &mut BTreeMap::new());
         assert_eq!((pages.len(), end), (2, 0));
     }
 

@@ -19,6 +19,15 @@ service RecordsService {
   // currencies) and period (recurring fees apart from one-off prices), grouped by category,
   // year or month, and the categories and subjects the supplier provides.
   rpc SupplierSpend(SupplierSpendRequest) returns (SupplierSpendResponse);
+  // The normalised key facts of one document (issue #194): parties, dates and term, renewal
+  // and notice, payment, penalties, guarantees, law and court, each with its confidence and
+  // highlights, as typed fields and as compact canonical JSON made to be handed to an LLM.
+  // NOT_FOUND when the document has no key facts (no record, no card, or a record from
+  // before them).
+  rpc GetDocumentCard(GetDocumentCardRequest) returns (DocumentCard);
+  // The documents whose key facts match every filter set (issue #194), ordered by hash, a
+  // page at a time.
+  rpc FindDocuments(FindDocumentsRequest) returns (FindDocumentsResponse);
 }
 
 message GetRecordRequest {
@@ -59,6 +68,8 @@ message GetDocumentTextRequest {
   uint32 page_size = 2;
   // `next_page_token` of the previous page; empty for the first.
   string page_token = 3;
+  // Leave out the highlights of the blocks (`TextBlock.highlights`).
+  bool skip_highlights = 4;
 }
 
 message GetDocumentTextResponse {
@@ -121,6 +132,21 @@ message TextBlock {
   uint32 level = 9;
   // A table row's table, counted on its page from 0.
   optional uint32 table = 10;
+  // The facts over this block (issue #194), from every `<namespace>.highlight` of the record
+  // (`card.*`, `contract.*`, `payment.*`, ...), ordered by start, end, key. Empty with
+  // `skip_highlights`, and for a record from before the key facts.
+  repeated BlockHighlight highlights = 11;
+}
+
+// A fact over a block's text: characters `start` to `end` (Unicode scalar values, end
+// exclusive) of `TextBlock.text`.
+message BlockHighlight {
+  // The fact key (`card.notice`, `contract.penalty`, `payment.amount`, ...).
+  string key = 1;
+  uint32 start = 2;
+  uint32 end = 3;
+  // The fact's confidence, 0 to 1.
+  float conf = 4;
 }
 
 message ListPaymentsRequest {
@@ -288,4 +314,235 @@ message SupplierProvides {
   // The subject as the documents state it; empty when unknown.
   string subject = 3;
   uint32 documents = 4;
+}
+
+message GetDocumentCardRequest {
+  // 64 hex digits.
+  string blake3 = 1;
+}
+
+// One document's key-facts card (quail's `card.*`). A field the document does not state is
+// empty (unset for the optional and message fields). Dates are `YYYY-MM-DD`, amounts exact
+// decimal text, codes lowercase, the governing law an ISO 3166 code.
+message DocumentCard {
+  // 64 lowercase hex digits.
+  string blake3 = 1;
+  // The card as compact canonical JSON: the fields below by name (absent when not stated),
+  // and `evidence`, per field its `conf` and `highlights` (`page`, `block`, `start`, `end`,
+  // `quote`). Made to be handed to an LLM as context or as a tool result.
+  string card_json = 2;
+  // quail's instrument kind: `contract`, `msa`, `invoice`, `offer`, `nda`, ...
+  string kind = 3;
+  // The document's own number as written.
+  string number = 4;
+  CardParty supplier = 5;
+  CardParty customer = 6;
+  // Signing, start (effective), end (expiry), invoice issue and payment due dates as stated.
+  string signed = 7;
+  string start = 8;
+  string end = 9;
+  string issued = 10;
+  string due = 11;
+  // The duration of the contract.
+  CardDuration term = 12;
+  // Whether the contract renews by itself.
+  optional bool auto_renewal = 13;
+  // The notice period.
+  CardDuration notice = 14;
+  // Days to pay.
+  optional uint32 payment_days = 15;
+  // `bank_transfer`, `cash`, `card`, `compensation`.
+  string payment_method = 16;
+  // The price, its basis (`gross`, `net`, `unstated`), ISO 4217 currency and period
+  // (`one_off`, `monthly`, `quarterly`, `yearly`).
+  string amount = 17;
+  string amount_basis = 18;
+  string currency = 19;
+  string period = 20;
+  // What is paid for, and its category code (as `ListPayments`).
+  string subject = 21;
+  string category = 22;
+  // Bank accounts and IBANs the document names.
+  repeated string accounts = 23;
+  CardAdvance advance = 24;
+  // How the price may change: `cpi`, `inflation`, `exchange_rate`, `fixed`, `other`.
+  string indexation = 25;
+  CardPenalty penalty = 26;
+  // Guarantee kinds: `bank_guarantee`, `bill_of_exchange`, `performance_bond`,
+  // `letter_of_credit`, `parent_guarantee`, `deposit`.
+  repeated string guarantees = 27;
+  CardLiabilityCap liability_cap = 28;
+  // Whether the document binds to confidentiality.
+  optional bool confidentiality = 29;
+  CardSla sla = 30;
+  // The warranty period.
+  CardDuration warranty = 31;
+  // ISO 3166: a country (`RS`) or a subdivision (`GB-EAW`, England and Wales).
+  string governing_law = 32;
+  // The court for disputes.
+  string court = 33;
+  // Arbitration: the institution, else the rules, else `arbitration`.
+  string arbitration = 34;
+  // ISO 639-1.
+  repeated string languages = 35;
+  // Annex labels.
+  repeated string annexes = 36;
+  // The number of the document an amendment amends.
+  string amends = 37;
+  // Derived: the stated end, else the start (or signing) date plus the term.
+  string ends = 38;
+  // Derived: `ends` minus the notice period, the last day to give notice.
+  string notice_due = 39;
+  // Every stated field with its confidence and highlights, in name order.
+  repeated CardField fields = 40;
+}
+
+// A party on the card.
+message CardParty {
+  string name = 1;
+  // Serbian tax and registration numbers, a VAT number, another registration number.
+  string pib = 2;
+  string mb = 3;
+  string vat = 4;
+  string reg = 5;
+  // A bank account or IBAN.
+  string account = 6;
+  string address = 7;
+  string representative = 8;
+}
+
+// A duration: ISO 8601, with whole months or days (years as 12 months, weeks as 7 days).
+message CardDuration {
+  string iso = 1;
+  optional uint32 months = 2;
+  optional uint32 days = 3;
+  // No fixed end (a term only).
+  bool indefinite = 4;
+}
+
+message CardAdvance {
+  optional double percent = 1;
+  string amount = 2;
+  string currency = 3;
+}
+
+message CardPenalty {
+  // Percent of the value, per `day` or `week` of delay.
+  optional double percent = 1;
+  string per = 2;
+  // A fixed amount.
+  string amount = 3;
+  string currency = 4;
+  // The cap, percent of the value.
+  optional double cap_percent = 5;
+}
+
+message CardLiabilityCap {
+  string amount = 1;
+  string currency = 2;
+  optional double percent = 3;
+  // `contract_value` or `fees_paid`.
+  string basis = 4;
+  // The fees of how many months.
+  optional uint32 months = 5;
+}
+
+message CardSla {
+  // Percent.
+  optional double availability = 1;
+  optional uint32 response_hours = 2;
+  optional uint32 resolution_hours = 3;
+}
+
+// One field of the card.
+message CardField {
+  // The field's name (`notice`, `penalty`, ...; its fact key is `card.<name>`).
+  string name = 1;
+  // Its value as JSON.
+  string value_json = 2;
+  // Its confidence, 0 to 1.
+  float conf = 3;
+  // Where its source facts sit in the document text (`key` is `card.<name>`).
+  repeated Highlight highlights = 4;
+}
+
+message FindDocumentsRequest {
+  // `card.kind`: `contract`, `invoice`, ...
+  string kind = 1;
+  // The supplier or the customer company (a UUID; the document's `party` edge marked
+  // `side: supplier` or `side: buyer`, as `ListPayments`).
+  string supplier_id = 2;
+  string customer_id = 3;
+  // Text the supplier's or the customer's name contains (case and Serbian diacritics
+  // ignored).
+  string supplier_name = 4;
+  string customer_name = 5;
+  // A category code (as `ListPayments`).
+  string category = 6;
+  // ISO 4217; needed with an amount bound.
+  string currency = 7;
+  // Decimal text (`100000`, `1200.50`), inclusive.
+  string amount_min = 8;
+  string amount_max = 9;
+  // Ends (`DocumentCard.ends`) on or before / on or after this day (`YYYY-MM-DD`).
+  string end_before = 10;
+  string end_after = 11;
+  // Notice due (`DocumentCard.notice_due`) on or before / on or after this day.
+  string notice_due_before = 12;
+  string notice_due_after = 13;
+  // Renews by itself (true) or does not (false, stated); unset for either.
+  optional bool auto_renewal = 14;
+  // Has a contractual penalty, or has none; unset for either.
+  optional bool has_penalty = 15;
+  // Has a guarantee, or has none; unset for either.
+  optional bool has_guarantee = 16;
+  // ISO 3166 (`RS`); a country finds its subdivisions too (`GB` finds `GB-EAW`, England and
+  // Wales).
+  string governing_law = 17;
+  // Text the court's name contains (case and Serbian diacritics ignored).
+  string court = 18;
+  // Signed on or after / on or before this day.
+  string signed_from = 19;
+  string signed_to = 20;
+  // 1 to 1000; 0 means 50.
+  uint32 page_size = 21;
+  // `next_page_token` of the previous page; empty for the first.
+  string page_token = 22;
+}
+
+message FindDocumentsResponse {
+  repeated FoundDocument documents = 1;
+  // Empty on the last page.
+  string next_page_token = 2;
+}
+
+// A document FindDocuments found: its card's searchable fields (`GetDocumentCard` has the
+// rest). A field the card does not state is empty.
+message FoundDocument {
+  // 64 lowercase hex digits.
+  string blake3 = 1;
+  // The Document node, when its graph was written.
+  string document_id = 2;
+  string kind = 3;
+  string number = 4;
+  string subject = 5;
+  // The supplier company and its name as the document writes it.
+  string supplier_id = 6;
+  string supplier_name = 7;
+  // The customer company (`side: buyer`) and its name.
+  string customer_id = 8;
+  string customer_name = 9;
+  string category = 10;
+  // Decimal text, in `currency`.
+  string amount = 11;
+  string currency = 12;
+  string period = 13;
+  string signed = 14;
+  string ends = 15;
+  string notice_due = 16;
+  optional bool auto_renewal = 17;
+  bool has_penalty = 18;
+  bool has_guarantee = 19;
+  string governing_law = 20;
+  string court = 21;
 }

@@ -276,6 +276,7 @@ async fn store_calls_are_one_round_trip() {
             blake3: h,
             title: format!("doc {n}"),
             body: String::new(),
+            facts: String::new(),
             kind: None,
             date: None,
             amount: None,

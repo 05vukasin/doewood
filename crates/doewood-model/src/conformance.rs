@@ -59,6 +59,9 @@ pub async fn run<B: Backend + ?Sized>(a: &B, b: &B) {
     live_writes(a, b).await;
     explorer(a).await;
     payments(a).await;
+    // Boxed: the suite's future is large (many filters held across awaits).
+    Box::pin(document_facts(a)).await;
+    Box::pin(fact_ranking(a)).await;
     purge_overlaps(a, b).await;
     purge_races(a, b).await;
     // Last: it purges every orphan the cases before left.
@@ -483,6 +486,546 @@ pub async fn payments<B: Backend + ?Sized>(s: &B) {
         s.delete_payment(&h(r.0)).await.unwrap();
     }
     assert!(list(f()).await.is_empty());
+}
+
+/// Key facts (issue #194): rows beside their records, read back as written, every filter of
+/// `find_documents`, pages, and the supplier and customer read through the `party` edges
+/// marked `side`.
+///
+/// # Panics
+///
+/// When the backend misbehaves.
+#[allow(clippy::too_many_lines)]
+pub async fn document_facts<B: Backend + ?Sized>(s: &B) {
+    use crate::{
+        BlockHighlight, Card, CardDuration, CardEvidence, CardHighlight, CardParty, CardPenalty,
+        FactFilter, FactRow, SIDE_PROP,
+    };
+    let h = |n| purge_hash(0xc4, n);
+    let party = |name: &str| {
+        Some(CardParty {
+            name: Some(name.to_owned()),
+            ..CardParty::default()
+        })
+    };
+    let months = |m| {
+        Some(CardDuration {
+            iso: Some(format!("P{m}M")),
+            months: Some(m),
+            ..CardDuration::default()
+        })
+    };
+    let days = |d| {
+        Some(CardDuration {
+            iso: Some(format!("P{d}D")),
+            days: Some(d),
+            ..CardDuration::default()
+        })
+    };
+    // 1: a Serbian service contract; 2: an English one; 3: a lease without an end;
+    // 4: an invoice; 5: a contract that ends by its term.
+    let cards = [
+        Card {
+            kind: Some("contract".into()),
+            number: Some("114/2026".into()),
+            supplier: party("Alfa Soft d.o.o."),
+            customer: party("Beta Trgovina d.o.o."),
+            signed: Some("2026-01-15".into()),
+            end: Some("2026-12-31".into()),
+            auto_renewal: Some(true),
+            notice: days(30),
+            amount: Some("1200000.00".into()),
+            currency: Some("RSD".into()),
+            category: Some("it_software".into()),
+            subject: Some("održavanje softvera".into()),
+            penalty: Some(CardPenalty {
+                percent: Some(0.5),
+                per: Some("day".into()),
+                ..CardPenalty::default()
+            }),
+            guarantees: vec!["bank_guarantee".into()],
+            governing_law: Some("RS".into()),
+            court: Some("Privredni sud u Beogradu".into()),
+            evidence: [(
+                "notice".to_owned(),
+                CardEvidence {
+                    conf: 0.8,
+                    highlights: vec![CardHighlight {
+                        page: 0,
+                        block: 12,
+                        start: 30,
+                        end: 52,
+                        quote: "otkazni rok od 30 dana".into(),
+                    }],
+                },
+            )]
+            .into(),
+            ..Card::default()
+        },
+        Card {
+            kind: Some("contract".into()),
+            supplier: party("Alpha Widgets LLC"),
+            customer: party("Beta Components GmbH"),
+            signed: Some("2026-03-01".into()),
+            end: Some("2028-02-29".into()),
+            auto_renewal: Some(false),
+            notice: days(90),
+            amount: Some("50000.00".into()),
+            currency: Some("EUR".into()),
+            category: Some("consulting".into()),
+            guarantees: vec!["performance_bond".into()],
+            governing_law: Some("gb-eaw".into()),
+            court: Some("courts of London".into()),
+            ..Card::default()
+        },
+        Card {
+            kind: Some("contract".into()),
+            supplier: party("Gama Nekretnine d.o.o."),
+            customer: party("Đorđević i sinovi d.o.o."),
+            signed: Some("2025-06-01".into()),
+            term: Some(CardDuration {
+                indefinite: Some(true),
+                ..CardDuration::default()
+            }),
+            notice: days(60),
+            amount: Some("150000.00".into()),
+            currency: Some("RSD".into()),
+            category: Some("rent_lease".into()),
+            penalty: Some(CardPenalty::default()),
+            governing_law: Some("RS".into()),
+            court: Some("Privredni sud u Nišu".into()),
+            ..Card::default()
+        },
+        Card {
+            kind: Some("invoice".into()),
+            supplier: party("Gamma Consulting LLC"),
+            customer: party("Beta Trgovina d.o.o."),
+            amount: Some("1944.00".into()),
+            currency: Some("USD".into()),
+            ..Card::default()
+        },
+        Card {
+            kind: Some("contract".into()),
+            supplier: party("Alfa Soft d.o.o."),
+            start: Some("2026-02-01".into()),
+            term: months(12),
+            notice: months(1),
+            amount: Some("10000.00".into()),
+            currency: Some("RSD".into()),
+            category: Some("it_software".into()),
+            auto_renewal: Some(true),
+            ..Card::default()
+        },
+    ];
+    let highlights = |n: u32| {
+        vec![
+            BlockHighlight {
+                key: "contract.notice".into(),
+                page: 0,
+                block: n + 2,
+                start: 4,
+                end: 9,
+                conf: 0.8,
+            },
+            BlockHighlight {
+                key: "card.notice".into(),
+                page: 0,
+                block: n + 2,
+                start: 4,
+                end: 9,
+                conf: 0.8,
+            },
+            BlockHighlight {
+                key: "payment.amount".into(),
+                page: 0,
+                block: n,
+                start: 0,
+                end: 3,
+                conf: 0.9,
+            },
+        ]
+    };
+    let rows: Vec<FactRow> = cards
+        .iter()
+        .zip(1u8..)
+        .map(|(c, n)| FactRow::new(h(n), c.clone(), highlights(u32::from(n))).unwrap())
+        .collect();
+    // A row needs its record.
+    let missing = s.put_document_facts(&rows[0]).await.unwrap_err();
+    assert!(matches!(missing, Error::NotFound(_)), "{missing}");
+    let mut docs = Vec::new();
+    for (r, n) in rows.iter().zip(1u8..) {
+        s.put_record(&h(n), &raw(&json!({"facts": n})), &versions("1"))
+            .await
+            .unwrap();
+        s.put_document_facts(r).await.unwrap();
+        // Again: unchanged.
+        s.put_document_facts(r).await.unwrap();
+        docs.push(
+            s.upsert_node(NodeKind::Document, &h(n).to_hex(), &json!({}))
+                .await
+                .unwrap(),
+        );
+    }
+    let company = |key: &'static str| async move {
+        s.upsert_node(NodeKind::Company, key, &json!({"name": key}))
+            .await
+            .unwrap()
+    };
+    let (alfa, beta) = (company("kf:alfa").await, company("kf:beta").await);
+    let edge = |doc: Uuid, c: Uuid, side: &str| {
+        Edge::new(doc, c, EdgeKind::Party, EdgeSource::Document)
+            .with_props(json!({"role": "party", SIDE_PROP: side}))
+            .with_confidence(0.9)
+    };
+    for e in [
+        edge(docs[0], alfa, "supplier"),
+        edge(docs[0], beta, "buyer"),
+        edge(docs[3], beta, "buyer"),
+        edge(docs[4], alfa, "supplier"),
+    ] {
+        s.upsert_edge(&e).await.unwrap();
+    }
+
+    // Read back as written: the card with its evidence, the highlights in block order.
+    let got = s.get_document_facts(&h(1)).await.unwrap().unwrap();
+    let card = got.card().unwrap();
+    assert_eq!(card.supplier, cards[0].supplier);
+    assert_eq!(
+        card.evidence["notice"].highlights[0].quote,
+        "otkazni rok od 30 dana"
+    );
+    assert_eq!(card.ends.as_deref(), Some("2026-12-31"));
+    assert_eq!(card.notice_due.as_deref(), Some("2026-12-01"));
+    assert_eq!(got.columns, rows[0].columns);
+    assert_eq!(got.columns.amount, Some(12_000_000_000));
+    let hs = got.highlights().unwrap();
+    assert_eq!(
+        hs.iter()
+            .map(|h| (h.block, h.key.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (1, "payment.amount"),
+            (3, "card.notice"),
+            (3, "contract.notice")
+        ]
+    );
+    assert!(s.get_document_facts(&h(9)).await.unwrap().is_none());
+    // Derived: 5 ends a year after its start, notice a month before; 3 never ends.
+    let five = s.get_document_facts(&h(5)).await.unwrap().unwrap().columns;
+    assert_eq!(
+        (five.ends, five.notice_due),
+        (Some(day(2027, 2, 1)), Some(day(2027, 1, 1)))
+    );
+    let three = s.get_document_facts(&h(3)).await.unwrap().unwrap().columns;
+    assert_eq!((three.ends, three.notice_due), (None, None));
+    assert_eq!(three.governing_law.as_deref(), Some("RS"));
+
+    let find = |filter: FactFilter| async move {
+        s.find_documents(&filter, None, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|d| d.columns.blake3)
+            .collect::<Vec<_>>()
+    };
+    let ids = |ns: &[u8]| ns.iter().map(|n| h(*n)).collect::<Vec<_>>();
+    let f = FactFilter::default;
+    // Only this suite's rows: they share the tag; the others' hashes sort apart.
+    let mine = |found: Vec<Blake3>| {
+        found
+            .into_iter()
+            .filter(|b| b.0[..31] == [0xc4; 31])
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(mine(find(f()).await), ids(&[1, 2, 3, 4, 5]));
+    let all = s.find_documents(&f(), None, 1000).await.unwrap();
+    let one = all.iter().find(|d| d.columns.blake3 == h(1)).unwrap();
+    assert_eq!(
+        (one.document, one.supplier, one.customer),
+        (Some(docs[0]), Some(alfa), Some(beta))
+    );
+    let four = all.iter().find(|d| d.columns.blake3 == h(4)).unwrap();
+    assert_eq!((four.supplier, four.customer), (None, Some(beta)));
+    for (filter, want) in [
+        (
+            FactFilter {
+                kind: Some("invoice".into()),
+                ..f()
+            },
+            vec![4],
+        ),
+        (
+            FactFilter {
+                supplier: Some(alfa),
+                ..f()
+            },
+            vec![1, 5],
+        ),
+        (
+            FactFilter {
+                customer: Some(beta),
+                ..f()
+            },
+            vec![1, 4],
+        ),
+        (
+            FactFilter {
+                supplier_name: Some("ALFA soft".into()),
+                ..f()
+            },
+            vec![1, 5],
+        ),
+        (
+            FactFilter {
+                customer_name: Some("djordjevic".into()),
+                ..f()
+            },
+            vec![3],
+        ),
+        (
+            FactFilter {
+                customer_name: Some("Đorđević".into()),
+                ..f()
+            },
+            vec![3],
+        ),
+        (
+            FactFilter {
+                category: Some("it_software".into()),
+                ..f()
+            },
+            vec![1, 5],
+        ),
+        (
+            FactFilter {
+                currency: Some("RSD".into()),
+                amount_min: Some(100_000 * 10_000),
+                ..f()
+            },
+            vec![1, 3],
+        ),
+        (
+            FactFilter {
+                currency: Some("RSD".into()),
+                amount_min: Some(10_000 * 10_000),
+                amount_max: Some(150_000 * 10_000),
+                ..f()
+            },
+            vec![3, 5],
+        ),
+        (
+            FactFilter {
+                end_before: Some(day(2027, 6, 30)),
+                ..f()
+            },
+            vec![1, 5],
+        ),
+        (
+            FactFilter {
+                end_after: Some(day(2027, 1, 1)),
+                ..f()
+            },
+            vec![2, 5],
+        ),
+        (
+            FactFilter {
+                notice_due_before: Some(day(2026, 12, 1)),
+                ..f()
+            },
+            vec![1],
+        ),
+        (
+            FactFilter {
+                notice_due_after: Some(day(2026, 12, 2)),
+                notice_due_before: Some(day(2027, 6, 30)),
+                ..f()
+            },
+            vec![5],
+        ),
+        (
+            FactFilter {
+                auto_renewal: Some(true),
+                ..f()
+            },
+            vec![1, 5],
+        ),
+        (
+            FactFilter {
+                auto_renewal: Some(false),
+                ..f()
+            },
+            vec![2],
+        ),
+        (
+            FactFilter {
+                has_penalty: Some(true),
+                ..f()
+            },
+            vec![1, 3],
+        ),
+        (
+            FactFilter {
+                has_penalty: Some(false),
+                kind: Some("contract".into()),
+                ..f()
+            },
+            vec![2, 5],
+        ),
+        (
+            FactFilter {
+                has_guarantee: Some(true),
+                ..f()
+            },
+            vec![1, 2],
+        ),
+        (
+            FactFilter {
+                governing_law: Some("GB".into()),
+                ..f()
+            },
+            vec![2],
+        ),
+        (
+            FactFilter {
+                governing_law: Some("GB-EAW".into()),
+                ..f()
+            },
+            vec![2],
+        ),
+        (
+            FactFilter {
+                governing_law: Some("G".into()),
+                ..f()
+            },
+            vec![],
+        ),
+        (
+            FactFilter {
+                court: Some("privredni sud u nisu".into()),
+                ..f()
+            },
+            vec![3],
+        ),
+        (
+            FactFilter {
+                signed_from: Some(day(2026, 1, 1)),
+                signed_to: Some(day(2026, 2, 28)),
+                ..f()
+            },
+            vec![1],
+        ),
+        (
+            FactFilter {
+                supplier: Some(alfa),
+                auto_renewal: Some(true),
+                end_before: Some(day(2026, 12, 31)),
+                ..f()
+            },
+            vec![1],
+        ),
+    ] {
+        assert_eq!(mine(find(filter.clone()).await), ids(&want), "{filter:?}");
+    }
+    // Pages, by hash.
+    let page = |after: Option<Blake3>| async move {
+        s.find_documents(
+            &FactFilter {
+                currency: Some("RSD".into()),
+                ..f()
+            },
+            after.as_ref(),
+            2,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| d.columns.blake3)
+        .collect::<Vec<_>>()
+    };
+    assert_eq!(page(None).await, ids(&[1, 3]));
+    assert_eq!(page(Some(h(3))).await, ids(&[5]));
+
+    // A changed card replaces the row; a deleted row is gone.
+    let mut changed = cards[3].clone();
+    changed.governing_law = Some("US".into());
+    s.put_document_facts(&FactRow::new(h(4), changed, Vec::new()).unwrap())
+        .await
+        .unwrap();
+    let four = s.get_document_facts(&h(4)).await.unwrap().unwrap();
+    assert_eq!(four.columns.governing_law.as_deref(), Some("US"));
+    assert!(four.highlights().unwrap().is_empty());
+    s.delete_document_facts(&h(4)).await.unwrap();
+    s.delete_document_facts(&h(4)).await.unwrap();
+    assert!(s.get_document_facts(&h(4)).await.unwrap().is_none());
+    assert_eq!(mine(find(f()).await), ids(&[1, 2, 3, 5]));
+}
+
+/// Search ranking (issue #194): the key facts (the card's text and the highlighted passages)
+/// weigh above the body, so a clause's words find the document that has
+/// the clause first.
+///
+/// # Panics
+///
+/// When the backend misbehaves.
+pub async fn fact_ranking<B: Backend + ?Sized>(s: &B) {
+    let h = |n| purge_hash(0xc5, n);
+    let docs = [
+        (1, "Ugovor o saradnji", "otkazni rok penalty kvorum", ""),
+        (
+            2,
+            "Ugovor o održavanju",
+            "kvorum",
+            "notice: iso=P30D; days=30\nSvaka strana može otkazati ugovor uz otkazni rok od 30 dana",
+        ),
+        (3, "Ugovor o zakupu", "otkazni rok kvorum", ""),
+        (
+            4,
+            "Service agreement",
+            "kvorum",
+            "penalty: percent=0.5; per=day\nLiquidated damages of 0.5% per day apply",
+        ),
+    ];
+    for (n, title, body, facts) in docs {
+        s.put_record(&h(n), &raw(&json!({"rank": n})), &versions("1"))
+            .await
+            .unwrap();
+        s.index_document(&SearchDoc {
+            blake3: h(n),
+            title: title.to_owned(),
+            body: body.to_owned(),
+            facts: facts.to_owned(),
+            kind: Some("rank_case".to_owned()),
+            date: None,
+            amount: None,
+        })
+        .await
+        .unwrap();
+    }
+    let ranked = |words: &str, kind: bool| SearchQuery {
+        text: Some(words.to_owned()),
+        kind: kind.then(|| "rank_case".to_owned()),
+        limit: 10,
+        ..SearchQuery::default()
+    };
+    for kind in [false, true] {
+        let hits = |q: SearchQuery| async move {
+            s.search(&q)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.blake3)
+                .collect::<Vec<_>>()
+        };
+        // The words alone (SQLite's words-only path) and with a filter.
+        let notice = hits(ranked("otkazni rok", kind)).await;
+        assert_eq!(notice.first(), Some(&h(2)), "{kind}: {notice:?}");
+        assert_eq!(notice.len(), 3, "{kind}: {notice:?}");
+        let penalty = hits(ranked("penalty", kind)).await;
+        assert_eq!(penalty, [h(4), h(1)], "{kind}");
+        // A word in the facts alone matches.
+        assert_eq!(hits(ranked("liquidated", kind)).await, [h(4)], "{kind}");
+    }
 }
 
 /// Records: insert, unchanged repeat, update, read back.
@@ -2458,6 +3001,7 @@ pub async fn search<B: Backend + ?Sized>(s: &B) {
         blake3: hash(39),
         title: "x".to_owned(),
         body: String::new(),
+        facts: String::new(),
         kind: None,
         date: None,
         amount: None,
@@ -2474,6 +3018,7 @@ pub async fn search<B: Backend + ?Sized>(s: &B) {
             blake3: *h,
             title: (*title).to_owned(),
             body: (*body).to_owned(),
+            facts: String::new(),
             kind: Some((*kind).to_owned()),
             date: Some(*date),
             amount: Some(*amount),
@@ -2610,6 +3155,7 @@ pub async fn search<B: Backend + ?Sized>(s: &B) {
         blake3: d1,
         title: "Credit note 42".to_owned(),
         body: "Consulting services for ACME".to_owned(),
+        facts: String::new(),
         kind: Some("credit_note".to_owned()),
         date: Some(day(2024, 3, 1)),
         amount: None,
@@ -2624,6 +3170,7 @@ pub async fn search<B: Backend + ?Sized>(s: &B) {
         blake3: d1,
         title: "Credit note 42".to_owned(),
         body: "Consulting services for ACME".to_owned(),
+        facts: String::new(),
         kind: Some("credit_note".to_owned()),
         date: Some(day(2024, 3, 1)),
         amount: None,
@@ -4903,6 +5450,7 @@ pub async fn purge<B: Backend + ?Sized>(s: &B) {
             blake3: h(n),
             title: format!("Purgeable {n}"),
             body: "zebrafinch".to_owned(),
+            facts: String::new(),
             kind: None,
             date: None,
             amount: None,
@@ -4945,6 +5493,22 @@ pub async fn purge<B: Backend + ?Sized>(s: &B) {
         })
         .await
         .unwrap();
+    }
+    // Their key-facts rows (issue #194): they go with the record too.
+    for n in [1, 2] {
+        let card = crate::Card {
+            kind: Some("contract".into()),
+            currency: Some("PRG".into()),
+            ..crate::Card::default()
+        };
+        let hl = crate::BlockHighlight {
+            key: "card.kind".into(),
+            end: 3,
+            ..crate::BlockHighlight::default()
+        };
+        s.put_document_facts(&crate::FactRow::new(h(n), card, vec![hl]).unwrap())
+            .await
+            .unwrap();
     }
     s.put_sketch(&h(1), &[1, 2, 3], &[0xd1_0001, 0xd1_0002])
         .await
@@ -5071,6 +5635,24 @@ pub async fn purge<B: Backend + ?Sized>(s: &B) {
         [h(2)],
         "the purged record's payment went with it"
     );
+    let carded = s
+        .find_documents(
+            &crate::FactFilter {
+                currency: Some("PRG".into()),
+                ..crate::FactFilter::default()
+            },
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        carded.iter().map(|d| d.columns.blake3).collect::<Vec<_>>(),
+        [h(2)],
+        "the purged record's key facts went with it"
+    );
+    assert!(s.get_document_facts(&h(1)).await.unwrap().is_none());
+    assert!(s.get_document_facts(&h(2)).await.unwrap().is_some());
     let out = s
         .neighbours(
             d2.document,

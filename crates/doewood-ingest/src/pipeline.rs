@@ -1715,8 +1715,8 @@ fn stored_outcome(body: &RawValue) -> Outcome {
 
 /// Writes the text of a file just analyzed beside its record (issue #166), or removes an old
 /// one when the analysis has none. A record new to the store (`put` is `Inserted`) has no old
-/// text. A record that changed loses its payment row (issue #193): the graph writer writes
-/// the new one, if the new record has payment facts.
+/// text. A record that changed loses its payment row (issue #193) and its key-facts row
+/// (issue #194): the graph writer writes the new ones, if the new record has those facts.
 async fn put_text(
     backend: &Arc<dyn Backend>,
     a: &Analysis,
@@ -1728,7 +1728,12 @@ async fn put_text(
         None => {}
     }
     if put == PutOutcome::Updated {
-        backend.delete_payment(&a.blake3).await?;
+        let (paid, carded) = tokio::join!(
+            backend.delete_payment(&a.blake3),
+            backend.delete_document_facts(&a.blake3)
+        );
+        paid?;
+        carded?;
     }
     Ok(())
 }

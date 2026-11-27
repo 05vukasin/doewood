@@ -935,6 +935,9 @@ pub struct SearchDoc {
     pub title: String,
     /// The text.
     pub body: String,
+    /// The key facts (issue #194): the key-facts card's text and the passages its fields were read from,
+    /// weighted above the body.
+    pub facts: String,
     /// The document kind (`invoice`, `contract`, ...).
     pub kind: Option<String>,
     /// The document's own date.

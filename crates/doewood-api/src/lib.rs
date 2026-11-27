@@ -32,6 +32,7 @@ mod explore;
 mod graph;
 mod icons;
 mod jobs;
+mod keyfacts;
 mod limits;
 mod merges;
 mod metrics;

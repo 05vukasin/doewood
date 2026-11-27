@@ -1827,6 +1827,7 @@ async fn get_document_text() {
             blake3: h.to_hex(),
             page_size,
             page_token,
+            skip_highlights: false,
         };
         let (mut token, mut sizes, mut pages, mut blocks) =
             (String::new(), Vec::new(), Vec::new(), Vec::new());
@@ -1937,6 +1938,396 @@ async fn get_document_text() {
             ),
             tonic::Code::NotFound
         );
+        a.stop().await;
+        shared.drop_schema().await;
+    }
+}
+
+/// Issue #194: the key facts through the API: `GetDocumentText` with the highlights over each
+/// block (and without, on request), `GetDocumentCard` as typed fields and canonical JSON with
+/// each field's evidence, `FindDocuments` with filters, pages and errors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
+async fn key_facts_card_text_and_find() {
+    use doewood_model::{
+        BlockHighlight, BlockKind, Card, CardDuration, CardEvidence, CardHighlight, CardParty,
+        CardPenalty, FactRow, SIDE_PROP, TEXT_MAX_BYTES, TextBlock, TextBuilder, TextOrigin,
+    };
+    for shared in Shared::all().await {
+        let a = Instance::start("inst-a", Some(shared.backend.clone())).await;
+        let ch = a.channel().await;
+        let be = &shared.backend;
+        let name = shared.name;
+        let mut records = RecordsServiceClient::new(ch.clone());
+        let lines = [
+            "UGOVOR O ODRŽAVANJU SOFTVERA",
+            "Ukupna vrednost ugovora iznosi 1.200.000,00 RSD.",
+            "Svaka strana može otkazati ugovor uz otkazni rok od 30 dana.",
+            "Ugovorna kazna iznosi 0,5% za svaki dan kašnjenja.",
+        ];
+        let card = |kind: &str, law: &str| Card {
+            kind: Some(kind.into()),
+            supplier: Some(CardParty {
+                name: Some("Alfa Soft d.o.o.".into()),
+                pib: Some("100000024".into()),
+                ..CardParty::default()
+            }),
+            end: Some("2026-12-31".into()),
+            notice: Some(CardDuration {
+                iso: Some("P30D".into()),
+                days: Some(30),
+                ..CardDuration::default()
+            }),
+            auto_renewal: Some(true),
+            amount: Some("1200000.00".into()),
+            currency: Some("RSD".into()),
+            penalty: Some(CardPenalty {
+                percent: Some(0.5),
+                per: Some("day".into()),
+                ..CardPenalty::default()
+            }),
+            governing_law: Some(law.into()),
+            evidence: [(
+                "notice".to_owned(),
+                CardEvidence {
+                    conf: 0.8,
+                    highlights: vec![CardHighlight {
+                        page: 0,
+                        block: 2,
+                        start: 37,
+                        end: 59,
+                        quote: "otkazni rok od 30 dana".into(),
+                    }],
+                },
+            )]
+            .into(),
+            ..Card::default()
+        };
+        let hl = |key: &str, block, start, end| BlockHighlight {
+            key: key.into(),
+            page: 0,
+            block,
+            start,
+            end,
+            conf: 0.8,
+        };
+        let mut hashes = Vec::new();
+        for n in 0..3u8 {
+            let h = hash(194 + n);
+            hashes.push(h);
+            be.put_record(
+                &h,
+                &doewood_model::canonical::to_canonical(&json!({"n": n})).unwrap(),
+                &[("quail".to_owned(), "1".to_owned())].into(),
+            )
+            .await
+            .unwrap();
+            let mut b = TextBuilder::new("docx.extract", "1", TEXT_MAX_BYTES);
+            b.page(0, None, TextOrigin::Native);
+            for l in lines {
+                b.block(TextBlock {
+                    kind: BlockKind::Paragraph,
+                    text: l.to_owned(),
+                    zone: None,
+                    level: None,
+                    table: None,
+                    row: None,
+                });
+            }
+            be.put_document_text(&h, &b.finish().to_body().unwrap())
+                .await
+                .unwrap();
+            let (kind, law) =
+                [("contract", "RS"), ("contract", "GB"), ("invoice", "RS")][usize::from(n)];
+            let row = FactRow::new(
+                h,
+                card(kind, law),
+                vec![
+                    hl("payment.amount", 1, 31, 43),
+                    hl("contract.notice", 2, 37, 60),
+                    hl("card.notice", 2, 37, 59),
+                    hl("contract.penalty", 3, 0, 50),
+                ],
+            )
+            .unwrap();
+            be.put_document_facts(&row).await.unwrap();
+        }
+        let doc = be
+            .upsert_node(NodeKind::Document, &hashes[0].to_hex(), &json!({}))
+            .await
+            .unwrap();
+        let alfa = be
+            .upsert_node(NodeKind::Company, "kf:api:alfa", &json!({"name": "Alfa"}))
+            .await
+            .unwrap();
+        be.upsert_edge(
+            &Edge::new(doc, alfa, EdgeKind::Party, EdgeSource::Document)
+                .with_props(json!({"role": "supplier", SIDE_PROP: "supplier"})),
+        )
+        .await
+        .unwrap();
+
+        // The text: each block with the facts over it, in start order.
+        let text = records
+            .get_document_text(pb::GetDocumentTextRequest {
+                blake3: hashes[0].to_hex(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let blocks: Vec<_> = text.pages.iter().flat_map(|p| p.blocks.iter()).collect();
+        let over: Vec<Vec<(&str, u32, u32)>> = blocks
+            .iter()
+            .map(|b| {
+                b.highlights
+                    .iter()
+                    .map(|h| (h.key.as_str(), h.start, h.end))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            over,
+            [
+                vec![],
+                vec![("payment.amount", 31, 43)],
+                vec![("card.notice", 37, 59), ("contract.notice", 37, 60)],
+                vec![("contract.penalty", 0, 50)],
+            ],
+            "{name}"
+        );
+        let amount = &blocks[1].highlights[0];
+        assert_eq!(
+            blocks[1]
+                .text
+                .chars()
+                .skip(amount.start as usize)
+                .take((amount.end - amount.start) as usize)
+                .collect::<String>(),
+            "1.200.000,00",
+            "{name}"
+        );
+        assert!((amount.conf - 0.8).abs() < 1e-6, "{name}");
+        // Without highlights, on request; and a page of the text holds its blocks' only.
+        let bare = records
+            .get_document_text(pb::GetDocumentTextRequest {
+                blake3: hashes[0].to_hex(),
+                skip_highlights: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            bare.pages
+                .iter()
+                .flat_map(|p| &p.blocks)
+                .all(|b| b.highlights.is_empty()),
+            "{name}"
+        );
+        let second = records
+            .get_document_text(pb::GetDocumentTextRequest {
+                blake3: hashes[0].to_hex(),
+                page_size: 2,
+                page_token: format!("{}.2", text.updated_at),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let keys: Vec<usize> = second
+            .pages
+            .iter()
+            .flat_map(|p| &p.blocks)
+            .map(|b| b.highlights.len())
+            .collect();
+        assert_eq!(keys, [2, 1], "{name}");
+
+        // The card: typed fields, the stored JSON, every field with its evidence.
+        let c = records
+            .get_document_card(pb::GetDocumentCardRequest {
+                blake3: hashes[0].to_hex(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(c.blake3, hashes[0].to_hex());
+        assert_eq!(c.kind, "contract", "{name}");
+        let sup = c.supplier.as_ref().unwrap();
+        assert_eq!(
+            (sup.name.as_str(), sup.pib.as_str()),
+            ("Alfa Soft d.o.o.", "100000024")
+        );
+        assert_eq!(c.notice.as_ref().unwrap().days, Some(30), "{name}");
+        assert_eq!(c.auto_renewal, Some(true), "{name}");
+        assert_eq!(
+            (c.amount.as_str(), c.currency.as_str()),
+            ("1200000.00", "RSD")
+        );
+        assert_eq!(c.penalty.as_ref().unwrap().per, "day", "{name}");
+        assert_eq!(
+            (c.ends.as_str(), c.notice_due.as_str()),
+            ("2026-12-31", "2026-12-01")
+        );
+        assert_eq!(c.term, None, "{name}");
+        assert_eq!(c.confidentiality, None, "{name}");
+        let stored = be.get_document_facts(&hashes[0]).await.unwrap().unwrap();
+        assert_eq!(c.card_json, stored.card.get(), "{name}");
+        let parsed: serde_json::Value = serde_json::from_str(&c.card_json).unwrap();
+        assert_eq!(parsed["notice"]["days"], 30, "{name}");
+        assert_eq!(
+            parsed["evidence"]["notice"]["highlights"][0]["quote"],
+            "otkazni rok od 30 dana"
+        );
+        let names: Vec<&str> = c.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "amount",
+                "auto_renewal",
+                "currency",
+                "end",
+                "governing_law",
+                "kind",
+                "notice",
+                "penalty",
+                "supplier"
+            ],
+            "{name}"
+        );
+        let notice = c.fields.iter().find(|f| f.name == "notice").unwrap();
+        assert_eq!(notice.value_json, r#"{"days":30,"iso":"P30D"}"#, "{name}");
+        assert_eq!(notice.highlights[0].key, "card.notice", "{name}");
+        assert_eq!(notice.highlights[0].block, 2, "{name}");
+
+        // Find: filters, pages, the supplier through its edge.
+        let find = |req: pb::FindDocumentsRequest| {
+            let mut r = records.clone();
+            async move { r.find_documents(req).await.map(tonic::Response::into_inner) }
+        };
+        let blake3s = |r: &pb::FindDocumentsResponse| {
+            r.documents
+                .iter()
+                .map(|d| d.blake3.clone())
+                .collect::<Vec<_>>()
+        };
+        let hex = |ns: &[usize]| ns.iter().map(|n| hashes[*n].to_hex()).collect::<Vec<_>>();
+        let r = find(pb::FindDocumentsRequest {
+            governing_law: "rs".into(),
+            has_penalty: Some(true),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(blake3s(&r), hex(&[0, 2]), "{name}");
+        let d = &r.documents[0];
+        assert_eq!(
+            (
+                d.supplier_id.as_str(),
+                d.supplier_name.as_str(),
+                d.document_id.as_str(),
+                d.amount.as_str(),
+                d.ends.as_str(),
+                d.notice_due.as_str(),
+                d.auto_renewal,
+            ),
+            (
+                alfa.to_string().as_str(),
+                "Alfa Soft d.o.o.",
+                doc.to_string().as_str(),
+                "1200000.00",
+                "2026-12-31",
+                "2026-12-01",
+                Some(true),
+            ),
+            "{name}"
+        );
+        let r = find(pb::FindDocumentsRequest {
+            supplier_id: alfa.to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(blake3s(&r), hex(&[0]), "{name}");
+        let r = find(pb::FindDocumentsRequest {
+            kind: "contract".into(),
+            currency: "rsd".into(),
+            amount_min: "1200000".into(),
+            amount_max: "1200000.00".into(),
+            notice_due_before: "2026-12-01".into(),
+            supplier_name: "alfa SOFT".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(blake3s(&r), hex(&[0, 1]), "{name}");
+        // Pages of one.
+        let mut token = String::new();
+        let mut seen = Vec::new();
+        loop {
+            let r = find(pb::FindDocumentsRequest {
+                supplier_name: "alfa".into(),
+                page_size: 1,
+                page_token: token,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            seen.extend(blake3s(&r));
+            if r.next_page_token.is_empty() {
+                break;
+            }
+            token = r.next_page_token;
+        }
+        assert_eq!(seen, hex(&[0, 1, 2]), "{name}");
+
+        // Errors.
+        let code = |r: Result<pb::FindDocumentsResponse, tonic::Status>| r.unwrap_err().code();
+        for bad in [
+            pb::FindDocumentsRequest {
+                amount_min: "100".into(),
+                ..Default::default()
+            },
+            pb::FindDocumentsRequest {
+                currency: "RSD".into(),
+                amount_min: "1,000".into(),
+                ..Default::default()
+            },
+            pb::FindDocumentsRequest {
+                end_before: "31.12.2026".into(),
+                ..Default::default()
+            },
+            pb::FindDocumentsRequest {
+                signed_from: "2026-02-01".into(),
+                signed_to: "2026-01-01".into(),
+                ..Default::default()
+            },
+            pb::FindDocumentsRequest {
+                supplier_id: "not-a-uuid".into(),
+                ..Default::default()
+            },
+            pb::FindDocumentsRequest {
+                page_size: 1001,
+                ..Default::default()
+            },
+            pb::FindDocumentsRequest {
+                page_token: "zz".into(),
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                code(find(bad.clone()).await),
+                tonic::Code::InvalidArgument,
+                "{bad:?}"
+            );
+        }
+        let missing = records
+            .get_document_card(pb::GetDocumentCardRequest {
+                blake3: hash(199).to_hex(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::NotFound, "{name}");
         a.stop().await;
         shared.drop_schema().await;
     }
@@ -2295,6 +2686,7 @@ async fn records_graph_and_search() {
                 blake3: hash(n),
                 title: title.into(),
                 body: format!("{title} body text"),
+                facts: String::new(),
                 kind: Some(kind.into()),
                 date: Some(time::Date::from_calendar_date(2026, time::Month::March, n).unwrap()),
                 amount: Some(amount),

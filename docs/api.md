@@ -34,7 +34,7 @@ The S3 event webhook is not part of the gRPC API: it is on the ops server (see
 |---|---|
 | `ConfigService` | `AddSource`, `UpdateSource`, `PauseSource`, `ResumeSource`, `RemoveSource`, `ReleaseSourceClaim`, `ListSources`, `GetSource`, `SetLlmPolicy`, `SetSqsInlet`, `RemoveSqsInlet`, `SetAiProvider`, `RemoveAiProvider`, `ListAiProviders`, `GetIngestSettings`, `SetIngestSettings`, `GetEnrichmentSettings`, `SetEnrichmentSettings`, `GetApiSettings`, `SetApiSettings` |
 | `JobsService` | `WatchProgress` (server stream), `ReprocessJob`, `WatchReprocess` (server stream), `PurgeSource`, `PurgeOrphans`, `WatchPurge` (server stream) |
-| `RecordsService` | `GetRecord`, `ListRecords`, `GetDocumentText`, `ListPayments`, `SupplierSpend` |
+| `RecordsService` | `GetRecord`, `ListRecords`, `GetDocumentText`, `ListPayments`, `SupplierSpend`, `GetDocumentCard`, `FindDocuments` |
 | `GraphService` | `GetNode`, `Neighbours`, `CompanyDocuments`, `ListMerges`, `MergeCompanies`, `UndoMerge`, `SplitCompany`, `DismissPair`, `ListDismissals`, `ListProposals`, `AcceptProposal`, `RejectProposal` |
 | `SearchService` | `Search` |
 | `SummarizeService` | `Summarize` |
@@ -258,7 +258,13 @@ refused: the workbook has more than 1,600,000 cells ...`, and how to raise the c
   then empty. See [ListRecords page budget](#listrecords-page-budget).
 - **GetDocumentText** (issue #166) returns a document's text with block locations: its pages,
   and their blocks with kind, text, zone, heading path, and for spreadsheets the sheet and
-  row. It pages blocks as ListRecords pages records. See [Document text](#document-text).
+  row; and per block the facts highlighted over it (issue #194). It pages blocks as
+  ListRecords pages records. See [Document text](#document-text).
+- **GetDocumentCard** and **FindDocuments** (issue #194) make every key fact of contracts and
+  invoices findable: the normalised key-facts card of one document (parties, dates and term,
+  renewal and notice, payment, penalties, guarantees, law and court, each with its
+  highlights), and the documents whose key facts match filters. See [Key facts](#key-facts)
+  and [For AI agents](#for-ai-agents).
 - **ListPayments** and **SupplierSpend** (issue #193) say what each document pays for and
   how much, and what each supplier is paid: one row per contract, offer or invoice with
   payment facts (scans included, through OCR), filtered by supplier, buyer, category,
@@ -705,6 +711,9 @@ grpcurl -plaintext -d '{"blake3": "<64 hex digits>"}' 127.0.0.1:7443 doewood.v1.
 grpcurl -plaintext -d '{"supplier_id": "<uuid>", "currency": "RSD", "date_from": "2026-01-01"}' \
     127.0.0.1:7443 doewood.v1.RecordsService/ListPayments
 grpcurl -plaintext -d '{"group_by": "SPEND_GROUP_BY_YEAR"}' 127.0.0.1:7443 doewood.v1.RecordsService/SupplierSpend
+grpcurl -plaintext -d '{"blake3": "<64 hex digits>"}' 127.0.0.1:7443 doewood.v1.RecordsService/GetDocumentCard
+grpcurl -plaintext -d '{"kind": "contract", "auto_renewal": true, "notice_due_before": "2026-12-31"}' \
+    127.0.0.1:7443 doewood.v1.RecordsService/FindDocuments
 grpcurl -plaintext -d '{"key": {"kind": "NODE_KIND_COMPANY", "key": "acme"}}' \
     127.0.0.1:7443 doewood.v1.GraphService/GetNode
 grpcurl -plaintext -d '{"node_id": "<uuid>", "direction": "DIRECTION_IN", "edge_kinds": ["EDGE_KIND_PARTY"]}' \
@@ -976,6 +985,12 @@ where each block sits.
     extraction);
   - a record from before this change. Its `doewood.ingest` step version is 1 (now 2), so
     `ReprocessJob` analyzes the file again and stores its text.
+- **Highlights** (issue #194). Each block has `highlights`: the facts quail found over it, from
+  every `<namespace>.highlight` of the record (`card.*`, `contract.*`, `payment.*`), as `key`
+  (the fact key), `start` and `end` (characters of the block's `text`, end exclusive) and the
+  fact's `conf`, ordered by start, end and key. One passage often carries two keys (the card
+  field and the contract fact it came from). `skip_highlights` leaves them out. A record from
+  before the key facts has none until it is analyzed again. See [Key facts](#key-facts).
 - **`want_text` on `PutObject`** (issue #166, with the push sources of #165) is not in this
   version. It comes once `PutObject` exists.
 
@@ -1051,6 +1066,187 @@ the record (see [ingest.md](ingest.md#payments)).
   `amount_basis` always says which, and `net`, `vat` and `gross` are there to pick from.
 - **Not yet:** an LLM refinement of the subject and category for documents the rules leave
   unlabelled (issue #195, off by default behind a source's LLM policy).
+
+## Key facts
+
+Issue #194: every important fact of a contract or invoice is extracted, normalised and
+highlighted, so an AI (or a UI) can find the documents, read the facts and quote the exact
+sentence. quail's `contract.facts` step reads the key contract facts and `card.facts` writes
+them as one **key-facts card** per document (quail's `docs/keys.md`, sections CONTRACT and
+CARD); both run in every profile, scans included through OCR. Ingest stores one row per
+document beside the record (see [ingest.md](ingest.md#key-facts)).
+
+- **The card** (`GetDocumentCard(blake3)`, a `DocumentCard`) has one canonical value per field:
+  - `kind` (quail's instrument kind: `contract`, `msa`, `invoice`, `offer`, `nda`, ...) and
+    `number`;
+  - `supplier` and `customer`: `name`, `pib`, `mb`, `vat`, `reg`, `account`, `address`,
+    `representative`, where stated;
+  - dates `signed`, `start`, `end`, `issued`, `due` (`YYYY-MM-DD`), the `term`, `notice` and
+    `warranty` durations (`iso` with whole `months` or `days`; years as 12 months, weeks as 7
+    days; a term may be `indefinite`), `auto_renewal`;
+  - payment: `payment_days`, `payment_method`, `amount` (exact decimal text) with
+    `amount_basis`, `currency` and `period`, `subject` and `category` (as
+    [ListPayments](#payments)), `accounts`, `advance`, `indexation`;
+  - risk: `penalty` (`percent`, `per` day or week, `amount`, `cap_percent`), `guarantees`
+    (kinds), `liability_cap`, `confidentiality`, `sla` (`availability`, `response_hours`,
+    `resolution_hours`);
+  - law: `governing_law` (ISO 3166: `RS`, or a subdivision, `GB-EAW`), `court`, `arbitration`, `languages`, `annexes`,
+    `amends`;
+  - derived by doewood: `ends`, the stated end, else the start (or signing) date plus the
+    term (none for an indefinite term); and `notice_due`, `ends` minus the notice period: the
+    last day to give notice before the contract runs on or ends.
+
+  A field the document does not state is empty (unset for the optional and message fields).
+  `fields` lists every stated field with its value as JSON, its confidence and its
+  `highlights` (`key` `card.<field>`, `page`, `block`, `start`, `end`, `quote`; at most 8 per
+  field). `card_json` is the same card as compact canonical JSON, the fields by name and
+  `evidence` (per field `conf` and `highlights`), at most 64 KiB: made to be handed to an LLM
+  as context or returned as a tool result. `NOT_FOUND` when the document has no key facts (no
+  record, nothing quail could read, or a record from before them, until it is analyzed again).
+- **Highlights.** Every highlight carries quail's block numbering, which is the
+  `TextBlock.index` of [GetDocumentText](#document-text) for the same record: the block's text
+  between `start` and `end` (characters) is the quote. GetDocumentText returns them per block;
+  the card per field; ListPayments per payment. At most 1024 per document.
+- **FindDocuments** filters the documents by their key facts; every filter set must hold:
+  - `kind` (quail's instrument kind: `contract`, `msa`, `invoice`, `offer`, `nda`, ...);
+    `category`; `governing_law` (case ignored; a country finds its subdivisions too, `GB`
+    finds `GB-EAW`, England and Wales);
+  - `supplier_id` and `customer_id`: a company, through the document's `party` edge marked
+    `side: supplier` or `side: buyer` (as ListPayments, so merges move them);
+    `supplier_name` and `customer_name`: text the name as written contains, case and the
+    Serbian diacritics ignored (`djordjevic` finds `Đorđević`); `court` likewise;
+  - `amount_min` and `amount_max` (decimal text, inclusive) with `currency`, which an amount
+    bound needs: amounts are never compared across currencies;
+  - `end_before`, `end_after`, `notice_due_before`, `notice_due_after` (on `ends` and
+    `notice_due`), `signed_from`, `signed_to`: `YYYY-MM-DD`, inclusive; a document without
+    the date never matches;
+  - `auto_renewal`, `has_penalty`, `has_guarantee`: true or false; unset for either.
+    `auto_renewal: false` finds the documents that state they do not renew.
+
+  Each `FoundDocument` has the card's searchable fields (kind, number, subject, supplier and
+  customer with their companies, category, amount and currency, period, signed, ends,
+  notice_due, auto_renewal, has_penalty, has_guarantee, governing_law, court) and its
+  `document_id`; GetDocumentCard has the rest. Pages as ListRecords: ordered by hash,
+  `page_size` 1 to 1000 (0 means 50), `next_page_token` back as `page_token`. A bad id, date,
+  decimal, token, an amount without a currency or a range that ends before it starts is
+  `INVALID_ARGUMENT`.
+- **Search ranking.** `Search` matches and ranks the key facts too: each document's search
+  row has `facts`, the card's text form (`notice: iso=P30D; days=30`, `penalty: percent=0.5;
+  per=day`, one line per field) and the passages its fields were read from (`otkazni rok od 30
+  dana`),
+  weighted above the body (Postgres: weight A in the `tsvector`, the body B;
+  SQLite: a third FTS5 column, `bm25` weights title 10, body 1, facts 20: BM25 divides by a
+  column's length against its average, and a card's facts are long next to the many documents
+  without any, so they weigh twice the title to come out above it). So `otkazni rok`
+  or `penalty` finds the contract with the clause before a letter that only mentions it (a
+  fact quail finds outside the card, as a cue in such a letter, keeps the body's weight), and
+  `penalty` finds a Serbian contract by its card line. See [Search ranking of key
+  facts](#search-ranking-of-key-facts) for the cost.
+
+## For AI agents
+
+A small, stable set of calls an LLM agent or an MCP server can use directly as tools. Each
+takes and returns one protobuf message; in JSON (the proto3 JSON mapping, which grpcurl and
+gRPC-Web clients speak) field names may be written as in the `.proto` file or in lowerCamelCase,
+`int64` comes as a string and empty fields are left out. They are all reads.
+
+| tool | call | when |
+|---|---|---|
+| `find_documents` | `RecordsService/FindDocuments` | find contracts and invoices by key facts: ending or notice due before a date, auto-renewing, a supplier, a category, an amount, a penalty, a law |
+| `get_document_card` | `RecordsService/GetDocumentCard` | the key facts of one document, with confidence and highlights: the context to answer a question about it |
+| `get_document_text` | `RecordsService/GetDocumentText` | the text, block by block, with the facts highlighted over each: to quote the exact sentence or read around it |
+| `list_payments` | `RecordsService/ListPayments` | what each document pays for and how much |
+| `supplier_spend` | `RecordsService/SupplierSpend` | what each supplier is paid, per currency and period |
+| `search` | `SearchService/Search` | full-text search when the question is in words ("otkazni rok", "penalty"); key facts rank first |
+
+A typical chain: `find_documents` (or `search`) for the candidates, `get_document_card` for
+each to answer, and `get_document_text` with the highlight's `block` to quote the passage
+(`page_token` `<updated_at>.<block>` of a previous page, or page through).
+
+**`find_documents`**: contracts that renew by themselves and whose notice is due by the end
+of the year, under Serbian law.
+
+```json
+{"kind": "contract", "auto_renewal": true, "notice_due_before": "2026-12-31",
+ "governing_law": "RS", "page_size": 20}
+```
+
+```json
+{"documents": [{"blake3": "9f2c…", "document_id": "0190…", "kind": "contract",
+  "number": "114/2026", "subject": "održavanje poslovnog softvera Naručioca",
+  "supplier_id": "0191…", "supplier_name": "Alfa Soft d.o.o.",
+  "customer_id": "0192…", "customer_name": "Beta Trgovina d.o.o.",
+  "category": "it_software", "amount": "1200000.00", "currency": "RSD",
+  "signed": "2026-01-15", "ends": "2026-12-31", "notice_due": "2026-12-01",
+  "auto_renewal": true, "has_penalty": true, "has_guarantee": true,
+  "governing_law": "RS", "court": "Privredni sud u Beogradu"}]}
+```
+
+Other filters: `{"supplier_name": "alfa soft"}`, `{"category": "rent_lease", "end_before":
+"2027-06-30"}`, `{"currency": "EUR", "amount_min": "10000"}`, `{"has_penalty": true}`,
+`{"has_guarantee": false, "kind": "contract"}`, `{"court": "sud u beogradu"}`,
+`{"signed_from": "2026-01-01", "signed_to": "2026-03-31"}`.
+
+**`get_document_card`**: `{"blake3": "9f2c…"}`. The answer's `card_json`, for the Serbian
+contract of `crates/doewood-ingest/tests/key_facts.rs` (shortened: fewer fields and
+highlights):
+
+```json
+{"amount": "1200000.00", "amount_basis": "net", "auto_renewal": true,
+ "category": "it_software", "court": "Privredni sud u Beogradu", "currency": "RSD",
+ "customer": {"name": "Beta Trgovina d.o.o.", "pib": "100000032", "mb": "07000020"},
+ "end": "2026-12-31", "ends": "2026-12-31", "governing_law": "RS",
+ "guarantees": ["bank_guarantee"], "kind": "contract",
+ "notice": {"days": 30, "iso": "P30D"}, "notice_due": "2026-12-01", "number": "114/2026",
+ "payment_days": 15, "payment_method": "bank_transfer",
+ "penalty": {"cap_percent": 10.0, "per": "day", "percent": 0.5}, "signed": "2026-01-15",
+ "subject": "održavanje poslovnog softvera Naručioca",
+ "supplier": {"name": "Alfa Soft d.o.o.", "pib": "100000024", "mb": "07000012",
+   "representative": "Petar Petrović, direktor"},
+ "evidence": {
+   "notice": {"conf": 0.8, "highlights": [{"page": 0, "block": 13, "start": 37, "end": 59,
+     "quote": "otkazni rok od 30 dana"}]},
+   "penalty": {"conf": 0.8, "highlights": [{"page": 0, "block": 15, "start": 0, "end": 64,
+     "quote": "Ugovorna kazna iznosi 0,5% za svaki dan kašnjenja, a najviše 10%"}]}}}
+```
+
+The typed fields (`supplier.name`, `notice.days`, `penalty.per`, `ends`, `notice_due`, ...)
+and `fields` (each stated field with `value_json`, `conf` and `highlights`) say the same.
+
+**`get_document_text`**: `{"blake3": "9f2c…", "page_size": 50}`; a block with its facts:
+
+```json
+{"index": 13, "kind": "paragraph", "page": 0, "zone": "body",
+ "text": "Svaka strana može otkazati ugovor uz otkazni rok od 30 dana.",
+ "heading_path": ["Član 3. Trajanje"],
+ "highlights": [{"key": "card.notice", "start": 37, "end": 59, "conf": 0.8},
+                {"key": "contract.notice", "start": 37, "end": 59, "conf": 0.8}]}
+```
+
+`"skip_highlights": true` returns the text alone.
+
+**`list_payments`**: `{"supplier_id": "0191…", "currency": "RSD", "date_from": "2026-01-01"}`
+returns `payments` with `subject`, `category`, `amount`, `amount_basis`, `currency`, `period`,
+`lines` and `highlights` (see [Payments](#payments)).
+
+**`supplier_spend`**: `{"company_id": "0191…", "group_by": "SPEND_GROUP_BY_YEAR"}` returns per
+supplier `totals` (`group`, `currency`, `period`, `total`, `annualized`, `label`) and
+`provides` (`category`, `subject`, `documents`); never summed across currencies.
+
+**`search`**: `{"text": "otkazni rok", "kind": "contract", "limit": 10}` returns `hits`
+(`blake3`, `title`, `kind`, `date`, `amount`, `score`), the documents whose key facts hold the
+words first.
+
+For an agent:
+
+- Prefer `find_documents` for questions with a date, an amount, a company or a yes/no fact,
+  `search` for questions in words. Both page; ask for what you need.
+- Quote from `get_document_card` (`evidence.*.highlights[].quote`) or `get_document_text`
+  (the block's text between `start` and `end`), not from memory, and give the block index.
+- Amounts are decimal text in their `currency`; a monthly fee is per month. Dates are
+  `YYYY-MM-DD`. `ends` and `notice_due` are derived (stated end, else start plus term).
+- Confidence (`conf`, 0 to 1) is quail's: the facts are rules over the text, nothing is sent
+  to a model. Treat a field below 0.5 as a hint.
 
 ## ListRecords page budget
 
@@ -1348,6 +1544,46 @@ pages on two generated corpora with the query before). Searches with a filter, a
 scored: the ranking (`bm25` on SQLite, `ts_rank` on Postgres) needs all of them for an exact
 page. See [deploy.md](deploy.md#search-on-a-big-corpus-issue-140) for the measurements.
 
+## Search ranking of key facts
+
+Measured with generated corpora (issue #194), release build, the 4 vCPU server, 50,000
+documents shaped as `api_load` seeds them (20 of 24 common words and 20 of 5,000 rare terms
+each, every 4th with `quarter`), 20 hits a page, medians and p99 of 60 searches; then every
+2nd document got about 250 bytes of facts (a card's text form and two passages, `otkazni
+rok` in every 10th). Postgres 17 (`pgvector/pgvector:pg17`) on an `--internal` Docker
+network (`fact_search_timings` in `crates/doewood-pg/src/tests/fact_search.rs`, through
+`PgStore::search`); SQLite on disk, one reader (`fact_search_timings` in
+`crates/doewood-store/src/standalone/search_scale.rs`, the words-alone query):
+
+```
+DOEWOOD_TEST_POSTGRES_URL=... cargo test --release -p doewood-pg --lib fact_search_timings \
+  -- --ignored --nocapture
+cargo test --release -p doewood-store --lib fact_search_timings -- --ignored --nocapture
+```
+
+| search, p50 (p99) ms | Postgres schema 17 | 18, no facts | 18, facts | SQLite schema 19 | 20, no facts | 20, facts |
+|---|---|---|---|---|---|---|
+| a rare term | 0.63 (1.25) | 0.41 (2.03) | 0.45 (0.48) | 0.23 (0.25) | 0.22 (0.31) | 0.22 (0.28) |
+| a word and a rare term | 0.73 (2.20) | 0.59 (1.00) | 0.55 (3.94) | 1.40 (1.54) | 1.40 (1.50) | 2.37 (2.58) |
+| a word in a quarter | 9.82 (12.3) | 10.3 (21.8) | 31.5 (41.3) | 8.09 (10.0) | 8.13 (8.54) | 8.07 (10.1) |
+| a word in most | 27.9 (48.7) | 27.2 (52.0) | 39.0 (50.5) | 25.7 (31.8) | 25.7 (31.2) | 28.7 (33.8) |
+| `otkazni rok` (5,000 matches with facts) | 0.23 (0 hits) | 0.33 (0 hits) | 9.01 (13.7) | 0.07 (0 hits) | 0.06 (0 hits) | 9.72 (13.6) |
+
+- **The schema change alone costs nothing**: with no facts written yet every search takes what
+  it took before, on both stores.
+- **With facts**, a search costs what its matches cost: SQLite's common-word search grows
+  12% (more text per document), a word that the facts add to 2,500 more documents costs those
+  matches (`a word and a rare term`, whose `term` words the facts carry too), and a facts
+  phrase now matches 5,000 documents. Postgres ranks from the heap row's `tsvector`, which the
+  facts make larger, so a common word's search grows from 28 to 39 ms and a word in a quarter
+  of the documents from 10 to 31 ms (`ts_rank` reads every match's vector); a rare term is
+  unchanged. With a kind filter the quarter word stays at 13 ms.
+- **The migration**: Postgres rewrites `search_index` and rebuilds its GIN index, 2.9 s for
+  50,000 documents (127 MB with its indexes after the facts); SQLite builds the FTS5 index
+  again from `search_index`, 0.3 s. Writing the facts (as reanalysis does) took 6.2 s and
+  0.5 s for 25,000 documents.
+
+
 ## Tests
 
 `cargo test -p doewood-api` starts in-process servers and calls every RPC with a tonic client:
@@ -1361,5 +1597,13 @@ methods are in the conformance suite. `ListPayments` and `SupplierSpend` are tes
 rows (`payments_and_supplier_spend`: fields, highlights, filters, pages, totals, labels and
 errors), the stores' payment methods in the conformance suite (`payments`), and generated
 contracts and invoices, a scan through OCR included, through ingest in
-`crates/doewood-ingest/tests/payments.rs`. With `DOEWOOD_TEST_POSTGRES_URL` set, the claim,
-records, payments, graph, merge-log and search tests also run against Postgres.
+`crates/doewood-ingest/tests/payments.rs`. The key facts (issue #194) are tested over stored
+rows (`key_facts_card_text_and_find`: the highlights per block, `skip_highlights`, the card's
+typed fields, JSON and evidence, FindDocuments' filters, pages and errors), in the conformance
+suite (`document_facts`: every filter, pages, sides through party edges, derived dates;
+`fact_ranking`: the facts outrank the body; the key-facts rows in the purge case), and with
+generated Serbian and English contracts through ingest in
+`crates/doewood-ingest/tests/key_facts.rs` (card fields, every highlight against the stored
+text, every filter, the ranking of `otkazni rok` and `penalty`). With
+`DOEWOOD_TEST_POSTGRES_URL` set, the claim, records, payments, key facts, graph, merge-log and
+search tests also run against Postgres.
