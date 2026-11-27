@@ -73,6 +73,20 @@ fn post(addr: SocketAddr, path: &str, content_type: &str, body: &[u8]) -> (u16, 
     (status, body)
 }
 
+/// Runs `doewood health` against an ops server at `ops`: whether it passed, and its stderr.
+fn health(dir: &Path, ops: &str) -> (bool, String) {
+    let out = bare(dir)
+        .arg("health")
+        .env("DOEWOOD_OPS_LISTEN", ops)
+        .output()
+        .unwrap();
+    assert!(out.stdout.is_empty());
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
 /// Forwards the child's JSON log lines to a channel.
 fn log_lines(stderr: ChildStderr) -> mpsc::Receiver<serde_json::Value> {
     let (tx, rx) = mpsc::channel();
@@ -165,6 +179,12 @@ fn serve_starts_with_nothing_configured() {
 
     assert_eq!(get(addr, "/healthz"), (200, "ok\n".to_owned()));
     assert_eq!(get(addr, "/readyz"), (200, "ready\n".to_owned()));
+    // `doewood health` (issue #144): ready, also through an unspecified address (loopback).
+    assert_eq!(health(tmp.path(), &addr.to_string()), (true, String::new()));
+    assert_eq!(
+        health(tmp.path(), &format!("0.0.0.0:{}", addr.port())),
+        (true, String::new())
+    );
     let (status, metrics) = get(addr, "/metrics");
     assert_eq!(status, 200);
     assert!(metrics.contains("doewood_ready 1"), "{metrics}");
@@ -265,6 +285,27 @@ fn started_in_order(seen: &[serde_json::Value], ready: &serde_json::Value) -> se
 
 const OPS_LISTENING: &str = "ops server listening (/healthz, /readyz, /metrics)";
 const API_LISTENING: &str = "gRPC API listening (gRPC and gRPC-Web, health, reflection)";
+
+/// `doewood health` fails fast when nothing listens on the ops port.
+#[test]
+fn health_fails_when_nothing_listens() {
+    let tmp = tempfile::tempdir().unwrap();
+    let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = free.local_addr().unwrap();
+    drop(free);
+    let started = Instant::now();
+    let (ok, why) = health(tmp.path(), &addr.to_string());
+    assert!(!ok);
+    assert!(
+        why.starts_with(&format!(
+            "doewood health: not ready: cannot connect to {addr}"
+        )),
+        "{why}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+    // It creates nothing: no data directory, no key.
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+}
 
 /// `dev add-source` goes through the API's code (validation, claim), and `serve` then starts
 /// a scanner for the source.
@@ -398,6 +439,16 @@ fn serve_runs_degraded_while_postgres_is_unreachable() {
         "{body}"
     );
     assert!(body.contains("retrying"), "{body}");
+    // `doewood health` fails while not ready, with the reason on one line.
+    let (ok, why) = health(tmp.path(), &addr.to_string());
+    assert!(!ok);
+    assert!(
+        why.starts_with("doewood health: not ready: ")
+            && why.contains("answered 503: not ready: shared Postgres unreachable")
+            && why.trim_end().lines().count() == 1,
+        "{why}"
+    );
+    assert!(!why.contains("hunter2"), "{why}");
     let (_, metrics) = get(addr, "/metrics");
     assert!(metrics.contains("doewood_ready 0"), "{metrics}");
     assert!(metrics.contains("mode=\"shared\""), "{metrics}");

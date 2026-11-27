@@ -38,17 +38,31 @@ glibc then returns the memory of big files and OCR to the system when it is free
 keeping it in per-thread arenas (a third less memory after OCR, see [Allocator](#allocator)). A
 binary run outside the image does not get it; set the variable yourself there.
 
+The image has a `HEALTHCHECK`: [`doewood health`](configuration.md#doewood-health), which asks
+`/readyz` (on loopback) and exits 0 when it answers 200, so `docker ps` shows `healthy` and
+Compose can start dependents with `condition: service_healthy` (example:
+[examples/compose.yml](examples/compose.yml)). Timings: `--interval=10s --timeout=3s
+--start-period=30s --start-interval=1s --retries=3`. A start is ready in about 0.15 s, and in
+0.5 s with an uncached store or a first Postgres migration ([Time to ready](#time-to-ready-issue-118);
+checking the OCR models takes 30 to 60 ms of that). The 30 s start period, during which
+failures do not count, leaves room for a slow disk or a shared Postgres still starting; its
+1 s probes mark the container healthy about a second after ready. After that, three failed
+probes 10 s apart (about 30 s not ready) mark it unhealthy; Docker restarts nothing on its own.
+On Kubernetes the chart's probes apply instead (the kubelet ignores `HEALTHCHECK`).
+
 ```sh
 docker run --rm -p 7443:7443 -p 7444:7444 -v doewood-data:/data \
   -e DOEWOOD_MASTER_KEY="$(openssl rand -base64 32)" doewood:dev
 curl -s 127.0.0.1:7444/readyz        # ready
 docker run --rm doewood:dev version
 docker run --rm doewood:dev config check
+docker ps --format '{{.Names}} {{.Status}}'   # ... (healthy)
 ```
 
 Keep the master key: the store refuses to start with a different one.
 
-CI (`image` job) builds the image, runs this smoke test, and lints and renders the chart, on every
+CI (`image` job) builds the image, runs this smoke test (it also waits for the container to turn
+`healthy`), and lints and renders the chart, on every
 pull request and every push to `staging` and `main`. It pushes nothing.
 
 ### The published image

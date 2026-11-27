@@ -46,6 +46,7 @@ With no environment at all, this:
 ```sh
 curl -s 127.0.0.1:7444/readyz     # ready
 cargo run -- config check         # effective configuration, secrets redacted
+cargo run -- health               # exit 0 once /readyz answers 200 (container health checks)
 cargo run -- version
 ```
 
@@ -81,7 +82,7 @@ crates/
                   enrichment job (ADR 0002 sections 1 to 3, 5 and 6)
   doewood-api     the gRPC API (tonic, gRPC-Web, health, reflection) and GET /icons/{domain};
                   protos in proto/doewood/v1
-  doewood         the binary: serve, version, config check
+  doewood         the binary: serve, health, version, config check
 charts/doewood    the Helm chart (StatefulSet, one volume per instance)
 Dockerfile        the image, with OCR
 ```

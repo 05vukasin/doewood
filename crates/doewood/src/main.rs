@@ -1,9 +1,10 @@
-//! The `doewood` binary: `serve`, `version` and `config check` (plus the hidden `dev` tools for
-//! local testing).
+//! The `doewood` binary: `serve`, `health`, `version` and `config check` (plus the hidden `dev`
+//! tools for local testing).
 
 mod cleanup;
 mod dev;
 mod enrichment;
+mod health;
 mod icons;
 mod ingest;
 mod logging;
@@ -30,6 +31,9 @@ struct Cli {
 enum Command {
     /// Run the service. Needs no configuration: every bootstrap value has a default.
     Serve,
+    /// Exit 0 when the local instance is ready (`/readyz` on DOEWOOD_OPS_LISTEN answers 200
+    /// within 2 s), else 1 with the reason on stderr. For container health checks.
+    Health,
     /// Print the version.
     Version,
     /// Inspect the configuration.
@@ -66,6 +70,7 @@ fn main() -> ExitCode {
             logging::init();
             serve::main(BootstrapConfig::from_env(), started)
         }
+        Command::Health => health(BootstrapConfig::from_env().config.ops_listen),
         Command::Version => {
             println!(
                 "doewood {VERSION} (store schema {}, shared schema {})",
@@ -94,6 +99,29 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             }
+        }
+    }
+}
+
+/// `doewood health`: one look at `/readyz`, on a single-threaded runtime.
+fn health(ops_listen: std::net::SocketAddr) -> ExitCode {
+    let addr = health::target(ops_listen);
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("doewood health: cannot start a runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match runtime.block_on(health::check(addr, health::TIMEOUT)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(why) => {
+            eprintln!("doewood health: not ready: {why}");
+            ExitCode::FAILURE
         }
     }
 }

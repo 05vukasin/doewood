@@ -505,6 +505,17 @@ impl Store {
     }
 }
 
+/// The result of a write that does nothing when the value is already stored, such as
+/// [`Store::apply_ai_provider`]: callers wake nothing when `changed` is false.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Applied<T> {
+    /// The value as stored now.
+    pub value: T,
+    /// Whether the call changed anything. When false nothing was written, not even a
+    /// timestamp.
+    pub changed: bool,
+}
+
 /// What [`Store::optimize_all`] did.
 #[derive(Clone, Debug, Default)]
 pub struct Optimized {

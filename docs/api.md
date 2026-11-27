@@ -87,8 +87,8 @@ The comments in the `.proto` files are the reference for every field. In short:
 - **SetLlmPolicy** sets which documents of a source get an LLM summary: `LLM_MODE_OFF` (the
   default), `LLM_MODE_ALL`, `LLM_MODE_KINDS` with `kinds`, or `LLM_MODE_ON_DEMAND`; with a
   concurrency (1 to 64, default 2) and an optional daily token budget (tokens per UTC day). It
-  applies to documents ingested from now on and to those waiting in the queue. See
-  [llm.md](llm.md).
+  applies to documents ingested from now on and to those waiting in the queue. The same
+  policy again writes nothing and leaves the queue alone. See [llm.md](llm.md).
 - **SetAiProvider** configures a provider with a preset, a model, an optional base URL and a
   write-only API key. The presets are those of quail's `ApiConfig` and hedgehog: `openai`,
   `openai_compatible` (needs `base_url`), `anthropic`, `bedrock`, `openrouter`, `groq`, `vllm`
@@ -96,7 +96,10 @@ The comments in the `.proto` files are the reference for every field. In short:
   side by side under other names. An empty `api_key` keeps the stored key; `clear_api_key`
   deletes it. The first provider set becomes the default; `make_default` moves the default.
   The LLM queue uses the default provider. For `bedrock`, `base_url` is required
-  (`https://bedrock-runtime.<region>.amazonaws.com`): the region is read from it.
+  (`https://bedrock-runtime.<region>.amazonaws.com`): the region is read from it. The call is
+  idempotent: the same preset, model, base URL, key and default again write nothing (the
+  `updated_at` it returns stays), requeue no job and leave the queue alone, so a service can
+  make it at every boot ([configuration.md](configuration.md#configuring-doewood-from-another-service)).
 - **ListAiProviders** lists them with `api_key_set`, never the key, plus every preset name.
 
 ### Ingest settings

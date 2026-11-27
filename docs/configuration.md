@@ -357,10 +357,129 @@ every variable, with secrets redacted, and every warning. It creates nothing.
 | path | answers |
 |---|---|
 | `/healthz` | `200 ok` while the process runs |
-| `/readyz` | `200 ready` once the store is open; `503` before that and during shutdown |
+| `/readyz` | `200 ready` once the gRPC API serves and the store answers; `503` with the reason before that, while the shared Postgres is unreachable, and during shutdown |
 | `/metrics` | Prometheus text: `doewood_build_info`, `doewood_ready`, `doewood_start_time_seconds`, `doewood_ops_requests_total`, `doewood_ingest_finish_unmatched_total`, `doewood_ingest_known_copies_total`, `doewood_ingest_known_copy_bytes_total` |
 | `POST /events/s3/{source_id}` | MinIO / S3 event notifications for a source (see [api.md](api.md#event-webhook)) |
 
 On SIGTERM or SIGINT, doewood reports not ready, stops its servers (the gRPC API gets up to 10 s
 to finish the calls in flight; its progress streams end), stops the scanners, checkpoints and
 closes the store, and exits 0.
+
+### `doewood health`
+
+```sh
+doewood health
+```
+
+asks `http://<DOEWOOD_OPS_LISTEN>/readyz` once (an unspecified address, `0.0.0.0` or `[::]`, is
+reached on loopback), with 2 s for the whole exchange, and exits 0 on `200`. Otherwise it exits
+1 and prints one line on stderr, such as `doewood health: not ready: http://127.0.0.1:7444/readyz
+answered 503: not ready: starting`. It needs no curl, so the image uses it as its
+`HEALTHCHECK` (see [deploy.md](deploy.md#the-image)), and Compose can wait for doewood with
+`depends_on: condition: service_healthy`. It reads only `DOEWOOD_OPS_LISTEN` and creates
+nothing.
+
+## Configuring doewood from another service
+
+A service that starts doewood next to it (in Docker Compose, say) and owns the AI settings
+pushes them into doewood through the runtime API at its own boot. doewood reads no provider
+variables from its environment (ADR 0001, section 3): the calls below are the way in. They are
+idempotent, so the service makes them at every boot.
+
+1. **Wait until doewood is ready.** Either let Compose wait for the health check
+   (`depends_on: doewood: condition: service_healthy`, see the [example](#compose-example)), or
+   call right away and retry `UNAVAILABLE` with backoff (0.5 s, doubling, up to 10 s): the
+   channel answers `UNAVAILABLE` while doewood starts.
+2. **`ConfigService.SetAiProvider` with `make_default: true`.** The same preset, model, base
+   URL, key and default again change nothing: nothing is written (`updated_at` stays), no LLM
+   job is queued again or reset, the queue is not woken, and no second provider appears. A
+   different key, model, base URL or default applies at once, to the next summary. The key is
+   compared with the stored one after decryption, never returned. An empty `api_key` keeps the
+   stored key; `clear_api_key` deletes it.
+3. **`ConfigService.SetLlmPolicy`** for each source that should get summaries (`ListSources`
+   lists them). The same policy again is a no-op too; a different one applies at once.
+
+Mapping common environment names of the calling service to `SetAiProvider` (`model` is
+required for every preset):
+
+| env | preset | other fields |
+|---|---|---|
+| `AI_PROVIDER=bedrock` | `bedrock` | `base_url=https://bedrock-runtime.<AWS_REGION>.amazonaws.com`, `api_key=<AWS_BEARER_TOKEN_BEDROCK>`, `model=<AI_CHAT_MODEL>` |
+| `anthropic` | `anthropic` | `api_key=<ANTHROPIC_API_KEY>`, `model=<AI_CHAT_MODEL>` |
+| `openai-compatible` | `openai_compatible` | `base_url=<OPENAI_COMPATIBLE_BASE_URL>`, `api_key=<OPENAI_COMPATIBLE_API_KEY>`, `model=<AI_CHAT_MODEL>` |
+| `none` | no call | |
+
+The boot call in Python with grpcio, from stubs generated out of `proto/`
+(`python -m grpc_tools.protoc -I proto --python_out=. --grpc_python_out=. proto/doewood/v1/*.proto`):
+
+```python
+import os
+import time
+
+import grpc
+from doewood.v1 import config_pb2 as pb
+from doewood.v1 import config_pb2_grpc
+
+
+def retry_unavailable(call, attempts=30):
+    """Runs call(), retrying UNAVAILABLE (doewood starting, or overloaded) with backoff."""
+    delay = 0.5
+    for attempt in range(attempts):
+        try:
+            return call()
+        except grpc.RpcError as e:
+            if e.code() != grpc.StatusCode.UNAVAILABLE or attempt == attempts - 1:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 10)
+
+
+def configure_doewood(addr, preset, model, base_url="", api_key=""):
+    config = config_pb2_grpc.ConfigServiceStub(grpc.insecure_channel(addr))
+    provider = retry_unavailable(lambda: config.SetAiProvider(
+        pb.SetAiProviderRequest(
+            preset=preset,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            make_default=True,
+        ),
+        timeout=10,
+    ))
+    sources = retry_unavailable(
+        lambda: config.ListSources(pb.ListSourcesRequest(), timeout=10)).sources
+    for source in sources:
+        retry_unavailable(lambda: config.SetLlmPolicy(
+            pb.SetLlmPolicyRequest(
+                source_id=source.id,
+                policy=pb.LlmPolicy(mode=pb.LLM_MODE_ALL),
+            ),
+            timeout=10,
+        ))
+    return provider
+
+
+if os.environ.get("AI_PROVIDER", "none") == "openai-compatible":
+    configure_doewood(
+        os.environ.get("DOEWOOD_ADDR", "doewood:7443"),
+        preset="openai_compatible",
+        model=os.environ["AI_CHAT_MODEL"],
+        base_url=os.environ["OPENAI_COMPATIBLE_BASE_URL"],
+        api_key=os.environ.get("OPENAI_COMPATIBLE_API_KEY", ""),
+    )
+```
+
+`provider` is the stored provider: `api_key_set`, `is_default` and `updated_at`, never the key.
+
+### Compose example
+
+[examples/compose.yml](examples/compose.yml) runs doewood from `ghcr.io/05vukasin/doewood:edge`
+with its health check, a named volume for `/data` and `DOEWOOD_LISTEN=0.0.0.0:7443`, and a
+placeholder `app` service that starts once doewood is healthy. No port is published: `app`
+reaches doewood as `doewood:7443` on an internal network, and doewood reaches S3 and the AI
+provider through a second network of its own.
+
+```sh
+DOEWOOD_MASTER_KEY="$(openssl rand -base64 32)" docker compose -f docs/examples/compose.yml up -d
+docker compose -f docs/examples/compose.yml ps     # doewood: healthy
+```
