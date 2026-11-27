@@ -20,7 +20,7 @@ Set through the API, kept in `doewood.sqlite`, applied without a restart:
 | A source's SQS inlet: queue URL, region, on/off (see [sources.md](sources.md#sqs)) | `SetSqsInlet`, `RemoveSqsInlet` | setting `sqs_inlet/<source id>` |
 | The SQS inlet's own credentials (unset: the source's) | `SetSqsInlet` | secret `sqs/<source id>` (sealed, write-only) |
 | A source's LLM policy: mode (`off` (default), `all`, `kinds`, `on_demand`), kinds, concurrency (1 to 64, default 2), daily token budget (tokens per UTC day, unset: no limit) | `SetLlmPolicy`, `AddSource` | `sources.policy_json` |
-| AI providers: preset, model, base URL | `SetAiProvider` | setting `ai.provider.<name>` |
+| AI providers: preset, model, base URL | `SetAiProvider`, `RemoveAiProvider` | setting `ai.provider.<name>` |
 | An AI provider's API key | `SetAiProvider` | secret `ai/<name>/api_key` (sealed, write-only) |
 | A `bedrock` provider's IAM credentials (access key id, secret access key, optional session token) | `SetAiProvider` | secret `ai/<name>/aws_credentials` (sealed, write-only) |
 | The default AI provider (the LLM queue's) | `SetAiProvider` (`make_default`; the first one set) | setting `ai.default_provider` |
@@ -416,6 +416,11 @@ idempotent, so the service makes them at every boot.
    `clear_aws_credentials` deletes them.
 3. **`ConfigService.SetLlmPolicy`** for each source that should get summaries (`ListSources`
    lists them). The same policy again is a no-op too; a different one applies at once.
+
+A service that switches its AI off calls **`ConfigService.RemoveAiProvider`** at boot instead
+of `SetAiProvider`: it deletes the provider with its sealed key and IAM credentials, and leaves
+no default, so queued summaries wait. Removing a provider that is already gone is OK (with
+`removed` false), so it too can run at every boot.
 
 Mapping common environment names of the calling service to `SetAiProvider` (`model` is
 required for every preset):

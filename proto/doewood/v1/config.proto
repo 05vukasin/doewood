@@ -47,6 +47,12 @@ service ConfigService {
   // base URL is required, `https://bedrock-runtime.<region>.amazonaws.com`: the region is read
   // from it.
   rpc SetAiProvider(SetAiProviderRequest) returns (AiProvider);
+  // Removes an AI provider with its sealed API key and IAM credentials. When it was the
+  // default there is no default afterwards, even if other providers remain (the next one set
+  // becomes the default): queued LLM jobs wait, and Summarize without a provider name answers
+  // FAILED_PRECONDITION. Summaries already in flight finish. Idempotent: an unknown provider
+  // is OK, with `removed` false.
+  rpc RemoveAiProvider(RemoveAiProviderRequest) returns (RemoveAiProviderResponse);
   // The configured AI providers (never their keys).
   rpc ListAiProviders(ListAiProvidersRequest) returns (ListAiProvidersResponse);
   // Ingest's settings, with the defaults filled in.
@@ -345,6 +351,18 @@ message AiProvider {
   bool aws_credentials_set = 8;
 }
 
+message RemoveAiProviderRequest {
+  // The provider's name, as ListAiProviders shows it.
+  string name = 1;
+}
+
+message RemoveAiProviderResponse {
+  // Whether a provider was removed (false: there was none of that name).
+  bool removed = 1;
+  // Whether it was the default: there is no default now.
+  bool was_default = 2;
+}
+
 message ListAiProvidersRequest {}
 
 message ListAiProvidersResponse {
@@ -357,8 +375,9 @@ message IngestSettings {
   // Least MinHash Jaccard estimate for a `similar_to` edge, the "related version" relation
   // (issue #169): above 0, at most 1. Default 0.6 (0.8 before issue #169).
   double similar_min_jaccard = 1;
-  // On-demand `Summarize` analyses (with the object read before them) that run at once: 1 to
-  // 16. Default 2. A call beyond it is refused at once with RESOURCE_EXHAUSTED.
+  // On-demand `Summarize` analyses (with the object read before them), or reads of a stored
+  // record (`blake3`), that run at once: 1 to 16. Default 2. A call beyond it is refused at
+  // once with RESOURCE_EXHAUSTED.
   uint32 summarize_max_concurrent = 2;
   // Largest LSH band bucket the `similar_to` candidate query reads: a band key shared by more
   // documents is skipped as a template's boilerplate (the "stop band"). 10 to 1000000.

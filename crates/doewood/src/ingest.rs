@@ -245,6 +245,7 @@ impl OnDemand for OnDemandSummaries {
             let input = match input {
                 OnDemandInput::Content { bytes, name } => SummarizeInput::Content { bytes, name },
                 OnDemandInput::Location { source, key } => SummarizeInput::Location { source, key },
+                OnDemandInput::Stored { blake3 } => SummarizeInput::Stored { blake3 },
             };
             let s = self
                 .0
