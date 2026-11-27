@@ -79,7 +79,9 @@ record, no summary, no job, no spend (the daily budget governs the queue only; a
 is the caller's choice).
 
 - Input: the bytes (`content` with a `name`) or an object of a source (`location`) whose policy
-  is not `off`. An object already stored with current step versions is read from its record;
+  is not `off`. A `content` call needs no source and no LLM policy, only a provider: the
+  policy governs what leaves a source's bucket, and these bytes come from the caller (example
+  in [api.md](api.md#summarize)). An object already stored with current step versions is read from its record;
   anything else is analyzed (and not stored).
 - Output: the summary, the fact check of the model's output (claims checked, supported, the
   unsupported ones), the provider and model, the file's BLAKE3 and kind. A failing provider or
