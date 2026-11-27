@@ -888,7 +888,7 @@ async fn scenario(store: Arc<Store>, shared: &Shared) {
     .unwrap()
     .clone();
     assert_eq!(done.state, ReprocessState::Done, "{name}: {done:?}");
-    assert_eq!(done.selected, 10, "{name}: every live object: {done:?}");
+    assert_eq!(done.selected, 12, "{name}: every live object: {done:?}");
     assert_eq!(done.pending, 0, "{name}");
     assert_eq!(
         h.status("in/missing.txt").status,

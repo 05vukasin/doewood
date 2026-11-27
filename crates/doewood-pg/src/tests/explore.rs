@@ -263,11 +263,13 @@ async fn schema_13_counts_the_total_with_log_rows_pending() {
     {
         let s = db.store().await;
         c.batch_execute(&seed(3000, 300, false)).await.unwrap();
-        // Fold a part as schema 12 would (the total's row aside), then go back to schema 12.
+        // Fold a part as schema 12 would (the total's row aside), then go back to schema 12
+        // (schema 14's table goes too, so 13 and 14 run again).
         s.fold_company_graph(2000).await.unwrap();
     }
     c.batch_execute(
-        "DROP TABLE company_graph_totals; DELETE FROM doewood_schema WHERE version = 13;",
+        "DROP TABLE document_texts; DROP TABLE company_graph_totals; \
+         DELETE FROM doewood_schema WHERE version >= 13;",
     )
     .await
     .unwrap();

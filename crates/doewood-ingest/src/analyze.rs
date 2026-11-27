@@ -304,14 +304,14 @@ impl Analyzer {
         let sniff = quail_engine::detect(&bytes);
         let route = route(sniff, &bytes, key);
         let blob = Blob::from(bytes);
-        // The locator is the content's own name: records are shared by every copy, and their
-        // locations live in the graph.
         // The text is built from the pages quail extracted, before they are dropped.
         let extractor = match route {
             Route::Quail(format) if self.text_max_bytes > 0 => self.engine.extractor_for(format),
             _ => None,
         };
         let mut text = None;
+        // The locator is the content's own name: records are shared by every copy, and their
+        // locations live in the graph.
         let item = SourceItem {
             locator: format!("blake3:{}", blake3.to_hex()),
             blob: blob.clone(),
