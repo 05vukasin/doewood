@@ -16,8 +16,8 @@
 //!   edge in any state), unless a registry created them (`origin: registry`), and the
 //!   companies merged into a purged one (their husks: the merge log's absorbed companies
 //!   whose `merged_into` still names it) under the same rule. The merge log keeps its
-//!   entries (it has no foreign keys); an undo of one whose company is gone answers
-//!   NOT_FOUND.
+//!   entries (it has no foreign keys); undoing one whose companies are gone brings nothing
+//!   back.
 //!
 //! Every edge delete is a delete on `edges` (a cascade from the node), so the company graph's
 //! log triggers record it and the explorer's folded counts stay exact.

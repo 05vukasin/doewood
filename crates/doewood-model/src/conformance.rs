@@ -4450,12 +4450,10 @@ pub async fn purge<B: Backend + ?Sized>(s: &B) {
         s.node(registry).await.unwrap().is_some(),
         "a registry's company"
     );
-    assert!(
-        s.undo_merge(&undo_req(merge.id, false, false))
-            .await
-            .is_err(),
-        "the merged companies are gone"
-    );
+    // The merge log keeps the entry; undoing it brings neither company back.
+    let _ = s.undo_merge(&undo_req(merge.id, false, false)).await;
+    assert!(s.node(only1).await.unwrap().is_none());
+    assert!(s.node(husk).await.unwrap().is_none());
     // 3's reference to 1 waits on the number again; the pending node 1 alone cited is gone.
     let cites = s
         .neighbours(

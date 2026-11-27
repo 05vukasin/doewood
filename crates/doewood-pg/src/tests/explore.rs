@@ -362,7 +362,8 @@ async fn schema_13_counts_the_total_with_log_rows_pending() {
         s.fold_company_graph(2000).await.unwrap();
     }
     c.batch_execute(
-        "DROP TABLE company_graph_totals; DELETE FROM doewood_schema WHERE version = 13;",
+        "DROP TABLE company_graph_totals; DROP INDEX locations_by_document; \
+         DELETE FROM doewood_schema WHERE version >= 13;",
     )
     .await
     .unwrap();

@@ -99,8 +99,8 @@ pub(crate) async fn ended_locations(
     let rows = tx
         .rows(
             "SELECT n.id, n.key, EXISTS (SELECT 1 FROM locations l WHERE l.node_id = n.id), \
-             ($3::text IS NULL OR (n.props->>'endpoint' = $3 AND n.props->>'bucket' = $4 \
-             AND starts_with(n.props->>'key', $5))) \
+             ($3::text IS NULL OR coalesce(n.props->>'endpoint' = $3 \
+             AND n.props->>'bucket' = $4 AND starts_with(n.props->>'key', $5), false)) \
              FROM nodes n WHERE n.kind = 'location' AND n.key > $1 ORDER BY n.key LIMIT $2",
             &[
                 &after.unwrap_or(""),

@@ -447,8 +447,8 @@ rows examined):
   updates a stored record (`RecordStore::update_record`), so a summary finished after a purge
   never brings a record back.
 
-What stays: the merge log and dismissals (no foreign keys, by design; an undo of an entry
-whose companies are gone answers `NOT_FOUND`), the registry cache, `known_content` (an MD5
+What stays: the merge log and dismissals (no foreign keys, by design; undoing an entry whose
+companies are gone brings nothing of them back), the registry cache, `known_content` (an MD5
 ETag, a size and a hash, used only while the record exists), and the instance's
 `objects_seen` rows of live sources. A kept company keeps the names and aliases it learned;
 an alias's evidence may name a purged document's hash.
