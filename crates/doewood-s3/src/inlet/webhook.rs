@@ -219,7 +219,8 @@ pub(crate) async fn deliver(
         );
         return Ok(outcome);
     }
-    if !src.state.is_scanned() {
+    // A push source has no bucket (ADR 0004): no notification is about it.
+    if !src.state.is_scanned() || src.is_push() {
         outcome.ignored = notifications.len();
         return Ok(outcome);
     }

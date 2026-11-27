@@ -10,8 +10,9 @@ import "doewood/v1/common.proto";
 
 service ConfigService {
   // Adds a source. The source is first claimed in the shared store; a source another instance
-  // owns fails with ALREADY_EXISTS naming that instance. An active source starts scanning at
-  // once.
+  // owns fails with ALREADY_EXISTS naming that instance. An active S3 source starts scanning at
+  // once. A push source (`kind` SOURCE_KIND_PUSH, ADR 0004) has no bucket and no scanner: its
+  // bytes come through IngestService.PutObject.
   rpc AddSource(AddSourceRequest) returns (Source);
   // Changes a source's options or credentials. The endpoint, bucket and prefix are its
   // identity and cannot change: remove it and add another.
@@ -68,6 +69,17 @@ service ConfigService {
   rpc SetApiSettings(SetApiSettingsRequest) returns (ApiSettings);
 }
 
+// What kind of source it is (ADR 0004).
+enum SourceKind {
+  // An S3 source.
+  SOURCE_KIND_UNSPECIFIED = 0;
+  // An S3-compatible bucket, scanned for changes.
+  SOURCE_KIND_S3 = 1;
+  // Bytes an application hands in through IngestService.PutObject. No scanner, no bucket:
+  // the application owns discovery, moves (MoveLocation) and deletions (RemoveLocation).
+  SOURCE_KIND_PUSH = 2;
+}
+
 // How bucket URLs are built.
 enum UrlStyle {
   // Path style.
@@ -116,6 +128,10 @@ message LlmPolicy {
 }
 
 message AddSourceRequest {
+  // S3 (the default) or push. A push source takes only `max_object_bytes`, `llm_policy` and
+  // `paused`; the endpoint, bucket, prefix, region, URL style, credentials, scan interval and
+  // known copies must be unset (INVALID_ARGUMENT otherwise).
+  SourceKind kind = 12;
   // `http://` or `https://` URL of the S3-compatible endpoint, without credentials, query or
   // fragment. A path (`https://gw/s3`) is kept as a prefix.
   string endpoint = 1;
@@ -131,7 +147,8 @@ message AddSourceRequest {
   // Seconds from the end of one scan pass to the start of the next, 1 to 604800; 0 means
   // the default, 300.
   uint64 scan_interval_seconds = 7;
-  // GetObject size cap in bytes; 0 means the default, 512 MiB.
+  // GetObject size cap in bytes (for a push source: the largest file PutObject takes); 0
+  // means the default, 512 MiB.
   uint64 max_object_bytes = 8;
   // Unset means off.
   LlmPolicy llm_policy = 9;
@@ -147,7 +164,11 @@ message AddSourceRequest {
 message Source {
   // A UUIDv7.
   string id = 1;
-  // The endpoint as stored: scheme and host lowercased, no trailing `/`.
+  // S3 or push.
+  SourceKind kind = 19;
+  // The endpoint as stored: scheme and host lowercased, no trailing `/`. A push source's is
+  // `push:<id>`, with an empty bucket and prefix: its documents' locations are
+  // `["push:<id>", key]`.
   string endpoint = 2;
   string bucket = 3;
   string prefix = 4;
@@ -231,6 +252,7 @@ message RemoveSqsInletRequest {
   string source_id = 1;
 }
 
+// A push source takes only `max_object_bytes` (FAILED_PRECONDITION for the other options).
 message UpdateSourceRequest {
   string source_id = 1;
   // Unset keeps the region; empty goes back to the default.
@@ -268,6 +290,7 @@ message RemoveSourceResponse {
 
 message ReleaseSourceClaimRequest {
   // The source's identity, as in AddSourceRequest; the endpoint is normalized the same way.
+  // For a push source: `push:<source id>`, with the bucket and prefix empty.
   string endpoint = 1;
   string bucket = 2;
   string prefix = 3;

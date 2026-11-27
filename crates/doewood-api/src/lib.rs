@@ -2,8 +2,9 @@
 //!
 //! - **Services** (package `doewood.v1`, `proto/doewood/v1/*.proto`): `ConfigService`
 //!   (sources, LLM policies, AI providers), `JobsService` (the progress stream and
-//!   reprocessing), `RecordsService`, `GraphService`, `SearchService` and `SummarizeService` (its
-//!   messages are final; the work arrives with the LLM step).
+//!   reprocessing), `RecordsService`, `GraphService`, `SearchService`, `SummarizeService` (its
+//!   messages are final; the work arrives with the LLM step) and `IngestService` (push
+//!   sources, ADR 0004).
 //! - **gRPC-Web** (`tonic-web`, HTTP/1.1 accepted), so a browser frontend calls the API
 //!   directly. No CORS headers are sent: serve the frontend from the same origin.
 //! - **Health** (`grpc.health.v1`) and **reflection** (v1 and v1alpha), for probes and
@@ -31,6 +32,7 @@ mod error;
 mod explore;
 mod graph;
 mod icons;
+mod ingest;
 mod jobs;
 mod limits;
 mod merges;
@@ -74,6 +76,9 @@ pub use icons::{
     CACHE_HIT, CACHE_MISS, CSP, ICON_CONTENT_TYPES, ICONS_PATH, IconAnswer, Icons,
     respond as icon_response,
 };
+pub use ingest::{
+    CHUNK_IDLE, PushFailure, PushHeader, PushOutcome, PushResult, PushUpload, Pusher,
+};
 pub use limits::{
     HTTP2_KEEPALIVE_INTERVAL, HTTP2_KEEPALIVE_TIMEOUT, MAX_CONCURRENT_STREAMS, MAX_CONNECTION_AGE,
     MAX_CONNECTION_AGE_GRACE, MAX_CONNECTION_AGE_JITTER_PERCENT, TCP_KEEPALIVE,
@@ -95,6 +100,7 @@ pub mod pb {
 
 use pb::config_service_server::ConfigServiceServer;
 use pb::graph_service_server::GraphServiceServer;
+use pb::ingest_service_server::IngestServiceServer;
 use pb::jobs_service_server::JobsServiceServer;
 use pb::records_service_server::RecordsServiceServer;
 use pb::search_service_server::SearchServiceServer;
@@ -119,6 +125,7 @@ const BACKED_SERVICES: &[&str] = &[
     pb::records_service_server::SERVICE_NAME,
     pb::graph_service_server::SERVICE_NAME,
     pb::search_service_server::SERVICE_NAME,
+    pb::ingest_service_server::SERVICE_NAME,
 ];
 
 /// Why the server stopped or did not start.
@@ -203,7 +210,8 @@ pub async fn serve(
         .add_service(guarded!(RecordsServiceServer))
         .add_service(guarded!(GraphServiceServer))
         .add_service(guarded!(SearchServiceServer))
-        .add_service(guarded!(SummarizeServiceServer));
+        .add_service(guarded!(SummarizeServiceServer))
+        .add_service(guarded!(IngestServiceServer));
     // gRPC-Web wraps the gRPC services only: it answers 400 to any other HTTP/1.1 request,
     // so the icon route sits next to it, and everything else falls through to it. The
     // metrics and the call limits sit inside gRPC-Web, so its calls get them too; the

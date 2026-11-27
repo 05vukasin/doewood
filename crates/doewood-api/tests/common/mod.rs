@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use doewood_api::{ApiOptions, ApiParts, ApiState, Icons, OnDemand, Progress, Reprocessor};
+use doewood_api::{ApiOptions, ApiParts, ApiState, Icons, OnDemand, Progress, Pusher, Reprocessor};
 use doewood_core::{InstanceId, MasterKey};
 use doewood_model::Backend;
 use doewood_s3::{ClientOptions, Discovery, DiscoveryOptions, ObjectEvent, RetryPolicy};
@@ -38,6 +38,8 @@ pub struct Options {
     pub max_message_bytes: usize,
     pub reprocess: Option<Arc<dyn Reprocessor>>,
     pub summarize: Option<Arc<dyn OnDemand>>,
+    /// Push sources' ingest (`IngestService`).
+    pub push: Option<Arc<dyn Pusher>>,
     /// Answers `GET /icons/{domain}`.
     pub icons: Option<Arc<dyn Icons>>,
     /// As `serve` with a shared store: sources are re-claimed at start.
@@ -54,6 +56,7 @@ impl Default for Options {
             max_message_bytes: 64 * 1024 * 1024,
             reprocess: None,
             summarize: None,
+            push: None,
             icons: None,
             shared_claims: false,
             progress_interval: Duration::from_millis(50),
@@ -114,6 +117,7 @@ impl Instance {
             progress: Arc::clone(&progress),
             reprocess: options.reprocess,
             summarize: options.summarize,
+            push: options.push,
             icons: options.icons,
             options: ApiOptions {
                 max_message_bytes: options.max_message_bytes,

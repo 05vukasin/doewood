@@ -70,7 +70,12 @@ impl JobsService for Api {
         let Some(id) = id else {
             return Err(Status::invalid_argument("source_id: required"));
         };
-        self.state.source(id).await?;
+        if self.state.source(id).await?.is_push() {
+            return Err(Status::failed_precondition(format!(
+                "source {id} is a push source: doewood keeps no bytes to analyze again; put the \
+                 files again (IngestService.PutObject) to reanalyze them"
+            )));
+        }
         let Some(reprocess) = self.state.parts().reprocess.clone() else {
             return Err(Status::unavailable(
                 "ingest is not running on this instance, so nothing can be reprocessed",

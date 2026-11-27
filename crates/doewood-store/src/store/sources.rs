@@ -1,11 +1,14 @@
 //! Sources (ADR 0001, section 5): an S3-compatible endpoint, a bucket and an optional prefix,
-//! with their state, schedule and options, and the credentials sealed in `secrets`.
+//! with their state, schedule and options, and the credentials sealed in `secrets`. A push
+//! source (ADR 0004) has the endpoint `push:<id>` and no bucket, prefix or credentials: its
+//! kind is read from that endpoint, which no `http(s)://` URL can be.
 
 use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
 
 use doewood_core::SourceId;
+use doewood_model::{is_push_endpoint, push_endpoint};
 use rusqlite::{OptionalExtension as _, Row, params};
 use zeroize::Zeroizing;
 
@@ -71,6 +74,33 @@ impl FromStr for SourceState {
                 )));
             }
         })
+    }
+}
+
+/// What kind of source it is (ADR 0004).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum SourceKind {
+    /// An S3-compatible bucket, scanned for changes.
+    #[default]
+    S3,
+    /// Bytes an application hands in through `IngestService.PutObject`. No scanner, no bucket:
+    /// the application owns discovery, moves and deletions.
+    Push,
+}
+
+impl SourceKind {
+    /// `s3` or `push`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::S3 => "s3",
+            Self::Push => "push",
+        }
+    }
+}
+
+impl fmt::Display for SourceKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -303,6 +333,18 @@ impl NewSource {
         }
     }
 
+    /// A push source (ADR 0004) with the defaults: active, the default size cap, LLM off. Its
+    /// endpoint is `push:<id>`; it has no bucket, prefix, region or credentials, and no
+    /// scanner, so its scan interval is never used.
+    pub fn push(id: SourceId) -> Self {
+        Self::new(push_endpoint(id), "")
+    }
+
+    /// Whether it is a push source.
+    pub fn kind(&self) -> SourceKind {
+        kind_of(&self.endpoint)
+    }
+
     fn validate(&self) -> Result<(), StoreError> {
         if !matches!(self.state, SourceState::Active | SourceState::Paused) {
             return Err(StoreError::InvalidSource(
@@ -311,6 +353,19 @@ impl NewSource {
         }
         self.llm_policy.validate()?;
         let bad = |m: &str| Err(StoreError::InvalidSource(m.to_owned()));
+        if self.kind() == SourceKind::Push {
+            if !self.bucket.is_empty()
+                || !self.prefix.is_empty()
+                || self.region.is_some()
+                || self.url_style != UrlStyle::Path
+                || self.skip_known_copies
+            {
+                return bad(
+                    "a push source has no bucket, prefix, region, URL style or known copies",
+                );
+            }
+            return check_options(self.scan_interval, self.max_object_bytes);
+        }
         let lower = self.endpoint.to_ascii_lowercase();
         if !(lower.starts_with("http://") || lower.starts_with("https://")) {
             return bad("the endpoint must be an http:// or https:// URL");
@@ -332,6 +387,16 @@ impl NewSource {
             return bad("the prefix is longer than 1024 bytes");
         }
         check_options(self.scan_interval, self.max_object_bytes)
+    }
+}
+
+/// The kind of the source with this endpoint: a push source's is `push:<id>`, which no
+/// `http(s)://` endpoint can be.
+fn kind_of(endpoint: &str) -> SourceKind {
+    if is_push_endpoint(endpoint) {
+        SourceKind::Push
+    } else {
+        SourceKind::S3
     }
 }
 
@@ -428,6 +493,17 @@ pub struct Source {
 }
 
 impl Source {
+    /// S3 or push (ADR 0004).
+    pub fn kind(&self) -> SourceKind {
+        kind_of(&self.endpoint)
+    }
+
+    /// Whether it is a push source: no scanner, no bucket, its bytes come through
+    /// `IngestService.PutObject`.
+    pub fn is_push(&self) -> bool {
+        self.kind() == SourceKind::Push
+    }
+
     /// The GetObject size cap, with the default applied.
     pub fn max_object_bytes(&self) -> u64 {
         self.max_object_bytes.unwrap_or(DEFAULT_MAX_OBJECT_BYTES)
@@ -625,8 +701,30 @@ impl Store {
         source: &NewSource,
         credentials: Option<&S3Credentials>,
     ) -> Result<SourceId, StoreError> {
+        self.add_source_with_id(SourceId::generate(), source, credentials)
+    }
+
+    /// [`Store::add_source`] under an id chosen before: a push source's endpoint
+    /// ([`NewSource::push`]) holds its id, and it is claimed by that before it is stored.
+    pub fn add_source_with_id(
+        &self,
+        id: SourceId,
+        source: &NewSource,
+        credentials: Option<&S3Credentials>,
+    ) -> Result<SourceId, StoreError> {
         source.validate()?;
-        let id = SourceId::generate();
+        if source.kind() == SourceKind::Push {
+            if source.endpoint != push_endpoint(id) {
+                return Err(StoreError::InvalidSource(
+                    "a push source's endpoint is push:<its id>".to_owned(),
+                ));
+            }
+            if credentials.is_some() {
+                return Err(StoreError::InvalidSource(
+                    "a push source has no credentials".to_owned(),
+                ));
+            }
+        }
         let now = now();
         let max = source
             .max_object_bytes

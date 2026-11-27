@@ -769,6 +769,12 @@ impl Summaries {
                 let src = self.db(move |s| s.source(source)).await?.ok_or_else(|| {
                     SummarizeError::NotFound(format!("source {source} does not exist"))
                 })?;
+                if src.is_push() {
+                    return Err(SummarizeError::FailedPrecondition(format!(
+                        "source {source} is a push source: doewood keeps no bytes of its \
+                         objects; send the content instead"
+                    )));
+                }
                 if !src.llm_policy.allows_on_demand() {
                     return Err(SummarizeError::FailedPrecondition(format!(
                         "the LLM policy of source {source} is off: set it to on_demand (or all, \

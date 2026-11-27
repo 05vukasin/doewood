@@ -312,6 +312,73 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// Records an object pushed through `IngestService.PutObject` (ADR 0004) as ingest left
+    /// it: its row is written with its final status, the content's hash (kept for a failed
+    /// analysis too, so a repeat put of the same bytes is recognized) and size. A push source
+    /// has no pending rows, so nothing sweeps, scans or reprocesses it.
+    pub fn record_pushed(
+        &self,
+        source: SourceId,
+        key: &str,
+        size: u64,
+        blake3: &[u8; 32],
+        outcome: &IngestOutcome,
+    ) -> Result<(), StoreError> {
+        let (status, error) = match outcome {
+            IngestOutcome::Done { .. } => ("done", None),
+            IngestOutcome::Skipped { .. } => ("skipped", None),
+            IngestOutcome::Failed { error, .. } => ("failed", Some(truncate(error, MAX_ERROR_LEN))),
+        };
+        let size = i64::try_from(size)
+            .map_err(|_| StoreError::InvalidSource(format!("object size {size} too large")))?;
+        self.conn()
+            .prepare_cached(
+                "INSERT INTO objects_seen (source_id, key, etag, size, last_modified, blake3,                  status, attempts, last_error, updated_at)                  VALUES (?1, ?2, NULL, ?3, ?6, ?4, ?5, 1, ?7, ?6)                  ON CONFLICT (source_id, key) DO UPDATE SET etag = NULL, size = excluded.size,                  last_modified = excluded.last_modified, blake3 = excluded.blake3,                  status = excluded.status, attempts = 1, last_error = excluded.last_error,                  updated_at = excluded.updated_at",
+            )
+            .and_then(|mut cached| {
+                cached.execute(params![
+                    source.to_string(),
+                    key,
+                    size,
+                    blake3.as_slice(),
+                    status,
+                    now(),
+                    error
+                ])
+            })?;
+        Ok(())
+    }
+
+    /// Moves a pushed object from `from` to `to` in one transaction: `to` gets `from`'s row
+    /// (status, hash and size), `from` turns `deleted`. Returns the moved row, `None` when
+    /// `from` is not a live object of the source (nothing changes then).
+    pub fn move_pushed(
+        &self,
+        source: SourceId,
+        from: &str,
+        to: &str,
+    ) -> Result<Option<IngestStatus>, StoreError> {
+        let id = source.to_string();
+        let now = now();
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let moved = tx
+            .prepare_cached(
+                "INSERT INTO objects_seen (source_id, key, etag, size, last_modified, blake3,                  status, attempts, last_error, updated_at)                  SELECT source_id, ?3, etag, size, ?4, blake3, status, attempts, last_error, ?4                  FROM objects_seen WHERE source_id = ?1 AND key = ?2 AND status <> 'deleted'                  ON CONFLICT (source_id, key) DO UPDATE SET etag = excluded.etag,                  size = excluded.size, last_modified = excluded.last_modified,                  blake3 = excluded.blake3, status = excluded.status, attempts = excluded.attempts,                  last_error = excluded.last_error, updated_at = excluded.updated_at",
+            )
+            .and_then(|mut cached| cached.execute(params![id, from, to, now]))?;
+        if moved == 0 {
+            return Ok(None);
+        }
+        tx.prepare_cached(
+            "UPDATE objects_seen SET status = 'deleted', updated_at = ?3              WHERE source_id = ?1 AND key = ?2",
+        )
+        .and_then(|mut cached| cached.execute(params![id, from, now]))?;
+        let row = Snapshot(&tx).ingest_status(source, to)?;
+        tx.commit()?;
+        Ok(row)
+    }
+
     /// Notes a failed attempt that will be retried: the row stays `pending`.
     pub fn note_attempt(
         &self,

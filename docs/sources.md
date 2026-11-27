@@ -1,13 +1,42 @@
 # Sources and discovery
 
 A **source** is an S3-compatible endpoint, a bucket and an optional key prefix
-([ADR 0001](adr/0001-architecture.md), section 5). Sources are runtime settings: the
+([ADR 0001](adr/0001-architecture.md), section 5), or a [push source](#push-sources) whose
+bytes an application hands in ([ADR 0004](adr/0004-push-sources.md)). Sources are runtime settings: the
 [gRPC API](api.md) adds, changes, pauses and removes them without a restart; they live in the
 instance's SQLite store, and their credentials are sealed in its encrypted secrets.
 
 Before a source is stored, the instance **claims** it (its endpoint, bucket and prefix) in the
 shared store. A source another instance owns is refused with `ALREADY_EXISTS`, naming that
 instance; removing the source releases the claim.
+
+## Push sources
+
+A **push source** ([ADR 0004](adr/0004-push-sources.md)) is the second kind of source: an
+application hands doewood the bytes of each file through `IngestService.PutObject` and gets
+the analysis back in the same call ([api.md](api.md#push-sources-ingestservice),
+[ingest.md](ingest.md#push-sources)). It suits an application that already reads its files
+from its own connectors (local folders, Drive, SharePoint, Dropbox, Box): nothing is copied to
+S3 first.
+
+- Add it with `AddSource` and `kind: SOURCE_KIND_PUSH`. It takes `max_object_bytes` (the largest
+  file `PutObject` accepts, 512 MiB by default), `llm_policy` and `paused`, nothing else.
+- It has **no scanner, no bucket and no event inlets**. The application owns discovery, moves
+  (`MoveLocation`) and deletions (`RemoveLocation`); doewood never looks for changes.
+- Its endpoint is `push:<id>`, with an empty bucket and prefix, and its documents' locations
+  are `["push:<id>", key]`. `ListRecords` and the `Search` source filter work on it as on an S3
+  source.
+- It is **claimed** like any source, by `(push:<id>, "", "")`: `AddSource` claims it, `serve`
+  re-claims it at start with a shared store, and `ResumeSource` claims it again. While another
+  instance owns it, every `IngestService` call to it is `FAILED_PRECONDITION`.
+  `ReleaseSourceClaim` takes `endpoint: "push:<id>"` with an empty bucket and prefix.
+- Paused, it refuses `PutObject`, `MoveLocation` and `RemoveLocation` with
+  `FAILED_PRECONDITION` until it is resumed.
+- doewood keeps no bytes of a pushed file, so `ReprocessJob` and `Summarize` by location are
+  refused. To reanalyze after an upgrade, put the files again: a stale record is analyzed again,
+  a current one answers `UNCHANGED`.
+- `UpdateSource` changes only `max_object_bytes`; `SetLlmPolicy` works as for any source.
+  `SetSqsInlet` is refused, and event notifications naming it are ignored.
 
 ## Claims
 

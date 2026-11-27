@@ -493,6 +493,7 @@ async fn source_validation_reports_every_field() {
             }),
             paused: false,
             skip_known_copies: false,
+            kind: 0,
         })
         .await
         .unwrap_err();

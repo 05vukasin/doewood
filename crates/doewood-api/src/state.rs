@@ -12,6 +12,7 @@ use tokio::sync::watch;
 use tonic::Status;
 
 use crate::icons::Icons;
+use crate::ingest::Pusher;
 use crate::limits::CallLimits;
 use crate::metrics::ApiMetrics;
 use crate::progress::{Progress, Snapshots};
@@ -60,6 +61,9 @@ pub struct ApiParts {
     /// On-demand summaries and the LLM queue; `None` when ingest does not run (`Summarize` is
     /// then UNAVAILABLE).
     pub summarize: Option<Arc<dyn OnDemand>>,
+    /// Push sources' `IngestService` (ADR 0004); `None` when ingest does not run (its calls
+    /// are then UNAVAILABLE).
+    pub push: Option<Arc<dyn Pusher>>,
     /// Company icons for `GET /icons/{domain}`; `None` answers every domain with a miss.
     pub icons: Option<Arc<dyn Icons>>,
     /// Tuning.

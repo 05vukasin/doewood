@@ -6,14 +6,15 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Instant;
 
 use doewood_api::{
-    BoxFuture, OnDemand, OnDemandError, OnDemandInput, OnDemandResult, Progress, ReprocessPhase,
-    ReprocessView, Reprocessor,
+    BoxFuture, OnDemand, OnDemandError, OnDemandInput, OnDemandResult, Progress, PushFailure,
+    PushHeader, PushOutcome, PushResult, PushUpload, Pusher, ReprocessPhase, ReprocessView,
+    Reprocessor,
 };
 use doewood_core::{BootstrapConfig, SourceId};
 use doewood_ingest::{
-    Analyzer, Fetch, Ingest, IngestConfig, IngestParts, QueueConfig, ReprocessState,
-    ReprocessStatus, S3Fetch, Summaries, SummariesParts, SummarizeError, SummarizeInput,
-    SystemClock,
+    Analyzer, Fetch, Ingest, IngestConfig, IngestParts, PushError, PushRequest, PushStatus,
+    PushTicket, Pushed, QueueConfig, ReprocessState, ReprocessStatus, S3Fetch, Summaries,
+    SummariesParts, SummarizeError, SummarizeInput, SystemClock,
 };
 use doewood_model::Backend;
 use doewood_s3::ClientOptions;
@@ -275,6 +276,98 @@ impl OnDemand for OnDemandSummaries {
 
     fn settings_changed(&self) {
         self.0.notify();
+    }
+}
+
+/// Push sources' ingest (ADR 0004), as the API sees it.
+pub struct Push(pub Ingest);
+
+fn push_failure(e: PushError) -> PushFailure {
+    match e {
+        PushError::NotFound(m) => PushFailure::NotFound(m),
+        PushError::InvalidArgument(m) => PushFailure::InvalidArgument(m),
+        PushError::FailedPrecondition(m) => PushFailure::FailedPrecondition(m),
+        PushError::Unavailable(m) => PushFailure::Unavailable(m),
+        PushError::ResourceExhausted(m) => PushFailure::ResourceExhausted(m),
+        PushError::Internal(m) => PushFailure::Internal(m),
+    }
+}
+
+fn push_result(p: Pushed) -> PushResult {
+    PushResult {
+        record: p.record,
+        kind: p.kind.unwrap_or_default(),
+        outcome: match p.status {
+            PushStatus::Analyzed => PushOutcome::Analyzed,
+            PushStatus::Reused => PushOutcome::Reused,
+            PushStatus::Unchanged => PushOutcome::Unchanged,
+        },
+        skipped: p.skipped,
+    }
+}
+
+/// An admitted push, waiting for its bytes.
+struct Upload(Ingest, PushTicket);
+
+impl PushUpload for Upload {
+    fn finish(
+        self: Box<Self>,
+        bytes: Vec<u8>,
+    ) -> BoxFuture<'static, Result<PushResult, PushFailure>> {
+        let Upload(ingest, ticket) = *self;
+        Box::pin(async move {
+            ingest
+                .push(ticket, bytes)
+                .await
+                .map(push_result)
+                .map_err(push_failure)
+        })
+    }
+}
+
+impl Pusher for Push {
+    fn admit(&self, h: PushHeader) -> BoxFuture<'_, Result<Box<dyn PushUpload>, PushFailure>> {
+        Box::pin(async move {
+            let ticket = self
+                .0
+                .admit_push(PushRequest {
+                    source: h.source,
+                    key: h.key,
+                    name: h.name,
+                    size: h.size,
+                })
+                .await
+                .map_err(push_failure)?;
+            Ok(Box::new(Upload(self.0.clone(), ticket)) as Box<dyn PushUpload>)
+        })
+    }
+
+    fn move_location(
+        &self,
+        source: SourceId,
+        from: String,
+        to: String,
+    ) -> BoxFuture<'_, Result<PushResult, PushFailure>> {
+        Box::pin(async move {
+            self.0
+                .move_pushed(source, &from, &to)
+                .await
+                .map(push_result)
+                .map_err(push_failure)
+        })
+    }
+
+    fn remove_location(
+        &self,
+        source: SourceId,
+        key: String,
+    ) -> BoxFuture<'_, Result<bool, PushFailure>> {
+        Box::pin(async move {
+            self.0
+                .remove_pushed(source, &key)
+                .await
+                .map_err(push_failure)
+        })
     }
 }
 

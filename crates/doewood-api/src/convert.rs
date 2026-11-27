@@ -6,7 +6,9 @@ use doewood_model::{
     Direction, EdgeKind, EdgeSource, EdgeState, Node, NodeKind, Record, SearchHit, StoredEdge,
 };
 use doewood_s3::inlet::InletStatsSnapshot;
-use doewood_store::{AiProvider, LlmMode, LlmPolicy, Source, SourceState, SqsInlet, UrlStyle};
+use doewood_store::{
+    AiProvider, LlmMode, LlmPolicy, Source, SourceKind, SourceState, SqsInlet, UrlStyle,
+};
 
 use crate::pb;
 use crate::validate::format_date;
@@ -80,6 +82,10 @@ pub(crate) fn sqs_inlet(
 pub(crate) fn source(s: &Source, owner: &InstanceId, running: Running) -> pb::Source {
     pb::Source {
         id: s.id.to_string(),
+        kind: match s.kind() {
+            SourceKind::S3 => pb::SourceKind::S3,
+            SourceKind::Push => pb::SourceKind::Push,
+        } as i32,
         endpoint: s.endpoint.clone(),
         bucket: s.bucket.clone(),
         prefix: s.prefix.clone(),

@@ -229,6 +229,9 @@ async fn run(Loaded { config, warnings }: Loaded, started: Instant) -> Result<()
         reprocess: ingest.as_ref().map(|(i, _)| {
             Arc::new(ingest::Reprocess(i.clone())) as Arc<dyn doewood_api::Reprocessor>
         }),
+        push: ingest
+            .as_ref()
+            .map(|(i, _)| Arc::new(ingest::Push(i.clone())) as Arc<dyn doewood_api::Pusher>),
         summarize: ingest
             .map(|(_, s)| Arc::new(ingest::OnDemandSummaries(s)) as Arc<dyn doewood_api::OnDemand>),
         icons: Some(Arc::new(icons::FaviconIcons::new(

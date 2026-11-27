@@ -11,8 +11,9 @@
 //!   a cap on calls in flight, beyond which a call is refused at once with `UNAVAILABLE`, and a
 //!   server deadline (`DEADLINE_EXCEEDED`). Both bound the response future: a unary call whole,
 //!   a stream only while it is set up, so an open `WatchProgress` is neither counted nor cut.
-//!   Health checks are exempt from both; `Summarize` is counted but has no server deadline
-//!   (its analysis and provider calls are bounded on their own and can take minutes).
+//!   Health checks are exempt from both; `Summarize` and `PutObject` are counted but have no
+//!   server deadline (their analysis and provider calls are bounded on their own and can take
+//!   minutes; `PutObject`'s upload has an idle timeout per chunk).
 //!   A shed call carries `grpc-retry-pushback-ms` (issue #104, gRFC A6): a delay drawn
 //!   uniformly from [[`RETRY_PUSHBACK_BASE`], 2 × [`RETRY_PUSHBACK_BASE`]), so clients with a
 //!   retry policy wait at least that long and clients shed together do not retry together.
@@ -70,6 +71,9 @@ pub const RETRY_PUSHBACK_HEADER: &str = "grpc-retry-pushback-ms";
 const HEALTH_PREFIX: &str = "/grpc.health.v1.Health/";
 /// Paths counted but without a server deadline.
 const SUMMARIZE_PREFIX: &str = "/doewood.v1.SummarizeService/";
+/// `PutObject` streams a file in and analyzes it: counted, no server deadline (the upload has
+/// an idle timeout per chunk, the analysis its own bounds).
+const PUT_OBJECT_PATH: &str = "/doewood.v1.IngestService/PutObject";
 
 /// The live per-call limits, shared by every connection and changed by `SetApiSettings`.
 #[derive(Debug)]
@@ -118,7 +122,7 @@ impl CallLimits {
 
     /// The retry pushback for one shed call, in milliseconds: uniform in
     /// [[`RETRY_PUSHBACK_BASE`], 2 × [`RETRY_PUSHBACK_BASE`]).
-    fn pushback_ms(&self) -> u64 {
+    pub(crate) fn pushback_ms(&self) -> u64 {
         let state = self
             .pushback
             .fetch_add(SPLITMIX_GAMMA, Ordering::Relaxed)
@@ -185,7 +189,8 @@ where
         if path.starts_with(HEALTH_PREFIX) {
             return Box::pin(self.inner.call(req));
         }
-        let deadline = (!path.starts_with(SUMMARIZE_PREFIX)).then(|| self.limits.deadline());
+        let deadline = (!path.starts_with(SUMMARIZE_PREFIX) && path != PUT_OBJECT_PATH)
+            .then(|| self.limits.deadline());
         let Some(slot) = self.limits.enter() else {
             tracing::debug!(path, "call shed: too many calls in flight");
             self.metrics.shed();

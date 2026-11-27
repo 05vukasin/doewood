@@ -1,4 +1,5 @@
-//! doewood's ingest (step 4 of ADR 0001): scanner events → fetch → analyze → store.
+//! doewood's ingest (step 4 of ADR 0001): scanner events → fetch → analyze → store, and
+//! pushed bytes → analyze → store for push sources (ADR 0004, [`pipeline::push`]).
 //!
 //! - [`route`]: quail for documents, hedgehog for spreadsheets, from the bytes.
 //! - [`analyze`]: one quail engine per instance (OCR behind the `ocr` feature), hedgehog
@@ -34,6 +35,7 @@ pub use llm::{
     Clock, OnDemandSummary, QueueConfig, Summaries, SummariesParts, SummarizeError, SummarizeInput,
     SystemClock,
 };
+pub use pipeline::push::{PUSH_SLOT_WAIT, PushError, PushRequest, PushStatus, PushTicket, Pushed};
 pub use pipeline::{
     Fetch, Fetched, Ingest, IngestConfig, IngestError, IngestHandle, IngestParts, ReprocessState,
     ReprocessStatus, S3Fetch, StageTimes, Stats, default_jobs,
