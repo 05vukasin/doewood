@@ -134,11 +134,11 @@ impl Fetch for MemFetch {
     }
 }
 
-fn zip_of(parts: &[(&str, String)]) -> Vec<u8> {
+fn zip_of<N: AsRef<str>>(parts: &[(N, String)]) -> Vec<u8> {
     let mut z = ZipWriter::new(Cursor::new(Vec::new()));
     let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
     for (name, data) in parts {
-        z.start_file(*name, opts).unwrap();
+        z.start_file(name.as_ref(), opts).unwrap();
         z.write_all(data.as_bytes()).unwrap();
     }
     z.finish().unwrap().into_inner()
@@ -233,46 +233,84 @@ pub fn big_xlsx(rows: usize, cols: usize, seed: u64) -> Vec<u8> {
 
 /// [`big_xlsx`], with every other column inline text (`text`) instead of numbers.
 pub fn big_xlsx_with(rows: usize, cols: usize, seed: u64, text: bool) -> Vec<u8> {
-    let mut data = String::with_capacity(rows * cols * 24);
-    for r in 1..=rows {
-        data.push_str(&format!("<row r=\"{r}\">"));
-        for c in 0..cols {
-            let col = char::from(b'A' + u8::try_from(c).unwrap());
-            let v = (r as u64 * 31 + c as u64) ^ seed;
-            if text && c % 2 == 1 {
-                data.push_str(&format!(
-                    "<c r=\"{col}{r}\" t=\"inlineStr\"><is><t>item {v} kom</t></is></c>"
-                ));
-            } else {
-                data.push_str(&format!("<c r=\"{col}{r}\"><v>{v}</v></c>"));
+    big_xlsx_sheets(1, rows, cols, seed, text)
+}
+
+/// [`big_xlsx_with`] with `sheets` sheets (`Data`, then `Data2`, ...), each `rows` x `cols`;
+/// sheet `i` is seeded with `seed + i`.
+pub fn big_xlsx_sheets(sheets: usize, rows: usize, cols: usize, seed: u64, text: bool) -> Vec<u8> {
+    let sheet_xml = |seed: u64| {
+        let mut data = String::with_capacity(rows * cols * 24);
+        for r in 1..=rows {
+            data.push_str(&format!("<row r=\"{r}\">"));
+            for c in 0..cols {
+                let col = char::from(b'A' + u8::try_from(c).unwrap());
+                let v = (r as u64 * 31 + c as u64) ^ seed;
+                if text && c % 2 == 1 {
+                    data.push_str(&format!(
+                        "<c r=\"{col}{r}\" t=\"inlineStr\"><is><t>item {v} kom</t></is></c>"
+                    ));
+                } else {
+                    data.push_str(&format!("<c r=\"{col}{r}\"><v>{v}</v></c>"));
+                }
             }
+            data.push_str("</row>");
         }
-        data.push_str("</row>");
-    }
+        data
+    };
     let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
     let rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-    zip_of(&[
+    let (mut overrides, mut entries, mut rels) = (String::new(), String::new(), String::new());
+    for i in 1..=sheets {
+        let name = if i == 1 {
+            "Data".to_owned()
+        } else {
+            format!("Data{i}")
+        };
+        overrides.push_str(&format!(r#"<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>"#));
+        entries.push_str(&format!(
+            r#"<sheet name="{name}" sheetId="{i}" r:id="rId{i}"/>"#
+        ));
+        rels.push_str(&format!(
+            r#"<Relationship Id="rId{i}" Type="{rel}/worksheet" Target="worksheets/sheet{i}.xml"/>"#
+        ));
+    }
+    let mut parts = vec![
         (
-            "[Content_Types].xml",
-            r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#.to_owned(),
+            "[Content_Types].xml".to_owned(),
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>{overrides}</Types>"#
+            ),
         ),
         (
-            "_rels/.rels",
-            format!(r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{rel}/officeDocument" Target="xl/workbook.xml"/></Relationships>"#),
+            "_rels/.rels".to_owned(),
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{rel}/officeDocument" Target="xl/workbook.xml"/></Relationships>"#
+            ),
         ),
         (
-            "xl/workbook.xml",
-            format!(r#"<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="{ns}" xmlns:r="{rel}"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>"#),
+            "xl/workbook.xml".to_owned(),
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="{ns}" xmlns:r="{rel}"><sheets>{entries}</sheets></workbook>"#
+            ),
         ),
         (
-            "xl/_rels/workbook.xml.rels",
-            format!(r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{rel}/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#),
+            "xl/_rels/workbook.xml.rels".to_owned(),
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{rels}</Relationships>"#
+            ),
         ),
-        (
-            "xl/worksheets/sheet1.xml",
-            format!(r#"<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="{ns}"><sheetData>{data}</sheetData></worksheet>"#),
-        ),
-    ])
+    ];
+    for i in 1..=sheets {
+        parts.push((
+            format!("xl/worksheets/sheet{i}.xml"),
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="{ns}"><sheetData>{}</sheetData></worksheet>"#,
+                sheet_xml(seed + i as u64 - 1)
+            ),
+        ));
+    }
+    zip_of(&parts)
 }
 
 /// US Letter, points.

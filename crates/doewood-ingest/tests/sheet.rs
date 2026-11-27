@@ -274,3 +274,80 @@ fn lent_threads_measure() {
     );
     assert_eq!(slots.in_use(), 0);
 }
+
+/// `cargo test -p doewood-ingest --test sheet -- --ignored --nocapture sheets_measure`.
+/// One generated workbook of `DOEWOOD_BENCH_SHEETS` sheets (default 12) of
+/// `DOEWOOD_BENCH_ROWS` x 26 cells (default 10,000), every other column text, analyzed through
+/// the ingest analyzer (`Analyzer::analyze`, 4 workers' CPU slots, all free). Peak RSS above
+/// the start is sampled every millisecond (issue #183).
+#[test]
+#[ignore = "a measurement, not a check"]
+fn sheets_measure() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    use doewood_ingest::{Analyzer, AnalyzerConfig, Outcome};
+
+    fn rss() -> u64 {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        status
+            .lines()
+            .find(|l| l.starts_with("VmRSS:"))
+            .and_then(|l| l.split_whitespace().nth(1)?.parse().ok())
+            .unwrap_or(0)
+    }
+    fn env(var: &str, default: usize) -> usize {
+        std::env::var(var)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+
+    let sheets = env("DOEWOOD_BENCH_SHEETS", 12);
+    let rows = env("DOEWOOD_BENCH_ROWS", 10_000);
+    let analyzer = Analyzer::new(&AnalyzerConfig {
+        file_timeout: Duration::from_mins(10),
+        max_bytes: u64::MAX,
+        sheet_max_cells: sheet::MAX_AUTO_CELLS,
+        workers: 4,
+        cpus: 4,
+        ocr_models: "/nonexistent/doewood-ocr-models".into(),
+        ..AnalyzerConfig::default()
+    })
+    .unwrap();
+    let bytes = common::big_xlsx_sheets(sheets, rows, 26, 7000, true);
+    let size = bytes.len();
+    let base = rss();
+    let (peak, stop) = (
+        Arc::new(AtomicU64::new(base)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let sampler = {
+        let (peak, stop) = (Arc::clone(&peak), Arc::clone(&stop));
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                peak.fetch_max(rss(), Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        })
+    };
+    let start = Instant::now();
+    let out = analyzer.analyze(bytes, "big.xlsx");
+    let secs = start.elapsed().as_secs_f64();
+    stop.store(true, Ordering::Relaxed);
+    sampler.join().unwrap();
+    assert_eq!(out.outcome, Outcome::Analyzed);
+    #[allow(clippy::cast_precision_loss)]
+    let mib = |kib: u64| kib as f64 / 1024.0;
+    let peak = peak.load(Ordering::Relaxed);
+    eprintln!(
+        "sheets_measure: {sheets} sheets x {} cells ({:.0} MiB file), {secs:.2}s; RSS before \
+         {:.0} MiB, peak {:.0} MiB (+{:.0} MiB); record {}",
+        rows * 26,
+        mib(size as u64 / 1024),
+        mib(base),
+        mib(peak),
+        mib(peak.saturating_sub(base)),
+        blake3::hash(out.body.get().as_bytes()).to_hex(),
+    );
+}
