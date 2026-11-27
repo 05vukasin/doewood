@@ -1,5 +1,6 @@
 //! `RecordsService`: records by hash, and by source a page at a time; a document's text with
-//! block locations a page of blocks at a time (issue #166).
+//! block locations a page of blocks at a time (issue #166); payments per document and spend
+//! per supplier (issue #193, in [`crate::payments`]).
 
 use std::ops::ControlFlow;
 
@@ -10,8 +11,9 @@ use tonic::{Request, Response, Status};
 
 use crate::pb::records_service_server::RecordsService;
 use crate::pb::{
-    GetDocumentTextRequest, GetDocumentTextResponse, GetRecordRequest, ListRecordsRequest,
-    ListRecordsResponse, Record,
+    GetDocumentTextRequest, GetDocumentTextResponse, GetRecordRequest, ListPaymentsRequest,
+    ListPaymentsResponse, ListRecordsRequest, ListRecordsResponse, Record, SupplierSpendRequest,
+    SupplierSpendResponse,
 };
 use crate::validate::{self, Violations};
 use crate::{Api, convert, error};
@@ -153,6 +155,20 @@ impl RecordsService for Api {
             next_page_token,
             updated_at: stored.updated_at,
         }))
+    }
+
+    async fn list_payments(
+        &self,
+        request: Request<ListPaymentsRequest>,
+    ) -> Result<Response<ListPaymentsResponse>, Status> {
+        crate::payments::list(self, request).await
+    }
+
+    async fn supplier_spend(
+        &self,
+        request: Request<SupplierSpendRequest>,
+    ) -> Result<Response<SupplierSpendResponse>, Status> {
+        crate::payments::spend(self, request).await
     }
 }
 

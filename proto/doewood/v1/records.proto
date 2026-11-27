@@ -12,6 +12,13 @@ service RecordsService {
   // paths), a page of blocks at a time. Stored by ingest beside the record; NOT_FOUND when
   // there is none (no record, a file without text, or a record from before the text was kept).
   rpc GetDocumentText(GetDocumentTextRequest) returns (GetDocumentTextResponse);
+  // What documents pay for and how much (issue #193): one row per document with payment
+  // facts, filtered, ordered by hash, a page at a time.
+  rpc ListPayments(ListPaymentsRequest) returns (ListPaymentsResponse);
+  // What suppliers are paid: per supplier, totals per currency (never summed across
+  // currencies) and period (recurring fees apart from one-off prices), grouped by category,
+  // year or month, and the categories and subjects the supplier provides.
+  rpc SupplierSpend(SupplierSpendRequest) returns (SupplierSpendResponse);
 }
 
 message GetRecordRequest {
@@ -114,4 +121,171 @@ message TextBlock {
   uint32 level = 9;
   // A table row's table, counted on its page from 0.
   optional uint32 table = 10;
+}
+
+message ListPaymentsRequest {
+  // Only documents whose supplier is this company (a UUID).
+  string supplier_id = 1;
+  // Only documents whose buyer is this company (a UUID).
+  string buyer_id = 2;
+  // Only this category code (`it_software`, `legal`, ...; see docs/api.md).
+  string category = 3;
+  // Only this period: `one_off`, `monthly`, `quarterly` or `yearly`.
+  string period = 4;
+  // Only this currency (ISO 4217, `RSD`).
+  string currency = 5;
+  // Only documents dated on or after this day (`YYYY-MM-DD`); undated ones are left out.
+  string date_from = 6;
+  // Only documents dated on or before this day (`YYYY-MM-DD`).
+  string date_to = 7;
+  // 1 to 1000; 0 means 50.
+  uint32 page_size = 8;
+  // `next_page_token` of the previous page; empty for the first.
+  string page_token = 9;
+}
+
+message ListPaymentsResponse {
+  repeated Payment payments = 1;
+  // Empty on the last page.
+  string next_page_token = 2;
+}
+
+// What one document pays for and how much. Amounts are exact decimal text (`120000.00`).
+// A field the document does not state is empty.
+message Payment {
+  // The record: 64 lowercase hex digits.
+  string blake3 = 1;
+  // The Document node, when its graph was written.
+  string document_id = 2;
+  // The supplier company (the document's `party` edge marked `side: supplier`).
+  string supplier_id = 3;
+  // The supplier's name as the document writes it.
+  string supplier_name = 4;
+  // The buyer company (`side: buyer`).
+  string buyer_id = 5;
+  // The buyer's name as the document writes it.
+  string buyer_name = 6;
+  // What is paid for, as the document states it.
+  string subject = 7;
+  // Where the subject came from: `clause`, `after_heading`, `line_items` or `title`.
+  string subject_source = 8;
+  // The category code.
+  string category = 9;
+  // The category's label.
+  string category_label = 10;
+  // The headline price: gross when stated, else the plain total, else net (`amount_basis`).
+  string amount = 11;
+  // `gross`, `net` or `unstated`.
+  string amount_basis = 12;
+  // ISO 4217.
+  string currency = 13;
+  // The price without VAT, the VAT and the price with VAT, each where stated.
+  string net = 14;
+  string vat = 15;
+  string gross = 16;
+  // `one_off`, `monthly`, `quarterly` or `yearly`. A monthly fee is the fee of one month,
+  // never multiplied.
+  string period = 17;
+  // The document's date (`YYYY-MM-DD`).
+  string date = 18;
+  // The confidence of the amount (of the subject when there is no amount), 0 to 1.
+  float conf = 19;
+  // How the facts were found: `rules`.
+  string method = 20;
+  // Line items, as the document lists them.
+  repeated PaymentLine lines = 21;
+  // Where each fact sits in the document text.
+  repeated Highlight highlights = 22;
+}
+
+// One line item; amounts are decimal text, fields empty when unknown.
+message PaymentLine {
+  string description = 1;
+  string quantity = 2;
+  string unit = 3;
+  string unit_price = 4;
+  string total = 5;
+  string currency = 6;
+  string vat_rate = 7;
+}
+
+// Where a fact sits in the document text (quail's shared highlight shape). `block` is the
+// `TextBlock.index` of GetDocumentText for the same record; `start` and `end` are characters
+// (Unicode scalar values) of that block's text, end exclusive.
+message Highlight {
+  // The fact key it proves (`payment.amount`, `payment.subject`, `payment.lines`, ...).
+  string key = 1;
+  // The page index, from 0.
+  uint32 page = 2;
+  uint32 block = 3;
+  uint32 start = 4;
+  uint32 end = 5;
+  // The passage as written.
+  string quote = 6;
+  // The fact's confidence.
+  float conf = 7;
+}
+
+enum SpendGroupBy {
+  // As `SPEND_GROUP_BY_CATEGORY`.
+  SPEND_GROUP_BY_UNSPECIFIED = 0;
+  SPEND_GROUP_BY_CATEGORY = 1;
+  // By the year of the document's date (`2026`).
+  SPEND_GROUP_BY_YEAR = 2;
+  // By its month (`2026-03`).
+  SPEND_GROUP_BY_MONTH = 3;
+}
+
+message SupplierSpendRequest {
+  // One supplier (a UUID); empty for every supplier.
+  string company_id = 1;
+  SpendGroupBy group_by = 2;
+}
+
+message SupplierSpendResponse {
+  // Ordered by company id; the documents without a supplier last, with an empty id.
+  repeated SupplierSpend suppliers = 1;
+  // More than 5000 totals or provides rows: the rest is left out.
+  bool truncated = 2;
+}
+
+message SupplierSpend {
+  // The company; empty for the documents without a supplier.
+  string company_id = 1;
+  // Its name (the company node's `name`).
+  string name = 2;
+  // Ordered by currency, period, group.
+  repeated SpendTotal totals = 3;
+  // What it provides: most documents first.
+  repeated SupplierProvides provides = 4;
+}
+
+// The sum of one currency and period in one group. Never summed across currencies or
+// periods.
+message SpendTotal {
+  // The category code, the year or the month; empty when unknown (no category, no date).
+  string group = 1;
+  // ISO 4217; empty when the documents do not say.
+  string currency = 2;
+  // `one_off`, `monthly`, `quarterly`, `yearly`; empty when the documents do not say.
+  string period = 3;
+  // The sum of the documents' amounts, decimal text. For a recurring period, the sum of the
+  // fees as stated (per month for `monthly`).
+  string total = 4;
+  // The documents summed.
+  uint32 documents = 5;
+  // For a recurring period: `total` for a year (x12 monthly, x4 quarterly, x1 yearly);
+  // empty otherwise.
+  string annualized = 6;
+  // What `total` is, for a reader: `one-off prices`, `monthly fees (per month)`, ...
+  string label = 7;
+}
+
+message SupplierProvides {
+  // The category code; empty when unknown.
+  string category = 1;
+  string category_label = 2;
+  // The subject as the documents state it; empty when unknown.
+  string subject = 3;
+  uint32 documents = 4;
 }

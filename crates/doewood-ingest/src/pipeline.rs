@@ -1715,7 +1715,8 @@ fn stored_outcome(body: &RawValue) -> Outcome {
 
 /// Writes the text of a file just analyzed beside its record (issue #166), or removes an old
 /// one when the analysis has none. A record new to the store (`put` is `Inserted`) has no old
-/// text.
+/// text. A record that changed loses its payment row (issue #193): the graph writer writes
+/// the new one, if the new record has payment facts.
 async fn put_text(
     backend: &Arc<dyn Backend>,
     a: &Analysis,
@@ -1725,6 +1726,9 @@ async fn put_text(
         Some(text) => backend.put_document_text(&a.blake3, text).await?,
         None if put != PutOutcome::Inserted => backend.delete_document_text(&a.blake3).await?,
         None => {}
+    }
+    if put == PutOutcome::Updated {
+        backend.delete_payment(&a.blake3).await?;
     }
     Ok(())
 }

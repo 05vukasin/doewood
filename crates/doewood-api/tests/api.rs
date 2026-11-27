@@ -1942,6 +1942,325 @@ async fn get_document_text() {
     }
 }
 
+/// Issue #193: `ListPayments` and `SupplierSpend` over stored payment rows: the fields as
+/// decimal text, the highlights, filters and pages, totals per currency and period with the
+/// recurring fees labelled and annualized, what each supplier provides, and the errors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
+async fn payments_and_supplier_spend() {
+    use doewood_model::{Highlight, PaymentDetail, PaymentLine, PaymentRow, SIDE_PROP};
+    for shared in Shared::all().await {
+        let a = Instance::start("inst-a", Some(shared.backend.clone())).await;
+        let ch = a.channel().await;
+        let be = &shared.backend;
+        let name = shared.name;
+        let supplier = be
+            .upsert_node(
+                NodeKind::Company,
+                "pay:alfa",
+                &json!({"name": "Alfa Soft d.o.o."}),
+            )
+            .await
+            .unwrap();
+        let buyer = be
+            .upsert_node(NodeKind::Company, "pay:beta", &json!({"name": "Beta a.d."}))
+            .await
+            .unwrap();
+        // 1: a contract, 2: a monthly fee of the same supplier, 3: a price in EUR, 4: no
+        // supplier.
+        let rows = [
+            (1u8, 1_200_000_000i64, "RSD", None, 3u8),
+            (2, 100_000_000, "RSD", Some("monthly"), 4),
+            (3, 5_000_000, "EUR", Some("one_off"), 5),
+            (4, 990_000, "USD", None, 6),
+        ];
+        for (n, amount, currency, period, month) in rows {
+            let h = hash(190 + n);
+            be.put_record(
+                &h,
+                &doewood_model::canonical::to_canonical(&json!({"n": n})).unwrap(),
+                &[("quail".to_owned(), "1".to_owned())].into(),
+            )
+            .await
+            .unwrap();
+            let detail = PaymentDetail {
+                subject_source: Some("clause".into()),
+                net: Some("1000.00".into()),
+                vat: Some("200.00".into()),
+                gross: Some("1200.00".into()),
+                method: "rules".into(),
+                lines: vec![PaymentLine {
+                    description: Some("Odrzavanje".into()),
+                    total: Some("1000.00".into()),
+                    currency: Some(currency.into()),
+                    ..PaymentLine::default()
+                }],
+                highlights: vec![Highlight {
+                    key: "payment.amount".into(),
+                    page: 0,
+                    block: 7,
+                    start: 2,
+                    end: 12,
+                    quote: "120.000,00".into(),
+                    conf: 0.9,
+                }],
+                ..PaymentDetail::default()
+            };
+            be.put_payment(&PaymentRow {
+                blake3: h,
+                subject: Some(format!("subject {n}")),
+                category: Some("it_software".into()),
+                category_label: Some("IT and software".into()),
+                amount: Some(amount),
+                basis: Some("gross".into()),
+                currency: Some(currency.into()),
+                period: period.map(str::to_owned),
+                date: Some(
+                    time::Date::from_calendar_date(2026, time::Month::try_from(month).unwrap(), 1)
+                        .unwrap(),
+                ),
+                supplier_name: Some("Alfa Soft d.o.o.".into()),
+                buyer_name: Some("Beta a.d.".into()),
+                conf: 0.9,
+                detail: detail.to_body().unwrap(),
+            })
+            .await
+            .unwrap();
+            let doc = be
+                .upsert_node(NodeKind::Document, &h.to_hex(), &json!({}))
+                .await
+                .unwrap();
+            if n < 4 {
+                for (c, side) in [(supplier, "supplier"), (buyer, "buyer")] {
+                    be.upsert_edge(
+                        &Edge::new(doc, c, EdgeKind::Party, EdgeSource::Document)
+                            .with_props(json!({"role": side, SIDE_PROP: side})),
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+        }
+        let mut records = RecordsServiceClient::new(ch.clone());
+
+        // A page of two, then the rest.
+        let page = records
+            .list_payments(pb::ListPaymentsRequest {
+                page_size: 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(page.payments.len(), 2, "{name}");
+        assert_eq!(page.next_page_token, hash(192).to_hex(), "{name}");
+        let p = &page.payments[0];
+        assert_eq!(p.blake3, hash(191).to_hex());
+        assert_eq!(p.supplier_id, supplier.to_string(), "{name}");
+        assert_eq!(p.buyer_id, buyer.to_string(), "{name}");
+        assert_eq!(p.amount, "120000.00");
+        assert_eq!(
+            (p.net.as_str(), p.vat.as_str(), p.gross.as_str()),
+            ("1000.00", "200.00", "1200.00")
+        );
+        assert_eq!(p.currency, "RSD");
+        assert_eq!(p.category, "it_software");
+        assert_eq!(p.category_label, "IT and software");
+        assert_eq!(p.date, "2026-03-01");
+        assert_eq!(p.method, "rules");
+        assert_eq!(p.subject_source, "clause");
+        assert!(!p.document_id.is_empty());
+        assert_eq!(p.lines.len(), 1);
+        assert_eq!(p.lines[0].description, "Odrzavanje");
+        let hl = &p.highlights[0];
+        assert_eq!(
+            (
+                hl.key.as_str(),
+                hl.page,
+                hl.block,
+                hl.start,
+                hl.end,
+                hl.quote.as_str()
+            ),
+            ("payment.amount", 0, 7, 2, 12, "120.000,00")
+        );
+        assert!((hl.conf - 0.9).abs() < 1e-6);
+        let rest = records
+            .list_payments(pb::ListPaymentsRequest {
+                page_size: 2,
+                page_token: page.next_page_token.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(rest.payments.len(), 2, "{name}");
+        assert!(rest.payments[1].supplier_id.is_empty(), "{name}");
+        // Filters.
+        let hashes = |r: pb::ListPaymentsResponse| {
+            r.payments.into_iter().map(|p| p.blake3).collect::<Vec<_>>()
+        };
+        let got = records
+            .list_payments(pb::ListPaymentsRequest {
+                supplier_id: supplier.to_string(),
+                currency: "RSD".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            hashes(got),
+            [hash(191).to_hex(), hash(192).to_hex()],
+            "{name}"
+        );
+        let got = records
+            .list_payments(pb::ListPaymentsRequest {
+                period: "monthly".into(),
+                date_from: "2026-04-01".into(),
+                date_to: "2026-04-30".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(hashes(got), [hash(192).to_hex()], "{name}");
+
+        // Spend of every supplier, by category.
+        let spend = records
+            .supplier_spend(pb::SupplierSpendRequest::default())
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!spend.truncated);
+        assert_eq!(spend.suppliers.len(), 2, "{name}: {spend:?}");
+        let alfa = &spend.suppliers[0];
+        assert_eq!(alfa.company_id, supplier.to_string());
+        assert_eq!(alfa.name, "Alfa Soft d.o.o.");
+        let totals: Vec<_> = alfa
+            .totals
+            .iter()
+            .map(|t| {
+                (
+                    t.currency.as_str(),
+                    t.period.as_str(),
+                    t.group.as_str(),
+                    t.total.as_str(),
+                    t.annualized.as_str(),
+                    t.label.as_str(),
+                    t.documents,
+                )
+            })
+            .collect();
+        assert_eq!(
+            totals,
+            [
+                (
+                    "EUR",
+                    "one_off",
+                    "it_software",
+                    "500.00",
+                    "",
+                    "one-off prices",
+                    1
+                ),
+                (
+                    "RSD",
+                    "",
+                    "it_software",
+                    "120000.00",
+                    "",
+                    "prices, period not stated",
+                    1
+                ),
+                (
+                    "RSD",
+                    "monthly",
+                    "it_software",
+                    "10000.00",
+                    "120000.00",
+                    "monthly fees (per month)",
+                    1
+                ),
+            ],
+            "{name}"
+        );
+        assert_eq!(alfa.provides.len(), 3, "{name}");
+        assert!(
+            alfa.provides
+                .iter()
+                .all(|p| p.category == "it_software" && p.documents == 1)
+        );
+        let nobody = &spend.suppliers[1];
+        assert!(nobody.company_id.is_empty() && nobody.name.is_empty());
+        assert_eq!(nobody.totals[0].currency, "USD");
+        // One supplier, by month.
+        let spend = records
+            .supplier_spend(pb::SupplierSpendRequest {
+                company_id: supplier.to_string(),
+                group_by: pb::SpendGroupBy::Month.into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(spend.suppliers.len(), 1);
+        let groups: Vec<_> = spend.suppliers[0]
+            .totals
+            .iter()
+            .map(|t| t.group.as_str())
+            .collect();
+        assert_eq!(groups, ["2026-05", "2026-03", "2026-04"], "{name}");
+
+        // Errors.
+        let code = |r: Result<tonic::Response<pb::ListPaymentsResponse>, tonic::Status>| {
+            r.map(|_| ()).unwrap_err().code()
+        };
+        for bad in [
+            pb::ListPaymentsRequest {
+                supplier_id: "x".into(),
+                ..Default::default()
+            },
+            pb::ListPaymentsRequest {
+                period: "weekly".into(),
+                ..Default::default()
+            },
+            pb::ListPaymentsRequest {
+                date_from: "2026-13-01".into(),
+                ..Default::default()
+            },
+            pb::ListPaymentsRequest {
+                date_from: "2026-05-01".into(),
+                date_to: "2026-04-01".into(),
+                ..Default::default()
+            },
+            pb::ListPaymentsRequest {
+                page_size: 1001,
+                ..Default::default()
+            },
+            pb::ListPaymentsRequest {
+                page_token: "nonsense".into(),
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                code(records.list_payments(bad.clone()).await),
+                Code::InvalidArgument,
+                "{bad:?}"
+            );
+        }
+        let err = records
+            .supplier_spend(pb::SupplierSpendRequest {
+                group_by: 99,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        a.stop().await;
+        shared.drop_schema().await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn records_graph_and_search() {
     for shared in Shared::all().await {

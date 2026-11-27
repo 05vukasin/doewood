@@ -2,7 +2,8 @@
 //! records, the typed graph, source claims, company leases, search, the enrichment job's
 //! registry and favicon caches and company freshness, the merge log and dismissals (ADR 0002
 //! section 1.8), the enrichment proposals (issue #52), the explorer's bounded graph reads
-//! (issue #172), documents' text with block locations (issue #166), and the store traits that both backends implement.
+//! (issue #172), documents' text with block locations (issue #166), payments per document and
+//! spend per supplier (issue #193), and the store traits that both backends implement.
 //!
 //! - **Shared mode:** `doewood-pg`, one Postgres database for every instance.
 //! - **Standalone mode:** `doewood-store`, the instance's own SQLite file.
@@ -17,6 +18,7 @@ mod error;
 pub mod explore;
 mod feed;
 pub mod merge;
+pub mod payment;
 pub mod proposal;
 mod props;
 pub mod purge;
@@ -46,6 +48,12 @@ pub use merge::{
     REASON_MAX_LEN, SPLIT_MAX_ITEMS, SplitRequest, UndoOutcome, UndoRequest, Undone, merged_into,
     merges_limit,
 };
+pub use payment::{
+    Highlight, PAYMENT_DETAIL_MAX, PAYMENT_SCALE, PAYMENT_TEXT_MAX, PAYMENTS_MAX_LIMIT,
+    PAYMENTS_PAGE_BYTES, PERIODS, Payment, PaymentDetail, PaymentFilter, PaymentLine, PaymentRow,
+    Provided, SIDE_BUYER, SIDE_PROP, SIDE_SUPPLIER, SPEND_MAX_ROWS, Spend, SpendGroup, SpendTotal,
+    format_decimal, format_units, payment_page_bytes, payments_limit, scaled_units,
+};
 pub use proposal::{
     Accepted, CANDIDATE_MAX_LEN, PROPOSALS_MAX_LIMIT, Proposal, ProposalQuery, ProposalRequest,
     Resolution, ResolveRequest, proposals_limit, registry_record_alias,
@@ -62,7 +70,7 @@ pub use text::{
 };
 pub use traits::{
     Backend, CacheStore, ClaimStore, FeedStore, FreshnessStore, GraphStore, MergeStore,
-    ProposalStore, PurgeStore, RecordStore, SearchStore, SketchStore, sketch_limit,
+    PaymentStore, ProposalStore, PurgeStore, RecordStore, SearchStore, SketchStore, sketch_limit,
 };
 pub use types::{
     ALIASES_MAX, Blake3, Candidates, Direction, Edge, EdgeCursor, EdgeKind, EdgeSource, EdgeState,

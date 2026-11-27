@@ -12,6 +12,7 @@ use time::{Date, Month};
 use doewood_model::{SIMILAR_MAX_KEYS, SimilarKey, SimilarKeyKind, SimilarKeys};
 
 use crate::company::{IdKind, Identifier};
+use crate::payment::PaymentFacts;
 
 /// Most bytes of a party mention's span apart from an identifier for it to belong to that
 /// party (same page).
@@ -167,7 +168,9 @@ const KEYS: &[&str] = &[
 
 /// Whether [`DocFacts`] reads facts of this key: only those are read into quail values.
 fn wanted(key: &str) -> bool {
-    KEYS.contains(&key) || IdKind::from_fact_key(key).is_some()
+    KEYS.contains(&key)
+        || crate::payment::PAYMENT_KEYS.contains(&key)
+        || IdKind::from_fact_key(key).is_some()
 }
 
 impl RecordView {
@@ -260,6 +263,8 @@ pub struct DocFacts {
     pub minhash: Option<(Vec<u8>, Vec<u64>)>,
     /// What typed similarity reads besides the `MinHash` (issue #169).
     pub similarity: SimilarityFacts,
+    /// What is paid for and how much (issue #193).
+    pub payment: Option<PaymentFacts>,
 }
 
 /// The facts behind the typed similarity relations other than the `MinHash` ones (issue
@@ -476,6 +481,7 @@ impl DocFacts {
             }
         }
         d.similarity = similarity(&best, &all);
+        d.payment = PaymentFacts::read(r.facts.iter().map(|f| (f.key.as_str(), &f.value, f.conf)));
         d
     }
 }

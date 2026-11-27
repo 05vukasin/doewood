@@ -8,6 +8,8 @@
 //! - [`company`]: the deterministic company identity rules of ADR 0002 section 1, from
 //!   `doewood-enrich`.
 //! - [`graph`]: documents, locations, companies, references, `similar_to` and search.
+//! - [`payment`]: what each document pays for and how much, and its supplier and buyer
+//!   (issue #193).
 //! - [`enrichment`]: the enrichment job (ADR 0002 sections 1 to 3, 5 and 6): registries,
 //!   the decision gate, dated edges, website and favicon.
 //! - [`llm`]: the LLM queue (per-source policy, concurrency cap, daily budget) and
@@ -20,6 +22,7 @@ pub mod enrichment;
 pub mod facts;
 pub mod graph;
 pub mod llm;
+pub mod payment;
 pub mod pipeline;
 pub mod route;
 pub mod sheet;

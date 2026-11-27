@@ -10,13 +10,14 @@ use doewood_core::InstanceId;
 use doewood_model::{
     Backend, Blake3, Candidates, ClaimStore, Edge, EdgeCursor, EdgeKind, EdgeSource, Error,
     GraphStore, KeyMatch, LiveEdge, Located, LocationEnded, MERGE_CHAIN_MAX, Neighbour,
-    NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PartyDocument,
-    PropsPatch, PurgeStore, Purged, PutOutcome, Record, RecordStore, Result, SKETCH_MAX_BANDS,
-    SearchDoc, SearchHit, SearchQuery, SearchStore, SimilarKey, SimilarKeyKind, SimilarKeys,
-    Sketch, SketchStore, SourceClaim, SourceKey, StepVersions, StoredEdge, StoredText, band_to_i64,
-    merged_into, record_page_bytes, records_limit, sketch_limit, validate_alias,
-    validate_alias_count, validate_batch_count, validate_hashes, validate_keys, validate_node,
-    validate_sketch, versions_from_json, versions_to_json,
+    NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PartyDocument, Payment,
+    PaymentFilter, PaymentRow, PaymentStore, PropsPatch, PurgeStore, Purged, PutOutcome, Record,
+    RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore,
+    SimilarKey, SimilarKeyKind, SimilarKeys, Sketch, SketchStore, SourceClaim, SourceKey, Spend,
+    SpendGroup, StepVersions, StoredEdge, StoredText, band_to_i64, merged_into, record_page_bytes,
+    records_limit, sketch_limit, validate_alias, validate_alias_count, validate_batch_count,
+    validate_hashes, validate_keys, validate_node, validate_sketch, versions_from_json,
+    versions_to_json,
 };
 use futures_util::future::try_join_all;
 use serde_json::Value;
@@ -1824,6 +1825,31 @@ impl SearchStore for PgStore {
                 })
             })
             .collect()
+    }
+}
+
+#[async_trait]
+impl PaymentStore for PgStore {
+    async fn put_payment(&self, row: &PaymentRow) -> Result<()> {
+        crate::payments::put(&self.pool, row).await
+    }
+
+    async fn delete_payment(&self, blake3: &Blake3) -> Result<()> {
+        crate::payments::delete(&self.pool, blake3).await
+    }
+
+    async fn list_payments(
+        &self,
+        filter: &PaymentFilter,
+        after: Option<&Blake3>,
+        limit: u32,
+        max_bytes: usize,
+    ) -> Result<Vec<Payment>> {
+        crate::payments::list(&self.pool, filter, after, limit, max_bytes).await
+    }
+
+    async fn supplier_spend(&self, supplier: Option<Uuid>, group: SpendGroup) -> Result<Spend> {
+        crate::payments::spend(&self.pool, supplier, group).await
     }
 }
 

@@ -15,12 +15,13 @@ use doewood_core::InstanceId;
 use doewood_model::{
     Backend, Blake3, Candidates, ClaimStore, Edge, EdgeCursor, EdgeKind, EdgeSource, Error,
     GraphStore, KeyMatch, LiveEdge, Located, LocationEnded, MERGE_CHAIN_MAX, Neighbour,
-    NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PartyDocument,
-    PropsPatch, PurgeStore, Purged, PutOutcome, Record, RecordStore, Result, SKETCH_MAX_BANDS,
-    SearchDoc, SearchHit, SearchQuery, SearchStore, SimilarKey, SimilarKeys, Sketch, SketchStore,
-    SourceClaim, SourceKey, StepVersions, StoredEdge, StoredText, band_to_i64, merged_into,
-    records_limit, sketch_limit, validate_alias, validate_batch_count, validate_hashes,
-    validate_keys, validate_node, validate_sketch, versions_from_json, versions_to_json,
+    NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PartyDocument, Payment,
+    PaymentFilter, PaymentRow, PaymentStore, PropsPatch, PurgeStore, Purged, PutOutcome, Record,
+    RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore,
+    SimilarKey, SimilarKeys, Sketch, SketchStore, SourceClaim, SourceKey, Spend, SpendGroup,
+    StepVersions, StoredEdge, StoredText, band_to_i64, merged_into, records_limit, sketch_limit,
+    validate_alias, validate_batch_count, validate_hashes, validate_keys, validate_node,
+    validate_sketch, versions_from_json, versions_to_json,
 };
 use rusqlite::types::Value as Sql;
 use rusqlite::{
@@ -43,6 +44,7 @@ mod explore_scale;
 mod feeds;
 mod merges;
 mod pages;
+mod payments;
 mod proposals;
 mod purge;
 #[cfg(test)]
@@ -1945,6 +1947,37 @@ fn search_hits(
         })
     })
     .collect()
+}
+
+#[async_trait]
+impl PaymentStore for Standalone {
+    async fn put_payment(&self, row: &PaymentRow) -> Result<()> {
+        row.validate()?;
+        let row = row.clone();
+        self.run(move |conn| payments::put(conn, &row)).await
+    }
+
+    async fn delete_payment(&self, blake3: &Blake3) -> Result<()> {
+        let h = *blake3;
+        self.run(move |conn| payments::delete(conn, &h)).await
+    }
+
+    async fn list_payments(
+        &self,
+        filter: &PaymentFilter,
+        after: Option<&Blake3>,
+        limit: u32,
+        max_bytes: usize,
+    ) -> Result<Vec<Payment>> {
+        let (filter, after) = (filter.clone(), after.copied());
+        self.read(move |conn| payments::list(conn, &filter, after.as_ref(), limit, max_bytes))
+            .await
+    }
+
+    async fn supplier_spend(&self, supplier: Option<Uuid>, group: SpendGroup) -> Result<Spend> {
+        self.read(move |conn| payments::spend(conn, supplier, group))
+            .await
+    }
 }
 
 #[async_trait]
