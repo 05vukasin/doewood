@@ -364,8 +364,9 @@ async fn schema_13_counts_the_total_with_log_rows_pending() {
     }
     c.batch_execute(
         // The schemas after 13 go too (issue #166's `document_texts`, #168's index, #169's
-        // `similar_keys`), so 13 runs again.
-        "DROP TABLE document_texts; DROP TABLE similar_keys; DROP TABLE company_graph_totals; \
+        // `similar_keys`, #193's `payments`), so 13 runs again.
+        "DROP TABLE document_texts; DROP TABLE similar_keys; DROP TABLE payments; \
+         DROP TABLE company_graph_totals; \
          DROP INDEX locations_by_document; DELETE FROM doewood_schema WHERE version >= 13;",
     )
     .await

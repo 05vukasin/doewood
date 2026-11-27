@@ -16,11 +16,12 @@ use doewood_model::{
     Backend, Blake3, Candidates, ClaimStore, Edge, EdgeCursor, EdgeKind, EdgeSource, Error,
     GraphStore, KeyMatch, LiveEdge, Located, LocationEnded, MERGE_CHAIN_MAX, Neighbour,
     NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PartyDocument, Payment,
-    PaymentFilter, PaymentRow, PaymentStore, PropsPatch, PurgeStore, Purged, PutOutcome, Record, RecordStore, Result, SKETCH_MAX_BANDS,
-    SearchDoc, SearchHit, SearchQuery, SearchStore, SimilarKey, SimilarKeys, Sketch, SketchStore,
-    SourceClaim, SourceKey, Spend, SpendGroup, StepVersions, StoredEdge, StoredText, band_to_i64, merged_into,
-    records_limit, sketch_limit, validate_alias, validate_batch_count, validate_hashes,
-    validate_keys, validate_node, validate_sketch, versions_from_json, versions_to_json,
+    PaymentFilter, PaymentRow, PaymentStore, PropsPatch, PurgeStore, Purged, PutOutcome, Record,
+    RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore,
+    SimilarKey, SimilarKeys, Sketch, SketchStore, SourceClaim, SourceKey, Spend, SpendGroup,
+    StepVersions, StoredEdge, StoredText, band_to_i64, merged_into, records_limit, sketch_limit,
+    validate_alias, validate_batch_count, validate_hashes, validate_keys, validate_node,
+    validate_sketch, versions_from_json, versions_to_json,
 };
 use rusqlite::types::Value as Sql;
 use rusqlite::{

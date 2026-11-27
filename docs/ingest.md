@@ -316,6 +316,54 @@ the record is analyzed, and removed when a new analysis has no text. `GetDocumen
   edges already written are kept (`ReprocessJob` with `force` compares again).
 - **Search:** title (`ref.title`, else the card's, the file's own, the file name), body (the
   summary card, the extractive summary, keywords, sheet text), kind, date and amount.
+- **Payments** (issue #193, [below](#payments)): the document's payment row, and
+  `side: supplier` / `side: buyer` on its `party` edges.
+
+## Payments
+
+Issue #193: every contract, offer and invoice is labelled with what is paid for and how much,
+scans included. quail's step `payment.extract@1` (quail #128, in quail-cli's default steps) runs
+in the analyzer plan in every profile, after OCR when the deep profile OCRs a scan, so a
+scanned contract gets the same facts as one with a text layer. Its facts are `payment.subject`,
+`payment.category`, `payment.amount` with `payment.amount_basis`, `payment.currency`,
+`payment.net`, `payment.vat`, `payment.gross`, `payment.period`, `payment.lines` and one
+`payment.highlight` per fact (quail's `docs/keys.md`). They are rules over the text, nothing
+is sent anywhere.
+
+- **The step changes the plan**, so `quail.plan` changes and every stored record is stale:
+  `ReprocessJob` (and any ingest of a file) analyzes it again, and the new record has its
+  payment facts. Spreadsheets (hedgehog) have none.
+- **The index row.** When the graph writer writes a document, it reads the payment facts
+  from the record (`DocFacts::payment`; the most confident fact of each key) and stores one
+  row in the `payments` table (shared schema 17, instance schema 19) for fast filters and
+  sums: subject, category code and label, the headline amount in units of 10^-4 of its
+  currency (exact; never a float), basis, currency, period, the document's date (as search
+  has it), the supplier's and buyer's names as written, the amount's confidence, and the rest
+  as canonical JSON (`doewood_model::PaymentDetail`: net, VAT, gross, at most 200 line items
+  and 64 highlights, at most 64 KiB). A record without payment facts (neither a subject nor
+  an amount) has no row. The row is rebuilt from the record each time the document is
+  written (a reprocess, another location of the same bytes); a record that changed loses its
+  old row first, so a document without payment facts costs no extra statement (the
+  round-trip counts of `tests/round_trips.rs` are unchanged). The row goes with its record
+  (`ON DELETE CASCADE`, so a purge removes it, issue #168).
+- **Supplier and buyer** come from quail's party roles (`party.candidates`), with no new edge
+  kind (that would need an ADR): the supplier is the most likely party with the role
+  `supplier`, else the `issuer` (the letterhead) when it is not also on the buying side; the
+  buyer is the most likely other party with `customer`, `bill_to` or `ship_to`. The graph
+  writer sets `side: supplier` or `side: buyer` in the props of the document's `party` edge
+  to that company (when two parties resolve to one company, the supplier side wins). The
+  payment's companies are read through those edges, so a merge, undo or split moves the
+  payment with its edge.
+- **Highlights** carry quail's block numbering, which is the one of the stored document text
+  (`GetDocumentText`): blank blocks skipped, a table row's cells merged with tabs. So the
+  block's text between `start` and `end` (characters) is the quote; the tests check it for
+  every highlight of their documents, the OCR'd scan included.
+- **Defaults while the owner decides:** the category taxonomy is quail's 16 codes; the
+  headline amount is gross when stated, else the plain total, else net, always with its
+  basis. A price with no recurring cue has no period (`SupplierSpend` labels it "period not
+  stated"; quail states `one_off` on invoices).
+- **Not yet:** the optional LLM refinement of the subject and category (issue #195). It
+  would run only under a source's LLM policy with a configured provider, off by default.
 
 ## Similar documents by relation
 
@@ -522,7 +570,8 @@ rows examined):
 
 - **Documents no live location holds** (of any source): the record (Postgres text, SQLite
   JSON) with its search row (`tsvector` or FTS5, and the pgvector column, all in
-  `search_index`), its text (`document_texts`, issue #166) and its sketch and band rows
+  `search_index`), its text (`document_texts`, issue #166), its payment row (`payments`,
+  issue #193) and its sketch and band rows
   (`sketch_band_sizes` follows through its triggers), all by the foreign keys' cascade from
   `records`; the Document node, and with it
   every edge from or to it (`located_at`, `party`, `amends`, `cites`, `similar_to`) and its
@@ -606,6 +655,13 @@ without it every node a purge deletes would read all of `locations` for the fore
   image, ZIP, unknown, empty, broken PDF and XLSX): the record text is the `Value` tree's text byte for
   byte, `DocFacts` reads the same as reading every fact, and SQLite (and Postgres with
   `DOEWOOD_TEST_POSTGRES_URL`) store it and give that text back, a second write unchanged.
+- `tests/payments.rs` (issue #193): a Serbian service contract (PDF) and a monthly licence
+  of the same supplier (DOCX), an English invoice with line items (PDF) and minutes without a
+  price (text) through the pipeline into SQLite and Postgres: each payment row, its supplier
+  and buyer companies, every highlight against the stored document text, the filters, and
+  the spend per supplier (the monthly fee apart). `a_scanned_contract_is_labelled_too`
+  (feature `ocr`, with `DOEWOOD_OCR_MODELS`; skipped without) renders the contract to an
+  image-only PDF and checks the same facts and highlights through OCR.
 - `tests/minio_postgres.rs`: an S3 put in MinIO to a record in Postgres, with both
   `DOEWOOD_TEST_S3_ENDPOINT` and `DOEWOOD_TEST_POSTGRES_URL` set (CI's `ingest-e2e` job).
 

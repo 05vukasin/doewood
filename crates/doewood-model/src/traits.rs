@@ -18,10 +18,10 @@ use crate::{
     CompanyRow, DismissRequest, Dismissal, DismissalQuery, DueCompany, Edge, EdgeCursor,
     Enrichment, FeedState, Folded, IconRow, LiveEdge, Located, LocationEnded, MergeEntry,
     MergeQuery, MergeRequest, Neighbour, NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation,
-    OwnedAlias, PartyDocument, Payment, PaymentFilter, PaymentRow, Proposal, ProposalQuery, ProposalRequest, PropsPatch, Purged,
-    PutOutcome, Record, ResolveRequest, Result, SearchDoc, SearchHit, SearchQuery, SimilarKey,
-    SimilarKeys, Sketch, SourceClaim, SourceKey, Spend, SpendGroup, SplitRequest, StepVersions,
-    StoredText, UndoOutcome, UndoRequest,
+    OwnedAlias, PartyDocument, Payment, PaymentFilter, PaymentRow, Proposal, ProposalQuery,
+    ProposalRequest, PropsPatch, Purged, PutOutcome, Record, ResolveRequest, Result, SearchDoc,
+    SearchHit, SearchQuery, SimilarKey, SimilarKeys, Sketch, SourceClaim, SourceKey, Spend,
+    SpendGroup, SplitRequest, StepVersions, StoredText, UndoOutcome, UndoRequest,
 };
 
 /// quail and hedgehog records, keyed by BLAKE3.
@@ -684,8 +684,11 @@ pub trait PaymentStore: Send + Sync {
     /// amounts by currency, period and `group`, and the categories and subjects of their
     /// documents. Payments without an amount count in `provides` only. At most
     /// [`crate::SPEND_MAX_ROWS`] rows of each, `truncated` when more were left out.
-    async fn supplier_spend(&self, supplier: Option<uuid::Uuid>, group: SpendGroup)
-    -> Result<Spend>;
+    async fn supplier_spend(
+        &self,
+        supplier: Option<uuid::Uuid>,
+        group: SpendGroup,
+    ) -> Result<Spend>;
 }
 
 /// A complete backend: everything the service needs from its store.

@@ -33,8 +33,8 @@ use std::time::{Duration, Instant};
 
 use doewood_model::{
     Backend, Blake3, Direction, Edge, EdgeKind, EdgeSource, EdgeState, NeighbourQuery, NodeKind,
-    ObjectLocation, PENDING_REF_PREFIX, PropsPatch, Result, SearchDoc, SimilarEdge, SimilarKeyKind,
-    SIDE_BUYER, SIDE_PROP, SIDE_SUPPLIER, SimilarRelation, merged_into,
+    ObjectLocation, PENDING_REF_PREFIX, PropsPatch, Result, SIDE_BUYER, SIDE_PROP, SIDE_SUPPLIER,
+    SearchDoc, SimilarEdge, SimilarKeyKind, SimilarRelation, merged_into,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -414,11 +414,12 @@ impl GraphWriter {
         Ok(stats)
     }
 
-    /// The document's payment row (issue #193), rebuilt from its facts; removed when it has
-    /// none.
+    /// The document's payment row (issue #193), rebuilt from its facts. A document without
+    /// payment facts costs nothing here: ingest removes the row of a record that changed
+    /// before it writes the graph (`pipeline::put_text`), so none is left over.
     async fn payment(&self, blake3: &Blake3, facts: &DocFacts) -> Result<()> {
         let Some(p) = &facts.payment else {
-            return self.backend.delete_payment(blake3).await;
+            return Ok(());
         };
         let (supplier, buyer) = crate::payment::sides(&facts.parties);
         let row = p.row(
@@ -655,19 +656,7 @@ impl GraphWriter {
             return Ok(()); // nothing to match: no lock, no reads
         }
         let keys = lock_keys(&work);
-        // The payment's sides (issue #193): which party is the supplier, which the buyer.
-        let (supplier, buyer) = crate::payment::sides(&facts.parties);
-        let key_of = |i: Option<usize>| i.map(|i| facts.parties[i].quail_key.as_str());
-        let (supplier, buyer) = (key_of(supplier), key_of(buyer));
-        let side_of = |p: &Party| {
-            if Some(p.quail_key.as_str()) == supplier {
-                Some(SIDE_SUPPLIER)
-            } else if Some(p.quail_key.as_str()) == buyer {
-                Some(SIDE_BUYER)
-            } else {
-                None
-            }
-        };
+        let side_of = payment_sides(facts);
         // One edge per company: candidates that resolve to the same one merge their roles.
         let mut edges: BTreeMap<Uuid, (Party, Match, Option<&str>)> = BTreeMap::new();
         let waited = Instant::now();
@@ -1037,6 +1026,24 @@ fn learned_aliases(name: &CompanyName, facts: &DocFacts, hex: &str) -> Vec<(Stri
             Some((key, props))
         })
         .collect()
+}
+
+/// Which side of the payment (issue #193) a party of `facts` is on: [`SIDE_SUPPLIER`],
+/// [`SIDE_BUYER`] or neither ([`crate::payment::sides`]).
+fn payment_sides(facts: &DocFacts) -> impl Fn(&Party) -> Option<&'static str> + '_ {
+    let (supplier, buyer) = crate::payment::sides(&facts.parties);
+    let key = move |i: Option<usize>| i.map(|i| facts.parties[i].quail_key.as_str());
+    let (supplier, buyer) = (key(supplier), key(buyer));
+    move |p: &Party| {
+        let k = Some(p.quail_key.as_str());
+        if k == supplier {
+            Some(SIDE_SUPPLIER)
+        } else if k == buyer {
+            Some(SIDE_BUYER)
+        } else {
+            None
+        }
+    }
 }
 
 /// A party with a name, and the learned aliases it claims.

@@ -77,8 +77,8 @@ fn day_from(text: Option<String>) -> Result<Option<Date>> {
         .map_err(|_| bad())
 }
 
-fn opt_uuid(text: Option<String>) -> Result<Option<Uuid>> {
-    text.as_deref().map(uuid).transpose()
+fn opt_uuid(text: Option<&str>) -> Result<Option<Uuid>> {
+    text.map(uuid).transpose()
 }
 
 pub(super) fn put(conn: &mut Connection, row: &PaymentRow) -> Result<()> {
@@ -148,7 +148,15 @@ fn read_row(r: &Row<'_>) -> rusqlite::Result<Read> {
 #[allow(clippy::cast_possible_truncation)] // a confidence, stored from an f32
 fn payment_from(read: Read) -> Result<Payment> {
     let (hash, texts, amount, supplier_name, buyer_name, conf, detail, ids) = read;
-    let [subject, category, category_label, basis, currency, period, day] = texts;
+    let [
+        subject,
+        category,
+        category_label,
+        basis,
+        currency,
+        period,
+        day,
+    ] = texts;
     let [document, supplier, buyer] = ids;
     Ok(Payment {
         row: PaymentRow {
@@ -166,9 +174,9 @@ fn payment_from(read: Read) -> Result<Payment> {
             conf: conf as f32,
             detail: raw_json(detail)?,
         },
-        document: opt_uuid(document)?,
-        supplier: opt_uuid(supplier)?,
-        buyer: opt_uuid(buyer)?,
+        document: opt_uuid(document.as_deref())?,
+        supplier: opt_uuid(supplier.as_deref())?,
+        buyer: opt_uuid(buyer.as_deref())?,
     })
 }
 
@@ -262,7 +270,10 @@ pub(super) fn spend(
         Some(s) => {
             args.push(Sql::Text(s.to_string()));
             args.push(Sql::Text(s.to_string()));
-            (format!("WHERE {}", by_company("p", SIDE_SUPPLIER)), "WHERE sup = ?")
+            (
+                format!("WHERE {}", by_company("p", SIDE_SUPPLIER)),
+                "WHERE sup = ?",
+            )
         }
         None => (String::new(), ""),
     };
@@ -302,7 +313,7 @@ pub(super) fn spend(
         for r in rows {
             let (sup, currency, period, group, total, n) = r.map_err(sql)?;
             out.totals.push(SpendTotal {
-                supplier: opt_uuid(sup)?,
+                supplier: opt_uuid(sup.as_deref())?,
                 currency,
                 period,
                 group,
@@ -327,7 +338,7 @@ pub(super) fn spend(
         for r in rows {
             let (sup, category, category_label, subject, n) = r.map_err(sql)?;
             out.provides.push(Provided {
-                supplier: opt_uuid(sup)?,
+                supplier: opt_uuid(sup.as_deref())?,
                 category,
                 category_label,
                 subject,

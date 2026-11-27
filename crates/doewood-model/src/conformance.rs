@@ -87,6 +87,17 @@ fn versions(quail: &str) -> StepVersions {
     StepVersions::from([("quail".to_owned(), quail.to_owned())])
 }
 
+/// Hash, subject, category, amount, currency, period, date.
+type PaymentCase = (
+    u8,
+    Option<&'static str>,
+    Option<&'static str>,
+    Option<i64>,
+    &'static str,
+    Option<&'static str>,
+    Option<Date>,
+);
+
 /// Payments (issue #193): rows beside their records, filters, pages, the supplier and buyer
 /// read through the `party` edges marked `side`, and per-currency spend.
 ///
@@ -123,33 +134,59 @@ pub async fn payments<B: Backend + ?Sized>(s: &B) {
         .to_body()
         .unwrap()
     };
-    #[allow(clippy::type_complexity)]
-    let rows: [(u8, Option<&str>, Option<&str>, Option<i64>, &str, Option<&str>, Option<Date>); 5] = [
-        (1, Some("software maintenance"), Some("it_software"), Some(1_200_000_000), "RSD",
-         Some("one_off"), Some(day(2026, 3, 14))),
-        (2, Some("software licence"), Some("it_software"), Some(100_000_000), "RSD",
-         Some("monthly"), Some(day(2026, 4, 1))),
-        (3, Some("legal services"), Some("legal"), Some(5_000_000), "EUR", Some("one_off"),
-         Some(day(2025, 12, 31))),
-        (4, Some("office cleaning"), Some("cleaning_facility"), None, "RSD", None, None),
+    let rows: [PaymentCase; 5] = [
+        (
+            1,
+            Some("software maintenance"),
+            Some("it_software"),
+            Some(1_200_000_000),
+            "RSD",
+            Some("one_off"),
+            Some(day(2026, 3, 14)),
+        ),
+        (
+            2,
+            Some("software licence"),
+            Some("it_software"),
+            Some(100_000_000),
+            "RSD",
+            Some("monthly"),
+            Some(day(2026, 4, 1)),
+        ),
+        (
+            3,
+            Some("legal services"),
+            Some("legal"),
+            Some(5_000_000),
+            "EUR",
+            Some("one_off"),
+            Some(day(2025, 12, 31)),
+        ),
+        (
+            4,
+            Some("office cleaning"),
+            Some("cleaning_facility"),
+            None,
+            "RSD",
+            None,
+            None,
+        ),
         (5, None, None, Some(990_000), "USD", None, None),
     ];
-    let row = |r: &(u8, Option<&str>, Option<&str>, Option<i64>, &str, Option<&str>, Option<Date>)| {
-        PaymentRow {
-            blake3: h(r.0),
-            subject: r.1.map(str::to_owned),
-            category: r.2.map(str::to_owned),
-            category_label: r.2.map(|c| format!("label {c}")),
-            amount: r.3,
-            basis: Some("gross".into()),
-            currency: Some(r.4.to_owned()),
-            period: r.5.map(str::to_owned),
-            date: r.6,
-            supplier_name: Some(format!("Supplier {}", r.0)),
-            buyer_name: None,
-            conf: 0.8,
-            detail: detail(u32::from(r.0)),
-        }
+    let row = |r: &PaymentCase| PaymentRow {
+        blake3: h(r.0),
+        subject: r.1.map(str::to_owned),
+        category: r.2.map(str::to_owned),
+        category_label: r.2.map(|c| format!("label {c}")),
+        amount: r.3,
+        basis: Some("gross".into()),
+        currency: Some(r.4.to_owned()),
+        period: r.5.map(str::to_owned),
+        date: r.6,
+        supplier_name: Some(format!("Supplier {}", r.0)),
+        buyer_name: None,
+        conf: 0.8,
+        detail: detail(u32::from(r.0)),
     };
     // A row needs its record.
     let missing = s.put_payment(&row(&rows[0])).await.unwrap_err();
@@ -217,7 +254,10 @@ pub async fn payments<B: Backend + ?Sized>(s: &B) {
         all.iter().map(|p| p.row.blake3).collect::<Vec<_>>(),
         (1..=5).map(h).collect::<Vec<_>>()
     );
-    let sides: Vec<_> = all.iter().map(|p| (p.document, p.supplier, p.buyer)).collect();
+    let sides: Vec<_> = all
+        .iter()
+        .map(|p| (p.document, p.supplier, p.buyer))
+        .collect();
     assert_eq!(
         sides,
         [
@@ -262,27 +302,86 @@ pub async fn payments<B: Backend + ?Sized>(s: &B) {
     assert_eq!(small.len(), 1);
     // Filters.
     let f = PaymentFilter::default;
-    assert_eq!(list(PaymentFilter { supplier: Some(s1), ..f() }).await, [h(1), h(2)]);
-    assert_eq!(list(PaymentFilter { supplier: Some(s2), ..f() }).await, [h(3)]);
-    assert_eq!(list(PaymentFilter { buyer: Some(b1), ..f() }).await, [h(1)]);
     assert_eq!(
-        list(PaymentFilter { category: Some("it_software".into()), ..f() }).await,
-        [h(1), h(2)]
-    );
-    assert_eq!(list(PaymentFilter { currency: Some("EUR".into()), ..f() }).await, [h(3)]);
-    assert_eq!(list(PaymentFilter { period: Some("monthly".into()), ..f() }).await, [h(2)]);
-    assert_eq!(
-        list(PaymentFilter { from: Some(day(2026, 1, 1)), ..f() }).await,
+        list(PaymentFilter {
+            supplier: Some(s1),
+            ..f()
+        })
+        .await,
         [h(1), h(2)]
     );
     assert_eq!(
-        list(PaymentFilter { from: Some(day(2026, 3, 14)), to: Some(day(2026, 3, 14)), ..f() })
-            .await,
+        list(PaymentFilter {
+            supplier: Some(s2),
+            ..f()
+        })
+        .await,
+        [h(3)]
+    );
+    assert_eq!(
+        list(PaymentFilter {
+            buyer: Some(b1),
+            ..f()
+        })
+        .await,
         [h(1)]
     );
-    assert_eq!(list(PaymentFilter { to: Some(day(2025, 12, 31)), ..f() }).await, [h(3)]);
     assert_eq!(
-        list(PaymentFilter { supplier: Some(s1), period: Some("one_off".into()), ..f() }).await,
+        list(PaymentFilter {
+            category: Some("it_software".into()),
+            ..f()
+        })
+        .await,
+        [h(1), h(2)]
+    );
+    assert_eq!(
+        list(PaymentFilter {
+            currency: Some("EUR".into()),
+            ..f()
+        })
+        .await,
+        [h(3)]
+    );
+    assert_eq!(
+        list(PaymentFilter {
+            period: Some("monthly".into()),
+            ..f()
+        })
+        .await,
+        [h(2)]
+    );
+    assert_eq!(
+        list(PaymentFilter {
+            from: Some(day(2026, 1, 1)),
+            ..f()
+        })
+        .await,
+        [h(1), h(2)]
+    );
+    assert_eq!(
+        list(PaymentFilter {
+            from: Some(day(2026, 3, 14)),
+            to: Some(day(2026, 3, 14)),
+            ..f()
+        })
+        .await,
+        [h(1)]
+    );
+    assert_eq!(
+        list(PaymentFilter {
+            to: Some(day(2025, 12, 31)),
+            ..f()
+        })
+        .await,
+        [h(3)]
+    );
+    assert_eq!(
+        list(PaymentFilter {
+            supplier: Some(s1),
+            period: Some("one_off".into()),
+            ..f()
+        })
+        .await,
         [h(1)]
     );
 
@@ -317,7 +416,14 @@ pub async fn payments<B: Backend + ?Sized>(s: &B) {
     let provides: Vec<_> = spend
         .provides
         .iter()
-        .map(|p| (p.supplier, p.category.as_str(), p.subject.as_str(), p.documents))
+        .map(|p| {
+            (
+                p.supplier,
+                p.category.as_str(),
+                p.subject.as_str(),
+                p.documents,
+            )
+        })
         .collect();
     assert!(provides.contains(&(Some(s1), "it_software", "software maintenance", 1)));
     assert!(provides.contains(&(Some(s1), "it_software", "software licence", 1)));

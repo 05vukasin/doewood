@@ -93,7 +93,8 @@ fn payment(p: Payment) -> pb::Payment {
                 start: h.start,
                 end: h.end,
                 quote: h.quote,
-                conf: h.conf,
+                #[allow(clippy::cast_possible_truncation)] // 0 to 1, two decimals
+                conf: h.conf as f32,
             })
             .collect(),
     }
@@ -244,7 +245,11 @@ pub(crate) async fn spend(
                 .node(company)
                 .await
                 .map_err(error::model)?
-                .and_then(|n| n.props.get("name").and_then(|v| v.as_str().map(str::to_owned)))
+                .and_then(|n| {
+                    n.props
+                        .get("name")
+                        .and_then(|v| v.as_str().map(str::to_owned))
+                })
                 .unwrap_or_default();
         }
         suppliers.push(e);
@@ -261,7 +266,10 @@ mod tests {
 
     #[test]
     fn periods_are_labelled() {
-        assert_eq!(period_label("monthly"), ("monthly fees (per month)", Some(12)));
+        assert_eq!(
+            period_label("monthly"),
+            ("monthly fees (per month)", Some(12))
+        );
         assert_eq!(period_label("one_off").1, None);
         assert_eq!(period_label("").0, "prices, period not stated");
     }

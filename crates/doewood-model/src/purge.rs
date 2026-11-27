@@ -5,7 +5,8 @@
 //! loses it. A purge deletes, in bounded batches of one transaction each:
 //!
 //! - **documents** no live location holds: the record (with its search row, the pgvector
-//!   column with it, its text in `document_texts`, and its sketch and band rows), the Document node with every edge from or
+//!   column with it, its text in `document_texts`, its payment row in `payments`, and its sketch
+//!   and band rows), the Document node with every edge from or
 //!   to it (`located_at`, `party`, `amends`, `cites`, `similar_to`) and its aliases. A live
 //!   document's `cites` or `amends` edge to a purged one goes back to the pending reference
 //!   node of its number, as it was before that document arrived;

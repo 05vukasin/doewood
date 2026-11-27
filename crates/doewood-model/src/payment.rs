@@ -222,8 +222,8 @@ pub struct Highlight {
     pub end: u32,
     /// The passage as written.
     pub quote: String,
-    /// The fact's confidence.
-    pub conf: f32,
+    /// The fact's confidence, two decimals.
+    pub conf: f64,
 }
 
 /// A stored payment as read back, with the companies its document's `party` edges name as
@@ -335,7 +335,11 @@ pub fn scaled_units(units: i64, scale: u8) -> Option<i64> {
         let u = i128::from(units);
         let q = u / div;
         let r = u % div;
-        let q = if r.abs() * 2 >= div { q + u.signum() } else { q };
+        let q = if r.abs() * 2 >= div {
+            q + u.signum()
+        } else {
+            q
+        };
         i64::try_from(q).ok()
     }
 }

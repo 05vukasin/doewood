@@ -34,7 +34,7 @@ The S3 event webhook is not part of the gRPC API: it is on the ops server (see
 |---|---|
 | `ConfigService` | `AddSource`, `UpdateSource`, `PauseSource`, `ResumeSource`, `RemoveSource`, `ReleaseSourceClaim`, `ListSources`, `GetSource`, `SetLlmPolicy`, `SetSqsInlet`, `RemoveSqsInlet`, `SetAiProvider`, `RemoveAiProvider`, `ListAiProviders`, `GetIngestSettings`, `SetIngestSettings`, `GetEnrichmentSettings`, `SetEnrichmentSettings`, `GetApiSettings`, `SetApiSettings` |
 | `JobsService` | `WatchProgress` (server stream), `ReprocessJob`, `WatchReprocess` (server stream), `PurgeSource`, `PurgeOrphans`, `WatchPurge` (server stream) |
-| `RecordsService` | `GetRecord`, `ListRecords`, `GetDocumentText` |
+| `RecordsService` | `GetRecord`, `ListRecords`, `GetDocumentText`, `ListPayments`, `SupplierSpend` |
 | `GraphService` | `GetNode`, `Neighbours`, `CompanyDocuments`, `ListMerges`, `MergeCompanies`, `UndoMerge`, `SplitCompany`, `DismissPair`, `ListDismissals`, `ListProposals`, `AcceptProposal`, `RejectProposal` |
 | `SearchService` | `Search` |
 | `SummarizeService` | `Summarize` |
@@ -259,6 +259,12 @@ refused: the workbook has more than 1,600,000 cells ...`, and how to raise the c
 - **GetDocumentText** (issue #166) returns a document's text with block locations: its pages,
   and their blocks with kind, text, zone, heading path, and for spreadsheets the sheet and
   row. It pages blocks as ListRecords pages records. See [Document text](#document-text).
+- **ListPayments** and **SupplierSpend** (issue #193) say what each document pays for and
+  how much, and what each supplier is paid: one row per contract, offer or invoice with
+  payment facts (scans included, through OCR), filtered by supplier, buyer, category,
+  period, currency and date, paged as ListRecords, each with the highlights that prove it;
+  and per supplier the totals per currency and period, by category, year or month, with what
+  it provides. See [Payments](#payments).
 - **GetNode** finds a node by id or by kind and key; **Neighbours** follows its edges with the
   filters of the model's `NeighbourQuery` (direction, edge kinds, neighbour kind, a day the edge
   must hold on, inactive edges); **CompanyDocuments** lists the documents with a live `party`
@@ -696,6 +702,9 @@ grpcurl -plaintext -d '{}' 127.0.0.1:7443 doewood.v1.JobsService/WatchProgress  
 grpcurl -plaintext -d "{\"source_id\": \"$ID\", \"page_size\": 100}" \
     127.0.0.1:7443 doewood.v1.RecordsService/ListRecords
 grpcurl -plaintext -d '{"blake3": "<64 hex digits>"}' 127.0.0.1:7443 doewood.v1.RecordsService/GetRecord
+grpcurl -plaintext -d '{"supplier_id": "<uuid>", "currency": "RSD", "date_from": "2026-01-01"}' \
+    127.0.0.1:7443 doewood.v1.RecordsService/ListPayments
+grpcurl -plaintext -d '{"group_by": "SPEND_GROUP_BY_YEAR"}' 127.0.0.1:7443 doewood.v1.RecordsService/SupplierSpend
 grpcurl -plaintext -d '{"key": {"kind": "NODE_KIND_COMPANY", "key": "acme"}}' \
     127.0.0.1:7443 doewood.v1.GraphService/GetNode
 grpcurl -plaintext -d '{"node_id": "<uuid>", "direction": "DIRECTION_IN", "edge_kinds": ["EDGE_KIND_PARTY"]}' \
@@ -969,6 +978,79 @@ where each block sits.
     `ReprocessJob` analyzes the file again and stores its text.
 - **`want_text` on `PutObject`** (issue #166, with the push sources of #165) is not in this
   version. It comes once `PutObject` exists.
+
+## Payments
+
+`ListPayments` and `SupplierSpend` (issue #193) answer "what are we paying for, and how much".
+quail's `payment.extract` step reads it from each contract, offer and invoice, native text
+and OCR'd scans alike, in Serbian (Latin and Cyrillic) and English; ingest stores it beside
+the record (see [ingest.md](ingest.md#payments)).
+
+- **A payment** (`Payment`) is one document's:
+  - `subject`: what is paid for, as the document states it (`subject_source`: `clause`,
+    `after_heading`, `line_items` or `title`);
+  - `category` and `category_label`: one of `it_software`, `telecom`, `legal`,
+    `accounting_audit`, `consulting`, `marketing`, `rent_lease`, `utilities`, `fuel_energy`,
+    `logistics_transport`, `cleaning_facility`, `maintenance_repair`, `insurance`,
+    `goods_materials`, `financial_services`, `other` (quail's list; the taxonomy is open for
+    the owner);
+  - `amount`: the headline price, **gross when stated, else the plain total, else net**, and
+    `amount_basis` says which (`gross`, `net`, `unstated`). `net`, `vat` and `gross` are
+    there where the document states them. Penalties, guarantees, deposits, interest,
+    advances, damages and rates (per hour, unit prices) are never the price;
+  - `currency` (ISO 4217) and `period` (`one_off`, `monthly`, `quarterly`, `yearly`; empty
+    when the document gives no cue). **A monthly fee is the fee of one month, never
+    multiplied**;
+  - `date`: the document's own date, as search has it;
+  - `lines`: the line items of an invoice or offer;
+  - `supplier_id` and `buyer_id`: the companies, from the document's party roles (see
+    below), with `supplier_name` and `buyer_name` as the document writes them;
+  - `conf`: the amount's confidence (the subject's when there is no amount), and `method`:
+    `rules`;
+  - `highlights`: where each fact sits, as `key` (the fact: `payment.amount`,
+    `payment.subject`, `payment.lines`, ...), `page`, `block`, `start`, `end` and `quote`,
+    with the fact's `conf`. **`block` is the `TextBlock.index` of
+    [GetDocumentText](#document-text)** for the same record, and `start` and `end` are
+    characters (Unicode scalar values) of that block's text, end exclusive: the block's text
+    between them is `quote`. At most 64 per document.
+  Amounts are exact decimal text with at least two decimals (`120000.00`); a field the
+  document does not state is empty.
+- **Supplier and buyer.** quail's party roles decide: the supplier is the most likely party
+  named as supplier (`supplier`, `vendor`, `seller`, `contractor`, `izvršilac`, `dobavljač`,
+  `prodavac`, `pružalac usluga`, ...), else the document's issuer (its letterhead) when it is
+  not on the buying side; the buyer is the most likely other party on the buying side
+  (`customer`, `buyer`, `client`, `naručilac`, `kupac`, `korisnik`, a bill-to or ship-to
+  block). Ingest marks the document's `party` edge to each with `side: supplier` or
+  `side: buyer` in its props (no new edge kind), and the payment reads its companies through
+  those edges, so a merge, undo or split that moves the edge moves the payment with it. A
+  document with two supplier edges (the supplier changed between versions) takes the most
+  confident.
+- **ListPayments** filters by `supplier_id`, `buyer_id`, `category`, `period`, `currency`,
+  `date_from` and `date_to` (`YYYY-MM-DD`, inclusive; undated documents are left out by a
+  date filter); every filter set must hold. Pages as ListRecords: ordered by hash,
+  `page_size` 1 to 1000 (0 means 50), a page ends with the row that brings it to 3 MiB, and
+  `next_page_token` goes back as `page_token`. A bad id, period, date or token is
+  `INVALID_ARGUMENT`.
+- **SupplierSpend** takes `company_id` (one supplier; empty for all) and `group_by`
+  (`CATEGORY`, the default, `YEAR` or `MONTH` of the document's date). Per supplier
+  (ordered by id, the documents without a supplier last with an empty `company_id`):
+  - `totals`: one per currency, period and group. **Amounts are never summed across
+    currencies**, and recurring fees never with one-off prices: each total has its `period`
+    and a `label` (`one-off prices`, `monthly fees (per month)`, `quarterly fees (per
+    quarter)`, `yearly fees (per year)`, `prices, period not stated`). For a recurring
+    period `annualized` is the total for a year (x12 monthly, x4 quarterly, x1 yearly),
+    labelled as such; `total` itself is the sum of the fees as stated. A group is empty when
+    unknown (no category, or no date for `YEAR`/`MONTH`);
+  - `provides`: the categories and subjects of its documents, with their document counts,
+    the most documents first (documents without an amount count here too);
+  - `name`: the company's name.
+
+  At most 5000 totals and 5000 provides rows come back; `truncated` says more were left
+  out (ask for one supplier).
+- **Gross or net.** The headline is gross when the document states it (open for the owner);
+  `amount_basis` always says which, and `net`, `vat` and `gross` are there to pick from.
+- **Not yet:** an LLM refinement of the subject and category for documents the rules leave
+  unlabelled (issue #195, off by default behind a source's LLM policy).
 
 ## ListRecords page budget
 
@@ -1275,5 +1357,9 @@ request over HTTP/1.1, health, reflection and the message limit. `tests/icons.rs
 headers with a fake resolver. `tests/api_load.rs` (ignored) is the load benchmark (see
 [Capacity](#capacity)). `GetDocumentText` is tested on generated PDF, DOCX, PPTX, HTML, text and XLSX files,
 through ingest, on SQLite (`get_document_text` in `tests/api.rs`), and the stores' text
-methods are in the conformance suite. With `DOEWOOD_TEST_POSTGRES_URL` set, the claim, records,
-graph, merge-log and search tests also run against Postgres.
+methods are in the conformance suite. `ListPayments` and `SupplierSpend` are tested over stored
+rows (`payments_and_supplier_spend`: fields, highlights, filters, pages, totals, labels and
+errors), the stores' payment methods in the conformance suite (`payments`), and generated
+contracts and invoices, a scan through OCR included, through ingest in
+`crates/doewood-ingest/tests/payments.rs`. With `DOEWOOD_TEST_POSTGRES_URL` set, the claim,
+records, payments, graph, merge-log and search tests also run against Postgres.

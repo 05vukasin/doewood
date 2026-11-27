@@ -2,8 +2,8 @@
 //! records, the typed graph, source claims, company leases, search, the enrichment job's
 //! registry and favicon caches and company freshness, the merge log and dismissals (ADR 0002
 //! section 1.8), the enrichment proposals (issue #52), the explorer's bounded graph reads
-//! (issue #172), documents' text with block locations (issue #166), payments per document and spend per
-//! supplier (issue #193), and the store traits that both backends implement.
+//! (issue #172), documents' text with block locations (issue #166), payments per document and
+//! spend per supplier (issue #193), and the store traits that both backends implement.
 //!
 //! - **Shared mode:** `doewood-pg`, one Postgres database for every instance.
 //! - **Standalone mode:** `doewood-store`, the instance's own SQLite file.
@@ -48,15 +48,15 @@ pub use merge::{
     REASON_MAX_LEN, SPLIT_MAX_ITEMS, SplitRequest, UndoOutcome, UndoRequest, Undone, merged_into,
     merges_limit,
 };
-pub use proposal::{
-    Accepted, CANDIDATE_MAX_LEN, PROPOSALS_MAX_LIMIT, Proposal, ProposalQuery, ProposalRequest,
-    Resolution, ResolveRequest, proposals_limit, registry_record_alias,
-};
 pub use payment::{
     Highlight, PAYMENT_DETAIL_MAX, PAYMENT_SCALE, PAYMENT_TEXT_MAX, PAYMENTS_MAX_LIMIT,
     PAYMENTS_PAGE_BYTES, PERIODS, Payment, PaymentDetail, PaymentFilter, PaymentLine, PaymentRow,
     Provided, SIDE_BUYER, SIDE_PROP, SIDE_SUPPLIER, SPEND_MAX_ROWS, Spend, SpendGroup, SpendTotal,
     format_decimal, format_units, payment_page_bytes, payments_limit, scaled_units,
+};
+pub use proposal::{
+    Accepted, CANDIDATE_MAX_LEN, PROPOSALS_MAX_LIMIT, Proposal, ProposalQuery, ProposalRequest,
+    Resolution, ResolveRequest, proposals_limit, registry_record_alias,
 };
 pub use props::{PATCH_MAX_DEPTH, PATCH_MAX_OPS, PropOp, PropsPatch};
 pub use purge::{PURGE_BATCH_MAX, Purged, purge_limit};

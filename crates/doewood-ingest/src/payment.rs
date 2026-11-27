@@ -159,7 +159,7 @@ impl PaymentFacts {
                         start,
                         end,
                         quote: text_field(value, "quote").unwrap_or_default(),
-                        conf: conf.clamp(0.0, 1.0),
+                        conf: (f64::from(conf.clamp(0.0, 1.0)) * 100.0).round() / 100.0,
                     });
                 }
                 continue;
@@ -333,10 +333,7 @@ mod tests {
         ];
         assert_eq!(sides(&ps), (Some(3), Some(1)));
         // An invoice: the letterhead issues it, a bill-to block names the buyer.
-        let ps = [
-            party("x", 0.8, &["issuer"]),
-            party("y", 0.6, &["bill_to"]),
-        ];
+        let ps = [party("x", 0.8, &["issuer"]), party("y", 0.6, &["bill_to"])];
         assert_eq!(sides(&ps), (Some(0), Some(1)));
         // An issuer on the buying side is not the supplier.
         let ps = [party("x", 0.8, &["issuer", "customer"])];
@@ -387,7 +384,12 @@ mod tests {
         let p = PaymentFacts::read(facts).unwrap();
         assert_eq!(p.currency.as_deref(), Some("RSD"));
         let row = p
-            .row(Blake3([1; 32]), None, Some(&party("s", 0.9, &["supplier"])), None)
+            .row(
+                Blake3([1; 32]),
+                None,
+                Some(&party("s", 0.9, &["supplier"])),
+                None,
+            )
             .unwrap();
         assert_eq!(row.amount, Some(1_200_000_000));
         assert_eq!(row.category.as_deref(), Some("it_software"));
