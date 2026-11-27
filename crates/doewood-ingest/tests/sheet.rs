@@ -279,7 +279,8 @@ fn lent_threads_measure() {
 /// One generated workbook of `DOEWOOD_BENCH_SHEETS` sheets (default 12) of
 /// `DOEWOOD_BENCH_ROWS` x 26 cells (default 10,000), every other column text, analyzed through
 /// the ingest analyzer (`Analyzer::analyze`, 4 workers' CPU slots, all free). Peak RSS above
-/// the start is sampled every millisecond (issue #183).
+/// the start is sampled every millisecond; the record's hash (without timings) shows the output
+/// did not change (issue #183).
 #[test]
 #[ignore = "a measurement, not a check"]
 fn sheets_measure() {
@@ -340,14 +341,17 @@ fn sheets_measure() {
     #[allow(clippy::cast_precision_loss)]
     let mib = |kib: u64| kib as f64 / 1024.0;
     let peak = peak.load(Ordering::Relaxed);
+    // The record without its step timings, which change from run to run.
+    let mut record: serde_json::Value = serde_json::from_str(out.body.get()).unwrap();
+    record.as_object_mut().unwrap().remove("timings");
     eprintln!(
         "sheets_measure: {sheets} sheets x {} cells ({:.0} MiB file), {secs:.2}s; RSS before \
-         {:.0} MiB, peak {:.0} MiB (+{:.0} MiB); record {}",
+         {:.0} MiB, peak {:.0} MiB (+{:.0} MiB); record without timings {}",
         rows * 26,
         mib(size as u64 / 1024),
         mib(base),
         mib(peak),
         mib(peak.saturating_sub(base)),
-        blake3::hash(out.body.get().as_bytes()).to_hex(),
+        blake3::hash(record.to_string().as_bytes()).to_hex(),
     );
 }
