@@ -1,6 +1,7 @@
 //! Issue #172 on generated data: the company graph's counts, folded from the log, match a
 //! count from scratch over the edges (and the document total of issue #181, also across the
-//! upgrade to schema 15); and an ignored test times the explorer's reads on
+//! upgrade to schema 15, and after purges, issue #168); and an ignored test times the
+//! explorer's reads on
 //! `DOEWOOD_BENCH_DOCS` documents (default 200,000) and `DOEWOOD_BENCH_COMPANIES` companies
 //! (default 20,000). See docs/api.md, "The explorer's reads".
 
@@ -9,8 +10,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use doewood_core::MasterKey;
-use doewood_model::GraphStore;
 use doewood_model::explore::LINK_PARTIES_MAX;
+use doewood_model::{GraphStore, PurgeStore, Purged};
 use rusqlite::{Connection, params};
 use serde_json::json;
 use uuid::Uuid;
@@ -266,6 +267,96 @@ async fn folded_counts_match_a_count_from_scratch() {
     let (want, got) = totals(&conn);
     assert_eq!(got, want);
     assert!(got < 3000 - 150, "retractions lower the total: {got}");
+}
+
+/// Records for every seeded document, and a live location for one in ten (`i % 10 == 0`):
+/// the rest are orphans for a purge. Returns how many have a location.
+fn locate_some(conn: &mut Connection, n: u64) -> i64 {
+    let t = now();
+    let tx = conn.transaction().unwrap();
+    let mut kept = 0;
+    for i in 1..=n {
+        let key = format!("{i:064x}");
+        let mut h = [0u8; 32];
+        h[24..].copy_from_slice(&i.to_be_bytes());
+        tx.execute(
+            "INSERT INTO records (blake3, body_json, versions_json, updated_at) \
+             VALUES (?1, '{}', '{}', ?2)",
+            params![&h[..], t],
+        )
+        .unwrap();
+        if i % 10 == 0 {
+            let loc = uuid_of(5, i).to_string();
+            tx.execute(
+                "INSERT INTO nodes (id, kind, key, props_json, created_at, updated_at) \
+                 VALUES (?1, 'location', ?2, '{}', ?3, ?3)",
+                params![loc, json!(["http://s", "b", key]).to_string(), t],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO locations (node_id, document_id, blake3, endpoint, bucket, \
+                 object_key, updated_at) VALUES (?1, ?2, ?3, 'http://s', 'b', ?4, ?5)",
+                params![loc, uuid_of(2, i).to_string(), &h[..], key, t],
+            )
+            .unwrap();
+            kept += 1;
+        }
+    }
+    tx.commit().unwrap();
+    kept
+}
+
+/// Issue #168: purges delete documents (and the companies only they named, with their
+/// corporate edges) through the edges' delete triggers, so the folded counts still match a
+/// count from scratch.
+#[tokio::test]
+async fn purged_counts_match_a_count_from_scratch() {
+    let store = Arc::new(Store::open_in_memory(&MasterKey::from_bytes([1; 32])).unwrap());
+    let s = Standalone::new(Arc::clone(&store));
+    seed(&mut store.conn(), 3000, 300, false);
+    let kept = locate_some(&mut store.conn(), 3000);
+    s.fold_company_graph(2000).await.unwrap();
+    {
+        let mut conn = store.conn();
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(CHURN).unwrap();
+        tx.commit().unwrap();
+    }
+    let (mut purged, mut after) = (Purged::default(), None::<String>);
+    loop {
+        let p = s.purge_orphan_records(after.as_deref(), 97).await.unwrap();
+        purged.add(&p);
+        // A fold between batches, as the background fold runs.
+        s.fold_company_graph(50).await.unwrap();
+        match p.next {
+            Some(n) => after = Some(n),
+            None => break,
+        }
+    }
+    assert_eq!(i64::try_from(purged.records).unwrap(), 3000 - kept);
+    assert!(purged.companies > 0, "{purged:?}");
+    while s.fold_company_graph(500).await.unwrap().more {}
+    let conn = store.conn();
+    let left: i64 = conn
+        .query_row("SELECT count(*) FROM records", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(left, kept);
+    let (want_stats, want_pairs) = from_scratch(&conn);
+    let (stats, pairs) = stored(&conn);
+    assert!(!want_pairs.is_empty());
+    assert_eq!(pairs, want_pairs);
+    assert_eq!(stats, want_stats);
+    let (want, got) = totals(&conn);
+    assert_eq!(got, want);
+    let stale: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM company_stats s WHERE NOT EXISTS \
+             (SELECT 1 FROM nodes n WHERE n.id = s.company_id)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stale, 0);
 }
 
 /// Issue #181: the upgrade to schema 15 counts the total as folded so far, so the folds after

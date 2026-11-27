@@ -57,4 +57,10 @@ pub trait Reprocessor: Send + Sync {
 
     /// A job this instance started, if it still knows it.
     fn watch(&self, job: Uuid) -> Option<watch::Receiver<ReprocessView>>;
+
+    /// How many of the source's objects ingest holds now (queued or being ingested). A purge
+    /// of a removed source waits until none is (issue #168).
+    fn in_flight(&self, _source: SourceId) -> usize {
+        0
+    }
 }

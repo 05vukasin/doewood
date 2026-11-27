@@ -20,6 +20,23 @@ service JobsService {
   // Streams a reprocess job's progress: its current state first, then every change, until it
   // is done or failed (the last update), the client cancels or the server shuts down.
   rpc WatchReprocess(WatchReprocessRequest) returns (stream ReprocessProgress);
+  // Purges a source of this instance (issue #168): stops it, removes every location of it,
+  // and deletes the records, search rows and graph nodes that no live location of any source
+  // still holds, in bounded batches; then removes the source as RemoveSource does. The source
+  // stays in state REMOVED until the purge is done, and a PurgeSource of it again resumes an
+  // interrupted purge (it also resumes when the instance starts). Answers at once with the
+  // job's id (the running job's, if the source is being purged); WatchPurge streams its
+  // progress. A source another instance owns, or whose prefix overlaps another source's, is
+  // FAILED_PRECONDITION.
+  rpc PurgeSource(PurgeSourceRequest) returns (PurgeJobResponse);
+  // Purges everything already orphaned: the records no live location holds, and the
+  // Location nodes whose object is gone, with what they leave behind. One job per instance
+  // at a time (a second call answers with the running job's id). Safe on several instances
+  // at once.
+  rpc PurgeOrphans(PurgeOrphansRequest) returns (PurgeJobResponse);
+  // Streams a purge job's progress: its current state first, then every change, until it is
+  // done or failed (the last update), the client cancels or the server shuts down.
+  rpc WatchPurge(WatchPurgeRequest) returns (stream PurgeProgress);
 }
 
 message WatchProgressRequest {
@@ -188,4 +205,55 @@ message ReprocessProgress {
   string error = 10;
   // When the update was made, Unix seconds.
   int64 at = 11;
+}
+
+message PurgeSourceRequest {
+  string source_id = 1;
+}
+
+message PurgeOrphansRequest {}
+
+message PurgeJobResponse {
+  string job_id = 1;
+}
+
+message WatchPurgeRequest {
+  // From PurgeJobResponse. Jobs live in the instance that started them, until it restarts.
+  string job_id = 1;
+}
+
+message PurgeProgress {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    // Waiting: for the shared store to connect, or (a source) for the files ingest still
+    // holds to finish.
+    STATE_WAITING = 1;
+    // Deleting, a batch at a time.
+    STATE_RUNNING = 2;
+    // Nothing is left to purge. The last update.
+    STATE_DONE = 3;
+    // The job stopped; see `error`. Purging again resumes it. The last update.
+    STATE_FAILED = 4;
+  }
+  string job_id = 1;
+  // The purged source; empty for PurgeOrphans.
+  string source_id = 2;
+  State state = 3;
+  // Batches done (each one transaction).
+  uint64 batches = 4;
+  // Rows the batches looked at: live locations removed, Location nodes and records examined.
+  uint64 examined = 5;
+  // Location nodes deleted.
+  uint64 locations = 6;
+  // Records deleted, with their search rows, sketches and Document nodes.
+  uint64 records = 7;
+  // Other Document nodes deleted: pending references left without edges.
+  uint64 other_documents = 8;
+  // Company nodes deleted.
+  uint64 companies = 9;
+  // This instance's LLM queue entries of the deleted records, deleted.
+  uint64 llm_jobs = 10;
+  string error = 11;
+  // When the update was made, Unix seconds.
+  int64 at = 12;
 }

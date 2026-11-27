@@ -21,8 +21,8 @@ use crate::{
     Error, IconRow, MergeActor, MergeActorKind, MergeOp, MergeQuery, MergeRequest, Neighbour,
     NeighbourQuery, Node, NodeKind, ObjectLocation, OwnedAlias, ProposalKind, ProposalQuery,
     ProposalReason, ProposalRequest, ProposalState, PropsPatch, PutOutcome, ResolveRequest,
-    SearchDoc, SearchQuery, SourceKey, SplitRequest, StepVersions, StoredEdge, StoredIcon,
-    UndoRequest, merged_into,
+    SearchDoc, SearchQuery, SourceClaim, SourceKey, SplitRequest, StepVersions, StoredEdge,
+    StoredIcon, UndoRequest, merged_into,
 };
 use crate::{BlockKind, TEXT_MAX_BYTES, TextBlock, TextBuilder, TextOrigin, TextZone};
 
@@ -57,6 +57,10 @@ pub async fn run<B: Backend + ?Sized>(a: &B, b: &B) {
     live_edges(a, b).await;
     live_writes(a, b).await;
     explorer(a).await;
+    purge_overlaps(a, b).await;
+    purge_races(a, b).await;
+    // Last: it purges every orphan the cases before left.
+    purge(a).await;
     a.ping().await.expect("ping");
 }
 
@@ -968,6 +972,7 @@ pub async fn locations<B: Backend + ?Sized>(s: &B) {
         key: "inbox/a.pdf".to_owned(),
     };
     let first = s.upsert_location(&hash(21), &at).await.unwrap();
+    assert!(!first.record, "no record stored");
     assert_eq!(s.upsert_location(&hash(21), &at).await.unwrap(), first);
     let doc = s.node(first.document).await.unwrap().expect("document");
     assert_eq!(
@@ -1019,6 +1024,7 @@ pub async fn ended_locations<B: Backend + ?Sized>(s: &B) {
         .await
         .unwrap();
     let first = s.upsert_location(&doc, &at("in/a.pdf")).await.unwrap();
+    assert!(first.record);
     let second = s.upsert_location(&doc, &at("in/b.pdf")).await.unwrap();
     assert_eq!(first.document, second.document);
     assert_eq!(
@@ -4219,4 +4225,535 @@ pub async fn explorer_timings<B: Backend + ?Sized>(
         )
     });
     println!("Path (two small companies, depth 4) | {ms:.1} ms | {what}");
+}
+
+/// A hash for the purge cases: `tag` then `n`, so a case's hashes sort together.
+fn purge_hash(tag: u8, n: u8) -> Blake3 {
+    let mut h = [tag; 32];
+    h[31] = n;
+    Blake3(h)
+}
+
+fn purge_at(key: &str) -> ObjectLocation {
+    ObjectLocation {
+        endpoint: "http://purge.test:9000".to_owned(),
+        bucket: "docs".to_owned(),
+        key: key.to_owned(),
+    }
+}
+
+/// Every batch of a source purge, as the job runs them: the live locations, then the ended
+/// ones under the source. Returns the counts.
+async fn purge_source_all<B: Backend + ?Sized>(
+    s: &B,
+    key: &SourceKey,
+    limit: u32,
+) -> crate::Purged {
+    let mut total = crate::Purged::default();
+    loop {
+        let p = s.purge_source_locations(key, limit).await.unwrap();
+        total.add(&p);
+        if p.next.is_none() {
+            break;
+        }
+    }
+    let mut after = None;
+    loop {
+        let p = s
+            .purge_ended_locations(Some(key), after.as_deref(), limit)
+            .await
+            .unwrap();
+        total.add(&p);
+        match p.next {
+            Some(n) => after = Some(n),
+            None => break,
+        }
+    }
+    total
+}
+
+/// Every batch of an orphan purge: the records, then the ended locations.
+async fn purge_orphans_all<B: Backend + ?Sized>(s: &B, limit: u32) -> crate::Purged {
+    let mut total = crate::Purged::default();
+    let mut after = None;
+    loop {
+        let p = s
+            .purge_orphan_records(after.as_deref(), limit)
+            .await
+            .unwrap();
+        total.add(&p);
+        total.hashes.extend(p.hashes);
+        match p.next {
+            Some(n) => after = Some(n),
+            None => break,
+        }
+    }
+    let mut after = None;
+    loop {
+        let p = s
+            .purge_ended_locations(None, after.as_deref(), limit)
+            .await
+            .unwrap();
+        total.add(&p);
+        match p.next {
+            Some(n) => after = Some(n),
+            None => break,
+        }
+    }
+    total
+}
+
+/// Purges (issue #168): a source purge deletes what only its locations held (records, search
+/// rows, sketches, Document and Location nodes, the companies only its documents named and
+/// their husks, pending references left alone) and keeps what another location still holds;
+/// a live document's reference to a purged one goes back to a pending node; a registry's
+/// company stays; an orphan purge deletes the records and ended locations left; both are
+/// idempotent; the LLM writer cannot bring a purged record back.
+///
+/// # Panics
+///
+/// When the backend misbehaves.
+#[allow(clippy::too_many_lines)]
+pub async fn purge<B: Backend + ?Sized>(s: &B) {
+    let h = |n| purge_hash(0xd1, n);
+    let body = |n: u8, title: &str| raw(&json!({"n": n, "title": title}));
+    // 1: only under the purged prefix; 2: there and elsewhere; 3: outside it, citing 1;
+    // 4: under it, its object already deleted; 5: a record without a location.
+    for n in 1..=5u8 {
+        s.put_record(&h(n), &body(n, "purgeable"), &versions("1"))
+            .await
+            .unwrap();
+    }
+    let d1 = s
+        .upsert_location(&h(1), &purge_at("pa/1.pdf"))
+        .await
+        .unwrap();
+    assert!(d1.record);
+    let d2 = s
+        .upsert_location(&h(2), &purge_at("pa/2.pdf"))
+        .await
+        .unwrap();
+    s.upsert_location(&h(2), &purge_at("other/2.pdf"))
+        .await
+        .unwrap();
+    let d3 = s
+        .upsert_location(&h(3), &purge_at("pb/3.pdf"))
+        .await
+        .unwrap();
+    // 3's older copy, gone from its bucket: an ended location of a live document.
+    let old3 = s
+        .upsert_location(&h(3), &purge_at("pc/3.pdf"))
+        .await
+        .unwrap();
+    s.end_location(&purge_at("pc/3.pdf"), day(2026, 1, 2))
+        .await
+        .unwrap();
+    s.upsert_location(&h(4), &purge_at("pa/4.pdf"))
+        .await
+        .unwrap();
+    s.end_location(&purge_at("pa/4.pdf"), day(2026, 1, 2))
+        .await
+        .unwrap();
+    for n in 1..=3 {
+        s.index_document(&SearchDoc {
+            blake3: h(n),
+            title: format!("Purgeable {n}"),
+            body: "zebrafinch".to_owned(),
+            kind: None,
+            date: None,
+            amount: None,
+        })
+        .await
+        .unwrap();
+    }
+    // Their text (issue #166): it goes with the record.
+    for n in [1, 2, 4] {
+        let mut b = TextBuilder::new("docx.extract", "2", TEXT_MAX_BYTES);
+        assert!(b.page(0, None, TextOrigin::Native));
+        assert!(b.block(TextBlock {
+            kind: BlockKind::Paragraph,
+            text: format!("purgeable text {n}"),
+            zone: None,
+            level: None,
+            table: None,
+            row: None,
+        }));
+        s.put_document_text(&h(n), &b.finish().to_body().unwrap())
+            .await
+            .unwrap();
+    }
+    s.put_sketch(&h(1), &[1, 2, 3], &[0xd1_0001, 0xd1_0002])
+        .await
+        .unwrap();
+    s.put_sketch(&h(2), &[1, 2, 4], &[0xd1_0001, 0xd1_0003])
+        .await
+        .unwrap();
+    let company = |key: &'static str, props: serde_json::Value| async move {
+        s.upsert_node(NodeKind::Company, key, &props).await.unwrap()
+    };
+    let only1 = company("purge:only1", json!({"name": "Only One"})).await;
+    let both = company("purge:both", json!({"name": "Both"})).await;
+    let registry = company(
+        "purge:reg",
+        json!({"name": "Registry", "origin": "registry"}),
+    )
+    .await;
+    let husk = company("purge:husk", json!({"name": "Husk"})).await;
+    s.claim_alias(NodeKind::Company, "name:purge only one", only1, &json!({}))
+        .await
+        .unwrap();
+    let party = |doc: Uuid, c: Uuid, role: &str| {
+        Edge::new(doc, c, EdgeKind::Party, EdgeSource::Document).with_props(json!({"role": role}))
+    };
+    for e in [
+        party(d1.document, only1, "buyer"),
+        party(d1.document, both, "supplier"),
+        party(d3.document, both, "buyer"),
+        party(d1.document, registry, "signatory"),
+    ] {
+        s.upsert_edge(&e).await.unwrap();
+    }
+    let merge = s
+        .merge_companies(&merge_req(only1, husk, MergeActorKind::Manual))
+        .await
+        .unwrap();
+    // 1 has a number; 3 cites it; 1 cites a number nobody has.
+    s.claim_alias(
+        NodeKind::Document,
+        "number:PRG-1",
+        d1.document,
+        &json!({"document": h(1).to_hex()}),
+    )
+    .await
+    .unwrap();
+    let cite = Edge::new(
+        d3.document,
+        d1.document,
+        EdgeKind::Cites,
+        EdgeSource::Document,
+    )
+    .with_props(json!({"relation": "cites", "raw": "PRG-1", "key": "PRG-1", "kind": "doc"}));
+    s.upsert_edge(&cite).await.unwrap();
+    let ghost = s
+        .upsert_node(
+            NodeKind::Document,
+            "ref:PRG-404",
+            &json!({"pending": true, "key": "PRG-404"}),
+        )
+        .await
+        .unwrap();
+    s.upsert_edge(
+        &Edge::new(d1.document, ghost, EdgeKind::Cites, EdgeSource::Document)
+            .with_props(json!({"key": "PRG-404", "pending": true})),
+    )
+    .await
+    .unwrap();
+    s.upsert_edge(&Edge::new(
+        d1.document,
+        d2.document,
+        EdgeKind::SimilarTo,
+        EdgeSource::Document,
+    ))
+    .await
+    .unwrap();
+
+    // The source "pa/": batches of one, to cross every batch boundary.
+    let src = SourceKey::new("http://purge.test:9000/", "docs", "pa/").unwrap();
+    let done = purge_source_all(s, &src, 1).await;
+    assert_eq!(done.records, 2, "{done:?}");
+    assert!(done.locations >= 3, "{done:?}");
+    assert_eq!(done.companies, 2, "only1 and its husk: {done:?}");
+    assert!(done.other_documents >= 1, "the pending reference: {done:?}");
+    for n in [1, 4] {
+        assert_eq!(s.get_record(&h(n)).await.unwrap(), None, "record {n}");
+        assert!(
+            s.get_document_text(&h(n)).await.unwrap().is_none(),
+            "text {n}"
+        );
+        assert!(
+            s.node_by_key(NodeKind::Document, &h(n).to_hex())
+                .await
+                .unwrap()
+                .is_none(),
+            "document {n}"
+        );
+    }
+    for key in ["pa/1.pdf", "pa/2.pdf", "pa/4.pdf"] {
+        assert!(
+            s.node_by_key(NodeKind::Location, &purge_at(key).node_key())
+                .await
+                .unwrap()
+                .is_none(),
+            "location {key}"
+        );
+    }
+    // 2 stays, held elsewhere, with its text; its edge to 1 is gone with 1.
+    assert!(s.get_record(&h(2)).await.unwrap().is_some());
+    assert!(s.get_document_text(&h(2)).await.unwrap().is_some());
+    let out = s
+        .neighbours(
+            d2.document,
+            &NeighbourQuery {
+                direction: Direction::Both,
+                include_inactive: true,
+                ..NeighbourQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        out.iter().map(|n| n.edge.edge.kind).collect::<Vec<_>>(),
+        [EdgeKind::LocatedAt],
+        "{out:?}"
+    );
+    let hits = s
+        .search(&SearchQuery {
+            text: Some("zebrafinch".to_owned()),
+            ..SearchQuery::default()
+        })
+        .await
+        .unwrap();
+    let mut found: Vec<_> = hits.iter().map(|x| x.blake3).collect();
+    found.sort();
+    assert_eq!(found, [h(2), h(3)]);
+    let similar = s
+        .sketch_candidates(&[0xd1_0001, 0xd1_0002], &h(9), 10)
+        .await
+        .unwrap();
+    assert_eq!(similar.iter().map(|c| c.blake3).collect::<Vec<_>>(), [h(2)]);
+    // Companies: the one only 1 named goes with its husk, and its aliases; the others stay.
+    assert!(s.node(only1).await.unwrap().is_none());
+    assert!(s.node(husk).await.unwrap().is_none());
+    assert!(
+        s.alias(NodeKind::Company, "name:purge only one")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(s.node(both).await.unwrap().is_some());
+    assert!(
+        s.node(registry).await.unwrap().is_some(),
+        "a registry's company"
+    );
+    // The merge log keeps the entry; undoing it brings neither company back.
+    let _ = s.undo_merge(&undo_req(merge.id, false, false)).await;
+    assert!(s.node(only1).await.unwrap().is_none());
+    assert!(s.node(husk).await.unwrap().is_none());
+    // 3's reference to 1 waits on the number again; the pending node 1 alone cited is gone.
+    let cites = s
+        .neighbours(
+            d3.document,
+            &NeighbourQuery {
+                direction: Direction::Out,
+                edge_kinds: vec![EdgeKind::Cites],
+                ..NeighbourQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(cites.len(), 1, "{cites:?}");
+    assert_eq!(cites[0].node.key, "ref:PRG-1");
+    assert_eq!(cites[0].edge.edge.props["pending"], json!(true));
+    assert_eq!(cites[0].edge.edge.props["raw"], json!("PRG-1"));
+    assert!(s.node(ghost).await.unwrap().is_none());
+    assert!(
+        s.alias(NodeKind::Document, "number:PRG-1")
+            .await
+            .unwrap()
+            .is_none_or(|a| a.node.is_none())
+    );
+    // 3's ended copy is outside the source: kept by the source purge.
+    assert!(s.node(old3.location).await.unwrap().is_some());
+
+    // Again: nothing left.
+    let again = purge_source_all(s, &src, 1).await;
+    assert_eq!(
+        (
+            again.records,
+            again.locations,
+            again.companies,
+            again.other_documents
+        ),
+        (0, 0, 0, 0),
+        "{again:?}"
+    );
+
+    // The LLM writer edits a record and never brings back a purged one.
+    assert!(
+        !s.update_record(&h(1), &body(1, "summary"), &versions("1"))
+            .await
+            .unwrap()
+    );
+    assert_eq!(s.get_record(&h(1)).await.unwrap(), None);
+    assert!(
+        s.update_record(&h(2), &body(2, "summary"), &versions("1"))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        s.get_record(&h(2))
+            .await
+            .unwrap()
+            .unwrap()
+            .body_value()
+            .unwrap()["title"],
+        json!("summary")
+    );
+
+    // The orphans: 5's record, 3's ended copy, and what other cases left.
+    let orphans = purge_orphans_all(s, 3).await;
+    assert!(orphans.records >= 1, "{orphans:?}");
+    assert!(orphans.hashes.contains(&h(5)));
+    assert_eq!(s.get_record(&h(5)).await.unwrap(), None);
+    assert!(s.node(old3.location).await.unwrap().is_none());
+    for n in [2, 3] {
+        assert!(s.get_record(&h(n)).await.unwrap().is_some(), "record {n}");
+    }
+    assert!(s.node(d3.location).await.unwrap().is_some());
+    assert!(s.node(both).await.unwrap().is_some());
+    let again = purge_orphans_all(s, 3).await;
+    assert_eq!(
+        (
+            again.records,
+            again.locations,
+            again.companies,
+            again.other_documents
+        ),
+        (0, 0, 0, 0),
+        "{again:?}"
+    );
+    // Purged content can come back: a new copy is ingested as new.
+    s.put_record(&h(1), &body(1, "back"), &versions("1"))
+        .await
+        .unwrap();
+    let back = s
+        .upsert_location(&h(1), &purge_at("pa/1.pdf"))
+        .await
+        .unwrap();
+    assert!(back.record);
+    assert_ne!(back.document, d1.document);
+}
+
+/// A source purge never removes another source's locations: the claims whose objects overlap
+/// a source's are found, whichever instance holds them.
+///
+/// # Panics
+///
+/// When the backend misbehaves.
+pub async fn purge_overlaps<B: Backend + ?Sized>(a: &B, b: &B) {
+    let key = |p: &str| SourceKey::new("http://overlap.test", "docs", p.to_owned()).unwrap();
+    a.claim_source(&key("ov/a/"), &instance("inst-a"))
+        .await
+        .unwrap();
+    b.claim_source(&key("ov/b/"), &instance("inst-b"))
+        .await
+        .unwrap();
+    let prefixes = |claims: Vec<SourceClaim>| {
+        claims
+            .into_iter()
+            .map(|c| (c.key.prefix().to_owned(), c.owner.as_str().to_owned()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        prefixes(b.overlapping_claims(&key("ov/")).await.unwrap()),
+        [
+            ("ov/a/".to_owned(), "inst-a".to_owned()),
+            ("ov/b/".to_owned(), "inst-b".to_owned())
+        ]
+    );
+    assert_eq!(
+        prefixes(a.overlapping_claims(&key("ov/a/x/")).await.unwrap()),
+        [("ov/a/".to_owned(), "inst-a".to_owned())]
+    );
+    // Its own claim is not an overlap, nor a sibling prefix.
+    assert!(
+        a.overlapping_claims(&key("ov/a/"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        a.overlapping_claims(&key("ov/c/"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let other = SourceKey::new("http://overlap.test", "other", "ov/").unwrap();
+    assert!(a.overlapping_claims(&other).await.unwrap().is_empty());
+}
+
+/// A purge racing ingest of the same content (issue #168): the content's location is written
+/// through one handle while the other purges the orphan record. Either the purge sees the
+/// location and keeps the record, or it deleted the record first and the location says so
+/// (`Located::record` false: ingest stores the record again). A live location never ends up
+/// with its record gone unnoticed.
+///
+/// # Panics
+///
+/// When the backend misbehaves.
+pub async fn purge_races<B: Backend + ?Sized>(a: &B, b: &B) {
+    let (mut kept, mut lost) = (0, 0);
+    for n in 1..=40u8 {
+        let h = purge_hash(0xe7, n);
+        let before = purge_hash(0xe7, n - 1);
+        a.put_record(&h, &raw(&json!({"race": n})), &versions("1"))
+            .await
+            .unwrap();
+        let at = purge_at(&format!("race/{n}.pdf"));
+        let after = before.to_hex();
+        let (located, purged) = futures_join(
+            b.upsert_location(&h, &at),
+            a.purge_orphan_records(Some(&after), 1),
+        )
+        .await;
+        let located = located.unwrap();
+        let purged = purged.unwrap();
+        let record = a.get_record(&h).await.unwrap();
+        if located.record {
+            assert!(
+                record.is_some(),
+                "round {n}: a live location lost its record"
+            );
+            assert!(purged.hashes.is_empty(), "round {n}: {purged:?}");
+            kept += 1;
+        } else {
+            assert!(record.is_none(), "round {n}");
+            assert_eq!(purged.hashes, [h], "round {n}");
+            lost += 1;
+            // Ingest's retry: the record again, and the location now holds it.
+            a.put_record(&h, &raw(&json!({"race": n})), &versions("1"))
+                .await
+                .unwrap();
+            assert!(b.upsert_location(&h, &at).await.unwrap().record);
+            let p = a.purge_orphan_records(Some(&after), 1).await.unwrap();
+            assert!(p.hashes.is_empty(), "round {n}: {p:?}");
+            assert!(a.get_record(&h).await.unwrap().is_some());
+        }
+    }
+    assert_eq!(kept + lost, 40);
+}
+
+/// Both futures to completion, polled together.
+async fn futures_join<X: Future, Y: Future>(x: X, y: Y) -> (X::Output, Y::Output) {
+    let (mut x, mut y) = (Box::pin(x), Box::pin(y));
+    let (mut xo, mut yo) = (None, None);
+    std::future::poll_fn(|cx| {
+        if xo.is_none()
+            && let Poll::Ready(v) = x.as_mut().poll(cx)
+        {
+            xo = Some(v);
+        }
+        if yo.is_none()
+            && let Poll::Ready(v) = y.as_mut().poll(cx)
+        {
+            yo = Some(v);
+        }
+        if xo.is_some() && yo.is_some() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    (xo.expect("polled"), yo.expect("polled"))
 }

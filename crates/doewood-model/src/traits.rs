@@ -18,9 +18,9 @@ use crate::{
     CompanyRow, DismissRequest, Dismissal, DismissalQuery, DueCompany, Edge, EdgeCursor,
     Enrichment, FeedState, Folded, IconRow, LiveEdge, Located, LocationEnded, MergeEntry,
     MergeQuery, MergeRequest, Neighbour, NeighbourQuery, Node, NodeAlias, NodeKind, ObjectLocation,
-    OwnedAlias, PartyDocument, Proposal, ProposalQuery, ProposalRequest, PropsPatch, PutOutcome,
-    Record, ResolveRequest, Result, SearchDoc, SearchHit, SearchQuery, Sketch, SourceClaim,
-    SourceKey, SplitRequest, StepVersions, StoredText, UndoOutcome, UndoRequest,
+    OwnedAlias, PartyDocument, Proposal, ProposalQuery, ProposalRequest, PropsPatch, Purged,
+    PutOutcome, Record, ResolveRequest, Result, SearchDoc, SearchHit, SearchQuery, Sketch,
+    SourceClaim, SourceKey, SplitRequest, StepVersions, StoredText, UndoOutcome, UndoRequest,
 };
 
 /// quail and hedgehog records, keyed by BLAKE3.
@@ -38,6 +38,16 @@ pub trait RecordStore: Send + Sync {
 
     /// The record, if stored.
     async fn get_record(&self, blake3: &Blake3) -> Result<Option<Record>>;
+
+    /// Replaces a stored record, as [`RecordStore::put_record`] does, but never inserts one:
+    /// `false` when there is no record (a purge deleted it, issue #168), and nothing is
+    /// written. For writers that edit a record they read (the LLM summary).
+    async fn update_record(
+        &self,
+        blake3: &Blake3,
+        body: &RawValue,
+        versions: &StepVersions,
+    ) -> Result<bool>;
 
     /// The step versions of the stored records among `hashes`, without their bodies (issue
     /// #75: reprocess compares versions only). Hashes with no record are missing from the
@@ -200,7 +210,10 @@ pub trait GraphStore: Send + Sync {
 
     /// Records that a document lives at a location, in one transaction: upserts the Document
     /// and Location nodes and the `located_at` edge, and supersedes any `located_at` edge from
-    /// another document to that location (the object was overwritten).
+    /// another document to that location (the object was overwritten). The location is
+    /// written whether or not the record is stored; [`Located::record`] says whether it was,
+    /// read under a share lock on the record so that a purge either sees the location or has
+    /// deleted the record first (issue #168).
     async fn upsert_location(&self, blake3: &Blake3, location: &ObjectLocation) -> Result<Located>;
 
     /// Records that the object at a location is gone (deleted from its bucket), in one
@@ -454,6 +467,10 @@ pub trait ClaimStore: Send + Sync {
     /// Who owns the source, if anyone.
     async fn source_owner(&self, key: &SourceKey) -> Result<Option<SourceClaim>>;
 
+    /// The claims on other sources of the same endpoint and bucket whose prefix contains
+    /// `key`'s or is contained in it (so their objects overlap), at most 100.
+    async fn overlapping_claims(&self, key: &SourceKey) -> Result<Vec<SourceClaim>>;
+
     /// Takes or renews the enrichment lease on a company for `ttl`. Returns `false` when
     /// another instance holds an unexpired lease.
     async fn lease_company(&self, company: Uuid, owner: &InstanceId, ttl: Duration)
@@ -583,6 +600,31 @@ pub trait FeedStore: Send + Sync {
     ) -> Result<Vec<(String, Uuid)>>;
 }
 
+/// Purges (issue #168; see [`crate::purge`]): deleting the records, search rows and graph
+/// nodes no live location holds. Each call is one bounded batch in one transaction, safe to
+/// repeat, to stop between, and to run on several instances at once.
+#[async_trait]
+pub trait PurgeStore: Send + Sync {
+    /// Removes up to `limit` ([`crate::purge_limit`]) live locations under `source` (the
+    /// Location node, its row and its `located_at` edges), then purges the documents that no
+    /// live location holds any more. `next` is `Some` while live locations may remain.
+    async fn purge_source_locations(&self, source: &SourceKey, limit: u32) -> Result<Purged>;
+
+    /// Examines up to `limit` Location nodes after `after` (a previous batch's `next`) in key
+    /// order, under `source` when it is given, and deletes those without a live location,
+    /// then purges the documents they leave without one.
+    async fn purge_ended_locations(
+        &self,
+        source: Option<&SourceKey>,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<Purged>;
+
+    /// Examines up to `limit` records after `after` (a previous batch's `next`) in hash
+    /// order, and purges those no live location holds.
+    async fn purge_orphan_records(&self, after: Option<&str>, limit: u32) -> Result<Purged>;
+}
+
 /// A complete backend: everything the service needs from its store.
 #[async_trait]
 pub trait Backend:
@@ -596,6 +638,7 @@ pub trait Backend:
     + FeedStore
     + MergeStore
     + ProposalStore
+    + PurgeStore
 {
     /// `postgres` or `sqlite`.
     fn name(&self) -> &'static str;

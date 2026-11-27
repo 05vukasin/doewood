@@ -15,10 +15,10 @@ use doewood_core::InstanceId;
 use doewood_model::{
     Backend, Blake3, Candidates, ClaimStore, Edge, EdgeCursor, EdgeKind, EdgeSource, Error,
     GraphStore, LiveEdge, Located, LocationEnded, MERGE_CHAIN_MAX, Neighbour, NeighbourQuery, Node,
-    NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PartyDocument, PropsPatch, PutOutcome, Record,
-    RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore, Sketch,
-    SketchStore, SourceClaim, SourceKey, StepVersions, StoredEdge, StoredText, band_to_i64,
-    merged_into, records_limit, sketch_limit, validate_alias, validate_batch_count,
+    NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PartyDocument, PropsPatch, PurgeStore, Purged,
+    PutOutcome, Record, RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery,
+    SearchStore, Sketch, SketchStore, SourceClaim, SourceKey, StepVersions, StoredEdge, StoredText,
+    band_to_i64, merged_into, records_limit, sketch_limit, validate_alias, validate_batch_count,
     validate_hashes, validate_node, validate_sketch, versions_from_json, versions_to_json,
 };
 use rusqlite::types::Value as Sql;
@@ -43,6 +43,7 @@ mod feeds;
 mod merges;
 mod pages;
 mod proposals;
+mod purge;
 #[cfg(test)]
 mod read_paths;
 #[cfg(test)]
@@ -527,6 +528,33 @@ impl RecordStore for Standalone {
         .await
     }
 
+    async fn update_record(
+        &self,
+        blake3: &Blake3,
+        body: &RawValue,
+        versions: &StepVersions,
+    ) -> Result<bool> {
+        let (h, body, versions) = (*blake3, body.get().to_owned(), versions_to_json(versions));
+        self.run(move |conn| {
+            let n = conn
+                .prepare_cached(
+                    "UPDATE records SET body_json = ?2, versions_json = ?3, updated_at = ?4 \
+                     WHERE blake3 = ?1",
+                )
+                .and_then(|mut cached| {
+                    cached.execute(params![
+                        h.as_bytes().as_slice(),
+                        body,
+                        versions.to_string(),
+                        now()
+                    ])
+                })
+                .map_err(sql)?;
+            Ok(n > 0)
+        })
+        .await
+    }
+
     async fn record_versions(&self, hashes: &[Blake3]) -> Result<BTreeMap<Blake3, StepVersions>> {
         validate_hashes(hashes)?;
         if hashes.is_empty() {
@@ -974,8 +1002,18 @@ impl GraphStore for Standalone {
                 &tx,
                 &Edge::new(document, location, EdgeKind::LocatedAt, EdgeSource::Storage),
             )?;
+            // In the same write as the location: a purge runs on this writer too, so it either
+            // saw the location or deleted the record before (issue #168).
+            let record: bool = tx
+                .prepare_cached("SELECT EXISTS (SELECT 1 FROM records WHERE blake3 = ?1)")
+                .and_then(|mut cached| cached.query_row([h.as_bytes().as_slice()], |r| r.get(0)))
+                .map_err(sql)?;
             tx.commit().map_err(sql)?;
-            Ok(Located { document, location })
+            Ok(Located {
+                document,
+                location,
+                record,
+            })
         })
         .await
     }
@@ -1224,6 +1262,32 @@ impl GraphStore for Standalone {
 }
 
 #[async_trait]
+impl PurgeStore for Standalone {
+    async fn purge_source_locations(&self, source: &SourceKey, limit: u32) -> Result<Purged> {
+        let source = source.clone();
+        self.run(move |conn| purge::source_locations(conn, &source, limit))
+            .await
+    }
+
+    async fn purge_ended_locations(
+        &self,
+        source: Option<&SourceKey>,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<Purged> {
+        let (source, after) = (source.cloned(), after.map(str::to_owned));
+        self.run(move |conn| purge::ended_locations(conn, source.as_ref(), after.as_deref(), limit))
+            .await
+    }
+
+    async fn purge_orphan_records(&self, after: Option<&str>, limit: u32) -> Result<Purged> {
+        let after = after.map(str::to_owned);
+        self.run(move |conn| purge::orphan_records(conn, after.as_deref(), limit))
+            .await
+    }
+}
+
+#[async_trait]
 impl SketchStore for Standalone {
     async fn put_sketch(&self, blake3: &Blake3, signature: &[u8], bands: &[u64]) -> Result<()> {
         validate_sketch(signature, bands)?;
@@ -1426,6 +1490,39 @@ impl ClaimStore for Standalone {
     async fn source_owner(&self, key: &SourceKey) -> Result<Option<SourceClaim>> {
         let key = key.clone();
         self.read(move |conn| source_owner(conn, &key)).await
+    }
+
+    async fn overlapping_claims(&self, key: &SourceKey) -> Result<Vec<SourceClaim>> {
+        let key = key.clone();
+        self.read(move |conn| {
+            let rows: Vec<(String, String, i64)> = {
+                let mut stmt = conn
+                    .prepare_cached(
+                        "SELECT prefix, owner, claimed_at FROM source_claims \
+                         WHERE endpoint = ?1 AND bucket = ?2 AND prefix <> ?3 \
+                         AND (substr(prefix, 1, length(?3)) = ?3 \
+                         OR substr(?3, 1, length(prefix)) = prefix) \
+                         ORDER BY prefix LIMIT 100",
+                    )
+                    .map_err(sql)?;
+                stmt.query_map(params![key.endpoint(), key.bucket(), key.prefix()], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })
+                .map_err(sql)?
+                .collect::<rusqlite::Result<_>>()
+                .map_err(sql)?
+            };
+            rows.into_iter()
+                .map(|(prefix, owner, at)| {
+                    claim_row(
+                        &SourceKey::new(key.endpoint(), key.bucket(), prefix)?,
+                        &owner,
+                        at,
+                    )
+                })
+                .collect()
+        })
+        .await
     }
 
     async fn lease_company(

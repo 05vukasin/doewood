@@ -19,6 +19,7 @@ mod feed;
 pub mod merge;
 pub mod proposal;
 mod props;
+pub mod purge;
 pub mod text;
 mod traits;
 mod types;
@@ -49,13 +50,14 @@ pub use proposal::{
     Resolution, ResolveRequest, proposals_limit, registry_record_alias,
 };
 pub use props::{PATCH_MAX_DEPTH, PATCH_MAX_OPS, PropOp, PropsPatch};
+pub use purge::{PURGE_BATCH_MAX, Purged, purge_limit};
 pub use text::{
     BlockKind, DocumentText, StoredText, TEXT_MAX_BYTES, TextBlock, TextBuilder, TextOrigin,
     TextPage, TextZone,
 };
 pub use traits::{
     Backend, CacheStore, ClaimStore, FeedStore, FreshnessStore, GraphStore, MergeStore,
-    ProposalStore, RecordStore, SearchStore, SketchStore, sketch_limit,
+    ProposalStore, PurgeStore, RecordStore, SearchStore, SketchStore, sketch_limit,
 };
 pub use types::{
     ALIASES_MAX, Blake3, Candidates, Direction, Edge, EdgeCursor, EdgeKind, EdgeSource, EdgeState,

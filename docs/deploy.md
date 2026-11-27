@@ -182,6 +182,37 @@ stay, and no other instance can add or resume those sources. To move them:
    already there (in `error`, claimed by the old name). The new owner scans the whole bucket; a
    file whose record is already in the shared store is fetched and hashed, not analyzed again.
 
+## Privacy and deletion
+
+doewood keeps what it learned from a file after the file is gone: deleting an object, or
+`RemoveSource`, ends its locations, but the record (the facts, an LLM
+summary), the document's text, the search row, the Document node with its parties, and the companies found in it
+stay. To honour a deletion request, purge (issue #168; [api.md](api.md#purges), and
+[ingest.md](ingest.md#purges) for exactly what goes):
+
+- **A whole source:** `PurgeSource` with its id, on the instance that holds it. The source is
+  stopped at once and removed when the purge is done; what another source still holds (the
+  same content elsewhere) stays. Watch it with `WatchPurge` until `STATE_DONE`.
+- **Deleted objects:** delete them in the bucket and let the scan (or the SQS inlet) see it,
+  then `PurgeOrphans` on any one instance. It purges every record no location holds, for every
+  source, and the locations whose objects are gone. Run it on a schedule if deletions must take
+  effect within a bound; a pass reads every record and every location node, a batch of 200 at a
+  time.
+- **A source removed earlier:** its locations are still live. Add it again (`paused: true`, so
+  nothing is scanned) and `PurgeSource` it.
+
+A purge deletes the rows; Postgres frees their space for reuse at the next (auto)vacuum, and
+the bytes may stay in the data files, the WAL, replicas and backups until those turn over.
+SQLite reuses the pages; `VACUUM` the instance file to rewrite it. Plan the backup retention
+with the deletion deadline in mind. Purges are logged at INFO with the job and its counts, never
+with content.
+
+Not deleted: the merge log and dismissals (company ids and the evidence of merges), the
+registry cache (public registry answers), the instance's own scan state of live sources
+(`objects_seen`: keys, ETags, hashes), `known_content` (MD5 ETags, sizes and hashes) and a
+kept company's names and aliases (a company another document still names, or one a registry
+created).
+
 ## Load balancing
 
 A Kubernetes `ClusterIP` Service balances **TCP connections**, not calls. A gRPC client keeps

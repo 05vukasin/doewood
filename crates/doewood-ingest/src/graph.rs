@@ -280,7 +280,15 @@ impl GraphWriter {
         let similar_settings = similar_settings.into();
         let b = &self.backend;
         let hex = blake3.to_hex();
-        let doc = b.upsert_location(blake3, location).await?.document;
+        let located = b.upsert_location(blake3, location).await?;
+        if !located.record {
+            // A purge deleted the record between its write and this location (issue #168).
+            // The location now holds the document, so a retry stores the record and keeps it.
+            return Err(doewood_model::Error::NotFound(format!(
+                "the record of {hex} was purged while it was ingested"
+            )));
+        }
+        let doc = located.document;
         let title = facts.title.clone().unwrap_or_else(|| name.to_owned());
         // Only this document's own keys: whatever else is on the node stays.
         let patch = PropsPatch::new()

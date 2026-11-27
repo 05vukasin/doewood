@@ -10,10 +10,10 @@ use doewood_core::InstanceId;
 use doewood_model::{
     Backend, Blake3, Candidates, ClaimStore, Edge, EdgeCursor, EdgeKind, EdgeSource, Error,
     GraphStore, LiveEdge, Located, LocationEnded, MERGE_CHAIN_MAX, Neighbour, NeighbourQuery, Node,
-    NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PartyDocument, PropsPatch, PutOutcome, Record,
-    RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery, SearchStore, Sketch,
-    SketchStore, SourceClaim, SourceKey, StepVersions, StoredEdge, StoredText, band_to_i64,
-    merged_into, record_page_bytes, records_limit, sketch_limit, validate_alias,
+    NodeAlias, NodeKind, ObjectLocation, OwnedAlias, PartyDocument, PropsPatch, PurgeStore, Purged,
+    PutOutcome, Record, RecordStore, Result, SKETCH_MAX_BANDS, SearchDoc, SearchHit, SearchQuery,
+    SearchStore, Sketch, SketchStore, SourceClaim, SourceKey, StepVersions, StoredEdge, StoredText,
+    band_to_i64, merged_into, record_page_bytes, records_limit, sketch_limit, validate_alias,
     validate_alias_count, validate_batch_count, validate_hashes, validate_node, validate_sketch,
     versions_from_json, versions_to_json,
 };
@@ -121,10 +121,18 @@ const LIST_RECORDS_BATCH: usize = 8;
 /// superseded (the object was overwritten), and the `located_at` edge (`$10` to `$16`). The
 /// parts touch different rows, and the foreign keys are checked at the end of the statement,
 /// when the new nodes are there. Followed by [`EDGE_ON_CONFLICT`] and the final select.
-const UPSERT_LOCATION: &str = "WITH doc AS (INSERT INTO nodes (id, kind, key) \
-     VALUES ($1, 'document', $2) \
+///
+/// `rec` takes a share lock on the record first (issue #168): the nodes are inserted from a
+/// count over it, so it is read before them. A purge locks the record before it looks for
+/// live locations, so it either sees this location or has deleted the record, and then the
+/// final select says so (`Located::record`).
+const UPSERT_LOCATION: &str = "WITH rec AS (SELECT blake3 FROM records WHERE blake3 = $6 \
+     FOR KEY SHARE), \
+     doc AS (INSERT INTO nodes (id, kind, key) \
+     SELECT $1::uuid, 'document', $2::text FROM (SELECT count(*) FROM rec) r \
      ON CONFLICT ON CONSTRAINT nodes_kind_key DO UPDATE SET kind = EXCLUDED.kind RETURNING id), \
-     loc AS (INSERT INTO nodes (id, kind, key, props) VALUES ($3, 'location', $4, $5) \
+     loc AS (INSERT INTO nodes (id, kind, key, props) \
+     SELECT $3::uuid, 'location', $4::text, $5::jsonb FROM (SELECT count(*) FROM rec) r \
      ON CONFLICT ON CONSTRAINT nodes_kind_key \
      DO UPDATE SET props = EXCLUDED.props, updated_at = now() RETURNING id), \
      row AS (INSERT INTO locations (node_id, document_id, blake3, endpoint, bucket, object_key) \
@@ -636,6 +644,34 @@ impl RecordStore for PgStore {
         })
     }
 
+    async fn update_record(
+        &self,
+        blake3: &Blake3,
+        body: &RawValue,
+        versions: &StepVersions,
+    ) -> Result<bool> {
+        if has_nul_escape(body.get()) {
+            return Err(Error::Backend {
+                backend: "postgres",
+                message: "22P05: unsupported Unicode escape sequence (\\u0000 in a record)"
+                    .to_owned(),
+            });
+        }
+        let c = client(&self.pool).await?;
+        let n = c
+            .exec(
+                "UPDATE records SET body = $2, record = NULL, versions = $3, updated_at = now() \
+                 WHERE blake3 = $1",
+                &[
+                    &blake3.as_bytes().as_slice(),
+                    &body.get(),
+                    &versions_to_json(versions),
+                ],
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
     async fn get_record(&self, blake3: &Blake3) -> Result<Option<Record>> {
         let c = client(&self.pool).await?;
         c.opt(
@@ -1043,7 +1079,8 @@ impl GraphStore for PgStore {
         let row = c
             .one(
                 &format!(
-                    "{UPSERT_LOCATION}{EDGE_ON_CONFLICT}) SELECT doc.id, loc.id FROM doc, loc"
+                    "{UPSERT_LOCATION}{EDGE_ON_CONFLICT}) \
+                     SELECT doc.id, loc.id, EXISTS (SELECT 1 FROM rec) FROM doc, loc"
                 ),
                 &[
                     &Uuid::now_v7(),
@@ -1068,6 +1105,7 @@ impl GraphStore for PgStore {
         Ok(Located {
             document: row.try_get(0).map_err(pg)?,
             location: row.try_get(1).map_err(pg)?,
+            record: row.try_get(2).map_err(pg)?,
         })
     }
 
@@ -1381,6 +1419,26 @@ impl SketchStore for PgStore {
 }
 
 #[async_trait]
+impl PurgeStore for PgStore {
+    async fn purge_source_locations(&self, source: &SourceKey, limit: u32) -> Result<Purged> {
+        crate::purge::source_locations(&self.pool, source, limit).await
+    }
+
+    async fn purge_ended_locations(
+        &self,
+        source: Option<&SourceKey>,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<Purged> {
+        crate::purge::ended_locations(&self.pool, source, after, limit).await
+    }
+
+    async fn purge_orphan_records(&self, after: Option<&str>, limit: u32) -> Result<Purged> {
+        crate::purge::orphan_records(&self.pool, after, limit).await
+    }
+}
+
+#[async_trait]
 impl ClaimStore for PgStore {
     async fn claim_source(&self, key: &SourceKey, owner: &InstanceId) -> Result<SourceClaim> {
         let c = client(&self.pool).await?;
@@ -1446,6 +1504,25 @@ impl ClaimStore for PgStore {
 
     async fn source_owner(&self, key: &SourceKey) -> Result<Option<SourceClaim>> {
         source_owner(&client(&self.pool).await?, key).await
+    }
+
+    async fn overlapping_claims(&self, key: &SourceKey) -> Result<Vec<SourceClaim>> {
+        let c = client(&self.pool).await?;
+        let rows = c
+            .rows(
+                "SELECT owner, extract(epoch FROM claimed_at)::bigint, prefix FROM source_claims \
+                 WHERE endpoint = $1 AND bucket = $2 AND prefix <> $3 \
+                 AND (starts_with(prefix, $3) OR starts_with($3, prefix)) \
+                 ORDER BY prefix LIMIT 100",
+                &[&key.endpoint(), &key.bucket(), &key.prefix()],
+            )
+            .await?;
+        rows.iter()
+            .map(|r| {
+                let prefix: String = r.try_get(2).map_err(pg)?;
+                claim_from(&SourceKey::new(key.endpoint(), key.bucket(), prefix)?, r)
+            })
+            .collect()
     }
 
     async fn lease_company(
