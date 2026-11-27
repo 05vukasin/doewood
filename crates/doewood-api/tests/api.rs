@@ -2545,9 +2545,31 @@ async fn summarize_hands_requests_to_ingest() {
         .unwrap()
         .into_inner();
     assert_eq!(r.provider, "local");
+    // By BLAKE3 (issue #167): the hash goes to ingest as it is; a malformed one is refused.
+    let r = sum
+        .summarize(pb::SummarizeRequest {
+            input: Some(pb::summarize_request::Input::Blake3("cd".repeat(32))),
+            name: String::new(),
+            provider: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(r.digest, "A supply contract.");
+    for bad in ["", "not-a-hash"] {
+        let err = sum
+            .summarize(pb::SummarizeRequest {
+                input: Some(pb::summarize_request::Input::Blake3(bad.into())),
+                name: String::new(),
+                provider: String::new(),
+            })
+            .await
+            .unwrap_err();
+        invalid(&err, &["blake3"]);
+    }
     {
         let seen = fake.seen.lock().unwrap();
-        assert_eq!(seen.len(), 2);
+        assert_eq!(seen.len(), 3);
         assert!(matches!(
             &seen[0],
             (doewood_api::OnDemandInput::Location { key, .. }, Some(p)) if key == "in/a.pdf" && p == "local"
@@ -2555,6 +2577,10 @@ async fn summarize_hands_requests_to_ingest() {
         assert!(matches!(
             &seen[1],
             (doewood_api::OnDemandInput::Content { name, bytes }, None) if name == "a.txt" && bytes == b"text"
+        ));
+        assert!(matches!(
+            &seen[2],
+            (doewood_api::OnDemandInput::Stored { blake3 }, None) if blake3.to_hex() == "cd".repeat(32)
         ));
     }
     // Ingest's errors are statuses with their message.

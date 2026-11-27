@@ -8,10 +8,15 @@ package doewood.v1;
 service SummarizeService {
   // Summarizes one file now, with the named or the default AI provider. Errors:
   // - FAILED_PRECONDITION: no AI provider is configured (or the one used has no API key, or
-  //   no base URL where its preset needs one); the source's LLM policy is `off`; the file has
-  //   no text;
-  // - NOT_FOUND: the provider or the source does not exist;
-  // - UNAVAILABLE: ingest does not run on this instance, or the object cannot be read.
+  //   no base URL where its preset needs one); the source's LLM policy is `off` (with
+  //   `blake3`: no source of this instance with a policy that is not `off` holds the object);
+  //   the file has no text;
+  // - NOT_FOUND: the provider or the source does not exist, or (with `blake3`) doewood has no
+  //   record of that hash;
+  // - RESOURCE_EXHAUSTED: as many Summarize calls as IngestSettings.summarize_max_concurrent
+  //   allows are reading or analyzing a file;
+  // - UNAVAILABLE: ingest does not run on this instance, the object cannot be read, or the
+  //   records store is not connected.
   // A provider that fails or answers badly is not an error: the response is then the
   // extractive summary, with `extractive` set and the reason in `warnings`.
   rpc Summarize(SummarizeRequest) returns (SummarizeResponse);
@@ -30,9 +35,13 @@ message SummarizeRequest {
     bytes content = 1;
     // Or an object to fetch.
     S3Location location = 2;
+    // Or a document doewood has stored, by its BLAKE3 (64 hex digits): its stored record's
+    // digest is summarized as it is, with no fetch, no OCR and no analysis. One of this
+    // instance's sources must hold the object with an LLM policy that is not `off`.
+    string blake3 = 5;
   }
   // The file name; its extension picks the reader (`.pdf`, `.docx`, `.xlsx`, ...). Required
-  // with `content`; defaults to the key with `location`.
+  // with `content`; defaults to the key with `location`; ignored with `blake3`.
   string name = 3;
   // An AI provider name (see ConfigService.ListAiProviders); empty uses the default.
   string provider = 4;

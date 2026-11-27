@@ -247,6 +247,36 @@ impl Store {
         self.snapshot(|s| s.llm_usage(source, day))
     }
 
+    /// The first of this instance's sources (oldest first) whose LLM policy is not `off` and
+    /// that holds a live object with this content: what `Summarize` by BLAKE3 needs before it
+    /// sends a stored record anywhere (issue #167). Only those sources' objects are looked at,
+    /// so with every policy `off` nothing is read.
+    pub fn on_demand_source_of(&self, blake3: &[u8; 32]) -> Result<Option<SourceId>, StoreError> {
+        let allowed: Vec<SourceId> = self
+            .sources()?
+            .into_iter()
+            .filter(|s| s.llm_policy.allows_on_demand())
+            .map(|s| s.id)
+            .collect();
+        if allowed.is_empty() {
+            return Ok(None);
+        }
+        self.read(StoreError::from, |conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM objects_seen WHERE source_id = ?1 \
+                 AND blake3 = ?2 AND status <> 'deleted')",
+            )?;
+            for id in allowed {
+                if stmt.query_row(params![id.to_string(), &blake3[..]], |r| {
+                    r.get::<_, bool>(0)
+                })? {
+                    return Ok(Some(id));
+                }
+            }
+            Ok(None)
+        })
+    }
+
     /// Adds one call and its tokens to a source's spend on UTC day `day`; returns the day's
     /// total. Days before the previous one are dropped: only today's spend counts.
     pub fn add_llm_usage(
@@ -346,6 +376,47 @@ mod tests {
             .add_source(&NewSource::new("http://127.0.0.1:9000", "docs"), None)
             .unwrap();
         (store, id)
+    }
+
+    /// Issue #167: `Summarize` by BLAKE3 needs a source that holds a live object with that
+    /// content and whose policy is not `off`.
+    #[test]
+    fn on_demand_source_of_needs_a_policy_and_a_live_object() {
+        use crate::{IngestOutcome, LlmMode, LlmPolicy, ObjectChange, SeenObject};
+
+        let (store, id) = setup();
+        let (held, other) = ([7; 32], [8; 32]);
+        let obj = ObjectChange::Upsert(SeenObject {
+            key: "a.txt".into(),
+            etag: Some("e1".into()),
+            size: 1,
+            last_modified: None,
+        });
+        store
+            .record_objects(id, std::slice::from_ref(&obj), None)
+            .unwrap();
+        let done = IngestOutcome::Done { blake3: held };
+        assert!(store.finish_object(id, "a.txt", Some("e1"), &done).unwrap());
+        // The policy is off (the default): no source qualifies.
+        assert_eq!(store.on_demand_source_of(&held).unwrap(), None);
+        let on_demand = LlmPolicy {
+            mode: LlmMode::OnDemand,
+            ..LlmPolicy::default()
+        };
+        store.set_llm_policy(id, &on_demand).unwrap();
+        assert_eq!(store.on_demand_source_of(&held).unwrap(), Some(id));
+        assert_eq!(store.on_demand_source_of(&other).unwrap(), None);
+        // A deleted object no longer counts.
+        store
+            .record_objects(
+                id,
+                &[ObjectChange::Delete {
+                    key: "a.txt".into(),
+                }],
+                None,
+            )
+            .unwrap();
+        assert_eq!(store.on_demand_source_of(&held).unwrap(), None);
     }
 
     #[test]

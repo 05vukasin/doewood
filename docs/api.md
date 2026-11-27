@@ -151,7 +151,7 @@ The comments in the `.proto` files are the reference for every field. In short:
   the `similar_to` candidate query reads: 10 to 1000000 (default 1000), anything else is
   `INVALID_ARGUMENT`; a band key shared by more documents is skipped (issue #148, see
   [ingest.md](ingest.md)). `summarize_max_concurrent` is how many `Summarize`
-  calls read and analyze a file at once: 1 to 16 (default 2), anything else is
+  calls read and analyze a file (or read a stored record) at once: 1 to 16 (default 2), anything else is
   `INVALID_ARGUMENT`. It is read for every `Summarize` call, so it applies to the next one;
   calls in flight keep running.
 
@@ -393,16 +393,20 @@ grpcurl -plaintext -d "{\"job_id\": \"$JOB\"}" 127.0.0.1:7443 doewood.v1.JobsSer
 ### Summarize
 
 **Summarize** summarizes one file now, outside the LLM queue, and stores nothing (no record, no
-summary, no spend). Send the bytes (`content`, with `name`) or an object of a source
-(`location`); a source whose LLM policy is `LLM_MODE_OFF` is refused. `provider` names an AI
+summary, no spend). Send the bytes (`content`, with `name`), an object of a source
+(`location`), or the BLAKE3 of a document doewood has stored (`blake3`, 64 hex digits); a source
+whose LLM policy is `LLM_MODE_OFF` is refused. With `blake3` the stored record's digest is
+summarized as it is (no fetch, no OCR, no analysis): one of this instance's sources must hold
+the object with a policy other than `LLM_MODE_OFF` (else `FAILED_PRECONDITION`), and an unknown
+hash is `NOT_FOUND`. `provider` names an AI
 provider; empty uses the default. The answer has the summary (`digest`), the fact check of the
 model's output, the provider and model, the file's BLAKE3 and kind. When the provider fails or
 its output fails the fact check, the answer is quail's extractive summary with `extractive`
 set and the reason in `warnings`. Without a configured provider it answers
 `FAILED_PRECONDITION`. See [llm.md](llm.md).
 
-At most `summarize_max_concurrent` calls (an ingest setting, default 2) read and analyze a file
-at once. A call beyond that is answered `RESOURCE_EXHAUSTED` at once ("... Summarize analyses
+At most `summarize_max_concurrent` calls (an ingest setting, default 2) read and analyze a file,
+or read a stored record, at once. A call beyond that is answered `RESOURCE_EXHAUSTED` at once ("... Summarize analyses
 are in flight ...: retry later"); nothing waits in a queue. Retry with backoff. `content` is
 bounded by the message limit (`DOEWOOD_API_MAX_MESSAGE_MIB`, default 64 MiB), an object by its
 source's `max_object_bytes`; a file larger than ingest analyzes (512 MiB) is
@@ -416,6 +420,12 @@ jq -n --arg name report.pdf --rawfile b <(base64 -w0 report.pdf) '{name:$name, c
   | grpcurl -plaintext -d @ 127.0.0.1:7443 doewood.v1.SummarizeService/Summarize
 ```
 
+A stored document, by its BLAKE3 (from `RecordsService.ListRecords`, say):
+
+```sh
+grpcurl -plaintext -d "{\"blake3\": \"$BLAKE3\"}" 127.0.0.1:7443 doewood.v1.SummarizeService/Summarize
+```
+
 `"provider": "<name>"` in the request picks a provider other than the default. On macOS,
 `base64 -w0` is `base64 -i report.pdf`.
 
@@ -424,12 +434,12 @@ jq -n --arg name report.pdf --rawfile b <(base64 -w0 report.pdf) '{name:$name, c
 | code | when |
 |---|---|
 | `INVALID_ARGUMENT` | a field is wrong. Every problem is reported at once: the message lists `field: reason` pairs, and a `google.rpc.BadRequest` detail carries the same field paths (`credentials.access_key_id`, `llm_policy.kinds[2]`, ...). |
-| `NOT_FOUND` | the source, record, node or provider does not exist |
+| `NOT_FOUND` | the source, record, node or provider does not exist (also `Summarize` by an unknown `blake3`) |
 | `ALREADY_EXISTS` | the source exists on this instance, or another instance has claimed it (named in the message) |
-| `UNAVAILABLE` | the shared Postgres is not connected (yet), or a call to it failed; retry. `ReprocessJob` and `Summarize` on an instance without ingest; `Summarize` of an object that cannot be read. The server is overloaded: more calls are in flight than `max_calls_in_flight` (the message says `overloaded` and the trailer `grpc-retry-pushback-ms` says how long to wait; nothing ran, retry with backoff). |
+| `UNAVAILABLE` | the shared Postgres is not connected (yet), or a call to it failed; retry. `ReprocessJob` and `Summarize` on an instance without ingest; `Summarize` of an object that cannot be read, or by `blake3` while the records store is not connected. The server is overloaded: more calls are in flight than `max_calls_in_flight` (the message says `overloaded` and the trailer `grpc-retry-pushback-ms` says how long to wait; nothing ran, retry with backoff). |
 | `DEADLINE_EXCEEDED` | the call ran longer than the server's deadline (`deadline_seconds`, default 60 s), or than the client's own deadline |
 | `CANCELLED` | the client's `grpc-timeout` ran out on the server side (the client usually reports its own `DEADLINE_EXCEEDED` first) |
-| `FAILED_PRECONDITION` | the shared database was migrated by a newer doewood. A merge of a dismissed pair or of a merged-away company; an undo that later merges depend on (named in the message), of an entry already undone, or of a split that dismissed its pair; a dismissal of two companies merged now. `Summarize` without a configured AI provider (or with one missing its key or base URL), of a source whose LLM policy is off, of a file without text, or of a file larger than ingest analyzes |
+| `FAILED_PRECONDITION` | the shared database was migrated by a newer doewood. A merge of a dismissed pair or of a merged-away company; an undo that later merges depend on (named in the message), of an entry already undone, or of a split that dismissed its pair; a dismissal of two companies merged now. `Summarize` without a configured AI provider (or with one missing its key or base URL), of a source whose LLM policy is off (by `blake3`: of a document no source with a policy other than off holds), of a file without text, or of a file larger than ingest analyzes |
 | `RESOURCE_EXHAUSTED` | `Summarize` while as many calls as `summarize_max_concurrent` allows are reading or analyzing a file; retry later |
 | `OUT_OF_RANGE` | a message larger than the limit |
 | `INTERNAL` | anything else; the details are in the server log, not in the message |

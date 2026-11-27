@@ -374,8 +374,9 @@ message ListAiProvidersResponse {
 message IngestSettings {
   // Least MinHash Jaccard estimate for a `similar_to` edge: above 0, at most 1. Default 0.8.
   double similar_min_jaccard = 1;
-  // On-demand `Summarize` analyses (with the object read before them) that run at once: 1 to
-  // 16. Default 2. A call beyond it is refused at once with RESOURCE_EXHAUSTED.
+  // On-demand `Summarize` analyses (with the object read before them), or reads of a stored
+  // record (`blake3`), that run at once: 1 to 16. Default 2. A call beyond it is refused at
+  // once with RESOURCE_EXHAUSTED.
   uint32 summarize_max_concurrent = 2;
   // Largest LSH band bucket the `similar_to` candidate query reads: a band key shared by more
   // documents is skipped as a template's boilerplate (the "stop band"). 10 to 1000000.
