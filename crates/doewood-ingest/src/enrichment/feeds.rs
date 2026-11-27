@@ -16,7 +16,7 @@
 //! ([`FeedStore::lease_feed`]), renewed while it reads. The feed's cursor (where it stopped)
 //! and its next run are kept there too, so another instance carries on after a restart or a
 //! crash (an abandoned lease expires). An instance where a feed is switched off never takes
-//! its lease.
+//! its lease; one switched off while reading stops the run and gives the lease back at once.
 //!
 //! **Failure-soft:** a failed run is a warning (logged, counted in `failures`); the cursor
 //! stays where it was and the feed is tried again after the retry interval.
@@ -327,20 +327,19 @@ impl Run<'_> {
 
 impl Enrichment {
     /// Runs `feed` once now if its next run has come (and its lease is free): what the feed's
-    /// loop does on every tick. Returns whether this instance holds the lease afterwards.
+    /// loop does on every tick. Returns whether this instance holds the lease afterwards. A
+    /// feed switched off gives its lease up (when this instance held it) and shows off.
     pub async fn run_feed(&self, feed: Feed, backend: &Arc<dyn Backend>) -> bool {
         let Some(settings) = self.settings().await else {
             return false;
         };
-        let on = feed.enabled(&settings);
-        self.inner.feed_counters[feed.index()]
-            .enabled
-            .store(on, Ordering::Relaxed);
-        if !on {
+        self.note_feed_switches(&settings);
+        let owner = self.inner.instance.clone();
+        if !feed.enabled(&settings) {
+            let _ = backend.release_feed(feed.as_str(), &owner).await;
             return false;
         }
         let (_tx, rx) = watch::channel(false);
-        let owner = self.inner.instance.clone();
         let holding = self.feed_once(feed, backend, &settings, &owner, &rx).await;
         self.inner.feed_counters[feed.index()]
             .leader
@@ -354,10 +353,38 @@ impl Enrichment {
         self.inner.feed_counters[feed.index()].snapshot(feed)
     }
 
-    /// Runs one feed's loop until shutdown.
+    /// Records which feeds `settings` switch on (each loop and each pass reads them): a feed
+    /// switched off shows `enabled: false, leader: false` at once, and its loop stops its run
+    /// and gives up the lease (issue #174).
+    pub(crate) fn note_feed_switches(&self, settings: &EnrichmentConfig) {
+        let on = Feed::ALL.map(|f| f.enabled(settings));
+        let mut moved = false;
+        for f in Feed::ALL {
+            let c = &self.inner.feed_counters[f.index()];
+            let now = on[f.index()];
+            moved |= c.enabled.swap(now, Ordering::Relaxed) != now;
+            if !now {
+                moved |= c.leader.swap(false, Ordering::Relaxed);
+            }
+        }
+        self.inner.feed_switches.send_if_modified(|s| {
+            let modified = *s != on;
+            *s = on;
+            modified
+        });
+        if moved {
+            self.changed();
+        }
+    }
+
+    /// Runs one feed's loop until shutdown. The settings are read on every tick and by every
+    /// pass; when they switch the feed off, a run in progress is stopped (its progress
+    /// dropped, as when the lease is lost) and the lease given up at once.
     pub(crate) async fn feed_loop(&self, feed: Feed, mut shutdown: watch::Receiver<bool>) {
         let options = self.inner.options.feeds.clone();
         let owner = self.inner.instance.clone();
+        let name = feed.as_str();
+        let mut switches = self.inner.feed_switches.subscribe();
         let mut holding = false;
         loop {
             if *shutdown.borrow() {
@@ -365,6 +392,11 @@ impl Enrichment {
             }
             let backend = self.inner.backend.borrow().clone();
             let settings = self.settings().await;
+            if let Some(s) = &settings {
+                self.note_feed_switches(s);
+            }
+            // This loop has seen the switches it just set.
+            switches.borrow_and_update();
             let on = settings.as_ref().is_some_and(|s| feed.enabled(s));
             let counters = &self.inner.feed_counters[feed.index()];
             if counters.enabled.swap(on, Ordering::Relaxed) != on {
@@ -372,11 +404,23 @@ impl Enrichment {
             }
             if let (Some(backend), Some(settings)) = (backend, settings) {
                 if on {
-                    holding = self
-                        .feed_once(feed, &backend, &settings, &owner, &shutdown)
-                        .await;
+                    let off = async {
+                        if switches.wait_for(|s| !s[feed.index()]).await.is_err() {
+                            std::future::pending::<()>().await;
+                        }
+                    };
+                    tokio::select! {
+                        h = self.feed_once(feed, &backend, &settings, &owner, &shutdown) => {
+                            holding = h;
+                        }
+                        () = off => {
+                            info!(feed = name, "feed switched off; its run is stopped");
+                            let _ = backend.release_feed(name, &owner).await;
+                            holding = false;
+                        }
+                    }
                 } else if holding {
-                    let _ = backend.release_feed(feed.as_str(), &owner).await;
+                    let _ = backend.release_feed(name, &owner).await;
                     holding = false;
                 }
                 if counters.leader.swap(holding, Ordering::Relaxed) != holding {
@@ -385,12 +429,14 @@ impl Enrichment {
             }
             tokio::select! {
                 () = tokio::time::sleep(options.tick) => {}
+                // A switch moved (a pass read new settings): look again now.
+                _ = switches.changed() => {}
                 _ = shutdown.wait_for(|s| *s) => break,
             }
         }
         let backend = self.inner.backend.borrow().clone();
         if holding && let Some(b) = backend {
-            let _ = b.release_feed(feed.as_str(), &owner).await;
+            let _ = b.release_feed(name, &owner).await;
         }
     }
 

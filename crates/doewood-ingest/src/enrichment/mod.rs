@@ -202,6 +202,9 @@ struct Inner {
     edgar_www_url: String,
     on_change: Arc<dyn Fn(EnrichmentStats) + Send + Sync>,
     wake: Notify,
+    /// Which feeds the settings last read switch on (in [`Feed::ALL`]'s order): a feed's loop
+    /// stops its run when its switch goes off, and looks again when any switch moves.
+    feed_switches: watch::Sender<[bool; 4]>,
     /// The companies this instance's tasks work on now: a lease is the instance's, so this
     /// keeps two of its own tasks off one company (a merge takes the other company too).
     busy: Busy,
@@ -301,6 +304,7 @@ impl Enrichment {
                 edgar_www_url,
                 on_change: parts.on_change,
                 wake: Notify::new(),
+                feed_switches: watch::Sender::new([false; 4]),
                 busy: Busy::default(),
             }),
         }
@@ -384,6 +388,8 @@ impl Enrichment {
         let Some(settings) = self.settings().await else {
             return 0;
         };
+        // A feed switched off since its loop last looked shows off now, and stops (#174).
+        self.note_feed_switches(&settings);
         let (clients, warnings) = self.inner.clients.lock().await.clients(&settings);
         for w in &warnings {
             warn!(registry = %w.registry, warning = %w.kind, "registry client not built; it is skipped");
