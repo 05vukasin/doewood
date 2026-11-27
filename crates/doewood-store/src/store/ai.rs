@@ -496,7 +496,7 @@ mod tests {
     /// write nothing; a changed key, model, base URL or default applies at once.
     #[test]
     fn set_ai_provider_is_idempotent() {
-        use crate::{LlmJobStatus, LlmMode, LlmPolicy, NewSource};
+        use crate::{LlmJobStatus, NewSource};
 
         let store = Store::open_in_memory(&MasterKey::from_bytes([5; 32])).unwrap();
         let source = store
@@ -548,11 +548,11 @@ mod tests {
         );
         assert!(!store.apply_ai_provider(&mock, &k2, true).unwrap().changed);
         // So do a new model and a new base URL.
-        let changes: [fn(&mut AiProviderInput); 2] = [
+        let edits: [fn(&mut AiProviderInput); 2] = [
             |m| m.model = "test-model-2".into(),
             |m| m.base_url = Some("http://127.0.0.1:10/v1".into()),
         ];
-        for change in changes {
+        for change in edits {
             change(&mut mock);
             backdate(&store);
             let changed = store
@@ -579,37 +579,36 @@ mod tests {
         // The default flag: a second provider takes it only when asked, and asking again for
         // it is a no-op.
         let other = input("other", "openai");
-        assert!(
+        let set = |make_default| {
             store
-                .apply_ai_provider(&other, &KeyChange::Keep, false)
+                .apply_ai_provider(&other, &KeyChange::Keep, make_default)
                 .unwrap()
-                .changed
-        );
-        assert!(
-            !store
-                .apply_ai_provider(&other, &KeyChange::Keep, false)
-                .unwrap()
-                .changed
-        );
+        };
+        assert!(set(false).changed && !set(false).changed);
         assert_eq!(
             store.default_ai_provider().unwrap().as_deref(),
             Some("mock")
         );
-        let moved = store
-            .apply_ai_provider(&other, &KeyChange::Keep, true)
-            .unwrap();
-        assert!(moved.changed && moved.value.is_default);
-        assert!(
-            !store
-                .apply_ai_provider(&other, &KeyChange::Keep, true)
-                .unwrap()
-                .changed
-        );
+        let moved = set(true);
+        assert!(moved.changed && moved.value.is_default && !set(true).changed);
         assert_eq!(store.ai_providers().unwrap().len(), 2);
-        // No call above touched a job.
-        assert_eq!(store.pending_llm_jobs(10).unwrap().len(), 1);
+        assert_eq!(
+            store.pending_llm_jobs(10).unwrap().len(),
+            1,
+            "no job touched"
+        );
+    }
 
-        // SetLlmPolicy: the same policy writes nothing; a new one applies.
+    /// Issue #144, for `SetLlmPolicy`: the same policy writes nothing; a new one applies.
+    #[test]
+    fn set_llm_policy_is_idempotent() {
+        use crate::{LlmMode, LlmPolicy, NewSource};
+
+        let store = Store::open_in_memory(&MasterKey::from_bytes([5; 32])).unwrap();
+        let source = store
+            .add_source(&NewSource::new("http://127.0.0.1:9000", "docs"), None)
+            .unwrap();
+        store.queue_llm_job(source, &[1; 32], None).unwrap();
         let policy = LlmPolicy {
             mode: LlmMode::Kinds(vec!["contract".into(), "invoice".into()]),
             concurrency: 2,

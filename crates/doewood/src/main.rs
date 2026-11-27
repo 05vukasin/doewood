@@ -31,7 +31,7 @@ struct Cli {
 enum Command {
     /// Run the service. Needs no configuration: every bootstrap value has a default.
     Serve,
-    /// Exit 0 when the local instance is ready (`/readyz` on DOEWOOD_OPS_LISTEN answers 200
+    /// Exit 0 when the local instance is ready (`/readyz` on the ops address answers 200
     /// within 2 s), else 1 with the reason on stderr. For container health checks.
     Health,
     /// Print the version.
