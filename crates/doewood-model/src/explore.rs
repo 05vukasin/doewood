@@ -117,7 +117,8 @@ pub fn cap(value: u32, default: u32, max: u32) -> u32 {
 pub struct CompanyFilter {
     /// The name starts with this, ignoring case (lowercased; on SQLite only ASCII letters).
     pub name_prefix: Option<String>,
-    /// The `jurisdiction` prop is this, ignoring ASCII case.
+    /// The `jurisdiction` prop is this, ignoring ASCII case, or one of its subdivisions: `US`
+    /// finds `US` and `US-CA`.
     pub jurisdiction: Option<String>,
     /// It owns an identifier alias (`id:<kind>:<value>`), or owns none.
     pub has_identifier: Option<bool>,

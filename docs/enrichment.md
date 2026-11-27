@@ -157,7 +157,15 @@ the two, or recorded a proposal). Former names become learned aliases (`name:<ke
 
 **Props** of the company: `registry.<name>` (each registry's facts and fetch date: status,
 legal form, registered name, events), `ids` and `registry_ids`, `legal_name`, `former_names` (at
-most 20), `website`, `icon` and `enriched_at`. The proposals lists of schema 4
+most 20), `website`, `icon` and `enriched_at`. The `jurisdiction` is one ISO 3166 code (`RS`,
+or `US-CA` where the subdivision is known; see [ingest.md](ingest.md#company-props)): EDGAR's
+state of incorporation fills it when it is missing, or refines a bare country (`US` becomes
+`US-CA`). In an SEC source a two-letter code is a US state when it is one (`CA` is California,
+`US-CA`, never Canada), and EDGAR's `A0`–`B0` are the Canadian provinces (`CA-ON`); the
+EDGAR facts keep `state_of_incorporation` as given next to the normalised `jurisdiction`, and
+an Exhibit 21 edge has `jurisdiction` (normalised, or null) and `jurisdiction_as_written`. A
+stored value that is no single code (`us|ca`, written before issue #201) is replaced by the
+registry's, else removed. The proposals lists of schema 4
 (`merge_proposals`, `registry_proposals`) are removed when the job writes (the migration
 moved them, and an undo of an older merge can bring them back). The document name (`name`) is kept. The job writes only these keys, as one
 atomic patch (`GraphStore::update_live_props`, see [ingest.md](ingest.md#company-props)), so what

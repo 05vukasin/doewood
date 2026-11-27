@@ -207,7 +207,12 @@ fn list_sql(
     }
     if let Some(j) = filter.jurisdiction_key() {
         let j = args.push(j);
-        let _ = write!(w, " AND upper(n.props->>'jurisdiction') = {j}");
+        // The country also finds its subdivisions: `US` finds `US-CA`.
+        let _ = write!(
+            w,
+            " AND (upper(n.props->>'jurisdiction') = {j} \
+             OR starts_with(upper(n.props->>'jurisdiction'), ({j}::text || '-')))"
+        );
     }
     if let Some(has) = filter.has_identifier {
         let _ = write!(

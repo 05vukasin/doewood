@@ -507,7 +507,10 @@ anywhere.
 
 Ingest and the enrichment job write the same company nodes, each only its own keys (ingest:
 `name`, `key`, `legal_form`, `jurisdiction`, `names`, `quail_keys`, `ids.<kind>`; the
-document's `format`, `title`, `kind` and `numbers`). A writer never reads,
+document's `format`, `title`, `kind` and `numbers`). The `jurisdiction` is one ISO 3166
+code, uppercase: a country (`RS`) or a subdivision (`US-CA`). Ingest writes quail's party
+jurisdiction only when it is one code; quail's list of candidates (`us|ca` for an `Inc.`:
+the US or Canada) is written as none. A writer never reads,
 changes and writes back the whole props: it sends a `PropsPatch` (set, set if missing, remove,
 add to a capped set, push to a capped list replacing the same entry) to
 `GraphStore::update_props`, which applies it to the props as stored, with the node row locked,

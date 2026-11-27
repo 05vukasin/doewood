@@ -536,7 +536,8 @@ message CompanyFilter {
   // The name starts with this, ignoring case (on the instance store only ASCII letters); at
   // most 200 bytes.
   string name_prefix = 1;
-  // The `jurisdiction` prop (`GB`, `RS`), ignoring ASCII case; at most 16 bytes.
+  // The `jurisdiction` prop (`GB`, `RS`, `US-CA`), ignoring ASCII case; a country also finds
+  // its subdivisions (`US` finds `US-CA`). At most 16 bytes.
   string jurisdiction = 2;
   // Set: only companies with (true) or without (false) an identifier (LEI, VAT, ...).
   optional bool has_identifier = 3;

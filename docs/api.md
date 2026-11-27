@@ -307,7 +307,8 @@ refused: the workbook has more than 1,600,000 cells ...`, and how to raise the c
   - **ListCompanies** lists live companies (merged-away husks never), with id, name, other
     names, identifiers (`lei`, `vat`, ...), jurisdiction, website, favicon domain (for
     `GET /icons/{domain}`), document count, degree and whether they were enriched. Filter by
-    name prefix (ignoring case), jurisdiction, having an identifier, and enriched or not;
+    name prefix (ignoring case), jurisdiction (ignoring case; a country also finds its
+    subdivisions, so `US` finds `US-CA`), having an identifier, and enriched or not;
     order by documents, degree (most first; ties by id, descending) or name. Pages as
     ListRecords: `page_size` default 50, at most 1000, a 3 MiB budget; a token only goes with
     the order it came from.
