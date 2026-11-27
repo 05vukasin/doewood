@@ -397,7 +397,10 @@ fn order_blind_corpus() -> Vec<Doc> {
         doc("e2", &[("EPSILON DOO", &[])]),
         doc(SPLIT, &[("Epsilon d.o.o.", &[])]),
         // A learned alias.
-        doc("z1", &[("Zeta Trade d.o.o. (formerly Omega Trade d.o.o.)", &[])]),
+        doc(
+            "z1",
+            &[("Zeta Trade d.o.o. (formerly Omega Trade d.o.o.)", &[])],
+        ),
         doc("z2", &[("Zeta Trade d.o.o.", &[])]),
         doc("z3", &[("Zeta Trade d.o.o.", &[]), ("Beta d.o.o.", &[])]),
     ]
@@ -431,7 +434,11 @@ async fn overlapping_parties_give_the_graph_of_one_worker() {
         let split = &one["documents"][SPLIT];
         assert_eq!(split.as_array().unwrap().len(), 1, "{kind}: {split}");
         assert!(!split[0]["dismissed"].is_null(), "{kind}: {split}");
-        assert_eq!(one["blocked"], json!(["blind:epsilon", "blind:gama"]), "{kind}");
+        assert_eq!(
+            one["blocked"],
+            json!(["blind:epsilon", "blind:gama"]),
+            "{kind}"
+        );
         for round in 0..rounds() {
             let order = shuffled(&docs, round as u64);
             let many = run_once(kind, &order, WORKERS).await;

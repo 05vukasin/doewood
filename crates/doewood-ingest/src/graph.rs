@@ -184,7 +184,9 @@ enum PartyGuard<'a> {
         _all: RwLockReadGuard<'a, ()>,
         _stripes: Vec<MutexGuard<'a, ()>>,
     },
-    All { _all: RwLockWriteGuard<'a, ()> },
+    All {
+        _all: RwLockWriteGuard<'a, ()>,
+    },
 }
 
 impl PartyGuard<'_> {
