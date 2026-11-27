@@ -2,7 +2,6 @@
 //! counters.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use doewood_core::{InstanceId, SourceId};
@@ -29,7 +28,8 @@ pub struct ApiOptions {
     pub progress_interval: Duration,
     /// `serve` with a shared store: the sources are re-claimed at start
     /// ([`crate::reclaim_sources`]). Until that pass finishes no scanner starts through the
-    /// API, and resuming a source claims it first. Off standalone (the default).
+    /// API, resuming a source claims it first, and ingest holds its work (the store's
+    /// [`doewood_store::ClaimView`]). Off standalone (the default).
     pub shared_claims: bool,
 }
 
@@ -81,8 +81,6 @@ struct Inner {
     /// Serializes source changes (add, update, remove), so a claim and the row that owns it
     /// never race.
     sources: tokio::sync::Mutex<()>,
-    /// Whether the start-up claim pass has finished (always, without shared claims).
-    claims_checked: AtomicBool,
     /// The per-call limits in effect (`SetApiSettings`); the stored ones once `serve` read
     /// them, the defaults before.
     call_limits: Arc<CallLimits>,
@@ -93,7 +91,10 @@ struct Inner {
 impl ApiState {
     /// The state of an API built from these parts.
     pub fn new(parts: ApiParts) -> Self {
-        let claims_checked = AtomicBool::new(!parts.options.shared_claims);
+        // Until the start-up claim pass has run, ingest holds its work (the store's claim view).
+        if parts.options.shared_claims {
+            parts.store.claims().expect_check();
+        }
         let discovery = parts.discovery.clone();
         let snapshots = Snapshots::new(
             Arc::clone(&parts.store),
@@ -107,7 +108,6 @@ impl ApiState {
                 parts,
                 snapshots,
                 sources: tokio::sync::Mutex::new(()),
-                claims_checked,
                 call_limits: Arc::new(CallLimits::new(doewood_store::ApiSettings::default())),
                 metrics: Arc::new(ApiMetrics::new()),
             }),
@@ -134,11 +134,11 @@ impl ApiState {
 
     /// Whether the start-up claim pass has finished.
     pub(crate) fn claims_checked(&self) -> bool {
-        self.inner.claims_checked.load(Ordering::Acquire)
+        self.inner.parts.store.claims().is_checked()
     }
 
     pub(crate) fn claims_done(&self) {
-        self.inner.claims_checked.store(true, Ordering::Release);
+        self.inner.parts.store.claims().set_checked();
     }
 
     /// Registers the API's metrics (`doewood_grpc_*`, `doewood_icons_requests_total`) on

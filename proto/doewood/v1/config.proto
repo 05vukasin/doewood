@@ -22,6 +22,14 @@ service ConfigService {
   rpc ResumeSource(ResumeSourceRequest) returns (Source);
   // Removes a source with its progress and credentials, and releases its claim.
   rpc RemoveSource(RemoveSourceRequest) returns (RemoveSourceResponse);
+  // Releases the claim on a source in the shared store, whichever instance owns it, so that
+  // another instance can add or resume it: for an owner that is gone for good (docs/deploy.md,
+  // "A dead instance"). Only the claim row is deleted; nothing is taken over, and the owner's
+  // own copy of the source is not touched. `owner` must name the instance that holds the
+  // claim, else FAILED_PRECONDITION and nothing changes. Idempotent: with no claim on the
+  // source, OK with `released` false. A claim this instance holds for one of its own sources is
+  // refused with FAILED_PRECONDITION: remove the source instead.
+  rpc ReleaseSourceClaim(ReleaseSourceClaimRequest) returns (ReleaseSourceClaimResponse);
   // This instance's sources, oldest first.
   rpc ListSources(ListSourcesRequest) returns (ListSourcesResponse);
   // One source.
@@ -256,6 +264,25 @@ message RemoveSourceRequest {
 message RemoveSourceResponse {
   // Whether this instance held a claim on the source in the shared store and released it.
   bool claim_released = 1;
+}
+
+message ReleaseSourceClaimRequest {
+  // The source's identity, as in AddSourceRequest; the endpoint is normalized the same way.
+  string endpoint = 1;
+  string bucket = 2;
+  string prefix = 3;
+  // The instance that holds the claim (its `DOEWOOD_INSTANCE_ID`), as named by the
+  // `claimed by instance ...` reason or the ALREADY_EXISTS error. Required.
+  string owner = 4;
+}
+
+message ReleaseSourceClaimResponse {
+  // Whether a claim was deleted; false when nobody held one.
+  bool released = 1;
+  // The instance whose claim was deleted; empty when none was.
+  string owner = 2;
+  // When it had claimed the source, in Unix seconds; 0 when no claim was deleted.
+  int64 claimed_at = 3;
 }
 
 message ListSourcesRequest {}

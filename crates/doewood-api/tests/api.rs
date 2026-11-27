@@ -3404,3 +3404,211 @@ async fn neighbours_and_company_documents_page() {
         shared.drop_schema().await;
     }
 }
+
+fn release_request(endpoint: &str, bucket: &str, owner: &str) -> pb::ReleaseSourceClaimRequest {
+    pb::ReleaseSourceClaimRequest {
+        endpoint: endpoint.into(),
+        bucket: bucket.into(),
+        prefix: String::new(),
+        owner: owner.into(),
+    }
+}
+
+/// Issue #24: `ReleaseSourceClaim` deletes a claim whose owner is gone, through another
+/// instance; it is idempotent, names the owner it released, refuses a wrong owner and this
+/// instance's own source, and another instance can then take the bucket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dead_instances_claim_is_released_and_taken_over() {
+    use doewood_store::SourceState as S;
+    for shared in Shared::all().await {
+        let name = shared.name;
+        let endpoint = format!("http://127.0.0.1:{}", closed_port().await);
+        let key = doewood_model::SourceKey::new(&endpoint, "orphan", "").unwrap();
+        // inst-a claims the source, then is gone for good.
+        let a = Instance::start("inst-a", Some(shared.backend.clone())).await;
+        let mut req = add_request(&endpoint, "orphan", "");
+        req.paused = true;
+        config(&a.channel().await)
+            .add_source(req.clone())
+            .await
+            .unwrap();
+        a.stop().await;
+
+        let b = Instance::start_with(
+            "inst-b",
+            Some(shared.backend.clone()),
+            Options {
+                shared_claims: true,
+                ..Options::default()
+            },
+        )
+        .await;
+        let chb = b.channel().await;
+        let conflict = local_source(&b, &endpoint, "orphan", S::Active);
+        let mine = local_source(&b, &endpoint, "mine", S::Paused);
+        doewood_api::reclaim_sources(&b.state, b.shutdown_rx())
+            .await
+            .unwrap();
+        let id: doewood_core::SourceId = conflict.parse().unwrap();
+        assert_eq!(
+            b.store
+                .claims()
+                .owner_elsewhere(id)
+                .map(|o| o.as_str().to_owned()),
+            Some("inst-a".to_owned()),
+            "{name}: the claim view knows the owner"
+        );
+
+        // Validation: every field at once.
+        let err = config(&chb)
+            .release_source_claim(pb::ReleaseSourceClaimRequest::default())
+            .await
+            .unwrap_err();
+        invalid(&err, &["endpoint", "bucket", "owner"]);
+        // A wrong owner changes nothing.
+        let err = config(&chb)
+            .release_source_claim(release_request(&endpoint, "orphan", "inst-c"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition, "{name}: {err:?}");
+        assert!(err.message().contains("\"inst-a\""), "{}", err.message());
+        assert!(shared.backend.source_owner(&key).await.unwrap().is_some());
+        // This instance's own source: remove it instead.
+        let err = config(&chb)
+            .release_source_claim(release_request(&endpoint, "mine", "inst-b"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition, "{name}: {err:?}");
+        assert!(err.message().contains(&mine), "{}", err.message());
+
+        // The release, spelled differently: the endpoint is normalized.
+        let claim = shared.backend.source_owner(&key).await.unwrap().unwrap();
+        let loud = endpoint.replace("http://", "HTTP://") + "/";
+        let released = config(&chb)
+            .release_source_claim(release_request(&loud, "orphan", "inst-a"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            released,
+            pb::ReleaseSourceClaimResponse {
+                released: true,
+                owner: "inst-a".into(),
+                claimed_at: claim.claimed_at,
+            },
+            "{name}"
+        );
+        assert_eq!(shared.backend.source_owner(&key).await.unwrap(), None);
+        // Idempotent.
+        let again = config(&chb)
+            .release_source_claim(release_request(&endpoint, "orphan", "inst-a"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(again, pb::ReleaseSourceClaimResponse::default(), "{name}");
+
+        // Takeover: resuming claims it for inst-b and scans it.
+        config(&chb)
+            .resume_source(pb::ResumeSourceRequest {
+                source_id: conflict.clone(),
+            })
+            .await
+            .unwrap();
+        let s = get_source(&chb, &conflict).await;
+        assert_eq!(s.state, pb::SourceState::Active as i32, "{name}");
+        assert!(s.scanner_running);
+        assert_eq!(b.store.claims().owner_elsewhere(id), None, "{name}");
+        let owner = shared.backend.source_owner(&key).await.unwrap().unwrap();
+        assert_eq!(owner.owner.as_str(), "inst-b");
+        // inst-a comes back: it cannot take the bucket again, and drops its work for it.
+        let a = Instance::start_with(
+            "inst-a",
+            Some(shared.backend.clone()),
+            Options {
+                shared_claims: true,
+                ..Options::default()
+            },
+        )
+        .await;
+        let back = local_source(&a, &endpoint, "orphan", S::Active);
+        let found = doewood_api::reclaim_sources(&a.state, a.shutdown_rx())
+            .await
+            .unwrap();
+        assert_eq!(found.conflicts, 1, "{name}");
+        let back_id: doewood_core::SourceId = back.parse().unwrap();
+        assert!(a.store.claims().owner_elsewhere(back_id).is_some());
+        // A release by the new owner's name, through the old owner: still idempotent and exact.
+        let err = config(&a.channel().await)
+            .release_source_claim(release_request(&endpoint, "orphan", "inst-a"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition, "{name}: {err:?}");
+        a.stop().await;
+        b.stop().await;
+        shared.drop_schema().await;
+    }
+}
+
+/// Issue #25: webhook notifications for a source another instance owns are accepted, counted as
+/// ignored and queue nothing; once this instance holds the claim again, they are queued.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn webhooks_for_a_source_claimed_elsewhere_are_ignored() {
+    use doewood_store::SourceState as S;
+    const PUT: &str = r#"{"Records":[{"eventName":"s3:ObjectCreated:Put",
+      "s3":{"bucket":{"name":"hooked"},"object":{"key":"a.pdf","size":42,"eTag":"0123"}}}]}"#;
+    for shared in Shared::all().await {
+        let name = shared.name;
+        let endpoint = format!("http://127.0.0.1:{}", closed_port().await);
+        let a = Instance::start("inst-a", Some(shared.backend.clone())).await;
+        let mut req = add_request(&endpoint, "hooked", "");
+        req.paused = true;
+        let owned = config(&a.channel().await)
+            .add_source(req)
+            .await
+            .unwrap()
+            .into_inner();
+        let b = Instance::start_with(
+            "inst-b",
+            Some(shared.backend.clone()),
+            Options {
+                shared_claims: true,
+                ..Options::default()
+            },
+        )
+        .await;
+        let id: doewood_core::SourceId = local_source(&b, &endpoint, "hooked", S::Active)
+            .parse()
+            .unwrap();
+        doewood_api::reclaim_sources(&b.state, b.shutdown_rx())
+            .await
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let inlet = doewood_s3::inlet::webhook::WebhookInlet::new(Arc::clone(&b.store), tx);
+        let out = inlet.handle(id, PUT.as_bytes()).await.unwrap();
+        assert_eq!((out.emitted, out.ignored), (0, 1), "{name}");
+        assert!(rx.try_recv().is_err(), "{name}: nothing queued");
+        assert!(b.store.seen_object(id, "a.pdf").unwrap().is_none());
+        assert_eq!(b.store.claims().drops().events, 1, "{name}");
+
+        // inst-a gives the source up and inst-b resumes it: the same notification is queued.
+        config(&a.channel().await)
+            .remove_source(pb::RemoveSourceRequest {
+                source_id: owned.id,
+            })
+            .await
+            .unwrap();
+        config(&b.channel().await)
+            .resume_source(pb::ResumeSourceRequest {
+                source_id: id.to_string(),
+            })
+            .await
+            .unwrap();
+        let out = inlet.handle(id, PUT.as_bytes()).await.unwrap();
+        assert_eq!((out.emitted, out.ignored), (1, 0), "{name}");
+        assert_eq!(rx.recv().await.unwrap().key, "a.pdf");
+        assert_eq!(b.store.claims().drops().events, 1);
+        a.stop().await;
+        b.stop().await;
+        shared.drop_schema().await;
+    }
+}

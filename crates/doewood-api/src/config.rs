@@ -1,7 +1,7 @@
 //! `ConfigService`: sources, LLM policies, AI providers, ingest's and enrichment's settings.
 //! Every change applies without a restart; secrets are write-only.
 
-use doewood_core::SourceId;
+use doewood_core::{InstanceId, SourceId};
 use doewood_model::SourceKey;
 use doewood_store::{
     AI_PRESETS, AiProviderInput, ApiKey, ApiSettingsPatch, CredentialsChange,
@@ -19,9 +19,10 @@ use crate::pb::{
     AddSourceRequest, AiProvider, ApiSettings, EnrichmentSettings, GetApiSettingsRequest,
     GetEnrichmentSettingsRequest, GetIngestSettingsRequest, GetSourceRequest, IngestSettings,
     ListAiProvidersRequest, ListAiProvidersResponse, ListSourcesRequest, ListSourcesResponse,
-    PauseSourceRequest, RemoveSourceRequest, RemoveSourceResponse, RemoveSqsInletRequest,
-    ResumeSourceRequest, SetAiProviderRequest, SetApiSettingsRequest, SetEnrichmentSettingsRequest,
-    SetIngestSettingsRequest, SetLlmPolicyRequest, SetSqsInletRequest, Source, UpdateSourceRequest,
+    PauseSourceRequest, ReleaseSourceClaimRequest, ReleaseSourceClaimResponse, RemoveSourceRequest,
+    RemoveSourceResponse, RemoveSqsInletRequest, ResumeSourceRequest, SetAiProviderRequest,
+    SetApiSettingsRequest, SetEnrichmentSettingsRequest, SetIngestSettingsRequest,
+    SetLlmPolicyRequest, SetSqsInletRequest, Source, UpdateSourceRequest,
 };
 use crate::validate::{self, Violations};
 use crate::{Api, ApiState, claims, convert, enrichment, error};
@@ -122,6 +123,34 @@ pub async fn add_source(state: &ApiState, req: &AddSourceRequest) -> Result<Sour
     }
     state.progress().touch();
     Ok(state.source_pb(&source))
+}
+
+fn check_release(req: &ReleaseSourceClaimRequest) -> Result<(SourceKey, InstanceId), Status> {
+    let mut v = Violations::default();
+    let endpoint = validate::http_url(&mut v, "endpoint", &req.endpoint);
+    // Any bucket a source could have been added with (path style accepts the most).
+    validate::bucket(&mut v, "bucket", &req.bucket, UrlStyle::Path);
+    validate::prefix(&mut v, "prefix", &req.prefix);
+    let owner = match InstanceId::new(req.owner.trim()) {
+        Ok(o) => Some(o),
+        Err(_) if req.owner.trim().is_empty() => {
+            v.add("owner", "required: the instance that holds the claim");
+            None
+        }
+        Err(e) => {
+            v.add("owner", e.to_string());
+            None
+        }
+    };
+    v.check()?;
+    let owner = owner.ok_or_else(|| Status::invalid_argument("invalid argument: owner"))?;
+    let key = SourceKey::new(
+        endpoint.unwrap_or_default(),
+        &req.bucket,
+        req.prefix.clone(),
+    )
+    .map_err(error::model)?;
+    Ok((key, owner))
 }
 
 fn check_id(field: &str, value: &str) -> Result<SourceId, Status> {
@@ -254,7 +283,10 @@ impl Api {
         let key = SourceKey::new(&source.endpoint, &source.bucket, source.prefix.clone())
             .map_err(error::model)?;
         match backend.claim_source(&key, self.state.instance()).await {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                self.state.store().claims().set_mine(source.id);
+                Ok(())
+            }
             Err(doewood_model::Error::SourceClaimed { owner, key }) => {
                 // Marked as an active source would be: resuming asked for a scan.
                 let mut marked = source.clone();
@@ -363,9 +395,21 @@ impl ConfigService for Api {
             d.stop_source(id);
         }
         self.state.db(move |s| s.delete_source(id)).await?;
+        self.state.store().claims().set_mine(id);
         self.state.progress().forget(id);
         info!(source = %id, claim_released, "source removed");
         Ok(Response::new(RemoveSourceResponse { claim_released }))
+    }
+
+    async fn release_source_claim(
+        &self,
+        request: Request<ReleaseSourceClaimRequest>,
+    ) -> Result<Response<ReleaseSourceClaimResponse>, Status> {
+        let peer = request.remote_addr();
+        let (key, owner) = check_release(request.get_ref())?;
+        claims::release_claim(&self.state, &key, &owner, peer)
+            .await
+            .map(Response::new)
     }
 
     async fn list_sources(

@@ -167,6 +167,11 @@ async fn run(Loaded { config, warnings }: Loaded, started: Instant) -> Result<()
         }
     };
 
+    // With a shared Postgres, ingest holds its work until the start-up claim pass has run
+    // (issue #25): nothing is ingested for a source another instance owns.
+    if supervisor.is_some() {
+        store.claims().expect_check();
+    }
     // Records, graph, claims and search: the shared Postgres when configured (the supervisor
     // publishes it), else this file.
     if supervisor.is_none() {
@@ -239,6 +244,9 @@ async fn run(Loaded { config, warnings }: Loaded, started: Instant) -> Result<()
     });
     if let Err(e) = api.register_metrics(state.registry()) {
         warn!(error = %e, "the gRPC metrics could not be registered");
+    }
+    if let Err(e) = ingest::register_claim_metrics(&store, state.registry()) {
+        warn!(error = %e, "the claim metrics could not be registered");
     }
     if let Err(e) = cleanup::register_metrics(&store, state.registry()) {
         warn!(error = %e, "the instance store's metrics could not be registered");

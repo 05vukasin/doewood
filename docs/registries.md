@@ -539,10 +539,8 @@ open and closed joint-stock forms, `Partnership`, `LimitedPartnership`, `PublicE
 as `d.o.o.`), the founding date, the municipality of the seat (code and name), the activity
 code, and the snapshot date. Statuses and legal forms are read in either script.
 
-- **Not in the set:** the PIB, deleted companies (a deleted company is absent, so `None`;
-  `Deleted` is read in case APR adds them), the date of a status change, statutory changes,
-  mergers and divisions, and the street address. ADR 0002 lists these for APR; the open data
-  does not have them, and APR's search pages may not be scraped (above). They stay open.
+- **Not in the set:** the PIB, deleted companies, status-change dates, corporate events and
+  the street address; see [What the open data lacks](#what-the-open-data-lacks).
 - **Before sending.** An MB must pass `doewood_enrich::check::rs_mb` (8 digits, MOD 11), a PIB
   `rs_pib` (9 digits, MOD 11,10); placeholders are refused. Anything else is `InvalidInput`. No
   identifier or name ever reaches a URL.
@@ -567,12 +565,95 @@ code, and the snapshot date. Statuses and legal forms are read in either script.
 - **Name search.** Every word of the name (after `doewood_enrich::normalize`: Cyrillic to
   Latin, marks, case and punctuation dropped) must be in the company's name; exact names first,
   then by MB, at most `search_size`. Matching a candidate to a company is doewood-enrich's.
-- **TLS.** In November 2026 `openapi.apr.gov.rs` sends its certificate (`*.apr.gov.rs`, issued
-  by "SSL2BUY EMEA RSA Domain Validation Secure Server CA") **without the intermediate**. The
-  platform verifier does not fetch intermediates, so the download fails with
-  `Transport(... UnknownIssuer)`. The operator can supply that intermediate (its URL is in the
-  leaf's Authority Information Access, `crt.sectigo.com`; it chains to Sectigo's public root)
-  as `extra_roots_pem`, a PEM bundle trusted next to the system's roots. doewood ships none.
+- **TLS.** `openapi.apr.gov.rs` sends its certificate without the intermediate; see
+  [TLS: the missing intermediate](#tls-the-missing-intermediate).
+
+### What the open data lacks
+
+ADR 0002 section 2 expects the PIB, deleted companies and corporate events from APR. The open
+data has none of them, so the client gives **only**:
+
+- a company by **MB** (`company`, `lookup(IdKind::RsMb, ..)`), and a name search;
+- per company: the name, the status (active, in liquidation, in forced liquidation, in
+  bankruptcy), the legal form, the founding date, the activity code, and the **municipality**
+  of the seat.
+
+It does **not** give:
+
+- **A PIB lookup.** `lookup(IdKind::RsPib, ..)` checks the PIB, sends nothing, and answers
+  `WarningKind::Unsupported` ("the APR open data has no PIB; look up by MB (docs/registries.md,
+  APR: What the open data lacks)"). The enrichment job then searches for the company by name
+  (see [enrichment.md](enrichment.md)).
+- **Deleted (struck-off) companies.** The set lists only active companies and those in
+  liquidation, forced liquidation or bankruptcy. A deleted company is absent, so its MB
+  answers `None` (no such MB), not `Deleted`. `Status::Deleted` is read only in case APR adds
+  such records.
+- **Dates of status changes** and **corporate events** (mergers, divisions, statutory
+  changes). APR therefore gives no dated edges beyond the current status.
+- **Street addresses.** Only the municipality's code and name.
+
+**Why.** doewood uses only official sources whose terms allow automated use. APR's website
+terms ("Terms and Conditions of Use", `www.apr.gov.rs/documents.1598.html`) forbid web robots
+for downloading data and search results, and allow copying only for personal, non-commercial
+use, so the search pages are not scraped. The paid, contract-based "e-data on request" service
+and APR's web service are out of scope. That leaves the open data, which lacks the fields
+above.
+
+**Sources checked** (November 2026, issue #34). None gives the missing data under terms that
+allow automated reuse:
+
+| source | terms | contents | verdict |
+|---|---|---|---|
+| data.gov.rs "АПИ за Регистар привредних друштава" (APR): `openapi.apr.gov.rs/api/opendata/companies` | Serbian open data licence | the set above: no PIB, no deleted companies, no events | used |
+| data.gov.rs "АПИ за Регистар финансијских извештаја – база ФИ за привредна друштва" (APR): `openapi.apr.gov.rs/api/opendata/companies/financial-statements` | Serbian open data licence | per MB: the name, the municipality, the year of the last annual report and seven key figures (assets, capital, loss, revenue, net profit, net loss, employees); no PIB, no events | not used: it fills none of the gaps |
+| data.gov.rs "АПИ за Регистар задужбина и фондација, ... Регистар удружења ..." (APR): `openapi.apr.gov.rs/api/opendata/ngo` | Serbian open data licence | associations, endowments and foundations, not companies | not relevant |
+| `openapi.apr.gov.rs`, other paths | none published | no public endpoint list or documentation beyond the data.gov.rs resources | nothing more to use |
+| APR website search and statistics (`apr.gov.rs`) | robots forbidden; copying for personal, non-commercial use only | company details including the PIB, deletions and changes | excluded |
+| APR "e-data on request" (`apr.gov.rs/services/e-data-on-request/`) | paid, by contract | register data including history | excluded |
+| Tax Administration (Poreska uprava, `purs.gov.rs`) | no open dataset on data.gov.rs; its e-services need a login | the PIB register | no MB to PIB mapping is available |
+
+If APR adds the PIB, deleted companies or a change history to the open data, the reader can be
+extended on the same host and licence (it already ignores unknown fields).
+
+### TLS: the missing intermediate
+
+In November 2026 `openapi.apr.gov.rs` sends its certificate (`*.apr.gov.rs`, issued by
+"SSL2BUY EMEA RSA Domain Validation Secure Server CA") **without the intermediate**. The
+platform verifier does not fetch intermediates, so the download fails with
+`Transport(... UnknownIssuer)`, and APR answers with that warning.
+
+The operator can supply the intermediate as `AprConfig::extra_roots_pem`. On the server, that
+is `apr_extra_roots_pem` in `SetEnrichmentSettings` (see [api.md](api.md#enrichment-settings)),
+kept as the sealed secret `registry/apr/extra_roots_pem` (see
+[configuration.md](configuration.md)):
+
+1. Find the intermediate's URL in the leaf certificate's Authority Information Access (CA
+   Issuers, on `crt.sectigo.com`). It chains to Sectigo's public root, which the system
+   already trusts.
+2. Download it, convert it to PEM if it is DER (`openssl x509 -inform der -in ca.crt -out
+   ca.pem`), and check its subject and fingerprint.
+3. Set it with `SetEnrichmentSettings` (`apr_extra_roots_pem`: a PEM bundle of at most 64 KiB
+   whose certificates parse). The next enrichment pass builds the APR client with it.
+
+The PEM is trusted **only** by the APR client, next to the system's roots. Verification is
+never disabled, and no other client sees it. doewood ships no certificate. Once APR sends the
+full chain, clear the setting (`clear_apr_extra_roots_pem`).
+
+### Attribution
+
+The open data licence (data.gov.rs terms, "Лиценца за коришћење података", article 6) asks,
+on every reuse, for:
+
+- the source: the publishing body, **Агенција за привредне регистре (APR)**;
+- the **download date**;
+- the **address** the data came from: `https://openapi.apr.gov.rs/api/opendata/companies`
+  (dataset `data.gov.rs/sr/datasets/api-za-registar-privrednikh-drushtava/`);
+- a clear note of any change to the data (doewood normalises names, statuses and legal
+  forms).
+
+Every record carries the snapshot date (`as_of`, from `DatumPreseka`) and the download date
+(`fetched_at`) for this. Anything that shows APR data to people, such as a UI or an export,
+must show this attribution. Nothing displays it yet.
 
 ### Settings
 

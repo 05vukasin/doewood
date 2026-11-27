@@ -2411,3 +2411,103 @@ async fn big_spreadsheets() {
     );
     h.stop().await;
 }
+
+/// Issue #25: the queued objects of a source another instance owns are dropped, not ingested
+/// (events and the sweep alike), and counted. Until the claims are checked the workers hold
+/// their work. Once the source is this instance's again, its objects are ingested.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_source_claimed_elsewhere_is_dropped_from_the_queue() {
+    for kind in ["sqlite", "postgres"] {
+        let store = Arc::new(Store::open_in_memory(&MasterKey::from_bytes([13; 32])).unwrap());
+        let mut all = Shared::all(&store).await;
+        let Some(i) = all.iter().position(|s| s.name == kind) else {
+            continue;
+        };
+        let shared = all.swap_remove(i);
+        for s in all {
+            s.drop_schema().await;
+        }
+        // As `serve` with a shared store: ingest waits for the start-up claim pass.
+        store.claims().expect_check();
+        let h = Harness::start(
+            Arc::clone(&store),
+            shared.backend.clone(),
+            2,
+            Duration::from_millis(10),
+        );
+        let owner = doewood_core::InstanceId::new("inst-a").unwrap();
+        h.put(&[
+            (
+                "in/event.txt",
+                b"Ugovor o zakupu, strana jedan".to_vec(),
+                true,
+            ),
+            (
+                "in/sweep.txt",
+                b"Ugovor o zakupu, strana dva".to_vec(),
+                false,
+            ),
+        ])
+        .await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(h.fetch.reads.lock().unwrap().is_empty(), "{kind}: held");
+        assert_eq!(store.object_counts(h.source).unwrap().pending, 2);
+
+        // The pass finds another owner.
+        store.claims().set_elsewhere(h.source, owner.clone());
+        store.claims().set_checked();
+        h.settle().await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            h.fetch.reads.lock().unwrap().is_empty(),
+            "{kind}: not fetched"
+        );
+        for key in ["in/event.txt", "in/sweep.txt"] {
+            assert!(
+                store.ingest_status(h.source, key).unwrap().is_none(),
+                "{kind}: {key}"
+            );
+        }
+        assert_eq!(store.claims().drops().queued, 2, "{kind}");
+        let stats = h.ingest.stats();
+        assert_eq!(
+            (stats.done, stats.skipped, stats.failed),
+            (0, 0, 0),
+            "{kind}"
+        );
+        // A deletion event is left to the owner.
+        h.events
+            .send(ObjectEvent {
+                source: h.source,
+                key: "in/gone.txt".into(),
+                kind: EventKind::Deleted,
+                origin: EventOrigin::Webhook,
+            })
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while store.claims().drops().queued < 3 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{kind}: delete dropped"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // The claim is this instance's again (a release and a resume): objects are ingested.
+        store.claims().set_mine(h.source);
+        h.put(&[(
+            "in/event.txt",
+            b"Ugovor o zakupu, strana jedan".to_vec(),
+            true,
+        )])
+        .await;
+        h.settle().await;
+        let st = h.status("in/event.txt").status;
+        assert!(st == "done" || st == "skipped", "{kind}: {st}");
+        assert_eq!(h.fetch.reads_of("in/event.txt"), 1);
+        assert_eq!(store.claims().drops().queued, 3);
+        h.stop().await;
+        shared.drop_schema().await;
+    }
+}

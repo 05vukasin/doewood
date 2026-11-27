@@ -340,6 +340,35 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// Drops the version `etag` of an object from ingest's queue without ingesting it: its
+    /// `pending` row is deleted, so a later scan sees the object as new (issue #25: another
+    /// instance owns the source). Returns whether there was such a row.
+    pub fn drop_pending_object(
+        &self,
+        source: SourceId,
+        key: &str,
+        etag: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let n = self
+            .conn()
+            .prepare_cached(
+                "DELETE FROM objects_seen \
+                 WHERE source_id = ?1 AND key = ?2 AND etag IS ?3 AND status = 'pending'",
+            )
+            .and_then(|mut cached| cached.execute(params![source.to_string(), key, etag]))?;
+        Ok(n > 0)
+    }
+
+    /// [`drop_pending_object`](Self::drop_pending_object) for every pending object of a source,
+    /// in one statement. Returns how many.
+    pub fn drop_pending_objects(&self, source: SourceId) -> Result<u64, StoreError> {
+        let n = self
+            .conn()
+            .prepare_cached("DELETE FROM objects_seen WHERE source_id = ?1 AND status = 'pending'")
+            .and_then(|mut cached| cached.execute(params![source.to_string()]))?;
+        Ok(u64::try_from(n).unwrap_or(u64::MAX))
+    }
+
     /// An object's ingest status, deleted objects included.
     pub fn ingest_status(
         &self,

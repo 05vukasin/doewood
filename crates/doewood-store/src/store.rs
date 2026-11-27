@@ -14,6 +14,7 @@ use readers::{Caller, Readers};
 
 pub(crate) mod ai;
 pub(crate) mod api;
+pub(crate) mod claims;
 pub(crate) mod enrichment;
 pub(crate) mod favicon;
 pub(crate) mod ingest;
@@ -80,6 +81,8 @@ pub struct Store {
     cipher: Cipher,
     /// An on-disk store's checkpoint connection and thread ([`wal`], issue #151).
     pub(crate) wal: Option<wal::Keeper>,
+    /// Which sources another instance owns, in memory ([`claims`], issue #25).
+    claims: claims::ClaimView,
 }
 
 /// The connection a read runs on: a read-only one, or the writer when the store has none.
@@ -240,9 +243,15 @@ impl Store {
             readers: Readers::default(),
             cipher: Cipher::new(key),
             wal: None,
+            claims: claims::ClaimView::default(),
         };
         store.check_key()?;
         Ok(store)
+    }
+
+    /// Which of this instance's sources another instance owns ([`claims::ClaimView`]).
+    pub fn claims(&self) -> &claims::ClaimView {
+        &self.claims
     }
 
     /// The writer. Every write, and every read that must see the caller's own uncommitted

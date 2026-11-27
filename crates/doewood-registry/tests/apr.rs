@@ -237,7 +237,8 @@ async fn pib_is_validated_then_unsupported() {
         .lookup(IdKind::RsPib, &pib("10873452"))
         .await
         .unwrap_err();
-    assert!(matches!(kind(&e), WarningKind::Unsupported(m) if m.contains("PIB")));
+    assert!(matches!(kind(&e), WarningKind::Unsupported(m)
+        if m.contains("PIB") && m.contains("docs/registries.md")));
     let p = pib("10873452");
     let broken = format!(
         "{}{}",

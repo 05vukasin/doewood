@@ -31,7 +31,7 @@ The S3 event webhook is not part of the gRPC API: it is on the ops server (see
 
 | service | RPCs |
 |---|---|
-| `ConfigService` | `AddSource`, `UpdateSource`, `PauseSource`, `ResumeSource`, `RemoveSource`, `ListSources`, `GetSource`, `SetLlmPolicy`, `SetSqsInlet`, `RemoveSqsInlet`, `SetAiProvider`, `ListAiProviders`, `GetIngestSettings`, `SetIngestSettings`, `GetEnrichmentSettings`, `SetEnrichmentSettings`, `GetApiSettings`, `SetApiSettings` |
+| `ConfigService` | `AddSource`, `UpdateSource`, `PauseSource`, `ResumeSource`, `RemoveSource`, `ReleaseSourceClaim`, `ListSources`, `GetSource`, `SetLlmPolicy`, `SetSqsInlet`, `RemoveSqsInlet`, `SetAiProvider`, `ListAiProviders`, `GetIngestSettings`, `SetIngestSettings`, `GetEnrichmentSettings`, `SetEnrichmentSettings`, `GetApiSettings`, `SetApiSettings` |
 | `JobsService` | `WatchProgress` (server stream), `ReprocessJob`, `WatchReprocess` (server stream) |
 | `RecordsService` | `GetRecord`, `ListRecords` |
 | `GraphService` | `GetNode`, `Neighbours`, `CompanyDocuments`, `ListMerges`, `MergeCompanies`, `UndoMerge`, `SplitCompany`, `DismissPair`, `ListDismissals`, `ListProposals`, `AcceptProposal`, `RejectProposal` |
@@ -67,6 +67,21 @@ The comments in the `.proto` files are the reference for every field. In short:
 - **RemoveSource** releases the claim, stops the scanner, and deletes the source with its
   progress and credentials. If the shared store is unreachable it fails with `UNAVAILABLE` and
   removes nothing, so no claim is left behind.
+- **ReleaseSourceClaim** (issue #24) deletes the claim on a source (`endpoint`, `bucket`,
+  `prefix`, normalized as in `AddSource`) in the shared store, whichever instance holds it, so
+  that another instance can add or resume the source. It is meant for an owner that is gone
+  for good ([deploy.md](deploy.md#a-dead-instance)); nothing is taken over automatically, and
+  claims still have no lease ([ADR 0001](adr/0001-architecture.md), section 2). `owner` is
+  required and must name the instance that holds the claim (as the `claimed by instance ...`
+  reason or the `ALREADY_EXISTS` error names it): another holder is `FAILED_PRECONDITION` and
+  nothing changes, so a retry never releases a claim a new owner has taken meanwhile. It is
+  idempotent: with no claim, it answers OK with `released: false`. A claim this instance holds
+  for one of its own sources is refused with `FAILED_PRECONDITION` (remove the source
+  instead). The answer has the released `owner` and its `claimed_at`. Each call is logged with
+  the key, the owner, the instance that served it (`released_by`) and the caller's address
+  (`peer`); a release at WARN, `source claim released by an operator`. If the old owner still
+  runs, it keeps scanning the source until it restarts: release only the claim of an instance
+  that is gone.
 - **SetSqsInlet** sets the source's SQS event inlet (see [sources](sources.md#sqs)): the
   `queue_url` (`https://sqs.<region>.amazonaws.com/<account>/<queue>`, without credentials,
   query or fragment), the `region` (empty: the one in an AWS queue URL, else `us-east-1`),
@@ -78,7 +93,8 @@ The comments in the `.proto` files are the reference for every field. In short:
   deleted, events emitted, records ignored, test events, malformed messages, errors and the
   last error. **RemoveSqsInlet** deletes the inlet and its credentials; removing the source
   does too.
-- While the shared Postgres is not connected yet, `AddSource`, `RemoveSource` and the records,
+- While the shared Postgres is not connected yet, `AddSource`, `RemoveSource`,
+  `ReleaseSourceClaim` and the records,
   graph and search RPCs answer `UNAVAILABLE`; the rest works. Once the start-up claim pass has
   run, `ResumeSource` needs the database too (it claims the source).
 
@@ -336,6 +352,17 @@ bounded by the message limit (`DOEWOOD_API_MAX_MESSAGE_MIB`, default 64 MiB), an
 source's `max_object_bytes`; a file larger than ingest analyzes (512 MiB) is
 `FAILED_PRECONDITION`.
 
+A local file, sent as `content`. It needs only a configured provider: no source and no LLM
+policy. `bytes` fields are base64 in grpcurl's JSON, and `-d @` reads the request from stdin:
+
+```sh
+jq -n --arg name report.pdf --rawfile b <(base64 -w0 report.pdf) '{name:$name, content:$b}' \
+  | grpcurl -plaintext -d @ 127.0.0.1:7443 doewood.v1.SummarizeService/Summarize
+```
+
+`"provider": "<name>"` in the request picks a provider other than the default. On macOS,
+`base64 -w0` is `base64 -i report.pdf`.
+
 ## Errors
 
 | code | when |
@@ -421,6 +448,7 @@ to `doewood_ready` and the others. gRPC-Web calls are counted like gRPC calls.
 | `doewood_grpc_connections_open` | gauge | | connections to the API port accepted and not yet closed |
 | `doewood_grpc_connections_total` | counter | | connections accepted |
 | `doewood_icons_requests_total` | counter | `outcome` | `GET /icons/{domain}`: `found`, `missing`, `invalid`, `busy` |
+| `doewood_ingest_claimed_elsewhere_dropped_total` | counter | `path` | work dropped because another instance owns the source in the shared store (issue #25, [sources.md](sources.md#claims)): `queue`, objects of ingest's local queue (pending objects and their events) dropped instead of ingested; `webhook`, event notification records ignored |
 | `doewood_ingest_finish_unmatched_total` | counter | | ingested objects whose status matched no `pending` row of that version, so it was not recorded: the object changed or was deleted meanwhile (issue #125). Near 0 in steady state |
 | `doewood_ingest_known_copies_total` | counter | | objects recorded against content already stored, by their single-part MD5 ETag and size, without a GetObject (sources with `skip_known_copies` on, issue #131; [sources.md](sources.md#known-copies)) |
 | `doewood_ingest_known_copy_bytes_total` | counter | | the listed bytes of those objects, not fetched |
@@ -483,6 +511,8 @@ grpcurl -plaintext -d "{\"source_id\": \"$ID\", \"policy\": {\"mode\": \"LLM_MOD
     \"kinds\": [\"invoice\", \"contract\"], \"concurrency\": 2}}" \
     127.0.0.1:7443 doewood.v1.ConfigService/SetLlmPolicy
 grpcurl -plaintext -d "{\"source_id\": \"$ID\"}" 127.0.0.1:7443 doewood.v1.ConfigService/RemoveSource
+grpcurl -plaintext -d '{"endpoint": "http://minio:9000", "bucket": "docs", "prefix": "in/",
+    "owner": "doewood-1"}' 127.0.0.1:7443 doewood.v1.ConfigService/ReleaseSourceClaim
 ```
 
 An SQS inlet with credentials of its own (read from variables; they never come back):
@@ -500,7 +530,7 @@ An AI provider (the key is read from a variable, and never comes back):
 
 ```sh
 grpcurl -plaintext -d @ 127.0.0.1:7443 doewood.v1.ConfigService/SetAiProvider <<EOF
-{"preset": "anthropic", "model": "claude-sonnet-4-5", "api_key": "$ANTHROPIC_API_KEY"}
+{"preset": "anthropic", "model": "claude-haiku-5-5", "api_key": "$ANTHROPIC_API_KEY"}
 EOF
 grpcurl -plaintext -d @ 127.0.0.1:7443 doewood.v1.ConfigService/SetAiProvider <<'EOF'
 {"name": "local", "preset": "openai_compatible", "model": "qwen2.5-7b-instruct",
@@ -593,7 +623,8 @@ POST /events/s3/{source_id}
 The body is the notification JSON (at most 1 MiB). Each record is compared with what the source
 has seen, and new, changed or removed objects become the same events a scan emits; the scan
 still catches anything a notification misses. The answer is `200 {"emitted": n, "ignored": m}`
-(ignored: another bucket, outside the prefix, already seen, or the source is paused), `400` for a
+(ignored: another bucket, outside the prefix, already seen, the source is paused, or another
+instance owns it, see [sources](sources.md#claims)), `400` for a
 body that is not a notification, `404` for an unknown source, `413` for a body over 1 MiB, and
 `503` before the store is open and during shutdown. Like the API, it has no authentication in
 v1: keep the ops port inside the cluster.
