@@ -579,28 +579,32 @@ impl GraphWriter {
         // Issue #126: the candidates' Document nodes in one read (the few missing ones are
         // created one by one), then every edge in one batch, instead of two round trips per
         // candidate.
-        let keys: Vec<String> = related.iter().map(|(h, _)| h.to_hex()).collect();
-        let ids = b.node_ids(NodeKind::Document, &keys).await?;
-        let mut edges = Vec::with_capacity(related.len());
-        for ((h, e), (key, id)) in related.into_iter().zip(keys.iter().zip(ids)) {
-            let other = match id {
-                Some(id) => id,
-                None => b.ensure_node(NodeKind::Document, key).await?,
-            };
-            // One edge per pair, from the smaller hash to the larger.
-            let (src, dst) = if *blake3 < h {
-                (doc, other)
-            } else {
-                (other, doc)
-            };
-            edges.push(
-                Edge::new(src, dst, EdgeKind::SimilarTo, EdgeSource::Document)
-                    .with_props(e.to_props())
-                    .with_confidence(e.confidence()),
-            );
+        // Batches of at most `GRAPH_BATCH_MAX`: one, unless many keys each brought their
+        // full 100 matches.
+        for batch in related.chunks(doewood_model::GRAPH_BATCH_MAX) {
+            let keys: Vec<String> = batch.iter().map(|(h, _)| h.to_hex()).collect();
+            let ids = b.node_ids(NodeKind::Document, &keys).await?;
+            let mut edges = Vec::with_capacity(batch.len());
+            for ((h, e), (key, id)) in batch.iter().zip(keys.iter().zip(ids)) {
+                let other = match id {
+                    Some(id) => id,
+                    None => b.ensure_node(NodeKind::Document, key).await?,
+                };
+                // One edge per pair, from the smaller hash to the larger.
+                let (src, dst) = if blake3 < h {
+                    (doc, other)
+                } else {
+                    (other, doc)
+                };
+                edges.push(
+                    Edge::new(src, dst, EdgeKind::SimilarTo, EdgeSource::Document)
+                        .with_props(e.to_props())
+                        .with_confidence(e.confidence()),
+                );
+            }
+            b.upsert_edges(&edges).await?;
+            stats.similar += edges.len();
         }
-        b.upsert_edges(&edges).await?;
-        stats.similar += edges.len();
         Ok(())
     }
 

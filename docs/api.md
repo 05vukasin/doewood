@@ -1093,7 +1093,7 @@ grpcurl -plaintext -d '{"blake3": "<64 hex>", "relations": ["SIMILAR_RELATION_NE
     127.0.0.1:7443 doewood.v1.GraphService/SimilarDocuments
 ```
 
-Timings: see [Similar documents by relation](ingest.md#similar-documents-by-relation).
+Timings: see [ingest.md](ingest.md#similar-documents-by-relation) (a call costs about 30 ms at 1000 edges, 170 to 200 ms at 5000).
 
 ## Search by company
 

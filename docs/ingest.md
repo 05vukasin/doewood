@@ -347,7 +347,7 @@ anywhere.
   with no keys and no sketch skips all of it; a document with no keys never had its old keys
   removed (only a new quail version could drop them for the same content).
 - **The edge props:** `relations`, `method` (of the first relation: `text_key`,
-  `minhash_lsh`, `masked_simhash` or `origin_id`), `score` and `raw_similarity` (the raw
+  `minhash_lsh`, `masked_simhash` or `origin_id`), `score` (the raw
   MinHash estimate, when both documents have a signature), `masked_similarity` (when both
   have a masked SimHash the writer knew: one found only through the bands has none),
   `shared_bands`, `template` (`template_property` or `headings`), `origin` (`xmp`, `w15` or
@@ -366,6 +366,35 @@ anywhere.
   `SimilarDocuments` counts it and leaves its entries out unless asked for, so one template
   does not flood the answer. Ingest still writes at most 100 band candidates and 100 key
   matches per key for a document.
+
+**Measurements (PR for issue #169).** 4-core server, test profile, Postgres 17
+(`pgvector/pgvector:pg17`) in Docker on an internal network, SQLite in memory.
+
+- `throughput` (2000 files, 4 workers, three runs each, two rounds; half the files are long
+  enough for a text key): Postgres 315 / 313 files/s before (`staging`), 285 / 314 after;
+  SQLite 423 / 412 before, 409 / 417 after (medians; round one's Postgres runs after the
+  change were 267 to 295, round two's 310 to 314, so the difference is within the runs'
+  spread). 11.1 statements per file before, 12.1 after (the keys' write and lookup, each
+  pipelined with the sketch's statement, so no round trip more); 2.9 to 3.0 s in Postgres
+  either way.
+- `near_duplicate_corpus` (2000 documents, 4 templates, `similar_min_jaccard` 0.8): without
+  keys 32.7 s before and 33.7 to 38.7 s after on Postgres, 30.1 s and 29.8 s on SQLite, the
+  same 139,800 edges. With keys (`DOEWOOD_NEAR_DUP_KEYS`: a text key each, a heading skeleton
+  and masked SimHash per template) 48.1 s on Postgres and 40.6 s on SQLite, for 197,837 edges
+  (same_template adds about 50 a document); the key lookup took 0.57 ms a document in
+  Postgres, the edge batch 8.2 ms.
+- Query time (`crates/doewood-api/tests/similar_bench.rs`, median ms through the API):
+
+  | edges at the document | Neighbours, page of 50 | SimilarDocuments, 50 | Neighbours, page of 1000 | SimilarDocuments, 1000 |
+  |---|---|---|---|---|
+  | 20, SQLite / Postgres | 1.1 / 1.5 | 1.8 / 3.3 | 2.6 / 2.8 | 3.2 / 3.4 |
+  | 100 | 4.3 / 4.1 | 8.0 / 7.2 | 7.7 / 7.5 | 7.5 / 5.8 |
+  | 1000 | 4.1 / 4.4 | 27 / 30 | 49 / 49 | 30 / 31 |
+  | 5000 | 4.7 / 6.9 | 167 / 203 | 49 / 49 | 164 / 176 |
+
+  SimilarDocuments reads every `similar_to` edge of the document (up to 10,000) to count and
+  sort them, so its cost grows with the document's degree, where a Neighbours page does not;
+  a template crowd's earliest documents are the expensive case.
 
 ## Company props
 

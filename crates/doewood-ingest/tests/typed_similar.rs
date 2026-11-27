@@ -260,12 +260,12 @@ async fn check(b: &Arc<dyn Backend>) {
         (&p["method"], &p["chars"], &p["template"]),
         (&json!("text_key"), &json!(3000), &json!("headings"))
     );
-    assert_eq!(p["raw_similarity"], 1.0);
+    assert_eq!(p["score"], 1.0);
     assert_eq!(p["masked_similarity"], 1.0);
     let p = props(b, 1, 5).await.unwrap();
     assert_eq!(p["method"], "masked_simhash");
     assert!(p["masked_similarity"].as_f64().unwrap() > 0.98);
-    assert!(p["raw_similarity"].as_f64().unwrap() < 0.6);
+    assert!(p["score"].as_f64().unwrap() < 0.6);
     let p = props(b, 1, 6).await.unwrap();
     assert_eq!(
         (&p["method"], &p["origin"]),
@@ -280,7 +280,10 @@ async fn check(b: &Arc<dyn Backend>) {
     );
     let p = props(b, 1, 3).await.unwrap();
     assert_eq!(p["method"], "minhash_lsh");
-    assert_eq!(p["score"], p["raw_similarity"]);
+    assert!(
+        p.get("raw_similarity").is_none(),
+        "the raw estimate is the score"
+    );
     assert!(p["shared_bands"].as_u64().unwrap() > 0);
     assert!(written >= 10, "{written} edges written");
 }

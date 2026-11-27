@@ -193,7 +193,8 @@ pub fn masked_similarity(a: u64, b: u64) -> f64 {
 }
 
 /// The props of a `similar_to` edge (issue #169). `score` stays the raw `MinHash` estimate
-/// when it is known, as before; `relations` names every relation that holds.
+/// when it is known, as before (read back as `raw_similarity`); `relations` names every
+/// relation that holds.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SimilarEdge {
     /// The relations that hold, each once, in report order.
@@ -230,9 +231,9 @@ impl SimilarEdge {
                     .collect::<Vec<_>>()
             ),
         );
+        // The raw estimate is `score`, as before issue #169 (no second copy).
         if let Some(x) = self.raw_similarity {
             p.insert("score".into(), json!(x));
-            p.insert("raw_similarity".into(), json!(x));
         }
         if let Some(x) = self.masked_similarity {
             p.insert("masked_similarity".into(), json!(x));
