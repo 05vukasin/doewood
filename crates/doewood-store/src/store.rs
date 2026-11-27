@@ -741,6 +741,7 @@ mod tests {
                 "company_dismissals",
                 "company_enrichment",
                 "company_graph_log",
+                "company_graph_totals",
                 "company_leases",
                 "company_links",
                 "company_merges",

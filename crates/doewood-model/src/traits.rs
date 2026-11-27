@@ -295,6 +295,10 @@ pub trait GraphStore: Send + Sync {
     /// nodes, in one transaction, one fold at a time across instances.
     async fn fold_company_graph(&self, max_rows: u32) -> Result<Folded>;
 
+    /// The documents with at least one live `party` edge, each once however many companies
+    /// it names, as last folded (issue #181): one stored row, no scan.
+    async fn company_documents_total(&self) -> Result<u64>;
+
     /// A page of the live companies (not merged away) that match `filter`, in `order`, after
     /// `after` (a cursor of the same order), with their counts as last folded: at most
     /// `limit` (at most [`crate::COMPANY_GRAPH_NODES_MAX`] + 1), ending early with the one

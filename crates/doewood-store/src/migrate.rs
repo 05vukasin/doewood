@@ -74,6 +74,11 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("migrations/0014_company_graph.sql"),
         fk_check: FkCheck::Tables(&["company_stats", "company_graph_log"]),
     },
+    // A new one-row table counted from `edges` and `company_graph_log` (issue #181).
+    Migration {
+        sql: include_str!("migrations/0015_company_documents_total.sql"),
+        fk_check: FkCheck::Tables(&["company_graph_totals"]),
+    },
 ];
 
 /// The schema version this binary writes.

@@ -1,5 +1,6 @@
 //! Issue #172 on generated data: the company graph's counts, folded from the log, match a
-//! count from scratch over the edges; and an ignored test times the explorer's reads on
+//! count from scratch over the edges (and the document total of issue #181, also across the
+//! upgrade to schema 15); and an ignored test times the explorer's reads on
 //! `DOEWOOD_BENCH_DOCS` documents (default 200,000) and `DOEWOOD_BENCH_COMPANIES` companies
 //! (default 20,000). See docs/api.md, "The explorer's reads".
 
@@ -213,6 +214,35 @@ fn stored(conn: &Connection) -> Counts {
     (stats, pairs)
 }
 
+/// The churn after the first fold: party edges retracted, deleted and moved to `co-1`, and
+/// every party edge of one document in 16 retracted (so those leave the document total).
+const CHURN: &str = "UPDATE edges SET state = 'retracted' WHERE kind = 'party' \
+     AND (unicode(substr(id, 36)) * 7 + unicode(substr(id, 35))) % 13 = 0;
+     DELETE FROM edges WHERE kind = 'party' \
+     AND (unicode(substr(id, 36)) * 5 + unicode(substr(id, 34))) % 29 = 0;
+     UPDATE OR IGNORE edges SET dst = (SELECT id FROM nodes WHERE key = 'co-1') \
+     WHERE kind = 'party' AND unicode(substr(id, 36)) % 31 = 0;
+     UPDATE edges SET state = 'retracted' WHERE kind = 'party' AND src IN \
+     (SELECT id FROM nodes WHERE kind = 'document' AND key LIKE '%0');";
+
+/// The documents with a live party edge, from scratch; and as folded.
+fn totals(conn: &Connection) -> (i64, i64) {
+    let want = conn
+        .query_row(
+            "SELECT count(DISTINCT src) FROM edges WHERE kind = 'party' \
+             AND state NOT IN ('retracted', 'superseded')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let got = conn
+        .query_row("SELECT documents FROM company_graph_totals", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    (want, got)
+}
+
 #[tokio::test]
 async fn folded_counts_match_a_count_from_scratch() {
     let store = Arc::new(Store::open_in_memory(&MasterKey::from_bytes([1; 32])).unwrap());
@@ -223,15 +253,7 @@ async fn folded_counts_match_a_count_from_scratch() {
     {
         let mut conn = store.conn();
         let tx = conn.transaction().unwrap();
-        tx.execute_batch(
-            "UPDATE edges SET state = 'retracted' WHERE kind = 'party' \
-             AND (unicode(substr(id, 36)) * 7 + unicode(substr(id, 35))) % 13 = 0;
-             DELETE FROM edges WHERE kind = 'party' \
-             AND (unicode(substr(id, 36)) * 5 + unicode(substr(id, 34))) % 29 = 0;
-             UPDATE OR IGNORE edges SET dst = (SELECT id FROM nodes WHERE key = 'co-1') \
-             WHERE kind = 'party' AND unicode(substr(id, 36)) % 31 = 0;",
-        )
-        .unwrap();
+        tx.execute_batch(CHURN).unwrap();
         tx.commit().unwrap();
     }
     while s.fold_company_graph(500).await.unwrap().more {}
@@ -241,6 +263,46 @@ async fn folded_counts_match_a_count_from_scratch() {
     assert!(want_pairs.len() > 1000, "{}", want_pairs.len());
     assert_eq!(pairs, want_pairs);
     assert_eq!(stats, want_stats);
+    let (want, got) = totals(&conn);
+    assert_eq!(got, want);
+    assert!(got < 3000 - 150, "retractions lower the total: {got}");
+}
+
+/// Issue #181: the upgrade to schema 15 counts the total as folded so far, so the folds after
+/// it keep it exact, though the log still holds rows of documents folded before (and churned
+/// since) and of documents never folded.
+#[tokio::test]
+async fn schema_15_counts_the_total_with_log_rows_pending() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join(crate::STORE_FILE);
+    {
+        let mut conn = Connection::open(&path).unwrap();
+        assert_eq!(crate::migrate::migrate_to(&mut conn, 15).unwrap(), 15);
+        seed(&mut conn, 3000, 300, false);
+        // Fold a part as schema 14 would (the total's row aside), then go back to schema 14.
+        super::explore::fold(&mut conn, 2000).unwrap();
+        conn.execute_batch("DROP TABLE company_graph_totals; PRAGMA user_version = 14;")
+            .unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(CHURN).unwrap();
+        tx.commit().unwrap();
+        assert!(
+            conn.query_row("SELECT count(*) FROM company_graph_log", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap()
+                > 1000
+        );
+    }
+    let store = Arc::new(Store::open(&path, &MasterKey::from_bytes([1; 32])).unwrap());
+    let s = Standalone::new(Arc::clone(&store));
+    while s.fold_company_graph(500).await.unwrap().more {}
+    let total = s.company_documents_total().await.unwrap();
+    let conn = store.conn();
+    let (want, got) = totals(&conn);
+    assert_eq!(got, want);
+    assert_eq!(total, u64::try_from(want).unwrap());
+    let (want_stats, want_pairs) = from_scratch(&conn);
+    assert_eq!(stored(&conn), (want_stats, want_pairs));
 }
 
 /// `cargo test -p doewood-store --lib explorer_timings -- --ignored --nocapture`

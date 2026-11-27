@@ -236,6 +236,7 @@ impl Api {
             links,
             truncated: g.truncated,
             stale: g.stale,
+            documents_total: g.documents_total,
         })
     }
 
