@@ -1,0 +1,53 @@
+# doewood next to a service that configures it at boot (docs/configuration.md, "Configuring
+# doewood from another service").
+#
+#   DOEWOOD_MASTER_KEY="$(openssl rand -base64 32)" docker compose -f docs/examples/compose.yml up
+#
+# The gRPC API (7443) and the ops port (7444) are published nowhere: `app` reaches them on the
+# internal `backend` network as doewood:7443 and doewood:7444 (the API has no authentication in
+# v1). doewood reaches S3, the AI provider and the public registries through `egress`.
+# Keep the master key: the store refuses to start with another one.
+name: doewood-example
+
+services:
+  doewood:
+    image: ghcr.io/05vukasin/doewood:edge
+    environment:
+      DOEWOOD_LISTEN: 0.0.0.0:7443
+      DOEWOOD_OPS_LISTEN: 0.0.0.0:7444
+      DOEWOOD_MASTER_KEY: ${DOEWOOD_MASTER_KEY:?set DOEWOOD_MASTER_KEY (openssl rand -base64 32)}
+    volumes:
+      - doewood-data:/data
+    networks: [backend, egress]
+    # The image has the same check (HEALTHCHECK); it is repeated here so it is visible.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/doewood", "health"]
+      interval: 10s
+      timeout: 3s
+      start_period: 30s
+      start_interval: 1s
+      retries: 3
+    restart: unless-stopped
+
+  # A placeholder for your service. It starts once doewood is ready, then calls
+  # ConfigService.SetAiProvider and SetLlmPolicy on doewood:7443.
+  app:
+    image: busybox:1.37
+    command: ["sh", "-c", "echo doewood is ready at doewood:7443; sleep infinity"]
+    environment:
+      DOEWOOD_ADDR: doewood:7443
+    networks: [backend]
+    depends_on:
+      doewood:
+        condition: service_healthy
+
+networks:
+  # doewood and the services that call it; no route out.
+  backend:
+    internal: true
+  # doewood's way out, to S3, the AI provider and the registries. Nothing listens on it but
+  # doewood, and no port is published.
+  egress: {}
+
+volumes:
+  doewood-data:

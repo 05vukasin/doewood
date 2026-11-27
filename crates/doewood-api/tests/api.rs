@@ -2240,6 +2240,48 @@ async fn summarize_hands_requests_to_ingest() {
         .unwrap();
     // A provider and a policy change wake the queue.
     assert_eq!(fake.changed.load(std::sync::atomic::Ordering::Relaxed), 2);
+    // The same calls again (a service configuring doewood at every boot) change nothing and
+    // wake nothing (issue #144); a new model does.
+    let provider = |model: &str| pb::SetAiProviderRequest {
+        name: "local".into(),
+        preset: "vllm".into(),
+        model: model.into(),
+        base_url: "http://127.0.0.1:9/v1".into(),
+        api_key: "test-key".into(),
+        make_default: true,
+        ..pb::SetAiProviderRequest::default()
+    };
+    let policy = pb::SetLlmPolicyRequest {
+        source_id: source.id.clone(),
+        policy: Some(pb::LlmPolicy {
+            mode: pb::LlmMode::OnDemand as i32,
+            ..pb::LlmPolicy::default()
+        }),
+    };
+    let first = config(&ch)
+        .set_ai_provider(provider("test-model"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(fake.changed.load(std::sync::atomic::Ordering::Relaxed), 3);
+    for _ in 0..2 {
+        let again = config(&ch)
+            .set_ai_provider(provider("test-model"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(again, first);
+        config(&ch).set_llm_policy(policy.clone()).await.unwrap();
+    }
+    assert_eq!(fake.changed.load(std::sync::atomic::Ordering::Relaxed), 3);
+    assert_eq!(a.store.ai_providers().unwrap().len(), 1);
+    let changed = config(&ch)
+        .set_ai_provider(provider("test-model-2"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(changed.model, "test-model-2");
+    assert_eq!(fake.changed.load(std::sync::atomic::Ordering::Relaxed), 4);
 
     let mut sum = SummarizeServiceClient::new(ch.clone());
     let r = sum

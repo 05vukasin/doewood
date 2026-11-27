@@ -25,6 +25,7 @@
 //! - **Search**: title, the summary card and keywords as the body, kind, date and amount.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,7 +34,7 @@ use doewood_model::{
     ObjectLocation, PENDING_REF_PREFIX, PropsPatch, Result, SearchDoc, Sketch, merged_into,
 };
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tracing::debug;
 use uuid::Uuid;
 
@@ -112,9 +113,9 @@ pub struct WriteStats {
     /// `party` edges that landed on the survivor of a merge that committed after the
     /// company was matched (issue #48).
     pub redirects: usize,
-    /// Time spent waiting for the instance's company-resolution lock.
+    /// Time spent waiting for the instance's party locks ([`GraphWriter`], issue #78).
     pub company_lock_wait: Duration,
-    /// Time the company-resolution lock was held (party matching and alias writes).
+    /// Time the party locks were held (party matching and alias writes).
     pub company_lock_hold: Duration,
 }
 
@@ -136,11 +137,109 @@ pub struct Match {
     pub dismissed: Option<Uuid>,
 }
 
-/// Writes documents into a backend. Company resolution is serialized within the instance.
+/// Stripes of [`PartyLocks`]. More stripes, fewer unrelated parties that share one.
+const PARTY_STRIPES: u64 = 1024;
+
+/// The locks of company resolution within the instance (issue #78). Across instances alias
+/// claims and `ensure_node` decide, as before.
+///
+/// A document's parties take one striped lock per key they can read or write: each party's
+/// identifier aliases and ladder keys (the form-blind key included) and the learned aliases
+/// it claims, deduplicated and in stripe order (no deadlock), together with `all` shared,
+/// for the whole of [`GraphWriter::parties`]' matching, as the one instance-wide lock was
+/// held before. Two parties that share a key run one after the other; unrelated ones run
+/// at the same time.
+///
+/// Why that keeps ADR 0002 section 1 (first claim wins, form-blind blocking, dismissals) as
+/// it was with the one lock:
+///
+/// - The keys a party reads (`aliases`, `node_by_key`) and writes (`claim_aliases`,
+///   `block_alias`, `ensure_node`, its learned aliases) are all known before its match: they
+///   follow from the facts alone, not from what the store holds. The company `create` makes
+///   is keyed by one of them. So every alias decision is made under its key's lock, and
+///   any two parties whose reads and writes of aliases overlap are serialized.
+/// - The other things matching reads are not written by party resolution: `merged_into`
+///   (the walk in `live`) and dismissals come from merges and splits, which never took this
+///   lock and also come from other instances; `upsert_live_edge` resolves `merged_into`
+///   again atomically. The document's own `party` edges (`attached`) are written after the
+///   locks are released, as before.
+/// - One read is of a company's props that another party may write without sharing a key:
+///   the form-blind step reads the owner's `legal_form`, and any party matched to that
+///   company (by an identifier, say) sets `legal_form` when it is absent. A `legal_form`
+///   that is set never changes here (`set_if_absent`), so a decision on a set one is stable.
+///   A decision on an absent one is not, so a party that has a legal form and finds the
+///   form-blind key's owner without one gives up its stripes and takes `all` exclusively
+///   (no other party of the instance runs), then matches again from the start. Nothing was
+///   written for that party yet; the parties before it in the document were written under
+///   their keys' locks.
+struct PartyLocks {
+    /// Shared by every party set, exclusive for the form-blind case above.
+    all: RwLock<()>,
+    stripes: Vec<Mutex<()>>,
+}
+
+/// The locks a document's parties hold.
+enum PartyGuard<'a> {
+    Keys {
+        _all: RwLockReadGuard<'a, ()>,
+        _stripes: Vec<MutexGuard<'a, ()>>,
+    },
+    All {
+        _all: RwLockWriteGuard<'a, ()>,
+    },
+}
+
+impl PartyGuard<'_> {
+    fn exclusive(&self) -> bool {
+        matches!(self, Self::All { .. })
+    }
+}
+
+impl PartyLocks {
+    fn new() -> Self {
+        Self {
+            all: RwLock::new(()),
+            stripes: (0..PARTY_STRIPES).map(|_| Mutex::new(())).collect(),
+        }
+    }
+
+    /// The stripe of a key (`DefaultHasher::new` has fixed keys: a key always has one stripe).
+    fn stripe(key: &str) -> usize {
+        let mut h = DefaultHasher::new();
+        key.hash(&mut h);
+        usize::try_from(h.finish() % PARTY_STRIPES).unwrap_or(0)
+    }
+
+    /// `all` shared, then the stripes of `keys` in order, each once.
+    async fn keys<'k>(&self, keys: impl IntoIterator<Item = &'k str>) -> PartyGuard<'_> {
+        let mut stripes: Vec<usize> = keys.into_iter().map(Self::stripe).collect();
+        stripes.sort_unstable();
+        stripes.dedup();
+        let all = self.all.read().await;
+        let mut held = Vec::with_capacity(stripes.len());
+        for i in stripes {
+            held.push(self.stripes[i].lock().await);
+        }
+        PartyGuard::Keys {
+            _all: all,
+            _stripes: held,
+        }
+    }
+
+    /// `all` exclusively: no other party of the instance runs.
+    async fn all(&self) -> PartyGuard<'_> {
+        PartyGuard::All {
+            _all: self.all.write().await,
+        }
+    }
+}
+
+/// Writes documents into a backend. Company resolution is serialized within the instance
+/// per alias key ([`PartyLocks`]).
 pub struct GraphWriter {
     backend: Arc<dyn Backend>,
     similarity: SimilarityConfig,
-    companies: Mutex<()>,
+    locks: PartyLocks,
 }
 
 impl std::fmt::Debug for GraphWriter {
@@ -158,7 +257,7 @@ impl GraphWriter {
         Self {
             backend,
             similarity,
-            companies: Mutex::new(()),
+            locks: PartyLocks::new(),
         }
     }
 
@@ -402,40 +501,51 @@ impl GraphWriter {
         facts: &DocFacts,
         stats: &mut WriteStats,
     ) -> Result<()> {
-        if facts.parties.is_empty() {
+        // The parties with a name, each with the learned aliases it claims.
+        let work: Vec<Work<'_>> = facts
+            .parties
+            .iter()
+            .filter_map(|p| {
+                let name = CompanyName::parse(&p.surface)?;
+                let learned = learned_aliases(&name, facts, hex);
+                Some((p, name, learned))
+            })
+            .collect();
+        if work.is_empty() {
             return Ok(()); // nothing to match: no lock, no reads
         }
+        let keys = lock_keys(&work);
         // One edge per company: candidates that resolve to the same one merge their roles.
         let mut edges: BTreeMap<Uuid, (Party, Match)> = BTreeMap::new();
         let waited = Instant::now();
-        let serial = self.companies.lock().await;
-        let held = Instant::now();
+        let mut guard = self.locks.keys(keys.iter().map(String::as_str)).await;
+        let mut held = Instant::now();
         stats.company_lock_wait += held - waited;
         let attached = self.attached(doc).await?;
-        for p in &facts.parties {
-            let Some(name) = CompanyName::parse(&p.surface) else {
-                continue;
+        for (p, name, learned) in &work {
+            let (m, created) = loop {
+                if let Some(r) = self
+                    .resolve(name, p, hex, &attached, guard.exclusive())
+                    .await?
+                {
+                    break r;
+                }
+                // The form-blind case of [`PartyLocks`]: match again with no other party
+                // of the instance running.
+                stats.company_lock_hold += held.elapsed();
+                drop(guard);
+                let waited = Instant::now();
+                guard = self.locks.all().await;
+                held = Instant::now();
+                stats.company_lock_wait += held - waited;
             };
-            let (m, created) = self.resolve(&name, p, hex, &attached).await?;
             if created {
                 stats.new_companies += 1;
             }
-            self.learn_aliases(m.company, &name, facts, hex).await?;
-            match edges.get_mut(&m.company) {
-                Some((q, _)) => {
-                    for r in &p.roles {
-                        if !q.roles.contains(r) {
-                            q.roles.push(r.clone());
-                        }
-                    }
-                    q.score = q.score.max(p.score);
-                }
-                None => {
-                    edges.insert(m.company, (p.clone(), m));
-                }
-            }
+            self.learn_aliases(m.company, learned).await?;
+            add_edge(&mut edges, p, m);
         }
-        drop(serial);
+        drop(guard);
         stats.company_lock_hold += held.elapsed();
         for (company, (p, m)) in edges {
             let mentions: Vec<Value> = p
@@ -534,14 +644,17 @@ impl GraphWriter {
     }
 
     /// The match ladder for one party. Returns the match and whether the company is new.
-    /// `attached` are the companies the document is a party to now.
+    /// `attached` are the companies the document is a party to now. `None` (nothing
+    /// written) when the match depends on a company's absent `legal_form` and `exclusive` is
+    /// not set: the caller takes the party locks exclusively and asks again ([`PartyLocks`]).
     async fn resolve(
         &self,
         name: &CompanyName,
         p: &Party,
         hex: &str,
         attached: &BTreeSet<Uuid>,
-    ) -> Result<(Match, bool)> {
+        exclusive: bool,
+    ) -> Result<Option<(Match, bool)>> {
         let b = &self.backend;
         // Every key of the ladder in one read (issue #103): the identifiers, then the names.
         let ids: Vec<String> = p
@@ -590,11 +703,15 @@ impl GraphWriter {
                 if step == LadderStep::FormBlind
                     && let Some(form) = name.legal_form
                     && let Some(node) = b.node(owner).await?
-                    && node.props["legal_form"]
-                        .as_str()
-                        .is_some_and(|f| !f.is_empty() && f != form)
                 {
-                    continue; // "ACME d.o.o." is not "ACME a.d."
+                    let theirs = node.props["legal_form"].as_str().filter(|f| !f.is_empty());
+                    if theirs.is_some_and(|f| f != form) {
+                        continue; // "ACME d.o.o." is not "ACME a.d."
+                    }
+                    if theirs.is_none() && !exclusive {
+                        // Another party matched to the owner may set its form meanwhile.
+                        return Ok(None);
+                    }
                 }
                 found = Some(Match {
                     company: owner,
@@ -617,7 +734,7 @@ impl GraphWriter {
         }
         self.claim(&mut m, name, p, hex).await?;
         self.update_company(&m, name, p).await?;
-        Ok((m, created))
+        Ok(Some((m, created)))
     }
 
     /// A new company, keyed by its strongest identifier, else its name key. A node with that
@@ -695,40 +812,10 @@ impl GraphWriter {
         Ok(())
     }
 
-    /// Former and trading names a document states become learned aliases of the company
-    /// (ladder step 5): from the name's brackets, and from quail's name statements.
-    async fn learn_aliases(
-        &self,
-        company: Uuid,
-        name: &CompanyName,
-        facts: &DocFacts,
-        hex: &str,
-    ) -> Result<()> {
-        let mut others: Vec<String> = name
-            .aliases
-            .iter()
-            .filter(|a| a.kind != AliasKind::Annotation)
-            .map(|a| a.text.clone())
-            .collect();
-        for s in &facts.statements {
-            let current = CompanyName::parse(&s.current);
-            if current.as_ref().is_some_and(|c| c.key == name.key) {
-                others.push(s.other.clone());
-            }
-        }
-        let step = LadderStep::LearnedAlias;
-        let claims: Vec<(String, Value)> = others
-            .into_iter()
-            .filter_map(|other| {
-                let alias = CompanyName::parse(&other)?;
-                let form = alias.legal_form.or(name.legal_form).unwrap_or("");
-                let key = format!("name:{}|{form}", alias.key);
-                let props = json!({"step": step.as_str(), "confidence": step.confidence(), "document": hex, "surface": other});
-                Some((key, props))
-            })
-            .collect();
+    /// Claims the party's learned aliases ([`learned_aliases`]) for the company.
+    async fn learn_aliases(&self, company: Uuid, claims: &[(String, Value)]) -> Result<()> {
         self.backend
-            .claim_aliases(NodeKind::Company, company, &claims)
+            .claim_aliases(NodeKind::Company, company, claims)
             .await?;
         Ok(())
     }
@@ -763,5 +850,68 @@ impl GraphWriter {
         patch = patch.remove(&["matches"]);
         self.backend.update_props(m.company, &patch).await?;
         Ok(())
+    }
+}
+
+/// Former and trading names a document states become learned aliases of the company (ladder
+/// step 5): from the name's brackets, and from quail's name statements. The keys and their
+/// props; they follow from the facts alone, so they are known before the party is matched.
+fn learned_aliases(name: &CompanyName, facts: &DocFacts, hex: &str) -> Vec<(String, Value)> {
+    let mut others: Vec<String> = name
+        .aliases
+        .iter()
+        .filter(|a| a.kind != AliasKind::Annotation)
+        .map(|a| a.text.clone())
+        .collect();
+    for s in &facts.statements {
+        let current = CompanyName::parse(&s.current);
+        if current.as_ref().is_some_and(|c| c.key == name.key) {
+            others.push(s.other.clone());
+        }
+    }
+    let step = LadderStep::LearnedAlias;
+    others
+        .into_iter()
+        .filter_map(|other| {
+            let alias = CompanyName::parse(&other)?;
+            let form = alias.legal_form.or(name.legal_form).unwrap_or("");
+            let key = format!("name:{}|{form}", alias.key);
+            let props = json!({"step": step.as_str(), "confidence": step.confidence(), "document": hex, "surface": other});
+            Some((key, props))
+        })
+        .collect()
+}
+
+/// A party with a name, and the learned aliases it claims.
+type Work<'a> = (&'a Party, CompanyName, Vec<(String, Value)>);
+
+/// Every key the parties read or write ([`PartyLocks`]): their identifier aliases, ladder
+/// keys (the form-blind one included) and learned aliases. A company `create` makes is
+/// keyed by one of the first two.
+fn lock_keys(work: &[Work<'_>]) -> Vec<String> {
+    let mut keys = Vec::new();
+    for (p, name, learned) in work {
+        keys.extend(p.ids.iter().map(crate::company::Identifier::alias));
+        keys.extend(name.ladder_keys().into_iter().map(|(_, k)| k));
+        keys.extend(learned.iter().map(|(k, _)| k.clone()));
+    }
+    keys
+}
+
+/// Adds a party's match to the document's edges: candidates that resolve to the same company
+/// merge their roles.
+fn add_edge(edges: &mut BTreeMap<Uuid, (Party, Match)>, p: &Party, m: Match) {
+    match edges.get_mut(&m.company) {
+        Some((q, _)) => {
+            for r in &p.roles {
+                if !q.roles.contains(r) {
+                    q.roles.push(r.clone());
+                }
+            }
+            q.score = q.score.max(p.score);
+        }
+        None => {
+            edges.insert(m.company, (p.clone(), m));
+        }
     }
 }

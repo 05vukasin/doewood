@@ -12,7 +12,7 @@ use doewood_store::{
     valid_summarize_max_concurrent,
 };
 use tonic::{Request, Response, Status};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::pb::config_service_server::ConfigService;
 use crate::pb::{
@@ -444,14 +444,20 @@ impl ConfigService for Api {
         let policy = validate::llm_policy(&mut v, "policy", req.policy.as_ref());
         v.check()?;
         let id = id.unwrap_or_else(SourceId::generate);
-        let patch = SourcePatch {
-            llm_policy: Some(policy),
-            ..SourcePatch::default()
-        };
         let _guard = self.state.lock_sources().await;
-        let source = self.state.db(move |s| s.update_source(id, &patch)).await?;
-        info!(source = %id, mode = source.llm_policy.mode.name(), "LLM policy set");
-        self.state.llm_settings_changed();
+        let applied = self
+            .state
+            .db(move |s| s.set_llm_policy(id, &policy))
+            .await?;
+        let source = applied.value;
+        if applied.changed {
+            info!(source = %id, mode = source.llm_policy.mode.name(), "LLM policy set");
+            self.state.llm_settings_changed();
+        } else {
+            // The same policy again (a service configuring doewood at every boot): nothing was
+            // written and the queue is left alone (issue #144).
+            debug!(source = %id, mode = source.llm_policy.mode.name(), "LLM policy unchanged");
+        }
         Ok(Response::new(self.state.source_pb(&source)))
     }
 
@@ -575,17 +581,24 @@ impl ConfigService for Api {
             base_url,
         };
         let make_default = req.make_default;
-        let provider = self
+        let applied = self
             .state
-            .db(move |s| s.set_ai_provider(&input, &key, make_default))
+            .db(move |s| s.apply_ai_provider(&input, &key, make_default))
             .await?;
-        info!(
-            provider = %provider.name,
-            preset = %provider.preset,
-            api_key_set = provider.api_key_set,
-            "AI provider set"
-        );
-        self.state.llm_settings_changed();
+        let provider = applied.value;
+        if applied.changed {
+            info!(
+                provider = %provider.name,
+                preset = %provider.preset,
+                api_key_set = provider.api_key_set,
+                "AI provider set"
+            );
+            self.state.llm_settings_changed();
+        } else {
+            // The same settings again (a service configuring doewood at every boot): nothing
+            // was written and the queue is left alone (issue #144).
+            debug!(provider = %provider.name, preset = %provider.preset, "AI provider unchanged");
+        }
         Ok(Response::new(convert::ai_provider(&provider)))
     }
 

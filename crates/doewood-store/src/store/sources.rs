@@ -11,7 +11,7 @@ use zeroize::Zeroizing;
 
 use super::Snapshot;
 use super::sqs::{self, SqsInlet};
-use super::{Store, now};
+use super::{Applied, Store, now};
 use crate::StoreError;
 
 /// Scan interval of a source that sets none.
@@ -821,6 +821,34 @@ impl Store {
         let updated = tx.query_row(&select, [id.to_string()], Source::from_row)??;
         tx.commit()?;
         Ok(updated)
+    }
+
+    /// Sets a source's LLM policy, like [`Store::update_source`] with only `llm_policy`, but
+    /// writes nothing (not even `updated_at`) when the source already has that policy
+    /// (issue #144): `changed` tells the caller whether to wake the LLM queue.
+    pub fn set_llm_policy(
+        &self,
+        id: SourceId,
+        policy: &LlmPolicy,
+    ) -> Result<Applied<Source>, StoreError> {
+        policy.validate()?;
+        let current = self
+            .source(id)?
+            .ok_or_else(|| StoreError::NoSuchSource(id.to_string()))?;
+        if current.llm_policy == *policy {
+            return Ok(Applied {
+                value: current,
+                changed: false,
+            });
+        }
+        let patch = SourcePatch {
+            llm_policy: Some(policy.clone()),
+            ..SourcePatch::default()
+        };
+        Ok(Applied {
+            value: self.update_source(id, &patch)?,
+            changed: true,
+        })
     }
 
     /// Removes a source's credentials: it is then read anonymously.
