@@ -23,6 +23,7 @@ pub mod llm;
 pub mod pipeline;
 pub mod route;
 pub mod sheet;
+pub mod text;
 
 pub use analyze::{Analysis, Analyzer, AnalyzerConfig, OcrState, Outcome};
 pub use enrichment::{

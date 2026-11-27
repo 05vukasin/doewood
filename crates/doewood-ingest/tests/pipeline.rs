@@ -401,6 +401,22 @@ async fn scenario(store: Arc<Store>, shared: &Shared) {
             true,
         ),
         ("in/notes-a.txt", common::prose(7, 600).into_bytes(), true),
+        (
+            "in/deck.pptx",
+            common::pptx(&[
+                (
+                    "Quarterly review",
+                    &["Revenue grew in March", "Two new suppliers"],
+                ),
+                ("Next steps", &["Sign the framework contract"]),
+            ]),
+            true,
+        ),
+        (
+            "in/page.html",
+            common::html("Delivery terms", &["Goods ship within 15 days."]),
+            true,
+        ),
         ("in/notes-b.txt", near_copy(7), true),
         ("in/notes-c.txt", common::prose(99, 600).into_bytes(), true),
         // Found by the sweep only.
@@ -427,7 +443,13 @@ async fn scenario(store: Arc<Store>, shared: &Shared) {
         .unwrap();
     h.settle().await;
 
-    for key in ["in/aneks.docx", "in/prices.xlsx", "in/notes-a.txt"] {
+    for key in [
+        "in/aneks.docx",
+        "in/prices.xlsx",
+        "in/notes-a.txt",
+        "in/deck.pptx",
+        "in/page.html",
+    ] {
         assert_eq!(h.status(key).status, "done", "{name} {key}");
     }
     assert_eq!(h.status("in/blob.bin").status, "skipped", "{name}");
@@ -468,7 +490,101 @@ async fn scenario(store: Arc<Store>, shared: &Shared) {
         assert!(keys.contains(&k), "{name}: {k} in {keys:?}");
     }
     assert_eq!(xl.versions["hedgehog"], "1a9811f");
-    assert_eq!(xl.versions["doewood.ingest"], "1");
+    assert_eq!(xl.versions["doewood.ingest"], "2");
+    // The text beside the records (issue #166): a row per sheet row, quail's blocks for the
+    // documents, none for the blob.
+    let text = |key: &str| {
+        let hash = h.hash(key);
+        async move {
+            b.get_document_text(&hash)
+                .await
+                .unwrap()
+                .map(|t| doewood_model::DocumentText::from_body(&t.body).unwrap())
+        }
+    };
+    let xl_text = text("in/prices.xlsx").await.expect("workbook text");
+    assert_eq!(
+        (
+            xl_text.extractor.as_str(),
+            xl_text.pages[0].sheet.as_deref()
+        ),
+        ("hedgehog", Some("Prices")),
+        "{name}"
+    );
+    let rows: Vec<(&str, Option<u32>)> = xl_text.pages[0]
+        .blocks
+        .iter()
+        .map(|b| (b.text.as_str(), b.row))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("Item\tQty\tPrice", Some(0)),
+            ("Bolts\t10\t2.5", Some(1)),
+            ("Nuts\t20\t1.25", Some(2))
+        ],
+        "{name}"
+    );
+    let docx_text = text("in/aneks.docx").await.expect("docx text");
+    assert_eq!(docx_text.extractor, "docx.extract", "{name}");
+    assert!(docx_text.block_count() > 0, "{name}");
+    let notes = text("in/notes-a.txt").await.expect("text file text");
+    assert_eq!(notes.extractor, "text.extract", "{name}");
+    let words: Vec<String> = notes
+        .pages
+        .iter()
+        .flat_map(|p| &p.blocks)
+        .flat_map(|b| {
+            b.text
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let prose = common::prose(7, 600);
+    let want: Vec<&str> = prose.split_whitespace().collect();
+    assert_eq!(words, want, "{name}: every word of the file, in order");
+    assert!(text("in/blob.bin").await.is_none(), "{name}");
+    // PPTX and HTML (quail #120) go to quail's own readers, end to end.
+    for (key, format, extractor, words) in [
+        (
+            "in/deck.pptx",
+            "pptx",
+            "pptx.extract",
+            [
+                "Quarterly review",
+                "Two new suppliers",
+                "Sign the framework contract",
+            ],
+        ),
+        (
+            "in/page.html",
+            "html",
+            "html.extract",
+            [
+                "Delivery terms",
+                "Goods ship within 15 days.",
+                "Delivery terms",
+            ],
+        ),
+    ] {
+        let rec = b.get_record(&h.hash(key)).await.unwrap().unwrap();
+        assert_eq!(rec.body_value().unwrap()["format"], format, "{name} {key}");
+        let t = text(key).await.expect(key);
+        assert_eq!(t.extractor, extractor, "{name} {key}");
+        let all: Vec<&str> = t
+            .pages
+            .iter()
+            .flat_map(|p| &p.blocks)
+            .map(|b| b.text.as_str())
+            .collect();
+        for w in words {
+            assert!(
+                all.iter().any(|b| b.contains(w)),
+                "{name} {key}: {w} in {all:?}"
+            );
+        }
+    }
     let blob_rec = b.get_record(&h.hash("in/blob.bin")).await.unwrap().unwrap();
     let blob_body = blob_rec.body_value().unwrap();
     assert_eq!(blob_body["format"], "unknown", "{name}");

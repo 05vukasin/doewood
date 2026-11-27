@@ -34,7 +34,7 @@ The S3 event webhook is not part of the gRPC API: it is on the ops server (see
 |---|---|
 | `ConfigService` | `AddSource`, `UpdateSource`, `PauseSource`, `ResumeSource`, `RemoveSource`, `ReleaseSourceClaim`, `ListSources`, `GetSource`, `SetLlmPolicy`, `SetSqsInlet`, `RemoveSqsInlet`, `SetAiProvider`, `RemoveAiProvider`, `ListAiProviders`, `GetIngestSettings`, `SetIngestSettings`, `GetEnrichmentSettings`, `SetEnrichmentSettings`, `GetApiSettings`, `SetApiSettings` |
 | `JobsService` | `WatchProgress` (server stream), `ReprocessJob`, `WatchReprocess` (server stream) |
-| `RecordsService` | `GetRecord`, `ListRecords` |
+| `RecordsService` | `GetRecord`, `ListRecords`, `GetDocumentText` |
 | `GraphService` | `GetNode`, `Neighbours`, `CompanyDocuments`, `ListMerges`, `MergeCompanies`, `UndoMerge`, `SplitCompany`, `DismissPair`, `ListDismissals`, `ListProposals`, `AcceptProposal`, `RejectProposal` |
 | `SearchService` | `Search` |
 | `SummarizeService` | `Summarize` |
@@ -246,6 +246,9 @@ refused: the workbook has more than 1,600,000 cells ...`, and how to raise the c
   about 1 MiB a page stays under the 4 MiB message size that gRPC clients accept by default.
   A page that ends exactly at the end of the source may still give a token; the next page is
   then empty. See [ListRecords page budget](#listrecords-page-budget).
+- **GetDocumentText** (issue #166) returns a document's text with block locations: its pages,
+  and their blocks with kind, text, zone, heading path, and for spreadsheets the sheet and
+  row. It pages blocks as ListRecords pages records. See [Document text](#document-text).
 - **GetNode** finds a node by id or by kind and key; **Neighbours** follows its edges with the
   filters of the model's `NeighbourQuery` (direction, edge kinds, neighbour kind, a day the edge
   must hold on, inactive edges); **CompanyDocuments** lists the documents with a live `party`
@@ -845,6 +848,67 @@ compares with `coalesce(?4, x'')` and searches the primary key from the token. I
 Python's sqlite3 (3.46.1, in memory, 50,000 records, the same query), walking a bucket 50 per
 page took 471 ms before and 69 ms after, with the same results.
 
+## Document text
+
+`GetDocumentText(blake3)` (issue #166) is for an application that does its own chunking,
+quoting, diff or compare. It returns the text quail extracted, or the rows hedgehog read, with
+where each block sits.
+
+- **Blocks.** Each block has a `kind`:
+  - `heading`, with its `level`;
+  - `paragraph`, `list_item`, `note` or `annotation`;
+  - `table_row`: one row of a table in a document, its cells separated by tabs, a tab per
+    column, with `table` and `row`;
+  - `sheet_row`: one row of a spreadsheet, with `sheet` and `row`. Numbers are written as
+    Rust writes them, and dates as ISO 8601.
+
+  A block also has its `text`, its `page`, its `zone` (`header`, `footer`, `body`, `title`,
+  `table`, `signature` or `unknown`; empty for a sheet row), and its `index` among all the
+  document's blocks. Blocks with blank text are left out. New kinds may be added.
+- **Heading paths** are derived on every read, not stored. A block's `heading_path` holds the
+  texts of the headings above it, the highest first. A heading of level `n` ends the open
+  headings of level `n` and below. Headings in a header or footer zone do not count. A path
+  holds at most 16 headings, each cut to 256 bytes.
+- **Pages.** A `TextPage` is a printed page (PDF), a section of a flowing document (DOCX), or a
+  sheet (with its name). Its `origin` says where its text came from: `native`, `ocr`, or `none`
+  for an image page that was not OCR'd. After OCR, the text is the revised pages'.
+- **Provenance.** `extractor` and `extractor_version` name the step that made the text
+  (`pdf.extract`, `docx.extract`, `pptx.extract`, `html.extract`, `text.extract`, ..., or
+  `hedgehog` with its revision). The
+  same bytes analyzed with the same step versions always give the same blocks.
+- **Stored, not re-derived.** doewood keeps no copy of a file's bytes, so ingest stores the
+  text when it analyzes the file, beside the record (`RecordStore::put_document_text`), and
+  replaces it whenever the record is analyzed again. It follows ADR 0003:
+  - it is canonical JSON text (`doewood_model::DocumentText`);
+  - Postgres keeps it in `document_texts.body` (`text`, lz4; schema 14);
+  - SQLite keeps it as it is, like `records.body_json` (`document_texts`, schema 16);
+  - it is read by `blake3` only;
+  - removing the record removes it.
+- **Size cap.** A stored text takes at most 2 MiB of JSON (`doewood_model::TEXT_MAX_BYTES`,
+  `AnalyzerConfig::text_max_bytes`). Past the cap the remaining blocks are left out and
+  `truncated` is true. Each block and page counts at most the JSON it takes, so the cap holds
+  for the stored body. A 300-page contract has well under 1 MiB of text.
+- **Pages of blocks.** As in ListRecords:
+  - `page_size` is 1 to 1000 blocks; 0 means 200, and more is `INVALID_ARGUMENT`.
+  - A page also ends with the block that brings its text, heading paths and sheet names to
+    1 MiB.
+  - Pass `next_page_token` back as `page_token` until it comes back empty.
+  - `pages` lists the pages that hold this response's blocks; a page split over two responses
+    comes in both.
+  - A page without blocks comes in the response that holds the next block, or in the last
+    response. So a walk over all responses sees every page and every block, in order.
+  - A token from a text stored again since the first page (the file was reprocessed) is
+    `FAILED_PRECONDITION`: start over. A token that is not from a previous page is
+    `INVALID_ARGUMENT`.
+- **`NOT_FOUND`** when there is no text for the hash:
+  - no record;
+  - a file without extracted text (an image, an archive, an unknown file, a failed
+    extraction);
+  - a record from before this change. Its `doewood.ingest` step version is 1 (now 2), so
+    `ReprocessJob` analyzes the file again and stores its text.
+- **`want_text` on `PutObject`** (issue #166, with the push sources of #165) is not in this
+  version. It comes once `PutObject` exists.
+
 ## ListRecords page budget
 
 Before issue #111 a `ListRecords` page was only bounded by its size (up to 1000 records), so a
@@ -1105,5 +1169,7 @@ the happy paths, validation errors, two instances sharing one backend (the claim
 secrets never coming back (SQS inlet credentials included), the progress stream, a gRPC-Web
 request over HTTP/1.1, health, reflection and the message limit. `tests/icons.rs` checks the icon route's answers and
 headers with a fake resolver. `tests/api_load.rs` (ignored) is the load benchmark (see
-[Capacity](#capacity)). With `DOEWOOD_TEST_POSTGRES_URL` set, the claim, records,
+[Capacity](#capacity)). `GetDocumentText` is tested on generated PDF, DOCX, PPTX, HTML, text and XLSX files,
+through ingest, on SQLite (`get_document_text` in `tests/api.rs`), and the stores' text
+methods are in the conformance suite. With `DOEWOOD_TEST_POSTGRES_URL` set, the claim, records,
 graph, merge-log and search tests also run against Postgres.

@@ -3,11 +3,13 @@
 //! One [`Analyzer`] per instance holds one quail engine, built like the `quail` CLI builds
 //! its own (`quail_cli::registry::builder`), shared by every ingest worker.
 //!
-//! - Documents (PDF, DOCX, text, CSV) get quail's record as is.
+//! - Documents (PDF, DOCX, PPTX, HTML, text, CSV) get quail's record as is.
 //! - Spreadsheets get quail's identity layer (hashes, sniffed format) plus hedgehog's `sheet.*`
 //!   facts, with the spreadsheet format as the record's `format`: the same top-level shape.
 //! - Documents also get `summary.digest` (quail's bounded summary input), which the LLM queue
 //!   reads ([`crate::llm`]).
+//! - Documents and spreadsheets also get their text with block locations ([`crate::text`],
+//!   issue #166), stored beside the record.
 //! - Anything without an extractor (an image, an archive, an unknown file) keeps the record of
 //!   quail's generic layer: identity and format only.
 //!
@@ -19,8 +21,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use doewood_model::canonical::{to_canonical, to_canonical_with};
-use doewood_model::{Blake3, StepVersions};
-use quail_core::{Blob, FileRecord, Format, Limits, Profile, Status};
+use doewood_model::{Blake3, DocumentText, StepVersions};
+use quail_core::{Blob, FileRecord, Format, Limits, Profile, SourceItem, Status};
 use quail_engine::Engine;
 use serde_json::Value as Json;
 use serde_json::value::RawValue;
@@ -32,7 +34,10 @@ use crate::sheet;
 
 /// Version of doewood's own conversion (records, graph, search). Part of every record's step
 /// versions, so changing it makes `ReprocessJob` redo every file.
-pub const INGEST_VERSION: &str = "1";
+///
+/// 2: the file's text with block locations is stored beside the record (issue #166), so
+/// `ReprocessJob` stores it for the files analyzed before.
+pub const INGEST_VERSION: &str = "2";
 
 /// Step-version keys that decide whether a stored record is current. The other keys (one per
 /// quail step) are informative.
@@ -66,6 +71,9 @@ pub struct AnalyzerConfig {
     /// (one engine per GiB of 20 % of the total memory, so one below 10 GiB). Only speed and
     /// memory change: the output is the same for any job and thread count (issue #116).
     pub ocr_jobs: Option<usize>,
+    /// Most bytes of a file's stored text ([`Analysis::text`], issue #166); 0 keeps none.
+    /// [`doewood_model::TEXT_MAX_BYTES`] by default.
+    pub text_max_bytes: usize,
 }
 
 impl Default for AnalyzerConfig {
@@ -78,6 +86,7 @@ impl Default for AnalyzerConfig {
             cpus: 1,
             ocr_models: PathBuf::from("ocr-models"),
             ocr_jobs: None,
+            text_max_bytes: doewood_model::TEXT_MAX_BYTES,
         }
     }
 }
@@ -111,6 +120,10 @@ pub struct Analysis {
     pub versions: StepVersions,
     /// How it ended.
     pub outcome: Outcome,
+    /// The file's text with block locations ([`doewood_model::DocumentText`] as canonical
+    /// JSON text), stored beside the record: `None` for a file without extracted text (an
+    /// image, an unknown file, a failed extraction) or when the analyzer keeps none.
+    pub text: Option<Box<RawValue>>,
 }
 
 /// How analysis ended.
@@ -131,6 +144,7 @@ pub struct Analyzer {
     ocr: OcrState,
     limits: Limits,
     sheet_max_cells: u64,
+    text_max_bytes: usize,
     cpus: std::sync::Arc<CpuSlots>,
 }
 
@@ -195,6 +209,7 @@ impl Analyzer {
             ocr,
             limits,
             sheet_max_cells: config.sheet_max_cells,
+            text_max_bytes: config.text_max_bytes,
             cpus: CpuSlots::new(config.cpus),
         })
     }
@@ -251,13 +266,16 @@ impl Analyzer {
     /// The analysis holds one of the instance's CPU slots until it returns; a spreadsheet's
     /// normalizer borrows the free ones for its call.
     pub fn analyze_hashed(&self, bytes: Vec<u8>, blake3: Blake3, key: &str) -> Analysis {
-        let (parts, versions, outcome, route) = self.analyze_parts(bytes, blake3, key);
+        let (parts, versions, outcome, route, text) = self.analyze_parts(bytes, blake3, key);
+        // A text this builder made always writes (its strings are valid UTF-8, no `\0`).
+        let text = text.and_then(|t| t.to_body().ok());
         Analysis {
             blake3,
             route,
             body: parts.to_body(),
             versions,
             outcome,
+            text,
         }
     }
 
@@ -274,7 +292,13 @@ impl Analyzer {
         bytes: Vec<u8>,
         blake3: Blake3,
         key: &str,
-    ) -> (RecordParts, StepVersions, Outcome, Route) {
+    ) -> (
+        RecordParts,
+        StepVersions,
+        Outcome,
+        Route,
+        Option<DocumentText>,
+    ) {
         let _slot = self.cpus.enter();
         let deadline = Instant::now().checked_add(self.limits.timeout);
         let sniff = quail_engine::detect(&bytes);
@@ -282,16 +306,32 @@ impl Analyzer {
         let blob = Blob::from(bytes);
         // The locator is the content's own name: records are shared by every copy, and their
         // locations live in the graph.
-        let record = self
-            .engine
-            .process_blob(format!("blake3:{}", blake3.to_hex()), &blob);
+        // The text is built from the pages quail extracted, before they are dropped.
+        let extractor = match route {
+            Route::Quail(format) if self.text_max_bytes > 0 => self.engine.extractor_for(format),
+            _ => None,
+        };
+        let mut text = None;
+        let item = SourceItem {
+            locator: format!("blake3:{}", blake3.to_hex()),
+            blob: blob.clone(),
+            modified: None,
+        };
+        let record = self.engine.process_with(item, |_, artifacts| {
+            if let Some(id) = extractor {
+                text = crate::text::from_artifacts(artifacts, id, self.text_max_bytes);
+            }
+        });
         debug_assert!(
             quail_hash_matches(&record, &blake3),
             "the hash passed in is not quail's hash.blake3"
         );
         let (parts, versions, outcome) = match route {
             Route::Sheet(format) => {
-                self.sheet_record(record, blob.as_bytes(), key, format, deadline)
+                let (parts, versions, outcome, sheet_text) =
+                    self.sheet_record(record, blob.as_bytes(), key, format, deadline);
+                text = sheet_text;
+                (parts, versions, outcome)
             }
             Route::Quail(format) => {
                 let outcome = match &record.status {
@@ -311,7 +351,7 @@ impl Analyzer {
                 (parts, versions, outcome)
             }
         };
-        (parts, versions, outcome, route)
+        (parts, versions, outcome, route, text)
     }
 
     fn sheet_record(
@@ -321,15 +361,16 @@ impl Analyzer {
         key: &str,
         format: crate::route::SheetFormat,
         deadline: Option<Instant>,
-    ) -> (RecordParts, StepVersions, Outcome) {
+    ) -> (RecordParts, StepVersions, Outcome, Option<DocumentText>) {
         let name = key.rsplit('/').next().unwrap_or(key);
-        let out = sheet::analyze_on(
+        let out = sheet::analyze_text_on(
             bytes,
             name,
             format.as_str(),
             deadline,
             self.sheet_max_cells,
             Some(&self.cpus),
+            self.text_max_bytes,
         );
         record.facts.extend(out.facts);
         record.steps.extend(out.steps);
@@ -360,7 +401,7 @@ impl Analyzer {
             record,
             format: Some(format.as_str()),
         };
-        (parts, versions, outcome)
+        (parts, versions, outcome, out.text)
     }
 
     fn versions(&self, record: &FileRecord, sheet: bool) -> StepVersions {

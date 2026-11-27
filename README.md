@@ -1,7 +1,7 @@
 # doewood
 
-A Rust service around [quail](https://github.com/05vukasin/quail) (PDF, DOCX and text) and
-[hedgehog](https://github.com/05vukasin/hedgehog) (spreadsheets). It watches S3-compatible
+A Rust service around [quail](https://github.com/05vukasin/quail) (PDF, DOCX, PPTX, HTML and
+text) and [hedgehog](https://github.com/05vukasin/hedgehog) (spreadsheets). It watches S3-compatible
 storage, extracts metadata from every file, links documents and companies in a shared graph, and
 serves it all over gRPC.
 

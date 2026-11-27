@@ -33,18 +33,18 @@ hh_core = { git = "https://github.com/05vukasin/hedgehog", rev = "1a9811f" }
 # quail: `quail-cli` is a library too, and its `registry` module wires every extractor and
 # analyzer. OCR is added here (feature `ocr`) so the model directory comes from doewood's
 # configuration, not from the process environment.
-quail-cli = { git = "https://github.com/05vukasin/quail", rev = "5557ef5" }
-quail-core = { git = "https://github.com/05vukasin/quail", rev = "5557ef5" }
-quail-engine = { git = "https://github.com/05vukasin/quail", rev = "5557ef5" }
-quail-ocr = { git = "https://github.com/05vukasin/quail", rev = "5557ef5", optional = true }
+quail-cli = { git = "https://github.com/05vukasin/quail", rev = "a1d7db8" }
+quail-core = { git = "https://github.com/05vukasin/quail", rev = "a1d7db8" }
+quail-engine = { git = "https://github.com/05vukasin/quail", rev = "a1d7db8" }
+quail-ocr = { git = "https://github.com/05vukasin/quail", rev = "a1d7db8", optional = true }
 # The free-mail list, so a free-mail domain never becomes a company's website (ADR 0002
 # section 1.5).
-quail-signals = { git = "https://github.com/05vukasin/quail", rev = "5557ef5" }
-quail-sketch = { git = "https://github.com/05vukasin/quail", rev = "5557ef5" }
+quail-signals = { git = "https://github.com/05vukasin/quail", rev = "a1d7db8" }
+quail-sketch = { git = "https://github.com/05vukasin/quail", rev = "a1d7db8" }
 # LLM summaries (ADR 0001, section 6): `summary.llm` through an HTTP API. Feature `api` sends
 # document text (the card and the digest) to the provider a source's policy and the configured
 # AI provider name; nothing is sent while every policy is `off` (the default).
-quail-summary = { git = "https://github.com/05vukasin/quail", rev = "5557ef5", features = ["api"] }
+quail-summary = { git = "https://github.com/05vukasin/quail", rev = "a1d7db8", features = ["api"] }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
@@ -67,7 +67,7 @@ zip = { version = "9.0.5", default-features = false }
 lopdf = { version = "0.47.0", default-features = false }
 # Renders the generated text pages into the scans of the OCR measurement (`tests/ocr_profile.rs`)
 # and decodes them as OCR does.
-quail-pdf = { git = "https://github.com/05vukasin/quail", rev = "5557ef5" }
+quail-pdf = { git = "https://github.com/05vukasin/quail", rev = "a1d7db8" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
 tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
 # The end-to-end test writes to MinIO with raw presigned requests, as doewood-s3's tests do.

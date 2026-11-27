@@ -8,6 +8,10 @@ service RecordsService {
   rpc GetRecord(GetRecordRequest) returns (Record);
   // The records of the files in a source, ordered by hash, a page at a time.
   rpc ListRecords(ListRecordsRequest) returns (ListRecordsResponse);
+  // A document's text with block locations (pages, blocks with kinds and zones, heading
+  // paths), a page of blocks at a time. Stored by ingest beside the record; NOT_FOUND when
+  // there is none (no record, a file without text, or a record from before the text was kept).
+  rpc GetDocumentText(GetDocumentTextRequest) returns (GetDocumentTextResponse);
 }
 
 message GetRecordRequest {
@@ -39,4 +43,75 @@ message ListRecordsResponse {
   repeated Record records = 1;
   // Empty on the last page.
   string next_page_token = 2;
+}
+
+message GetDocumentTextRequest {
+  // 64 hex digits.
+  string blake3 = 1;
+  // Blocks per page, 1 to 1000; 0 means 200.
+  uint32 page_size = 2;
+  // `next_page_token` of the previous page; empty for the first.
+  string page_token = 3;
+}
+
+message GetDocumentTextResponse {
+  // 64 lowercase hex digits.
+  string blake3 = 1;
+  // The step that extracted the text (`pdf.extract`, `docx.extract`, `text.extract`, ...;
+  // `hedgehog` for a spreadsheet).
+  string extractor = 2;
+  // That step's version (hedgehog's revision for a spreadsheet).
+  string extractor_version = 3;
+  // The size cap was reached when the text was stored: the blocks after the last one are
+  // missing.
+  bool truncated = 4;
+  // The pages that hold this response's blocks, in order. A page without blocks comes in the
+  // response that holds the next block (in the last response when no block follows it), so a
+  // walk over every response sees each page once, blocks spread over the responses.
+  repeated TextPage pages = 5;
+  // Blocks in the whole document.
+  uint32 total_blocks = 6;
+  // Empty on the last page.
+  string next_page_token = 7;
+  // When the text was stored, Unix seconds.
+  int64 updated_at = 8;
+}
+
+// One page of a document: a printed page, a section of a flowing document (DOCX), or a sheet.
+message TextPage {
+  // The page's index in the document, or the sheet's in the workbook, from 0.
+  uint32 index = 1;
+  // The sheet's name, for a spreadsheet.
+  string sheet = 2;
+  // Where the text came from: `native`, `ocr` or `none` (an image page not OCR'd).
+  string origin = 3;
+  // Its blocks on this response page, in reading order.
+  repeated TextBlock blocks = 4;
+}
+
+message TextBlock {
+  // Its index among all the document's blocks, from 0: stable for the same bytes and step
+  // versions.
+  uint32 index = 1;
+  // `heading`, `paragraph`, `list_item`, `table_row`, `sheet_row`, `note`, `annotation`; new
+  // kinds may come.
+  string kind = 2;
+  // The text. A table or sheet row's cells are separated by tabs, a tab per column.
+  string text = 3;
+  // The page's index (as `TextPage.index`).
+  uint32 page = 4;
+  // The texts of the headings above it, the highest first (a heading's own text is not in its
+  // path). Derived from the heading blocks; headings in a header or footer do not count.
+  repeated string heading_path = 5;
+  // The sheet's name, for a sheet row.
+  string sheet = 6;
+  // A table row's row in its table, or a sheet row's row in its sheet, from 0.
+  optional uint32 row = 7;
+  // Where on the page it is: `header`, `footer`, `body`, `title`, `table`, `signature` or
+  // `unknown`; empty for a sheet row.
+  string zone = 8;
+  // A heading's level, 1 the highest; 0 for other blocks.
+  uint32 level = 9;
+  // A table row's table, counted on its page from 0.
+  optional uint32 table = 10;
 }

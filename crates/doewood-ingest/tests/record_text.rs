@@ -113,6 +113,14 @@ fn corpus() -> Vec<(&'static str, Vec<u8>)> {
         ),
         ("contract.docx", common::docx("Supply contract", &docx_body)),
         ("prices.xlsx", common::xlsx("Prices", &row_refs)),
+        (
+            "deck.pptx",
+            common::pptx(&[
+                ("Supply plan", &["40 pallets in March"]),
+                ("Prices", &paragraphs[..3]),
+            ]),
+        ),
+        ("terms.html", common::html("Delivery terms", &invoice)),
         ("big.xlsx", common::big_xlsx_with(3000, 8, 11, true)),
         ("notes.txt", prose.clone().into_bytes()),
         (
@@ -270,4 +278,109 @@ async fn postgres() -> Option<(doewood_pg::PgStore, tokio_postgres::Client, Stri
         .await
         .unwrap_or_else(|e| panic!("connect {schema}: {e}"));
     Some((pg, admin, schema))
+}
+
+/// Issue #166: the text with block locations of every kind of file. Documents get quail's
+/// pages and blocks, spreadsheets a block per row, the rest none; the same bytes always give
+/// the same text, and a small cap truncates it.
+#[test]
+fn document_text_of_every_kind() {
+    let a = analyzer();
+    for (name, bytes) in corpus() {
+        let first = a.analyze(bytes.clone(), name);
+        let again = a.analyze(bytes.clone(), name);
+        assert_eq!(
+            first.text.as_ref().map(|t| t.get().to_owned()),
+            again.text.as_ref().map(|t| t.get().to_owned()),
+            "{name}: the same bytes give the same text"
+        );
+        let text = first
+            .text
+            .as_ref()
+            .map(|t| doewood_model::DocumentText::from_body(t).unwrap());
+        let words = |t: &doewood_model::DocumentText| -> String {
+            t.pages
+                .iter()
+                .flat_map(|p| &p.blocks)
+                .map(|b| b.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        match name {
+            "invoice.pdf" | "report.pdf" => {
+                let t = text.expect(name);
+                assert_eq!(t.extractor, "pdf.extract", "{name}");
+                assert!(!t.truncated, "{name}");
+                if name == "invoice.pdf" {
+                    assert!(words(&t).contains("INVOICE No. 7/2026"), "{name}");
+                } else {
+                    assert!(t.pages.len() > 1, "{name}: {} pages", t.pages.len());
+                }
+            }
+            "contract.docx" => {
+                let t = text.expect(name);
+                assert_eq!(t.extractor, "docx.extract", "{name}");
+                assert!(words(&t).contains("Delivery of 40 pallets"), "{name}");
+            }
+            "notes.txt" | "escapes.txt" | "table.csv" => {
+                let t = text.expect(name);
+                assert_eq!(t.extractor, "text.extract", "{name}");
+                assert!(t.block_count() > 0, "{name}");
+            }
+            "deck.pptx" | "terms.html" => {
+                let t = text.expect(name);
+                let want = if name == "deck.pptx" {
+                    ("pptx.extract", "40 pallets in March")
+                } else {
+                    ("html.extract", "INVOICE No. 7/2026")
+                };
+                assert_eq!(t.extractor, want.0, "{name}");
+                assert!(words(&t).contains(want.1), "{name}");
+            }
+            "prices.xlsx" => {
+                let t = text.expect(name);
+                assert_eq!(t.extractor, "hedgehog", "{name}");
+                let rows: Vec<&str> = t.pages[0].blocks.iter().map(|b| b.text.as_str()).collect();
+                assert_eq!(rows[0], "Item\tQty\tPrice", "{name}");
+                assert_eq!(rows.len(), 41, "{name}");
+            }
+            "big.xlsx" => {
+                let t = text.expect(name);
+                assert!(t.block_count() >= 3000, "{name}: {}", t.block_count());
+            }
+            "empty.bin" | "blob.bin" | "archive.zip" | "scan.png" | "broken.xlsx" => {
+                assert!(text.is_none(), "{name}");
+            }
+            _ => {}
+        }
+        if let Some(t) = &first.text {
+            assert!(
+                t.get().len() <= doewood_model::TEXT_MAX_BYTES + 256,
+                "{name}"
+            );
+        }
+    }
+    let small = Analyzer::new(&AnalyzerConfig {
+        workers: 1,
+        ocr_models: PathBuf::from("/nonexistent/doewood-ocr-models"),
+        text_max_bytes: 4096,
+        ..AnalyzerConfig::default()
+    })
+    .unwrap();
+    let big = common::big_xlsx_with(3000, 8, 11, true);
+    let t = small.analyze(big, "big.xlsx").text.unwrap();
+    let t = doewood_model::DocumentText::from_body(&t).unwrap();
+    assert!(t.truncated);
+    let off = Analyzer::new(&AnalyzerConfig {
+        workers: 1,
+        ocr_models: PathBuf::from("/nonexistent/doewood-ocr-models"),
+        text_max_bytes: 0,
+        ..AnalyzerConfig::default()
+    })
+    .unwrap();
+    assert!(
+        off.analyze(common::docx("x", &["one paragraph"]), "x.docx")
+            .text
+            .is_none()
+    );
 }

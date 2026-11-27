@@ -59,7 +59,7 @@ starts it, and freed when it is through. A HEAD is a short wait, not a download.
   The file timeout is quail's (2 min); see [Time limits](#time-limits).
 - **Routing** comes from the bytes: quail's sniff (`engine.sniff`), then a bounded look for the
   spreadsheet containers quail calls a plain ZIP or OLE file. XLSX/XLSM, XLSB, ODS and XLS go to
-  hedgehog; PDF, DOCX and text (CSV included: quail reads text) to quail. An object key's
+  hedgehog; PDF, DOCX, PPTX, HTML and text (CSV included: quail reads text) to quail. An object key's
   extension only decides when the bytes do not.
 - **Spreadsheets:** quail's identity layer (hashes, sniffed format), then hedgehog
   (`hh_core::reader::open_bytes_with` and its normalizer) as `sheet.*` facts: sheets, cells,
@@ -243,6 +243,15 @@ readers deserialize only what they use: `DocFacts` reads the facts it needs into
 and skips the rest as text, the outcome of a stored record reads `format` and `status` only.
 Numbers are in [Sizing, Records](deploy.md#records).
 
+Beside the record, ingest stores the file's **text with block locations** (issue #166):
+- for a document, quail's pages and blocks (after OCR, the revised pages), a table's cells
+  joined into one block per row;
+- for a spreadsheet, one block per row of each sheet.
+
+It is canonical JSON text of at most 2 MiB (`truncated` past that). It is written whenever
+the record is analyzed, and removed when a new analysis has no text. `GetDocumentText` reads it
+([api.md](api.md#document-text)).
+
 ## The graph
 
 - **Document** (BLAKE3) and **Location** through `upsert_location`.
@@ -419,8 +428,8 @@ are there for enrichment, and no document merges on a fuzzy match yet.
   forms, aliases, identifiers), the job sizing and error classes. `doewood-enrich` has its own
   (`cargo test -p doewood-enrich`): names in both scripts, every identifier check, the fuzzy
   rules and veto, the gate boundaries and pinned group ids.
-- `tests/pipeline.rs`: generated PDF, DOCX, TXT and XLSX files through the whole pipeline into
-  SQLite (and Postgres with `DOEWOOD_TEST_POSTGRES_URL`), then the records, the graph (pending
+- `tests/pipeline.rs`: generated PDF, DOCX, PPTX, HTML, TXT and XLSX files through the whole
+  pipeline into SQLite (and Postgres with `DOEWOOD_TEST_POSTGRES_URL`), then the records, the graph (pending
   references, companies across spellings and identifiers, `similar_to`), search, retries,
   deletes and reprocessing. `throughput` (ignored) measures files per second.
 - `tests/known_copies.rs`: a known copy is located with a HEAD and no GetObject only with the
@@ -437,8 +446,8 @@ are there for enrichment, and no document merges on a fuzzy match yet.
   the watchdog: a second big file waits for the budget until that analysis ends, small files
   flow meanwhile, and a file bigger than the budget takes all of it. `tests/sheet.rs`:
   hedgehog's read past the deadline, or over the cell cap, fails the workbook.
-- `tests/record_text.rs`: generated files of every kind (PDF, DOCX, XLSX, text, CSV, image,
-  ZIP, unknown, empty, broken PDF and XLSX): the record text is the `Value` tree's text byte for
+- `tests/record_text.rs`: generated files of every kind (PDF, DOCX, PPTX, HTML, XLSX, text, CSV,
+  image, ZIP, unknown, empty, broken PDF and XLSX): the record text is the `Value` tree's text byte for
   byte, `DocFacts` reads the same as reading every fact, and SQLite (and Postgres with
   `DOEWOOD_TEST_POSTGRES_URL`) store it and give that text back, a second write unchanged.
 - `tests/minio_postgres.rs`: an S3 put in MinIO to a record in Postgres, with both

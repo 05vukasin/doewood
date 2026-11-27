@@ -24,6 +24,7 @@ use crate::{
     SearchDoc, SearchQuery, SourceKey, SplitRequest, StepVersions, StoredEdge, StoredIcon,
     UndoRequest, merged_into,
 };
+use crate::{BlockKind, TEXT_MAX_BYTES, TextBlock, TextBuilder, TextOrigin, TextZone};
 
 /// Runs every check.
 ///
@@ -129,6 +130,69 @@ pub async fn records<B: Backend + ?Sized>(s: &B) {
     );
     record_versions(s).await;
     fact_texts(s).await;
+    document_texts(s).await;
+}
+
+/// Document texts (issue #166): stored beside a record, returned byte for byte, replaced,
+/// removed; a text without its record is refused.
+async fn document_texts<B: Backend + ?Sized>(s: &B) {
+    let h = hash(166);
+    assert!(s.get_document_text(&h).await.unwrap().is_none());
+    let mut b = TextBuilder::new("docx.extract", "2", TEXT_MAX_BYTES);
+    assert!(b.page(0, None, TextOrigin::Native));
+    for i in 0..2000 {
+        let block = TextBlock {
+            kind: if i % 50 == 0 {
+                BlockKind::Heading
+            } else {
+                BlockKind::Paragraph
+            },
+            text: format!("Clause {i}: \"Ünïcødé\" text, tab\there, 日本語 😀, line\u{2028}end"),
+            zone: Some(TextZone::Body),
+            level: (i % 50 == 0).then_some(1),
+            table: None,
+            row: None,
+        };
+        assert!(b.block(block));
+    }
+    let text = b.finish();
+    let body = text.to_body().unwrap();
+    assert!(matches!(
+        s.put_document_text(&h, &body).await,
+        Err(Error::NotFound(_))
+    ));
+    s.put_record(&h, &raw(&json!({"kind": "contract"})), &versions("1"))
+        .await
+        .unwrap();
+    s.put_document_text(&h, &body).await.unwrap();
+    let got = s.get_document_text(&h).await.unwrap().expect("stored");
+    assert_eq!((got.blake3, got.body.get()), (h, body.get()));
+    assert!(got.updated_at > 1_700_000_000, "{}", got.updated_at);
+    assert_eq!(crate::DocumentText::from_body(&got.body).unwrap(), text);
+    // The same text again changes nothing.
+    s.put_document_text(&h, &body).await.unwrap();
+    let again = s.get_document_text(&h).await.unwrap().expect("stored");
+    assert_eq!(
+        (again.body.get(), again.updated_at),
+        (body.get(), got.updated_at)
+    );
+    let mut other = TextBuilder::new("docx.extract", "3", TEXT_MAX_BYTES);
+    other.page(0, None, TextOrigin::Native);
+    other.block(TextBlock {
+        kind: BlockKind::Paragraph,
+        text: "short".to_owned(),
+        zone: Some(TextZone::Body),
+        level: None,
+        table: None,
+        row: None,
+    });
+    let other = other.finish().to_body().unwrap();
+    s.put_document_text(&h, &other).await.unwrap();
+    let got = s.get_document_text(&h).await.unwrap().expect("stored");
+    assert_eq!(got.body.get(), other.get());
+    s.delete_document_text(&h).await.unwrap();
+    assert!(s.get_document_text(&h).await.unwrap().is_none());
+    s.delete_document_text(&h).await.unwrap();
 }
 
 /// Versions of many records in one call (issue #75): missing hashes are left out.
