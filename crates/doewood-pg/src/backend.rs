@@ -96,6 +96,64 @@ pub(crate) const FEW_PARTIES: &str = "WITH lim AS (SELECT greatest(1000, \
      SELECT (SELECT count(*) FROM (SELECT 1 FROM edges WHERE dst = $1 AND kind = 'party' \
      LIMIT (SELECT n FROM lim)) x) < (SELECT n FROM lim)";
 
+/// [`SearchStore::index_document`] (schema 19, issue #198): `$1` the hash, `$2` the title,
+/// `$3` the body, `$4` the key facts, `$5` the kind, `$6` the date, `$7` the amount. The
+/// `search_index` row says whether there are facts; with facts, the `search_facts` row holds
+/// them and the full vector (title A, body B, facts A), without, it goes. An unchanged row is
+/// not written again.
+const INDEX_DOCUMENT: &str = "WITH d AS (DELETE FROM search_facts WHERE blake3 = $1 AND $4 = ''), \
+     f AS (INSERT INTO search_facts (blake3, title, kind, doc_date, amount, facts, tsv) \
+     SELECT $1::bytea, $2::text, $5::text, $6::date, $7::float8, $4::text, \
+     setweight(to_tsvector('simple', $2), 'A') || setweight(to_tsvector('simple', $3), 'B') \
+     || setweight(to_tsvector('simple', $4), 'A') \
+     WHERE $4 <> '' \
+     ON CONFLICT (blake3) DO UPDATE SET title = EXCLUDED.title, kind = EXCLUDED.kind, \
+     doc_date = EXCLUDED.doc_date, amount = EXCLUDED.amount, facts = EXCLUDED.facts, \
+     tsv = EXCLUDED.tsv \
+     WHERE (search_facts.title, search_facts.kind, search_facts.doc_date, search_facts.amount, \
+     search_facts.facts, search_facts.tsv) IS DISTINCT FROM (EXCLUDED.title, EXCLUDED.kind, \
+     EXCLUDED.doc_date, EXCLUDED.amount, EXCLUDED.facts, EXCLUDED.tsv)) \
+     INSERT INTO search_index (blake3, title, body, kind, doc_date, amount, has_facts) \
+     VALUES ($1, $2, $3, $5, $6, $7, $4 <> '') \
+     ON CONFLICT (blake3) DO UPDATE SET title = EXCLUDED.title, body = EXCLUDED.body, \
+     kind = EXCLUDED.kind, doc_date = EXCLUDED.doc_date, amount = EXCLUDED.amount, \
+     has_facts = EXCLUDED.has_facts, indexed_at = now() \
+     WHERE (search_index.title, search_index.body, search_index.kind, search_index.doc_date, \
+     search_index.amount, search_index.has_facts) IS DISTINCT FROM (EXCLUDED.title, \
+     EXCLUDED.body, EXCLUDED.kind, EXCLUDED.doc_date, EXCLUDED.amount, EXCLUDED.has_facts)";
+
+/// Whether any document's key facts hold any of the words `$1` (schema 19): one lookup in
+/// `search_facts_ftsv`.
+const IN_FACTS: &str = "SELECT EXISTS (SELECT 1 FROM search_facts WHERE ftsv @@ \
+     replace(plainto_tsquery('simple', $1)::text, ' & ', ' | ')::tsquery)";
+
+/// A row of [`SearchStore::search`]'s query.
+fn search_hit(r: &Row) -> Result<SearchHit> {
+    Ok(SearchHit {
+        blake3: Blake3::from_slice(r.try_get::<_, &[u8]>(0).map_err(pg)?)?,
+        title: r.try_get(1).map_err(pg)?,
+        kind: r.try_get(2).map_err(pg)?,
+        date: r.try_get(3).map_err(pg)?,
+        amount: r.try_get(4).map_err(pg)?,
+        score: r.try_get(5).map_err(pg)?,
+    })
+}
+
+/// The search `sql` (its table written `{table}`) over `search_index` alone, or, when the key
+/// facts hold a word (`facts`), over the documents with facts in `search_facts` and the others
+/// in `search_index`, with the same conditions (schema 19, issue #198).
+fn over_tables(sql: &str, facts: bool) -> String {
+    if facts {
+        format!(
+            "SELECT * FROM ({} UNION ALL {} AND NOT s.has_facts) s",
+            sql.replace("{table}", "search_facts"),
+            sql.replace("{table}", "search_index"),
+        )
+    } else {
+        sql.replace("{table}", "search_index")
+    }
+}
+
 /// [`RecordStore::put_record`]: `$1` the hash, `$2` the canonical text, `$3` the versions. The
 /// text is stored as it is (schema 8, issue #121): canonical text compares equal as text when
 /// the record is unchanged. A row from before schema 8 that is not converted yet is compared
@@ -1701,15 +1759,7 @@ impl SearchStore for PgStore {
     async fn index_document(&self, doc: &SearchDoc) -> Result<()> {
         let c = client(&self.pool).await?;
         c.exec(
-            "INSERT INTO search_index (blake3, title, body, facts, kind, doc_date, amount) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) \
-             ON CONFLICT (blake3) DO UPDATE SET title = EXCLUDED.title, body = EXCLUDED.body, \
-             facts = EXCLUDED.facts, kind = EXCLUDED.kind, doc_date = EXCLUDED.doc_date, \
-             amount = EXCLUDED.amount, indexed_at = now() \
-             WHERE (search_index.title, search_index.body, search_index.facts, \
-             search_index.kind, search_index.doc_date, search_index.amount) IS DISTINCT FROM \
-             (EXCLUDED.title, EXCLUDED.body, EXCLUDED.facts, EXCLUDED.kind, EXCLUDED.doc_date, \
-             EXCLUDED.amount)",
+            INDEX_DOCUMENT,
             &[
                 &doc.blake3.as_bytes().as_slice(),
                 &doc.title,
@@ -1726,7 +1776,17 @@ impl SearchStore for PgStore {
 
     async fn search(&self, q: &SearchQuery) -> Result<Vec<SearchHit>> {
         let words = q.words();
+        let db = client(&self.pool).await?;
         let mut args = Args::default();
+        // Which tables the words are matched in (schema 19, issue #198): `search_index` alone
+        // when no document's key facts hold any of them, else the documents with facts from
+        // `search_facts` (their full vector) and the others from `search_index`.
+        let facts = !words.is_empty()
+            && db
+                .one(IN_FACTS, &[&words.join(" ")])
+                .await?
+                .try_get(0)
+                .map_err(pg)?;
         let mut sql = if words.is_empty() {
             "SELECT s.blake3, s.title, s.kind, s.doc_date, s.amount, 0::real AS score \
              FROM search_index s WHERE true"
@@ -1737,10 +1797,9 @@ impl SearchStore for PgStore {
             format!(
                 "SELECT s.blake3, s.title, s.kind, s.doc_date, s.amount, \
                  ts_rank(s.tsv, plainto_tsquery('simple', {p})) AS score \
-                 FROM search_index s WHERE s.tsv @@ plainto_tsquery('simple', {p})"
+                 FROM {{table}} s WHERE s.tsv @@ plainto_tsquery('simple', {p})"
             )
         };
-        let db = client(&self.pool).await?;
         if let Some(company) = q.company {
             let few = db
                 .one(FEW_PARTIES, &[&company])
@@ -1807,6 +1866,7 @@ impl SearchStore for PgStore {
             args.push(i64::from(q.effective_limit())),
             args.push(i64::from(q.offset)),
         );
+        let mut sql = over_tables(&sql, facts);
         let _ = write!(
             sql,
             " ORDER BY score DESC, s.doc_date DESC NULLS LAST, s.blake3 \
@@ -1815,18 +1875,7 @@ impl SearchStore for PgStore {
         // Not cached: up to 256 shapes (one per combination of filters), user-driven and rare
         // next to the ingest statements, and a generic plan could not use the source prefix.
         let rows = db.query(&sql, &args.refs()).await.map_err(pg)?;
-        rows.iter()
-            .map(|r| {
-                Ok(SearchHit {
-                    blake3: Blake3::from_slice(r.try_get::<_, &[u8]>(0).map_err(pg)?)?,
-                    title: r.try_get(1).map_err(pg)?,
-                    kind: r.try_get(2).map_err(pg)?,
-                    date: r.try_get(3).map_err(pg)?,
-                    amount: r.try_get(4).map_err(pg)?,
-                    score: r.try_get(5).map_err(pg)?,
-                })
-            })
-            .collect()
+        rows.iter().map(search_hit).collect()
     }
 }
 

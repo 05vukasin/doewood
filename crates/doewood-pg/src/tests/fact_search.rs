@@ -47,13 +47,13 @@ const SEED_FACTS: &str = "UPDATE search_index s SET facts = 'kind: contract' || 
      FROM (SELECT blake3, (record->>'n')::int AS n FROM records) r \
      WHERE r.blake3 = s.blake3 AND r.n % 2 = 0";
 
-/// Schema 17's search vector, title above body, without the facts.
-const SCHEMA_17: &str = "DROP INDEX search_tsv; \
-     ALTER TABLE search_index DROP COLUMN facts CASCADE; \
-     ALTER TABLE search_index ADD COLUMN tsv tsvector GENERATED ALWAYS AS \
-     (setweight(to_tsvector('simple', title), 'A') \
-     || setweight(to_tsvector('simple', body), 'B')) STORED; \
-     CREATE INDEX search_tsv ON search_index USING gin (tsv) WITH (gin_pending_list_limit = 256); \
+/// Back to schema 17's search (title above body, no facts): schema 19 left that vector, so
+/// only its table and flag go. An empty stand-in for `search_facts` stays, so `PgStore::search`
+/// finds no facts and runs schema 17's (then 18's) query on `search_index` alone; the lookup
+/// is about 0.02 ms.
+const SCHEMA_17: &str = "DROP TABLE search_facts; \
+     ALTER TABLE search_index DROP COLUMN has_facts; \
+     CREATE TABLE search_facts (ftsv tsvector); \
      ANALYZE search_index";
 
 /// Schema 18's change to `search_index`, as its migration runs it.
@@ -62,6 +62,19 @@ fn schema_18() -> &'static str {
     &sql[sql
         .find("ALTER TABLE search_index")
         .expect("the search part")..]
+}
+
+/// `search_index` and `search_facts` (once there), with their indexes.
+async fn sizes(c: &tokio_postgres::Client) -> (String, String) {
+    let r = c
+        .query_one(
+            "SELECT pg_size_pretty(pg_total_relation_size('search_index')), \
+             pg_size_pretty(coalesce(pg_total_relation_size(to_regclass('search_facts')), 0))",
+            &[],
+        )
+        .await
+        .unwrap();
+    (r.get(0), r.get(1))
 }
 
 /// The median and the 99th percentile of 3 timed runs of `q` 20 times (after one untimed
@@ -103,6 +116,7 @@ async fn fact_search_timings() {
         ("a word and a rare term", "invoice term250"),
         ("a word in a quarter of the documents", "quarter"),
         ("a word in most documents", "annex"),
+        ("a word in most documents and the facts", "penalty"),
         ("two words of the facts", "otkazni rok"),
     ];
     let run = |label: &'static str| {
@@ -145,14 +159,31 @@ async fn fact_search_timings() {
         .unwrap();
     println!("facts: facts written in {:.2} s", t.elapsed().as_secs_f64());
     run("schema 18, facts on every 2nd").await;
-    let size: String = c
-        .query_one(
-            "SELECT pg_size_pretty(pg_total_relation_size('search_index'))",
-            &[],
-        )
+    println!("facts: schema 18, with indexes: {:?}", sizes(&c).await);
+    // Schema 19 (issue #198): the facts in their own table.
+    let t = Instant::now();
+    c.batch_execute(&format!(
+        "BEGIN; DROP TABLE search_facts; {} COMMIT; ANALYZE search_index; ANALYZE search_facts",
+        crate::migrate::MIGRATIONS[18]
+    ))
+    .await
+    .unwrap();
+    println!(
+        "facts: schema 19's migration ({n} documents): {:.2} s",
+        t.elapsed().as_secs_f64()
+    );
+    println!(
+        "facts: schema 19, search_index and search_facts with indexes: {:?}",
+        sizes(&c).await
+    );
+    run("schema 19").await;
+    // Reanalysis writes the facts again: `search_index` rows stay as they are.
+    c.batch_execute("UPDATE search_facts SET title = title")
         .await
-        .unwrap()
-        .get(0);
-    println!("facts: search_index with its indexes: {size}");
+        .unwrap();
+    c.batch_execute("VACUUM ANALYZE search_facts")
+        .await
+        .unwrap();
+    run("schema 19, facts written again").await;
     db.drop_schema().await;
 }

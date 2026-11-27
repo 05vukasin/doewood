@@ -364,13 +364,11 @@ async fn schema_13_counts_the_total_with_log_rows_pending() {
     }
     c.batch_execute(
         // The schemas after 13 go too (issue #166's `document_texts`, #168's index, #169's
-        // `similar_keys`, #193's `payments`, #194's `document_facts` and search vector), so 13
-        // runs again.
+        // `similar_keys`, #193's `payments`, #194's `document_facts`, #198's `search_facts`;
+        // schema 19 left schema 17's search vector), so 13 runs again.
         "DROP TABLE document_texts; DROP TABLE similar_keys; DROP TABLE payments; \
-         DROP TABLE document_facts; ALTER TABLE search_index DROP COLUMN facts CASCADE; \
-         ALTER TABLE search_index ADD COLUMN tsv tsvector GENERATED ALWAYS AS \
-         (setweight(to_tsvector('simple', title), 'A') \
-         || setweight(to_tsvector('simple', body), 'B')) STORED; \
+         DROP TABLE document_facts; DROP TABLE search_facts; \
+         ALTER TABLE search_index DROP COLUMN has_facts; \
          DROP TABLE company_graph_totals; \
          DROP INDEX locations_by_document; DELETE FROM doewood_schema WHERE version >= 13;",
     )
