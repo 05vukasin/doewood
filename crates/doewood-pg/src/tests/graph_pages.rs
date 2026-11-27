@@ -224,7 +224,7 @@ async fn graph_pages_start_at_their_token() {
     for after in [None, Some(&cursor)] {
         let mut args = Args::default();
         args.push(id);
-        let sql = neighbours_sql(&incoming, after, Some(50), &mut args).unwrap();
+        let sql = neighbours_sql("$1", &incoming, after, Some(50), &mut args).unwrap();
         let p = explain(&sql, &args.refs()).await;
         assert!(p.contains("Index Scan using edges_by_dst"), "{p}");
         // Each range is read in index order up to its limit; only the merge above the ranges

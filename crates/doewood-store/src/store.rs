@@ -710,10 +710,13 @@ mod tests {
             [
                 "company_dismissals",
                 "company_enrichment",
+                "company_graph_log",
                 "company_leases",
+                "company_links",
                 "company_merges",
                 "company_proposals",
                 "company_registry_due",
+                "company_stats",
                 "edges",
                 "favicons",
                 "jobs",

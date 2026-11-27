@@ -1,8 +1,8 @@
 //! doewood's shared data model (ADR 0001 sections 2 and 7, ADR 0002 sections 3 and 6): the
 //! records, the typed graph, source claims, company leases, search, the enrichment job's
 //! registry and favicon caches and company freshness, the merge log and dismissals (ADR 0002
-//! section 1.8), the enrichment proposals (issue #52), and the store traits
-//! that both backends implement.
+//! section 1.8), the enrichment proposals (issue #52), the explorer's bounded graph reads
+//! (issue #172), and the store traits that both backends implement.
 //!
 //! - **Shared mode:** `doewood-pg`, one Postgres database for every instance.
 //! - **Standalone mode:** `doewood-store`, the instance's own SQLite file.
@@ -14,6 +14,7 @@ pub mod canonical;
 pub mod conformance;
 mod enrichment;
 mod error;
+pub mod explore;
 mod feed;
 pub mod merge;
 pub mod proposal;
@@ -28,6 +29,10 @@ pub use enrichment::{
     validate_schedule,
 };
 pub use error::{Error, Result};
+pub use explore::{
+    COMPANY_GRAPH_LINKS_MAX, COMPANY_GRAPH_NODES_MAX, CORPORATE_KINDS, CompanyCursor,
+    CompanyFilter, CompanyLink, CompanyOrder, CompanyRow, Folded, LinkRole, company_row_bytes,
+};
 pub use feed::{
     FEED_BATCH_MAX, FEED_CURSOR_MAX_LEN, FEED_NAME_MAX_LEN, FeedState, validate_batch,
     validate_cursor, validate_feed,

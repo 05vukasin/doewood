@@ -3,7 +3,8 @@
 //! With a shared store every instance runs it; the delete is idempotent. The same task
 //! refreshes the instance store's query planner statistics (`PRAGMA optimize`). The instance
 //! store's WAL is kept bounded by the store itself (its checkpoint thread, issue #151); its
-//! metrics are registered here.
+//! metrics are registered here. A second task folds the company graph's change log into its
+//! counts every few seconds (issue #172, [`start_fold`]).
 
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -67,6 +68,58 @@ pub async fn optimize_all(store: &Arc<Store>) {
         Ok(Err(e)) => warn!(error = %e, "PRAGMA optimize failed; retried at the next interval"),
         Err(e) => warn!(error = %e, "PRAGMA optimize did not finish"),
     }
+}
+
+/// Between folds of the company graph's log.
+pub const FOLD_INTERVAL: Duration = Duration::from_secs(5);
+/// Most batches one fold pass takes before it waits for the next interval.
+const FOLD_PASS_BATCHES: u32 = 50;
+
+/// Folds the company graph's change log into its counts once (issue #172): batches until it
+/// is empty, at most [`FOLD_PASS_BATCHES`]. Returns the rows folded.
+pub async fn fold(backend: &dyn Backend) -> u64 {
+    let mut rows = 0;
+    for _ in 0..FOLD_PASS_BATCHES {
+        match backend
+            .fold_company_graph(doewood_model::explore::FOLD_BATCH)
+            .await
+        {
+            Ok(f) => {
+                rows += f.rows;
+                if !f.more {
+                    break;
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "company graph fold failed; retried at the next interval");
+                break;
+            }
+        }
+    }
+    if rows > 0 {
+        debug!(rows, "company graph log folded");
+    }
+    rows
+}
+
+/// Runs [`fold`] on whatever backend `backend` holds every [`FOLD_INTERVAL`], until
+/// shutdown. With a shared store every instance runs it; folds take turns on a lock.
+pub fn start_fold(
+    backend: watch::Receiver<Option<Arc<dyn Backend>>>,
+    mut shutdown: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(FOLD_INTERVAL) => {}
+                _ = shutdown.wait_for(|stop| *stop) => return,
+            }
+            let current = backend.borrow().clone();
+            if let Some(b) = current {
+                fold(b.as_ref()).await;
+            }
+        }
+    })
 }
 
 /// Runs [`optimize_all`] on the instance store once, then [`purge`] on whatever backend

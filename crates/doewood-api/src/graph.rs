@@ -1,5 +1,5 @@
 //! `GraphService`: nodes, neighbours and a company's documents, the merge log (in
-//! `merges`) and enrichment proposals (in `proposals`).
+//! `merges`), enrichment proposals (in `proposals`) and the explorer's reads (in `explore`).
 
 use doewood_model::{
     EdgeCursor, EdgeKind, NODE_KEY_MAX_LEN, NeighbourQuery, NodeKind, RECORDS_MAX_LIMIT,
@@ -224,6 +224,38 @@ impl GraphService for Api {
             documents: docs.iter().map(|d| convert::node(&d.node)).collect(),
             next_page_token,
         }))
+    }
+
+    async fn list_companies(
+        &self,
+        request: Request<pb::ListCompaniesRequest>,
+    ) -> Result<Response<pb::ListCompaniesResponse>, Status> {
+        Ok(Response::new(
+            self.list_companies_rpc(request.get_ref()).await?,
+        ))
+    }
+
+    async fn company_graph(
+        &self,
+        request: Request<pb::CompanyGraphRequest>,
+    ) -> Result<Response<pb::CompanyGraphResponse>, Status> {
+        Ok(Response::new(
+            self.company_graph_rpc(request.get_ref()).await?,
+        ))
+    }
+
+    async fn subgraph(
+        &self,
+        request: Request<pb::SubgraphRequest>,
+    ) -> Result<Response<pb::SubgraphResponse>, Status> {
+        Ok(Response::new(self.subgraph_rpc(request.get_ref()).await?))
+    }
+
+    async fn path(
+        &self,
+        request: Request<pb::PathRequest>,
+    ) -> Result<Response<pb::PathResponse>, Status> {
+        Ok(Response::new(self.path_rpc(request.get_ref()).await?))
     }
 
     async fn list_merges(

@@ -15,6 +15,23 @@ service GraphService {
   // ListRecords.
   rpc CompanyDocuments(CompanyDocumentsRequest) returns (CompanyDocumentsResponse);
 
+  // The explorer's reads (issue #172). Each is bounded: a page, or caps that end it with
+  // `truncated`. Document counts, degrees and weights are kept by the store and trail the
+  // edges by a few seconds at most (`stale` says when a large change is still being counted).
+  //
+  // Live companies (not merged away) matching a filter, with their counts; a page at a time,
+  // as ListRecords.
+  rpc ListCompanies(ListCompaniesRequest) returns (ListCompaniesResponse);
+  // The company-to-company graph: the companies with the most documents that match the
+  // filter, and the links between them (shared documents with roles, and corporate events
+  // with their dates and source), strongest first.
+  rpc CompanyGraph(CompanyGraphRequest) returns (CompanyGraphResponse);
+  // The nodes and live edges within `depth` edges of the seeds, either way.
+  rpc Subgraph(SubgraphRequest) returns (SubgraphResponse);
+  // The shortest paths between two nodes over live edges either way, each edge with its
+  // evidence.
+  rpc Path(PathRequest) returns (PathResponse);
+
   // Reversible company merges (ADR 0002 section 1.8). The merge log, newest first: every
   // merge and split, with its actor, evidence, confidence, fused probability and undo state.
   rpc ListMerges(ListMergesRequest) returns (ListMergesResponse);
@@ -435,4 +452,178 @@ message RejectProposalResponse {
   Proposal proposal = 1;
   // The dismissal recorded, for a merge proposal rejected with `dismiss`.
   Dismissal dismissal = 2;
+}
+
+// Which companies ListCompanies and CompanyGraph take. Empty fields match every company.
+message CompanyFilter {
+  // The name starts with this, ignoring case (on the instance store only ASCII letters); at
+  // most 200 bytes.
+  string name_prefix = 1;
+  // The `jurisdiction` prop (`GB`, `RS`), ignoring ASCII case; at most 16 bytes.
+  string jurisdiction = 2;
+  // Set: only companies with (true) or without (false) an identifier (LEI, VAT, ...).
+  optional bool has_identifier = 3;
+  // Set: only companies the enrichment job enriched (true) or never enriched (false).
+  optional bool enriched = 4;
+}
+
+enum CompanyOrder {
+  // As DOCUMENTS.
+  COMPANY_ORDER_UNSPECIFIED = 0;
+  // Most documents first; ties by id, descending.
+  COMPANY_ORDER_DOCUMENTS = 1;
+  // Highest degree first; ties by id, descending.
+  COMPANY_ORDER_DEGREE = 2;
+  // By lowercased name in byte order (no name first), then id.
+  COMPANY_ORDER_NAME = 3;
+}
+
+message CompanyIdentifier {
+  // `lei`, `vat`, `rs_pib`, ...
+  string kind = 1;
+  string value = 2;
+}
+
+message CompanySummary {
+  string id = 1;
+  string name = 2;
+  // Other names it was seen under (the `names` prop, without `name`); at most 32.
+  repeated string aliases = 3;
+  // The identifiers that resolve to it; at most 32.
+  repeated CompanyIdentifier identifiers = 4;
+  string jurisdiction = 5;
+  // Its verified website (`https://acme.com/`), empty when none.
+  string website = 6;
+  // The domain of its icon: fetch it as `GET /icons/{favicon_domain}`. Empty when none.
+  string favicon_domain = 7;
+  // Documents with a live `party` edge to it.
+  uint64 document_count = 8;
+  // Companies it is linked to, by a shared document or a live corporate-event edge.
+  uint64 degree = 9;
+  // Enriched at least once.
+  bool enriched = 10;
+}
+
+message ListCompaniesRequest {
+  CompanyFilter filter = 1;
+  CompanyOrder order = 2;
+  // 1 to 1000; 0 means 50. A page also ends at about 3 MiB of props.
+  uint32 page_size = 3;
+  // `next_page_token` of the previous page, with the same filter and order; empty for the
+  // first.
+  string page_token = 4;
+}
+
+message ListCompaniesResponse {
+  repeated CompanySummary companies = 1;
+  // Empty on the last page.
+  string next_page_token = 2;
+  // Counts are still behind the edges: a large change is being counted. Ask again later.
+  bool stale = 3;
+}
+
+message CompanyGraphRequest {
+  CompanyFilter filter = 1;
+  // Only links with at least this many shared documents (0 means 1); links with a
+  // corporate event are always included.
+  uint32 min_weight = 2;
+  // Most companies: 1 to 2000; 0 means 500.
+  uint32 limit = 3;
+  // Most links: 1 to 20000; 0 means 5000.
+  uint32 max_links = 4;
+}
+
+// One side's role in a pair's shared documents.
+message CompanyRole {
+  string company_id = 1;
+  // `buyer`, `supplier`, ...; empty when the party edge has none.
+  string role = 2;
+  // Shared documents where it has this role.
+  uint64 documents = 3;
+}
+
+message CompanyLink {
+  // The two companies, the smaller id first.
+  string a_id = 1;
+  string b_id = 2;
+  // Documents both are parties of: the weight.
+  uint64 shared_documents = 3;
+  // Their roles in those documents (at most 16 role counts a pair).
+  repeated CompanyRole roles = 4;
+  // The live corporate-event edges between them, either way, with dates and source.
+  repeated Edge events = 5;
+}
+
+message CompanyGraphResponse {
+  // Most documents first.
+  repeated CompanySummary companies = 1;
+  // Most shared documents first, then most events.
+  repeated CompanyLink links = 2;
+  // More companies matched than `limit`, more links than `max_links`, or a company had more
+  // corporate events than read (50 a company).
+  bool truncated = 3;
+  // As in ListCompaniesResponse.
+  bool stale = 4;
+}
+
+message SubgraphRequest {
+  // Node ids to start from; 1 to 100. Each is included.
+  repeated string seed_ids = 1;
+  // Edges away from the nearest seed: 0 to 3; 0 means the seeds only.
+  uint32 depth = 2;
+  // Only nodes of these kinds besides the seeds; empty means all.
+  repeated NodeKind node_kinds = 3;
+  // Only these edge kinds; empty means all.
+  repeated EdgeKind edge_kinds = 4;
+  // Most nodes: 1 to 2000; 0 means 200.
+  uint32 limit = 5;
+  // Most edges: 1 to 10000; 0 means 1000.
+  uint32 max_edges = 6;
+  // `YYYY-MM-DD`: only edges that hold on this day (the dated corporate edges). Empty means
+  // any day.
+  string as_of = 7;
+}
+
+message SubgraphNode {
+  Node node = 1;
+  // Edges from the nearest seed.
+  uint32 depth = 2;
+}
+
+message SubgraphResponse {
+  // Seeds first, then by depth.
+  repeated SubgraphNode nodes = 1;
+  // The edges followed, each once.
+  repeated Edge edges = 2;
+  // A cap ended the walk early: nodes, edges, about 8 MiB of props and evidence, or a node
+  // whose neighbours were more than its share of the edges.
+  bool truncated = 3;
+}
+
+message PathRequest {
+  string from_id = 1;
+  string to_id = 2;
+  // Longest path, in edges: 1 to 6; 0 means 4.
+  uint32 max_depth = 3;
+  // Only these edge kinds; empty means all.
+  repeated EdgeKind edge_kinds = 4;
+  // `YYYY-MM-DD`: only edges that hold on this day. Empty means any day.
+  string as_of = 5;
+  // Most paths: 1 to 10; 0 means 1.
+  uint32 max_paths = 6;
+}
+
+// `nodes[i]` and `nodes[i + 1]` are the ends of `edges[i]` (either way round).
+message GraphPath {
+  repeated Node nodes = 1;
+  repeated Edge edges = 2;
+}
+
+message PathResponse {
+  // The shortest paths, all of one length; empty when there is none within `max_depth`.
+  repeated GraphPath paths = 1;
+  // A cap cut the search (5000 visited nodes, 20000 edges a level, about 8 MiB, or a node
+  // with more neighbours than its share): a shorter path, or one when none was found, may
+  // exist.
+  bool truncated = 2;
 }

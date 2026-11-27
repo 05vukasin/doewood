@@ -55,6 +55,7 @@ pub async fn run<B: Backend + ?Sized>(a: &B, b: &B) {
     decisions(a).await;
     live_edges(a, b).await;
     live_writes(a, b).await;
+    explorer(a).await;
     a.ping().await.expect("ping");
 }
 
@@ -3505,4 +3506,639 @@ pub async fn live_writes<B: Backend + ?Sized>(a: &B, b: &B) {
         matches!(not_company, Err(Error::NotFound(_))),
         "{not_company:?}"
     );
+}
+
+/// Folds the company graph's whole log, a few rows at a time.
+async fn fold_all<B: Backend + ?Sized>(s: &B) {
+    for _ in 0..100_000 {
+        if !s.fold_company_graph(7).await.expect("fold").more {
+            return;
+        }
+    }
+    panic!("the log never emptied");
+}
+
+/// Every company of a listing, walked a page of `size` at a time.
+async fn walk_companies<B: Backend + ?Sized>(
+    s: &B,
+    filter: &crate::CompanyFilter,
+    order: crate::CompanyOrder,
+    size: u32,
+) -> Vec<crate::CompanyRow> {
+    let (mut out, mut after) = (Vec::new(), None::<crate::CompanyCursor>);
+    loop {
+        let page = s
+            .list_companies(filter, order, after.as_ref(), size, usize::MAX)
+            .await
+            .expect("list companies");
+        let full = page.len() == size as usize;
+        after = page.last().map(|r| crate::CompanyCursor::of(order, r));
+        // A cursor survives its text form, as a page token does.
+        after = after.map(|c| c.to_string().parse().expect("cursor"));
+        out.extend(page);
+        if !full {
+            return out;
+        }
+    }
+}
+
+/// The explorer's reads (issue #172): the company graph's counts through edge writes,
+/// retractions and a merge; the listing's orders, filters and pages; the links; and the
+/// bounded walks (`Subgraph`, `Path`) with their caps, depth limits and `as_of`.
+///
+/// # Panics
+///
+/// When the backend misbehaves.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+pub async fn explorer<B: Backend + ?Sized>(s: &B) {
+    use crate::explore::{self, PathQuery, SubgraphQuery};
+    use crate::{CompanyFilter, CompanyOrder};
+
+    let company = async |key: &str, props: serde_json::Value| {
+        s.upsert_node(NodeKind::Company, key, &props).await.unwrap()
+    };
+    let a = company(
+        "explore-a",
+        json!({"name": "Explore Alpha", "names": ["Explore Alpha", "EA Ltd"],
+               "jurisdiction": "gb", "website": {"url": "https://alpha.example/"},
+               "icon": {"domain": "alpha.example"}}),
+    )
+    .await;
+    let b = company("explore-b", json!({"name": "Explore Beta"})).await;
+    let c = company("explore-c", json!({"name": "explore gamma"})).await;
+    let d = company("explore-d", json!({"name": "Explore Delta"})).await;
+    let e = company("explore-e", json!({"name": "Explore Echo"})).await;
+    s.claim_alias(
+        NodeKind::Company,
+        "id:lei:EXPLOREALPHA0000001",
+        a,
+        &json!({}),
+    )
+    .await
+    .unwrap();
+    s.record_enrichment(a, &[]).await.unwrap();
+    let mut docs = Vec::new();
+    for i in 0..6u32 {
+        docs.push(
+            s.upsert_node(
+                NodeKind::Document,
+                &format!("{:064x}", 0x0172_0000 + i),
+                &json!({"n": i}),
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    let party = |doc: Uuid, co: Uuid, role: &str| {
+        Edge::new(doc, co, EdgeKind::Party, EdgeSource::Document).with_props(json!({"role": role}))
+    };
+    // d0: A buyer, B supplier; d1: A, B, C; d2: A, C; d3: B alone; d4: D, retracted;
+    // d5: E and A (E is merged into C below).
+    let edges = [
+        party(docs[0], a, "buyer"),
+        party(docs[0], b, "supplier"),
+        party(docs[1], a, "buyer"),
+        party(docs[1], b, "supplier"),
+        party(docs[1], c, "signatory"),
+        party(docs[2], a, "buyer"),
+        party(docs[2], c, "supplier"),
+        party(docs[3], b, "buyer"),
+        party(docs[4], d, "buyer").with_state(EdgeState::Retracted),
+        party(docs[5], e, "buyer"),
+        party(docs[5], a, "supplier"),
+        // A second edge from d1 to A: A still counts d1 once.
+        Edge::new(docs[1], a, EdgeKind::Party, EdgeSource::Registry)
+            .with_props(json!({"role": "owner"})),
+    ];
+    s.upsert_edges(&edges).await.unwrap();
+    // Corporate events: A was C's parent in 2020 and 2021; D acquired B from mid-2023.
+    let parent = s
+        .upsert_edge(
+            &Edge::new(a, c, EdgeKind::ParentOf, EdgeSource::Registry)
+                .with_evidence(json!([{"registry": "gleif"}]))
+                .valid(Some(day(2020, 1, 1)), Some(day(2022, 1, 1))),
+        )
+        .await
+        .unwrap();
+    s.upsert_edge(
+        &Edge::new(d, b, EdgeKind::Acquired, EdgeSource::Registry)
+            .valid(Some(day(2023, 6, 1)), None),
+    )
+    .await
+    .unwrap();
+    // Writing an edge again as it was changes nothing.
+    s.upsert_edge(&party(docs[0], a, "buyer")).await.unwrap();
+    s.merge_companies(&MergeRequest {
+        survivor: c,
+        absorbed: e,
+        actor: MergeActor {
+            kind: MergeActorKind::Manual,
+            instance: instance("explore"),
+        },
+        evidence: json!([]),
+        confidence: 1.0,
+        probability: 1.0,
+    })
+    .await
+    .unwrap();
+    fold_all(s).await;
+    assert!(!s.fold_company_graph(100).await.unwrap().more);
+
+    let mine = CompanyFilter {
+        name_prefix: Some("EXPLORE ".to_owned()),
+        ..CompanyFilter::default()
+    };
+    let counts = |rows: &[crate::CompanyRow]| -> Vec<(Uuid, u64, u64)> {
+        rows.iter()
+            .map(|r| (r.node.id, r.documents, r.degree))
+            .collect()
+    };
+    // Documents: A d0 d1 d2 d5 = 4; B d0 d1 d3 = 3; C d1 d2 d5 (from E) = 3; D none.
+    // Links: A-B (d0, d1), A-C (d1, d2, d5; and the event), B-C (d1), B-D (the event).
+    let mut want = vec![(a, 4, 2), (b, 3, 3), (c, 3, 2), (d, 0, 1)];
+    let by_docs = walk_companies(s, &mine, CompanyOrder::Documents, 1000).await;
+    want.sort_by_key(|x| std::cmp::Reverse((x.1, x.0)));
+    assert_eq!(
+        counts(&by_docs),
+        want,
+        "documents order; the husk E is not listed"
+    );
+    for size in [1, 2, 3] {
+        assert_eq!(
+            counts(&walk_companies(s, &mine, CompanyOrder::Documents, size).await),
+            want,
+            "pages of {size}"
+        );
+    }
+    want.sort_by_key(|x| std::cmp::Reverse((x.2, x.0)));
+    for size in [1, 1000] {
+        assert_eq!(
+            counts(&walk_companies(s, &mine, CompanyOrder::Degree, size).await),
+            want,
+            "degree order, pages of {size}"
+        );
+    }
+    for size in [1, 3, 1000] {
+        let names: Vec<Uuid> = walk_companies(s, &mine, CompanyOrder::Name, size)
+            .await
+            .iter()
+            .map(|r| r.node.id)
+            .collect();
+        assert_eq!(
+            names,
+            [a, b, d, c],
+            "name order, ignoring case, pages of {size}"
+        );
+    }
+    let alpha = &by_docs.iter().find(|r| r.node.id == a).unwrap();
+    assert!(alpha.enriched);
+    assert_eq!(alpha.identifiers, ["id:lei:EXPLOREALPHA0000001"]);
+    let only = async |f: CompanyFilter| -> BTreeSet<Uuid> {
+        walk_companies(s, &f, CompanyOrder::Name, 1000)
+            .await
+            .iter()
+            .map(|r| r.node.id)
+            .collect()
+    };
+    assert_eq!(
+        only(CompanyFilter {
+            jurisdiction: Some("GB".to_owned()),
+            ..mine.clone()
+        })
+        .await,
+        BTreeSet::from([a])
+    );
+    assert_eq!(
+        only(CompanyFilter {
+            has_identifier: Some(true),
+            ..mine.clone()
+        })
+        .await,
+        BTreeSet::from([a])
+    );
+    assert_eq!(
+        only(CompanyFilter {
+            has_identifier: Some(false),
+            enriched: Some(false),
+            ..mine.clone()
+        })
+        .await,
+        BTreeSet::from([b, c, d])
+    );
+    assert_eq!(
+        only(CompanyFilter {
+            name_prefix: Some("explore g".to_owned()),
+            ..CompanyFilter::default()
+        })
+        .await,
+        BTreeSet::from([c])
+    );
+    assert!(matches!(
+        s.list_companies(
+            &CompanyFilter {
+                name_prefix: Some("x".repeat(explore::NAME_PREFIX_MAX_LEN + 1)),
+                ..CompanyFilter::default()
+            },
+            CompanyOrder::Name,
+            None,
+            10,
+            usize::MAX
+        )
+        .await,
+        Err(Error::Invalid(_))
+    ));
+
+    // Links: strongest first; a pair with an event is kept below the weight.
+    let pair = |x: Uuid, y: Uuid| if x < y { (x, y) } else { (y, x) };
+    let links = s.company_links(&[a, b, c, d], 2, 100).await.unwrap();
+    let got: Vec<((Uuid, Uuid), u64, u64)> = links
+        .iter()
+        .map(|l| ((l.a, l.b), l.documents, l.events))
+        .collect();
+    assert_eq!(
+        got,
+        [(pair(a, c), 3, 1), (pair(a, b), 2, 0), (pair(b, d), 0, 1)]
+    );
+    let ab = &links[1];
+    let role = |co: Uuid, r: &str| {
+        ab.roles
+            .iter()
+            .find(|x| x.company == co && x.role == r)
+            .map(|x| x.documents)
+    };
+    assert_eq!(role(a, "buyer"), Some(2));
+    assert_eq!(role(a, "owner"), Some(1));
+    assert_eq!(role(b, "supplier"), Some(2));
+    assert_eq!(s.company_links(&[a, b, c, d], 1, 2).await.unwrap().len(), 2);
+    assert_eq!(s.company_links(&[a, d], 1, 100).await.unwrap().len(), 0);
+
+    // The company graph: caps say `truncated`.
+    let g = explore::company_graph(s, &mine, 1, 10, 100).await.unwrap();
+    assert!(!g.truncated && !g.stale);
+    assert_eq!(g.companies.len(), 4);
+    assert_eq!(g.links.len(), 4);
+    let events = &g.events[&pair(a, c)];
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].id, parent);
+    let g = explore::company_graph(s, &mine, 1, 3, 100).await.unwrap();
+    assert!(g.truncated, "four companies match");
+    assert_eq!(g.companies.len(), 3);
+    assert!(g.links.iter().all(|l| l.a != d && l.b != d));
+    let g = explore::company_graph(s, &mine, 1, 10, 2).await.unwrap();
+    assert!(g.truncated, "four links");
+    assert_eq!(g.links.len(), 2);
+
+    // Counts follow retractions: d3's only edge to B goes; then comes back.
+    let d3b = party(docs[3], b, "buyer");
+    s.upsert_edge(&d3b.clone().with_state(EdgeState::Retracted))
+        .await
+        .unwrap();
+    fold_all(s).await;
+    let count_of_b = async || {
+        walk_companies(s, &mine, CompanyOrder::Documents, 1000)
+            .await
+            .iter()
+            .find(|r| r.node.id == b)
+            .unwrap()
+            .documents
+    };
+    assert_eq!(count_of_b().await, 2);
+    s.upsert_edge(&d3b).await.unwrap();
+    fold_all(s).await;
+    assert_eq!(count_of_b().await, 3);
+
+    // Subgraph: A's neighbours (four documents and C by the event), then the caps.
+    let sub = |seeds: Vec<Uuid>, depth: u32| SubgraphQuery {
+        seeds,
+        depth,
+        node_kinds: Vec::new(),
+        edge_kinds: Vec::new(),
+        max_nodes: 100,
+        max_edges: 100,
+        as_of: None,
+    };
+    let g = explore::subgraph(s, &sub(vec![a], 1)).await.unwrap();
+    assert!(!g.truncated);
+    let ids: BTreeSet<Uuid> = g.nodes.iter().map(|r| r.node.id).collect();
+    assert_eq!(
+        ids,
+        BTreeSet::from([a, c, docs[0], docs[1], docs[2], docs[5]])
+    );
+    assert_eq!(g.nodes[0].node.id, a);
+    assert_eq!(g.nodes[0].depth, 0);
+    assert!(g.nodes[1..].iter().all(|r| r.depth == 1));
+    // Two edges from d1 to A, and the event.
+    assert_eq!(g.edges.len(), 6);
+    let g = explore::subgraph(s, &sub(vec![a], 0)).await.unwrap();
+    assert_eq!((g.nodes.len(), g.edges.len()), (1, 0));
+    let g = explore::subgraph(
+        s,
+        &SubgraphQuery {
+            max_nodes: 3,
+            ..sub(vec![a], 2)
+        },
+    )
+    .await
+    .unwrap();
+    assert!(g.truncated);
+    assert_eq!(g.nodes.len(), 3);
+    let g = explore::subgraph(
+        s,
+        &SubgraphQuery {
+            max_edges: 2,
+            ..sub(vec![a], 1)
+        },
+    )
+    .await
+    .unwrap();
+    assert!(g.truncated);
+    assert!(g.edges.len() <= 2);
+    // Depth 2 over companies only: A reaches C by the event, and no further.
+    let g = explore::subgraph(
+        s,
+        &SubgraphQuery {
+            node_kinds: vec![NodeKind::Company],
+            ..sub(vec![a], 2)
+        },
+    )
+    .await
+    .unwrap();
+    let ids: BTreeSet<Uuid> = g.nodes.iter().map(|r| r.node.id).collect();
+    assert_eq!(ids, BTreeSet::from([a, c]));
+    // As of a day: the parent edge held in 2021, not in 2023.
+    for (on, want) in [(day(2021, 6, 1), 2), (day(2023, 1, 1), 1)] {
+        let g = explore::subgraph(
+            s,
+            &SubgraphQuery {
+                edge_kinds: vec![EdgeKind::ParentOf],
+                as_of: Some(on),
+                ..sub(vec![a], 1)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(g.nodes.len(), want, "as of {on}");
+    }
+    assert!(matches!(
+        explore::subgraph(s, &sub(vec![Uuid::from_u128(0x172)], 1)).await,
+        Err(Error::NotFound(_))
+    ));
+
+    // Paths: A to D is three edges, through d0 or d1 to B, then the acquisition: three paths,
+    // as d1 has two edges to A.
+    let path = |from: Uuid, to: Uuid| PathQuery {
+        from,
+        to,
+        max_depth: 6,
+        edge_kinds: Vec::new(),
+        as_of: None,
+        max_paths: 10,
+    };
+    let found = explore::shortest_paths(s, &path(a, d)).await.unwrap();
+    assert!(!found.truncated);
+    assert_eq!(found.paths.len(), 3, "{found:?}");
+    let mut middles = BTreeSet::new();
+    for p in &found.paths {
+        assert_eq!(p.edges.len(), 3);
+        let ids: Vec<Uuid> = p.nodes.iter().map(|n| n.id).collect();
+        assert_eq!((ids[0], ids[2], ids[3]), (a, b, d));
+        middles.insert(ids[1]);
+        for (i, e) in p.edges.iter().enumerate() {
+            let ends = BTreeSet::from([e.edge.src, e.edge.dst]);
+            assert_eq!(ends, BTreeSet::from([ids[i], ids[i + 1]]));
+        }
+    }
+    assert_eq!(middles, BTreeSet::from([docs[0], docs[1]]));
+    let one = explore::shortest_paths(
+        s,
+        &PathQuery {
+            max_paths: 1,
+            ..path(d, a)
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(one.paths.len(), 1);
+    assert_eq!(one.paths[0].nodes[0].id, d);
+    // Not within two edges; not over party edges alone; not before the acquisition.
+    for q in [
+        PathQuery {
+            max_depth: 2,
+            ..path(a, d)
+        },
+        PathQuery {
+            edge_kinds: vec![EdgeKind::Party],
+            ..path(a, d)
+        },
+        PathQuery {
+            as_of: Some(day(2023, 1, 1)),
+            ..path(a, d)
+        },
+    ] {
+        let found = explore::shortest_paths(s, &q).await.unwrap();
+        assert!(found.paths.is_empty() && !found.truncated, "{q:?}");
+    }
+    // After the acquisition it holds.
+    let found = explore::shortest_paths(
+        s,
+        &PathQuery {
+            as_of: Some(day(2024, 1, 1)),
+            ..path(a, d)
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(found.paths.len(), 3);
+    // The retracted edge is not followed: D and d4 are not connected.
+    let found = explore::shortest_paths(s, &path(d, docs[4])).await.unwrap();
+    assert!(found.paths.is_empty());
+    let found = explore::shortest_paths(s, &path(a, a)).await.unwrap();
+    assert_eq!(found.paths.len(), 1);
+    assert!(found.paths[0].edges.is_empty());
+    assert!(matches!(
+        explore::shortest_paths(s, &path(a, Uuid::from_u128(0x172))).await,
+        Err(Error::NotFound(_))
+    ));
+}
+
+/// Times the explorer's reads on a seeded store (issue #172; a measurement, not a check):
+/// the first fold of the whole log, `CompanyGraph` at its defaults, the first `ListCompanies`
+/// page of each order and a page deep in the document order, a two-level `Subgraph` around
+/// `hub` and a `Path` between `from` and `to`. Prints one line a read: the median of `runs`.
+///
+/// # Panics
+///
+/// When a read fails.
+#[allow(clippy::too_many_lines)]
+pub async fn explorer_timings<B: Backend + ?Sized>(
+    s: &B,
+    hub: Uuid,
+    from: Uuid,
+    to: Uuid,
+    runs: usize,
+) {
+    use std::time::Instant;
+
+    use crate::explore::{self, PathQuery, SubgraphQuery};
+    use crate::{CompanyFilter, CompanyOrder};
+
+    let t = Instant::now();
+    let mut rows = 0;
+    loop {
+        let f = s
+            .fold_company_graph(explore::FOLD_BATCH)
+            .await
+            .expect("fold");
+        rows += f.rows;
+        if !f.more {
+            break;
+        }
+    }
+    println!(
+        "fold of the whole log: {rows} rows in {:.1} s ({:.0} rows/s)",
+        t.elapsed().as_secs_f64(),
+        f64::from(u32::try_from(rows).unwrap_or(u32::MAX)) / t.elapsed().as_secs_f64()
+    );
+    // The median of `runs` runs of an async block (after one warm-up), and its last answer.
+    macro_rules! median {
+        ($body:expr) => {{
+            let mut ms = Vec::new();
+            let mut what = String::new();
+            for _ in 0..=runs {
+                let t = Instant::now();
+                what = $body.await;
+                ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            ms.remove(0);
+            ms.sort_by(f64::total_cmp);
+            (ms[ms.len() / 2], what)
+        }};
+    }
+    let all = CompanyFilter::default();
+    let (ms, what) = median!(async {
+        let g = explore::company_graph(
+            s,
+            &all,
+            1,
+            explore::COMPANY_GRAPH_NODES_DEFAULT,
+            explore::COMPANY_GRAPH_LINKS_DEFAULT,
+        )
+        .await
+        .expect("company graph");
+        format!(
+            "{} companies, {} links, truncated {}",
+            g.companies.len(),
+            g.links.len(),
+            g.truncated
+        )
+    });
+    println!("CompanyGraph (500 companies, 5000 links) | {ms:.1} ms | {what}");
+    let (ms, what) = median!(async {
+        let g = explore::company_graph(
+            s,
+            &all,
+            1,
+            explore::COMPANY_GRAPH_NODES_MAX,
+            explore::COMPANY_GRAPH_LINKS_MAX,
+        )
+        .await
+        .expect("company graph");
+        format!(
+            "{} companies, {} links, truncated {}",
+            g.companies.len(),
+            g.links.len(),
+            g.truncated
+        )
+    });
+    println!("CompanyGraph (2000 companies, 20000 links) | {ms:.1} ms | {what}");
+    for order in [
+        CompanyOrder::Documents,
+        CompanyOrder::Degree,
+        CompanyOrder::Name,
+    ] {
+        let (ms, what) = median!(async {
+            let page = s
+                .list_companies(&all, order, None, 50, crate::RECORDS_PAGE_BYTES)
+                .await
+                .expect("list");
+            format!("{} companies", page.len())
+        });
+        println!("ListCompanies {order:?}, first page of 50 | {ms:.1} ms | {what}");
+    }
+    // A page deep in the document order: the cursor of the 10,000th company.
+    let mut after = None;
+    for _ in 0..10 {
+        let page = s
+            .list_companies(
+                &all,
+                CompanyOrder::Documents,
+                after.as_ref(),
+                1000,
+                usize::MAX,
+            )
+            .await
+            .expect("list");
+        after = page
+            .last()
+            .map(|r| crate::CompanyCursor::of(CompanyOrder::Documents, r));
+    }
+    let (ms, what) = median!(async {
+        let page = s
+            .list_companies(
+                &all,
+                CompanyOrder::Documents,
+                after.as_ref(),
+                50,
+                usize::MAX,
+            )
+            .await
+            .expect("list");
+        format!("{} companies", page.len())
+    });
+    println!("ListCompanies Documents, page 50 after 10,000 | {ms:.1} ms | {what}");
+    let (ms, what) = median!(async {
+        let g = explore::subgraph(
+            s,
+            &SubgraphQuery {
+                seeds: vec![hub],
+                depth: 2,
+                node_kinds: Vec::new(),
+                edge_kinds: Vec::new(),
+                max_nodes: explore::SUBGRAPH_NODES_DEFAULT,
+                max_edges: explore::SUBGRAPH_EDGES_DEFAULT,
+                as_of: None,
+            },
+        )
+        .await
+        .expect("subgraph");
+        format!(
+            "{} nodes, {} edges, truncated {}",
+            g.nodes.len(),
+            g.edges.len(),
+            g.truncated
+        )
+    });
+    println!("Subgraph (hub, depth 2, defaults) | {ms:.1} ms | {what}");
+    let (ms, what) = median!(async {
+        let p = explore::shortest_paths(
+            s,
+            &PathQuery {
+                from,
+                to,
+                max_depth: explore::PATH_DEPTH_DEFAULT,
+                edge_kinds: Vec::new(),
+                as_of: None,
+                max_paths: 1,
+            },
+        )
+        .await
+        .expect("path");
+        format!(
+            "{} paths of {} edges, truncated {}",
+            p.paths.len(),
+            p.paths.first().map_or(0, |p| p.edges.len()),
+            p.truncated
+        )
+    });
+    println!("Path (two small companies, depth 4) | {ms:.1} ms | {what}");
 }

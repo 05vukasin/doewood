@@ -247,6 +247,38 @@ refused: the workbook has more than 1,600,000 cells ...`, and how to raise the c
   (`INVALID_ARGUMENT`) apart. See [Pages of Neighbours and CompanyDocuments](#pages-of-neighbours-and-companydocuments).
 - **Search** matches every word of `text` and every filter that is set (company, kind, date and
   amount ranges, source), with `limit` (up to 1000) and `offset`.
+- **The explorer's reads** (issue #172), for a visual graph explorer. Each is bounded, by a
+  page or by caps that end it with `truncated: true`; a cap above its maximum is
+  `INVALID_ARGUMENT`. See [The explorer's reads](#the-explorers-reads) for how they are kept
+  fast.
+  - **ListCompanies** lists live companies (merged-away husks never), with id, name, other
+    names, identifiers (`lei`, `vat`, ...), jurisdiction, website, favicon domain (for
+    `GET /icons/{domain}`), document count, degree and whether they were enriched. Filter by
+    name prefix (ignoring case), jurisdiction, having an identifier, and enriched or not;
+    order by documents, degree (most first; ties by id, descending) or name. Pages as
+    ListRecords: `page_size` default 50, at most 1000, a 3 MiB budget; a token only goes with
+    the order it came from.
+  - **CompanyGraph** returns the `limit` companies with the most documents that match the
+    filter (default 500, at most 2000) and the links between them, most shared documents
+    first (`max_links` default 5000, at most 20000). A link is two companies that are parties
+    of the same documents (`shared_documents`, at least `min_weight`, with each side's roles)
+    or that have a live corporate-event edge (`events`: the edges themselves, with dates,
+    source and evidence; at most 50 read per company). A document with more than 32 distinct
+    parties (a register, not a deal) links none of them, but counts for each.
+  - **Subgraph** walks from 1 to 100 seeds up to `depth` 3 over live edges either way, only
+    through `node_kinds` and `edge_kinds` when given, and only over edges that hold on `as_of`
+    when given. Caps: `limit` nodes (default 200, at most 2000), `max_edges` (default 1000, at
+    most 10000), about 8 MiB of props and evidence, and per level each node's share of the
+    edges left (so one hub cannot take them all). Nodes come with their depth.
+  - **Path** finds the shortest paths (`max_paths`, default 1, at most 10) between two nodes
+    within `max_depth` edges (default 4, at most 6), over `edge_kinds` and `as_of` as above;
+    each edge carries its evidence. It is a bidirectional breadth-first search that grows the
+    smaller side a level at a time, within 5000 visited nodes and 20000 edges a level.
+    `truncated` says a cap cut it, so a shorter path (or one, when none came back) may exist;
+    no paths and `truncated: false` means there is none within `max_depth`.
+  - Document counts, degrees and weights are counted by the store, not on each read, and trail
+    the edges by a few seconds: `stale: true` says a large change (a bulk ingest) is still
+    being counted. A missing seed or path end is `NOT_FOUND`.
 
 Dates are `YYYY-MM-DD` strings; JSON props and evidence are strings holding JSON.
 
@@ -584,6 +616,30 @@ grpcurl -plaintext -d '{"text": "invoice", "kind": "invoice", "date_from": "2026
     127.0.0.1:7443 doewood.v1.SearchService/Search
 ```
 
+The explorer's reads (issue #172):
+
+```sh
+# Companies with the most documents; then the next page.
+grpcurl -plaintext -d '{"order": "COMPANY_ORDER_DOCUMENTS", "page_size": 100}' \
+    127.0.0.1:7443 doewood.v1.GraphService/ListCompanies
+grpcurl -plaintext -d '{"order": "COMPANY_ORDER_DOCUMENTS", "page_size": 100, "page_token": "<next_page_token>"}' \
+    127.0.0.1:7443 doewood.v1.GraphService/ListCompanies
+# British companies whose name starts with "acme", enriched and with an identifier, by name.
+grpcurl -plaintext -d '{"filter": {"name_prefix": "acme", "jurisdiction": "GB", "has_identifier": true, "enriched": true}, "order": "COMPANY_ORDER_NAME"}' \
+    127.0.0.1:7443 doewood.v1.GraphService/ListCompanies
+# The company graph: the 500 companies with the most documents, links of 3 shared documents or more.
+grpcurl -plaintext -d '{"min_weight": 3, "limit": 500, "max_links": 5000}' \
+    127.0.0.1:7443 doewood.v1.GraphService/CompanyGraph
+# Two levels around a company, companies and documents only, edges that held on 2022-05-01.
+grpcurl -plaintext -d '{"seed_ids": ["<uuid>"], "depth": 2, "node_kinds": ["NODE_KIND_COMPANY", "NODE_KIND_DOCUMENT"], "as_of": "2022-05-01", "limit": 300}' \
+    127.0.0.1:7443 doewood.v1.GraphService/Subgraph
+# Who owned whom: the shortest ownership paths between two companies on a day.
+grpcurl -plaintext -d '{"from_id": "<uuid>", "to_id": "<uuid>", "max_depth": 6, "edge_kinds": ["EDGE_KIND_PARENT_OF", "EDGE_KIND_SUBSIDIARY_OF", "EDGE_KIND_ACQUIRED"], "as_of": "2022-05-01", "max_paths": 3}' \
+    127.0.0.1:7443 doewood.v1.GraphService/Path
+```
+
+An answer that a cap ended says so (`"truncated": true`); proto3 JSON leaves out a `false`.
+
 A validation error lists every field:
 
 ```console
@@ -836,6 +892,86 @@ clients), its peak during the step.
 A client that needs every document now walks 12 pages of 1000 (or 240 of 50), and then the
 empty page that a full last page's token leads to; each page costs its own size, so the walk
 is linear.
+
+## The explorer's reads
+
+Issue #172: `ListCompanies`, `CompanyGraph`, `Subgraph` and `Path`, for a visual explorer
+(`doewood_model::explore`, the stores' `explore.rs`).
+
+**Counts kept, not computed per read.** Ordering 20,000 companies by documents, or the pairs
+of companies by shared documents, would aggregate every `party` edge on each call: on 200,000
+documents (600,000 party edges) 0.5 s for the counts and 0.8 s for the pairs on Postgres even
+with covering indexes. Instead the counts are kept in `company_stats` (a company's documents
+and degree; a row per company, made with it) and `company_links` (each pair `a < b` with
+shared documents, corporate events and each side's roles), shared schema 12 and instance
+schema 14:
+
+- **Writers do not touch them.** A trigger on `edges` (Postgres: statement triggers, one
+  `INSERT` per statement) appends each change to a live `party` or corporate-event edge to
+  `company_graph_log`: +1 when an edge is written live or becomes live, -1 when it stops or
+  is deleted (a cascade from a deleted node too), nothing for an upsert that rewrites an edge
+  as it was. The log has no unique key that two writers could wait on, so ingest's
+  concurrency is unchanged.
+- **A fold moves the log into the counts** (`GraphStore::fold_company_graph`): the nodes of
+  the first 1000 log rows, all their log rows, and their live edges now, read in one snapshot
+  (one statement on Postgres, the writer's transaction on SQLite). What was counted for a node
+  is its edges now minus its logged changes, so the counts move by the difference; then the
+  rows are deleted. Folds take a transaction-scoped advisory lock (Postgres) that writers
+  never take, so two instances never fold the same rows. Each instance folds every 5 s in the
+  background (`cleanup::start_fold`), and `ListCompanies` and `CompanyGraph` fold first (at
+  most 20 batches; past that they answer with `stale: true`). After a bulk load the first
+  fold counts everything; the upgrade to these schemas logs every live edge, so the first fold
+  after it builds the counts.
+- A document with more than 32 distinct parties links none of them (it still counts for
+  each), which also bounds a fold's work per document to 496 pairs. A pair keeps at most 16
+  role counts.
+- The tests compare the folded counts with a count from scratch on generated data with
+  retractions, deletions and moved edges (`folded_counts_match_a_count_from_scratch`, both
+  backends; on Postgres also with two writers and two folders racing), and the conformance
+  case `explorer` checks them through a merge.
+
+**Reads.** `ListCompanies` reads `company_stats` in `(documents, id)` or `(degree, id)` index
+order, or `nodes_company_name` (the lowercased name, partial on companies) for the name
+order, from its token, and checks the filters on the companies in order. `CompanyGraph` is
+that listing's first `limit` companies, then one indexed lookup of the links among them
+(strongest first, cut at `max_links`) and one statement for their corporate events.
+`Subgraph` and `Path` read a level of the walk in one statement (`neighbours_of_many`:
+Postgres runs the `Neighbours` page query for each node of the level in a lateral join;
+SQLite runs it per node on one read connection), each node capped at its share of the
+level's edge budget.
+
+Shared schema 12 and instance schema 14 add the tables, triggers and the name index; older
+instances refuse the shared schema, so every instance is upgraded together. The upgrade logs
+every live party and corporate edge (at 200,000 documents about 680,000 rows), and the
+background fold counts them in under half a minute (below).
+
+**Measured** (issue #172; `explorer_timings` in `doewood-store` and `doewood-pg`, release
+build, `cargo test --release -p doewood-store --lib explorer_timings -- --ignored
+--nocapture`, and the same in `doewood-pg` with `DOEWOOD_TEST_POSTGRES_URL`): 200,000
+documents with three `party` edges each (buyer and supplier skewed to a few hubs, signatory
+uniform), 20,000 companies, 2,000 `parent_of` edges, then one party edge in 13 retracted,
+one in 29 deleted (and on Postgres one in 31 moved); `pgvector/pgvector:pg17` in a container
+on an internal Docker network; 4-core server, median of 9 runs after a warm-up.
+
+| read | SQLite | Postgres |
+|---|---|---|
+| first fold of the whole log (666k / 681k rows) | 17.2 s | 24.3 s |
+| CompanyGraph, defaults (500 companies, 5,000 links) | 33.3 ms | 51.1 ms |
+| CompanyGraph, maximum (2,000 companies, 20,000 links) | 99.1 ms | 117.9 ms |
+| ListCompanies, first page of 50, by documents / degree / name | 0.3 / 0.3 / 0.3 ms | 1.0 / 1.0 / 1.1 ms |
+| ListCompanies, page of 50 after 10,000 companies | 0.3 ms | 1.1 ms |
+| Subgraph from the biggest hub, depth 2, defaults (truncated at 200 nodes) | 8.6 ms | 8.8 ms |
+| Path between two small companies, depth 4 (found, 4 edges) | 4.3 ms | 3.5 ms |
+
+Before the counts were kept, the same aggregation per read took 540 ms for the document
+counts and 650 to 770 ms for the pairs on Postgres alone. Two query plans needed care: on
+SQLite the listing joins `company_stats` first (`CROSS JOIN`; left to the planner it read
+every company by kind and sorted them: 13 ms a page), and on Postgres the filters on props
+sit behind a lateral `OFFSET 0` fence (the planner cannot estimate them and hash-joined
+every company: 33 ms a page). SQLite reads a CompanyGraph's links per company as a key range
+or as point probes, whichever is fewer (as one `IN` probe of every pair it took 1.0 s at
+2,000 companies).
+
 
 ## Search by company
 
