@@ -3,15 +3,16 @@
 //! template property, same origin by `w:rsidRoot` and by XMP id), and pairs that hit none (a
 //! shared heading skeleton with a distant masked `SimHash`, an identical text below the
 //! minimum length). On SQLite and, when `DOEWOOD_TEST_POSTGRES_URL` is set, on Postgres in a
-//! schema of its own.
+//! schema of its own. Also same origin from files quail analyzes (`w15:docId`, XMP ids).
 
 mod common;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use doewood_core::MasterKey;
 use doewood_ingest::facts::{DocFacts, SimilarityFacts};
-use doewood_ingest::{GraphWriter, Similar, SimilarityConfig};
+use doewood_ingest::{Analyzer, AnalyzerConfig, GraphWriter, Similar, SimilarityConfig};
 use doewood_model::similar::edge_relations;
 use doewood_model::{
     Backend, Blake3, Direction, EdgeKind, NeighbourQuery, NodeKind, ObjectLocation, SimilarKeyKind,
@@ -329,4 +330,80 @@ async fn each_relation_on_postgres() {
         .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
         .await
         .unwrap();
+}
+
+/// Same origin from the ids quail reads from the files themselves (quail #123): two DOCX
+/// with one `w15:docId`, and a PDF saved from another (its XMP `OriginalDocumentID` is the
+/// other's `DocumentID`). Their texts share nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_origin_from_analyzed_files() {
+    let a = Analyzer::new(&AnalyzerConfig {
+        workers: 1,
+        ocr_models: PathBuf::from("/nonexistent/doewood-ocr-models"),
+        ..AnalyzerConfig::default()
+    })
+    .unwrap();
+    let settings = |id: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml"><w15:docId w15:val="{id}"/></w:settings>"#
+        )
+    };
+    let xmp = |id: &str, original: &str| {
+        format!(
+            r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:xmpMM="http://ns.adobe.com/xap/1.0/mm/" xmpMM:DocumentID="{id}" xmpMM:OriginalDocumentID="{original}"/></rdf:RDF></x:xmpmeta>"#
+        )
+    };
+    let w15 = "{4B1C2D3E-0000-4000-8000-00000000ABCD}";
+    let docx = |seed, id: &str| {
+        common::docx_with_settings("Offer", &[&common::prose(seed, 80)], Some(&settings(id)))
+    };
+    let pdf = |seed, id: &str, original: &str| {
+        common::pdf_with_xmp(
+            &[&[&common::prose(seed, 12)]],
+            "Plan",
+            Some(&xmp(id, original)),
+        )
+    };
+    let files = [
+        ("1.docx", docx(101, w15)),
+        ("2.docx", docx(102, w15)),
+        (
+            "3.docx",
+            docx(103, "{11111111-2222-3333-4444-555555555555}"),
+        ),
+        ("4.pdf", pdf(104, "uuid:5d1c", "uuid:5d1c")),
+        ("5.pdf", pdf(105, "xmp.did:77", "uuid:5D1C")),
+    ];
+    let analyzed: Vec<DocFacts> = files
+        .into_iter()
+        .map(|(name, bytes)| DocFacts::from_record(&a.analyze(bytes, name).body))
+        .collect();
+    assert_eq!(
+        analyzed[0].similarity.origins,
+        [(
+            SimilarKeyKind::OriginW15,
+            "4b1c2d3e-0000-4000-8000-00000000abcd".to_owned()
+        )]
+    );
+    assert_eq!(
+        analyzed[4].similarity.origins,
+        [
+            (SimilarKeyKind::OriginXmp, "uuid:5d1c".to_owned()),
+            (SimilarKeyKind::OriginXmp, "xmp.did:77".to_owned()),
+        ]
+    );
+    let s = Store::open_in_memory(&MasterKey::from_bytes([4; 32])).unwrap();
+    let b = Arc::new(Standalone::new(Arc::new(s))) as Arc<dyn Backend>;
+    write_all(&b, &analyzed).await;
+    let b = &*b;
+    assert!(relations(b, 1, 2).await.contains(&R::SameOrigin));
+    assert_eq!(props(b, 1, 2).await.unwrap()["origin"], "w15");
+    assert!(relations(b, 4, 5).await.contains(&R::SameOrigin));
+    assert_eq!(props(b, 4, 5).await.unwrap()["origin"], "xmp");
+    for (x, y) in [(1, 3), (2, 3), (1, 4), (3, 5)] {
+        assert!(
+            !relations(b, x, y).await.contains(&R::SameOrigin),
+            "{x} and {y}"
+        );
+    }
 }
