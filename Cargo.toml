@@ -63,11 +63,11 @@ opt-level = 2
 [patch.crates-io]
 # quail: hayro with per-file decode budgets and image size checks for hostile PDFs, and the
 # faster lingua of quail-text (output unchanged).
-hayro = { git = "https://github.com/05vukasin/quail", rev = "62b747d" }
-hayro-syntax = { git = "https://github.com/05vukasin/quail", rev = "62b747d" }
-hayro-interpret = { git = "https://github.com/05vukasin/quail", rev = "62b747d" }
-hayro-jbig2 = { git = "https://github.com/05vukasin/quail", rev = "62b747d" }
-lingua = { git = "https://github.com/05vukasin/quail", rev = "62b747d" }
+hayro = { git = "https://github.com/05vukasin/quail", rev = "92cf682" }
+hayro-syntax = { git = "https://github.com/05vukasin/quail", rev = "92cf682" }
+hayro-interpret = { git = "https://github.com/05vukasin/quail", rev = "92cf682" }
+hayro-jbig2 = { git = "https://github.com/05vukasin/quail", rev = "92cf682" }
+lingua = { git = "https://github.com/05vukasin/quail", rev = "92cf682" }
 # hedgehog: calamine 0.37 with the fixes for hostile files its fuzzer found, and its
 # rust_xlsxwriter.
 calamine = { git = "https://github.com/05vukasin/hedgehog", rev = "1a9811f" }
