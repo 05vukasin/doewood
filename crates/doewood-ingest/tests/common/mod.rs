@@ -152,6 +152,11 @@ fn xml_escape(s: &str) -> String {
 
 /// A minimal DOCX: a title paragraph and one paragraph per body line.
 pub fn docx(title: &str, body: &[&str]) -> Vec<u8> {
+    docx_with_settings(title, body, None)
+}
+
+/// [`docx`] with a `word/settings.xml` part (linked from the document's relationships).
+pub fn docx_with_settings(title: &str, body: &[&str], settings: Option<&str>) -> Vec<u8> {
     const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
     let paras: String = body
         .iter()
@@ -163,7 +168,7 @@ pub fn docx(title: &str, body: &[&str]) -> Vec<u8> {
         })
         .collect();
     let title = xml_escape(title);
-    zip_of(&[
+    let mut parts = vec![
         (
             "[Content_Types].xml",
             r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#.to_owned(),
@@ -178,7 +183,15 @@ pub fn docx(title: &str, body: &[&str]) -> Vec<u8> {
                 r#"<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="{W}"><w:body><w:p><w:pPr><w:pStyle w:val="Title"/></w:pPr><w:r><w:t>{title}</w:t></w:r></w:p>{paras}</w:body></w:document>"#
             ),
         ),
-    ])
+    ];
+    if let Some(settings) = settings {
+        parts.push((
+            "word/_rels/document.xml.rels",
+            r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="settings.xml"/></Relationships>"#.to_owned(),
+        ));
+        parts.push(("word/settings.xml", settings.to_owned()));
+    }
+    zip_of(&parts)
 }
 
 /// A minimal PPTX: one slide per `(title, body lines)`, with a layout and a master.
@@ -409,6 +422,11 @@ pub fn pdf(lines: &[&str], title: &str) -> Vec<u8> {
 
 /// A PDF with one page per entry of `pages`, each with its lines of Helvetica text.
 pub fn pdf_pages(pages: &[&[&str]], title: &str) -> Vec<u8> {
+    pdf_with_xmp(pages, title, None)
+}
+
+/// [`pdf_pages`] with this XMP packet as the catalog's `/Metadata` stream.
+pub fn pdf_with_xmp(pages: &[&[&str]], title: &str, xmp: Option<&str>) -> Vec<u8> {
     let mut doc = Document::with_version("1.7");
     let pages_id = doc.new_object_id();
     let font_id = doc.add_object(dictionary! {
@@ -451,7 +469,15 @@ pub fn pdf_pages(pages: &[&[&str]], title: &str) -> Vec<u8> {
             "MediaBox" => vec![0.into(), 0.into(), W.into(), H.into()],
         }),
     );
-    let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    let mut catalog = dictionary! { "Type" => "Catalog", "Pages" => pages_id };
+    if let Some(xmp) = xmp {
+        let meta = doc.add_object(Stream::new(
+            dictionary! { "Type" => "Metadata", "Subtype" => "XML" },
+            xmp.as_bytes().to_vec(),
+        ));
+        catalog.set("Metadata", meta);
+    }
+    let catalog_id = doc.add_object(catalog);
     let info_id = doc.add_object(dictionary! {
         "Title" => Object::string_literal(title),
         "Producer" => Object::string_literal("doewood test generator"),
